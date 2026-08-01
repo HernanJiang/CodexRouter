@@ -1,0 +1,52 @@
+# Runtime data
+data/
+logs/
+downloads/
+postgres/
+redis/
+app/
+backups/
+.codegraph/
+source/
+**/target/
+Codex-Router-Configurator.exe
+config/models.json
+config/model-catalog.json
+config/sub2api-channels.json
+codex-router-config.json
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# Secrets
+*.secret
+*.key
+.env
+config/*.local.yaml
+config/*.local.json
+data/sub2api/config.yaml
+scripts/*.local.ps1
+
+# Node
+node_modules/
+dist/
+build/
+**/__pycache__/
+*.py[cod]
+.pnpm-debug.log*
+
+# Go build artifacts
+source/backend/sub2api
+source/backend/*.exe
+
+# PyInstaller build artifacts
+codex-router-gui/build/
+codex-router-gui/dist/
+codex-router-gui/*.spec

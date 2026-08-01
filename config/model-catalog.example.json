@@ -1,0 +1,83 @@
+[
+  {
+    "slug": "gpt-5.6-sol",
+    "display_name": "GPT-5.6-Sol",
+    "description": "Frontier agentic coding model.",
+    "default_reasoning_level": "low",
+    "supported_reasoning_levels": [
+      {
+        "effort": "low",
+        "description": "Fast responses with lighter reasoning"
+      },
+      {
+        "effort": "medium",
+        "description": "Balanced speed and reasoning depth"
+      },
+      {
+        "effort": "high",
+        "description": "Greater reasoning depth for complex problems"
+      },
+      {
+        "effort": "xhigh",
+        "description": "Extra high reasoning depth for hard problems"
+      },
+      {
+        "effort": "max",
+        "description": "Maximum reasoning depth for the hardest problems"
+      },
+      {
+        "effort": "ultra",
+        "description": "Maximum reasoning with automatic task delegation"
+      }
+    ],
+    "shell_type": "shell_command",
+    "visibility": "list",
+    "supported_in_api": true,
+    "priority": 1,
+    "additional_speed_tiers": [
+      "fast"
+    ],
+    "service_tiers": [
+      {
+        "id": "priority",
+        "name": "Fast",
+        "description": "1.5x speed, increased usage"
+      }
+    ],
+    "supports_vision": true
+  },
+  {
+    "slug": "deepseek-v4-flash",
+    "display_name": "DeepSeek V4 Flash",
+    "description": "Fast and affordable coding model via OpenRouter.",
+    "default_reasoning_level": "low",
+    "supported_reasoning_levels": [
+      {
+        "effort": "minimal",
+        "description": "Minimal reasoning"
+      },
+      {
+        "effort": "low",
+        "description": "Low reasoning"
+      },
+      {
+        "effort": "medium",
+        "description": "Medium reasoning"
+      },
+      {
+        "effort": "high",
+        "description": "High reasoning"
+      },
+      {
+        "effort": "xhigh",
+        "description": "Extra high reasoning"
+      }
+    ],
+    "shell_type": "shell_command",
+    "visibility": "list",
+    "supported_in_api": true,
+    "priority": 10,
+    "additional_speed_tiers": [],
+    "supports_vision": true
+  }
+]

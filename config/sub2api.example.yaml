@@ -1,0 +1,30 @@
+server:
+  host: 127.0.0.1
+  port: 18080
+  mode: release
+database:
+  host: 127.0.0.1
+  port: 15432
+  user: sub2api
+  password: CHANGE_ME
+  dbname: sub2api
+  sslmode: disable
+redis:
+  host: 127.0.0.1
+  port: 16379
+  username: ""
+  password: CHANGE_ME
+  db: 0
+  enable_tls: false
+jwt:
+  secret: CHANGE_ME_TO_A_RANDOM_STRING
+  expire_hour: 24
+default:
+  user_concurrency: 5
+  user_balance: 0
+  api_key_prefix: sk-
+  rate_multiplier: 1
+rate_limit:
+  requests_per_minute: 60
+  burst_size: 10
+timezone: UTC

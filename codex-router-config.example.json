@@ -1,0 +1,104 @@
+{
+  "version": "0.2.0",
+  "authMode": "chatgpt_oauth",
+  "localApiKey": "",
+  "deploy": {
+    "codexHome": "",
+    "sub2apiHost": "http://127.0.0.1:18080",
+    "ccSwitchDb": "",
+    "generateIsolation": true
+  },
+  "oauthFallback": {
+    "enabled": true,
+    "officialPriority": 1,
+    "fallbackPriority": 100
+  },
+  "reasoning": {
+    "mode": "auto"
+  },
+  "models": [
+    {
+      "model": "gpt-5.6-sol",
+      "alias": "GPT-5.6 Sol",
+      "baseURL": "https://api.openai.com/v1",
+      "apiKey": "<YOUR_OPENAI_KEY>",
+      "priority": 1,
+      "weight": 1,
+      "extra": "{}",
+      "multimodal": "auto"
+    },
+    {
+      "model": "deepseek-v4-flash",
+      "alias": "DeepSeek V4 Flash",
+      "baseURL": "https://openrouter.ai/api/v1",
+      "apiKey": "<YOUR_OPENROUTER_KEY>",
+      "priority": 10,
+      "weight": 1,
+      "extra": "{}",
+      "multimodal": "auto"
+    }
+  ],
+  "modelCatalog": [
+    {
+      "slug": "gpt-5.6-sol",
+      "display_name": "GPT-5.6 Sol",
+      "description": "Example model",
+      "default_reasoning_level": "low",
+      "supported_reasoning_levels": [
+        {
+          "effort": "low",
+          "description": "low reasoning level"
+        },
+        {
+          "effort": "medium",
+          "description": "medium reasoning level"
+        },
+        {
+          "effort": "high",
+          "description": "high reasoning level"
+        },
+        {
+          "effort": "xhigh",
+          "description": "xhigh reasoning level"
+        },
+        {
+          "effort": "max",
+          "description": "max reasoning level"
+        },
+        {
+          "effort": "ultra",
+          "description": "ultra reasoning level"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 1,
+      "additional_speed_tiers": [
+        "fast"
+      ],
+      "service_tiers": [
+        {
+          "id": "priority",
+          "name": "Fast",
+          "description": "Faster responses with higher usage"
+        }
+      ],
+      "supports_vision": true
+    }
+  ],
+  "ccSwitchProviders": [
+    {
+      "id": "codex-router-gpt-5-6-sol",
+      "name": "GPT-5.6 Sol (Codex Router)",
+      "app_type": "codex",
+      "settings": {
+        "model_provider": "sub2api",
+        "model": "gpt-5.6-sol",
+        "api_url": "http://127.0.0.1:18080/v1",
+        "api_key": "<YOUR_SUB2API_KEY>",
+        "requires_openai_auth": true
+      }
+    }
+  ]
+}
