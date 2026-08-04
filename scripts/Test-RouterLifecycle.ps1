@@ -434,6 +434,11 @@ Export-ModuleMember -Function Get-RouterBaseUri
             $startSource.Contains('$process.WaitForExit($TimeoutSeconds * 1000)')) `
         -Message 'Start is missing bounded, verified PostgreSQL recovery'
     Assert-Test `
+        -Condition ($startSource.Contains('$redisConfig = "$routerRoot\config\redis.conf"') -and
+            $startSource.Contains('-ArgumentList @($redisConfig)') -and
+            -not $startSource.Contains('../../config/redis.conf')) `
+        -Message 'Redis configuration is not resolved from the portable package root'
+    Assert-Test `
         -Condition ($monitorSource.Contains('/v1/models') -and
             $monitorSource.Contains('-RepairUnhealthy')) `
         -Message 'health monitor does not probe the authenticated data path before recovery'
