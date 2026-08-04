@@ -85,7 +85,6 @@ jobs:
           $roots = @(Get-ChildItem -LiteralPath $expanded -Directory)
           if ($roots.Count -ne 1) { throw 'The published stage root is unavailable.' }
           $root = $roots[0].FullName
-          $env:CODEX_ROUTER_PORTABLE_STATE = '1'
           try {
             $output = & (Join-Path $root 'scripts/Start-ProviderOAuth.ps1') `
               -Provider openai `
