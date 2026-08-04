@@ -6,7 +6,9 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $routerRoot = Split-Path -Parent $PSScriptRoot
+Import-Module "$routerRoot\scripts\CredentialStore.psm1" -Force
 Import-Module "$routerRoot\scripts\RouterAdmin.psm1" -Force
+Import-Module "$routerRoot\scripts\UserData.psm1" -Force
 Add-Type -AssemblyName System.Web
 
 function Send-CallbackResponse {
@@ -27,15 +29,24 @@ function Send-CallbackResponse {
     }
 }
 
-& "$routerRoot\scripts\Start-Router.ps1" | Out-Null
+$lifecycleLock = Enter-RouterLifecycleLock `
+    -RouterRoot $routerRoot `
+    -TimeoutMilliseconds 10000 `
+    -Operation 'Start ChatGPT OAuth'
+$previousLifecycleLockMarker = [Environment]::GetEnvironmentVariable(
+    'CODEX_ROUTER_LIFECYCLE_LOCK_HELD',
+    'Process')
+[Environment]::SetEnvironmentVariable('CODEX_ROUTER_LIFECYCLE_LOCK_HELD', [string]$PID, 'Process')
+try {
+    & "$routerRoot\scripts\Start-Router.ps1" | Out-Null
 $session = New-RouterAdminSession
 $group = (Get-RouterGroups -Session $session | Where-Object { $_.name -in @('Codex-Router', 'Codex Unified Router') } | Select-Object -First 1)
 if (-not $group) { throw 'Run the Codex-Router one-click configuration before starting ChatGPT OAuth.' }
-$routerConfigPath = Join-Path $routerRoot 'codex-router-config.json'
+$routerConfigPath = Get-RouterConfigPath -RouterRoot $routerRoot
 $oauthPriority = 1
 if (Test-Path -LiteralPath $routerConfigPath) {
     $routerConfig = Get-Content -LiteralPath $routerConfigPath -Raw | ConvertFrom-Json
-    if ($routerConfig.oauthFallback.officialPriority) { $oauthPriority = [int]$routerConfig.oauthFallback.officialPriority }
+    $oauthPriority = [int](Get-RouterOAuthRoutingPriorities -OAuthFallback $routerConfig.oauthFallback).OAuthPriority
 }
 
 $existing = Get-RouterAccounts -Session $session | Where-Object { $_.name -eq 'ChatGPT Plus OAuth' } | Select-Object -First 1
@@ -114,4 +125,11 @@ try {
     $code = $null
     $state = $null
     if ($session) { $session.Headers.Clear() }
+}
+} finally {
+    [Environment]::SetEnvironmentVariable(
+        'CODEX_ROUTER_LIFECYCLE_LOCK_HELD',
+        $previousLifecycleLockMarker,
+        'Process')
+    Exit-RouterLifecycleLock -Lock $lifecycleLock
 }

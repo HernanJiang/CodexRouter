@@ -1,0 +1,406 @@
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+function ConvertTo-CodexTomlString {
+    param([Parameter(Mandatory = $true)][string]$Value)
+    return $Value.Replace('\', '\\').Replace('"', '\"')
+}
+
+function Get-CodexRouterDefaultModel {
+    param(
+        [AllowNull()]$RouterConfig,
+        [string]$Fallback = 'deepseek-v4-flash'
+    )
+
+    if ($null -eq $RouterConfig) { return $Fallback }
+    $modelsProperty = $RouterConfig.PSObject.Properties['models']
+    if ($null -eq $modelsProperty) { return $Fallback }
+    $models = @($modelsProperty.Value)
+    if ($models.Count -eq 0) { return $Fallback }
+
+    $defaultProperty = $RouterConfig.PSObject.Properties['defaultModel']
+    if ($null -ne $defaultProperty -and -not [string]::IsNullOrWhiteSpace([string]$defaultProperty.Value)) {
+        $requested = [string]$defaultProperty.Value
+        if ($models | Where-Object { [string]$_.model -eq $requested } | Select-Object -First 1) {
+            return $requested
+        }
+    }
+    return [string]$models[0].model
+}
+
+function Set-CodexTopLevelValue {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Content,
+        [Parameter(Mandatory = $true)][string]$Key,
+        [Parameter(Mandatory = $true)][string]$Value
+    )
+
+    $firstTable = [Text.RegularExpressions.Regex]::Match($Content, '(?m)^\[')
+    $headLength = if ($firstTable.Success) { $firstTable.Index } else { $Content.Length }
+    $head = $Content.Substring(0, $headLength)
+    $tail = $Content.Substring($headLength)
+    $pattern = '(?m)^' + [Text.RegularExpressions.Regex]::Escape($Key) + '\s*=.*(?:\r?\n)?'
+    $line = "$Key = $Value`r`n"
+    $matches = [Text.RegularExpressions.Regex]::Matches($head, $pattern)
+    if ($matches.Count -gt 0) {
+        $firstIndex = $matches[0].Index
+        $head = [Text.RegularExpressions.Regex]::Replace($head, $pattern, '')
+        $head = $head.Insert([Math]::Min($firstIndex, $head.Length), $line)
+    } else {
+        $head = $head.TrimEnd() + $(if ([string]::IsNullOrWhiteSpace($head)) { '' } else { "`r`n" }) + $line
+    }
+    return $head + $tail
+}
+
+function Remove-CodexTopLevelValues {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Content,
+        [Parameter(Mandatory = $true)][string[]]$Keys
+    )
+
+    $firstTable = [Text.RegularExpressions.Regex]::Match($Content, '(?m)^\[')
+    $headLength = if ($firstTable.Success) { $firstTable.Index } else { $Content.Length }
+    $head = $Content.Substring(0, $headLength)
+    $tail = $Content.Substring($headLength)
+    foreach ($key in $Keys) {
+        $pattern = '(?m)^' + [Text.RegularExpressions.Regex]::Escape($key) + '\s*=.*(?:\r?\n)?'
+        $head = [Text.RegularExpressions.Regex]::Replace($head, $pattern, '')
+    }
+    return $head + $tail
+}
+
+function Set-CodexTableValue {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Content,
+        [Parameter(Mandatory = $true)][string]$Table,
+        [Parameter(Mandatory = $true)][string]$Key,
+        [Parameter(Mandatory = $true)][string]$Value
+    )
+
+    $tablePattern = '(?ms)^\[' + [Text.RegularExpressions.Regex]::Escape($Table) + '\]\s*\r?\n.*?(?=^\[|\z)'
+    $tableMatch = [Text.RegularExpressions.Regex]::Match($Content, $tablePattern)
+    $line = "$Key = $Value"
+    if ($tableMatch.Success) {
+        $section = $tableMatch.Value
+        $keyPattern = '(?m)^' + [Text.RegularExpressions.Regex]::Escape($Key) + '\s*=.*$'
+        if ($section -match $keyPattern) {
+            $updated = [Text.RegularExpressions.Regex]::Replace($section, $keyPattern, $line)
+        } else {
+            $headerEnd = $section.IndexOf("`n") + 1
+            $updated = $section.Insert($headerEnd, "$line`r`n")
+        }
+        return $Content.Remove($tableMatch.Index, $tableMatch.Length).Insert($tableMatch.Index, $updated)
+    }
+    return $Content.TrimEnd() + "`r`n`r`n[$Table]`r`n$line`r`n"
+}
+
+function Remove-CodexTableValue {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Content,
+        [Parameter(Mandatory = $true)][string]$Table,
+        [Parameter(Mandatory = $true)][string]$Key
+    )
+    $tablePattern = '(?ms)^\[' + [Text.RegularExpressions.Regex]::Escape($Table) + '\]\s*\r?\n.*?(?=^\[|\z)'
+    $tableMatch = [Text.RegularExpressions.Regex]::Match($Content, $tablePattern)
+    if (-not $tableMatch.Success) { return $Content }
+    $keyPattern = '(?m)^' + [Text.RegularExpressions.Regex]::Escape($Key) + '\s*=.*(?:\r?\n)?'
+    $updated = [Text.RegularExpressions.Regex]::Replace($tableMatch.Value, $keyPattern, '')
+    return $Content.Remove($tableMatch.Index, $tableMatch.Length).Insert($tableMatch.Index, $updated)
+}
+
+function Get-CodexTopLevelRawValue {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Content,
+        [Parameter(Mandatory = $true)][string]$Key
+    )
+
+    $firstTable = [Text.RegularExpressions.Regex]::Match($Content, '(?m)^\[')
+    $headLength = if ($firstTable.Success) { $firstTable.Index } else { $Content.Length }
+    $head = $Content.Substring(0, $headLength)
+    $match = [Text.RegularExpressions.Regex]::Match(
+        $head,
+        '(?m)^' + [Text.RegularExpressions.Regex]::Escape($Key) + '\s*=\s*(?<value>.+?)\s*$')
+    if (-not $match.Success) { return $null }
+    return $match.Groups['value'].Value
+}
+
+function Get-CodexTableRawValue {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Content,
+        [Parameter(Mandatory = $true)][string]$Table,
+        [Parameter(Mandatory = $true)][string]$Key
+    )
+
+    $tablePattern = '(?ms)^\[' + [Text.RegularExpressions.Regex]::Escape($Table) + '\]\s*\r?\n(?<body>.*?)(?=^\[|\z)'
+    $tableMatch = [Text.RegularExpressions.Regex]::Match($Content, $tablePattern)
+    if (-not $tableMatch.Success) { return $null }
+    $match = [Text.RegularExpressions.Regex]::Match(
+        $tableMatch.Groups['body'].Value,
+        '(?m)^' + [Text.RegularExpressions.Regex]::Escape($Key) + '\s*=\s*(?<value>.+?)\s*$')
+    if (-not $match.Success) { return $null }
+    return $match.Groups['value'].Value
+}
+
+function Copy-CodexPermissionSettings {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Content,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$SourceContent
+    )
+
+    $text = $Content
+    foreach ($key in @('approval_policy', 'sandbox_mode')) {
+        $value = Get-CodexTopLevelRawValue -Content $SourceContent -Key $key
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            $text = Set-CodexTopLevelValue -Content $text -Key $key -Value $value
+        }
+    }
+    $windowsSandbox = Get-CodexTableRawValue -Content $SourceContent -Table 'windows' -Key 'sandbox'
+    if (-not [string]::IsNullOrWhiteSpace($windowsSandbox)) {
+        $text = Set-CodexTableValue -Content $text -Table 'windows' -Key 'sandbox' -Value $windowsSandbox
+    }
+    return $text
+}
+
+function Get-CodexPermissionSourceContent {
+    param(
+        [Parameter(Mandatory = $true)][string]$CodexConfigPath,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Content
+    )
+
+    # First-time installs already carry the user's permission settings in Content.
+    # Only consult Router backups when upgrading a configuration managed by an
+    # older Router release that forced [windows].sandbox to "unelevated".
+    $providerMatch = [Text.RegularExpressions.Regex]::Match(
+        $Content,
+        '(?m)^model_provider\s*=\s*"(?<id>[A-Za-z0-9_-]+)"\s*$')
+    if (-not $providerMatch.Success) { return $Content }
+    $providerID = [Text.RegularExpressions.Regex]::Escape($providerMatch.Groups['id'].Value)
+    $providerBlock = [Text.RegularExpressions.Regex]::Match(
+        $Content,
+        '(?ms)^\[model_providers\.' + $providerID + '\]\s*(?<body>.*?)(?=^\[|\z)')
+    $providerBody = if ($providerBlock.Success) { $providerBlock.Groups['body'].Value } else { '' }
+    $routerProvider = $providerBlock.Success -and
+        $providerBody -match '(?m)^name\s*=\s*"Codex-Router"\s*$' -and
+        $providerBody -match '(?m)^base_url\s*=\s*"http://(?:127\.0\.0\.1|localhost):'
+    if (-not $routerProvider) { return $Content }
+
+    $directory = Split-Path -Parent $CodexConfigPath
+    if (-not (Test-Path -LiteralPath $directory -PathType Container)) { return $Content }
+    foreach ($backup in @(Get-ChildItem -LiteralPath $directory -Filter 'config.toml.codex-router-*.bak' -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTimeUtc, Name -Descending)) {
+        try { $candidate = [IO.File]::ReadAllText($backup.FullName) } catch { continue }
+        $approval = Get-CodexTopLevelRawValue -Content $candidate -Key 'approval_policy'
+        $sandboxMode = Get-CodexTopLevelRawValue -Content $candidate -Key 'sandbox_mode'
+        $windowsSandbox = Get-CodexTableRawValue -Content $candidate -Table 'windows' -Key 'sandbox'
+        if (-not [string]::IsNullOrWhiteSpace($approval) -or
+            -not [string]::IsNullOrWhiteSpace($sandboxMode) -or
+            (-not [string]::IsNullOrWhiteSpace($windowsSandbox) -and $windowsSandbox -ne '"unelevated"')) {
+            return $candidate
+        }
+    }
+    return $Content
+}
+
+function Get-CodexRouterModelDefaults {
+    param(
+        [AllowNull()]$RouterConfig,
+        [Parameter(Mandatory = $true)][string]$CatalogPath,
+        [AllowEmptyString()][string]$Model = ''
+    )
+    $configuredModel = Get-CodexRouterDefaultModel -RouterConfig $RouterConfig
+    if ([string]::IsNullOrWhiteSpace($Model)) { $Model = $configuredModel }
+    $effort = 'medium'
+    $supportsFast = $false
+    if (Test-Path -LiteralPath $CatalogPath) {
+        $catalog = Get-Content -LiteralPath $CatalogPath -Raw | ConvertFrom-Json
+        $entry = @($catalog.models) | Where-Object { [string]$_.slug -eq $Model } | Select-Object -First 1
+        if ($null -ne $entry) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$entry.default_reasoning_level)) {
+                $effort = ([string]$entry.default_reasoning_level).Trim().ToLowerInvariant()
+            }
+            $supportsFast = @($entry.additional_speed_tiers) -contains 'fast'
+        }
+    }
+    $fastMode = $false
+    if ($null -ne $RouterConfig -and $null -ne $RouterConfig.PSObject.Properties['models']) {
+        $modelConfig = @($RouterConfig.models) | Where-Object { [string]$_.model -eq $configuredModel } | Select-Object -First 1
+        if ($null -ne $modelConfig -and $null -ne $modelConfig.PSObject.Properties['fastMode']) {
+            $fastMode = $supportsFast -and [bool]$modelConfig.fastMode
+        }
+    }
+    return [pscustomobject]@{ Model = $Model; ReasoningEffort = $effort; FastMode = $fastMode }
+}
+
+function Remove-CodexTable {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Content,
+        [Parameter(Mandatory = $true)][string]$Table
+    )
+    $pattern = '(?ms)^\[' + [Text.RegularExpressions.Regex]::Escape($Table) + '\]\s*\r?\n.*?(?=^\[|\z)'
+    return [Text.RegularExpressions.Regex]::Replace($Content, $pattern, '')
+}
+
+function Remove-LegacyCodexRouterProvider {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Content)
+    $pattern = '(?ms)^\[model_providers\.custom\]\s*\r?\n.*?(?=^\[|\z)'
+    $match = [Text.RegularExpressions.Regex]::Match($Content, $pattern)
+    if ($match.Success -and ($match.Value -match '(?i)Codex(?: Unified)? Router|127\.0\.0\.1:18081')) {
+        return $Content.Remove($match.Index, $match.Length)
+    }
+    return $Content
+}
+
+function Remove-LegacyCodexLoopbackProxyProvider {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Content)
+    $pattern = '(?ms)^\[model_providers\.custom\]\s*\r?\n.*?(?=^\[|\z)'
+    $match = [Text.RegularExpressions.Regex]::Match($Content, $pattern)
+    if ($match.Success -and
+        $match.Value -match '127\.0\.0\.1:15721/v1' -and
+        $match.Value -match 'experimental_bearer_token\s*=\s*"PROXY_MANAGED"') {
+        return $Content.Remove($match.Index, $match.Length)
+    }
+    return $Content
+}
+
+function Get-CodexRouterRequiresOpenAiAuth {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Content)
+
+    $providerMatch = [Text.RegularExpressions.Regex]::Match(
+        $Content,
+        '(?m)^model_provider\s*=\s*"(?<id>[A-Za-z0-9_-]+)"\s*$')
+    if (-not $providerMatch.Success) { return $true }
+    $providerID = [Text.RegularExpressions.Regex]::Escape($providerMatch.Groups['id'].Value)
+    $blockMatch = [Text.RegularExpressions.Regex]::Match(
+        $Content,
+        "(?ms)^\[model_providers\.$providerID\]\s*(?<body>.*?)(?=^\[|\z)")
+    if (-not $blockMatch.Success) { return $true }
+    $body = $blockMatch.Groups['body'].Value
+    if ($body -notmatch '(?m)^name\s*=\s*"Codex-Router"\s*$') { return $true }
+    return $body -notmatch '(?m)^requires_openai_auth\s*=\s*false\s*$'
+}
+
+function New-CodexRouterConfig {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Content,
+        [Parameter(Mandatory = $true)][string]$Model,
+        [Parameter(Mandatory = $true)][string]$CatalogPath,
+        [Parameter(Mandatory = $true)][string]$LocalApiKey,
+        [string]$BaseUrl = 'http://127.0.0.1:18080',
+        [string]$ReasoningEffort = 'medium',
+        [bool]$FastMode = $false,
+        [Nullable[bool]]$RequireOpenAiAuth = $null,
+        [AllowNull()][string]$PermissionSourceContent = $null
+    )
+
+    $uri = $null
+    if (-not [Uri]::TryCreate($BaseUrl.TrimEnd('/'), [UriKind]::Absolute, [ref]$uri) -or
+        $uri.Scheme -ne 'http' -or
+        $uri.Host -notin @('127.0.0.1', 'localhost')) {
+        throw 'Codex-Router provider URL must be a local HTTP URL (127.0.0.1 or localhost).'
+    }
+    $base = $uri.GetLeftPart([UriPartial]::Authority).TrimEnd('/')
+    $ReasoningEffort = $ReasoningEffort.Trim().ToLowerInvariant()
+    if ($ReasoningEffort -notin @('none','minimal','low','medium','high','xhigh','max','ultra')) {
+        throw "Unsupported Codex reasoning effort: '$ReasoningEffort'."
+    }
+    if ([string]::IsNullOrWhiteSpace($LocalApiKey)) {
+        throw 'The local Router credential is required for Codex integration.'
+    }
+    if ($null -eq $RequireOpenAiAuth) {
+        $RequireOpenAiAuth = Get-CodexRouterRequiresOpenAiAuth -Content $Content
+    }
+
+    $text = Remove-CodexTopLevelValues -Content $Content -Keys @(
+        'openai_base_url',
+        'service_tier',
+        'disable_response_storage'
+    )
+    $text = Set-CodexTopLevelValue -Content $text -Key 'model_provider' -Value '"custom"'
+    $text = Set-CodexTopLevelValue -Content $text -Key 'model' -Value ('"' + (ConvertTo-CodexTomlString $Model) + '"')
+    $text = Set-CodexTopLevelValue -Content $text -Key 'model_catalog_json' -Value ('"' + (ConvertTo-CodexTomlString $CatalogPath) + '"')
+    $text = Set-CodexTopLevelValue -Content $text -Key 'model_reasoning_effort' -Value ('"' + $ReasoningEffort + '"')
+    $text = Set-CodexTableValue -Content $text -Table 'models.new_thread' -Key 'model' -Value ('"' + (ConvertTo-CodexTomlString $Model) + '"')
+    $text = Set-CodexTableValue -Content $text -Table 'models.new_thread' -Key 'model_reasoning_effort' -Value ('"' + $ReasoningEffort + '"')
+    if ($FastMode) {
+        $text = Set-CodexTopLevelValue -Content $text -Key 'service_tier' -Value '"fast"'
+        $text = Set-CodexTableValue -Content $text -Table 'models.new_thread' -Key 'service_tier' -Value '"fast"'
+        $text = Set-CodexTableValue -Content $text -Table 'features' -Key 'fast_mode' -Value 'true'
+    } else {
+        $text = Remove-CodexTableValue -Content $text -Table 'models.new_thread' -Key 'service_tier'
+        $text = Set-CodexTableValue -Content $text -Table 'features' -Key 'fast_mode' -Value 'false'
+    }
+    $permissionSource = if ($null -eq $PermissionSourceContent) { $Content } else { $PermissionSourceContent }
+    $text = Copy-CodexPermissionSettings -Content $text -SourceContent $permissionSource
+    $text = Set-CodexTableValue -Content $text -Table 'desktop' -Key 'enabled-reasoning-efforts' -Value '["low", "medium", "high", "xhigh", "ultra", "max"]'
+    $text = Remove-LegacyCodexRouterProvider -Content $text
+    $text = Remove-LegacyCodexLoopbackProxyProvider -Content $text
+    # Keep provider definitions owned by Codex, other switchers, and the user.
+    # Router owns the active custom provider and its legacy sub2api alias only.
+    foreach ($routerOwned in @('model_providers.sub2api', 'model_providers.custom')) {
+        $text = Remove-CodexTable -Content $text -Table $routerOwned
+    }
+
+    $localBearer = ConvertTo-CodexTomlString $LocalApiKey
+    $requiresOpenAiAuthLiteral = if ([bool]$RequireOpenAiAuth) { 'true' } else { 'false' }
+    $providerBlock = @"
+[model_providers.custom]
+name = "Codex-Router"
+base_url = "$base/v1"
+wire_api = "responses"
+requires_openai_auth = $requiresOpenAiAuthLiteral
+experimental_bearer_token = "$localBearer"
+request_max_retries = 2
+stream_max_retries = 2
+stream_idle_timeout_ms = 300000
+supports_websockets = false
+"@
+    return $text.TrimEnd() + "`r`n`r`n" + $providerBlock.Trim() + "`r`n"
+}
+
+function Set-CodexUserEnvironmentVariable {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$Value
+    )
+
+    [Environment]::SetEnvironmentVariable($Name, $Value, 'User')
+    [Environment]::SetEnvironmentVariable($Name, $Value, 'Process')
+    if (-not ('CodexRouter.EnvironmentBroadcast' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace CodexRouter {
+    public static class EnvironmentBroadcast {
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr SendMessageTimeout(
+            IntPtr hWnd, uint msg, UIntPtr wParam, string lParam,
+            uint flags, uint timeout, out UIntPtr result);
+
+        public static void Notify() {
+            UIntPtr result;
+            SendMessageTimeout(new IntPtr(0xffff), 0x001A, UIntPtr.Zero,
+                "Environment", 0x0002, 5000, out result);
+        }
+    }
+}
+'@
+    }
+    [CodexRouter.EnvironmentBroadcast]::Notify()
+}
+
+function Limit-CodexRouterBackups {
+    param(
+        [Parameter(Mandatory = $true)][string]$Directory,
+        [Parameter(Mandatory = $true)][string]$Filter,
+        [ValidateRange(1, 20)][int]$Keep = 3
+    )
+
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) { return }
+    $backups = @(Get-ChildItem -LiteralPath $Directory -Filter $Filter -File |
+        Sort-Object LastWriteTimeUtc, Name -Descending)
+    foreach ($backup in @($backups | Select-Object -Skip $Keep)) {
+        Remove-Item -LiteralPath $backup.FullName -Force
+    }
+}
+
+Export-ModuleMember -Function ConvertTo-CodexTomlString, Get-CodexRouterDefaultModel, Get-CodexRouterModelDefaults, Get-CodexRouterRequiresOpenAiAuth, Get-CodexPermissionSourceContent, New-CodexRouterConfig, Set-CodexUserEnvironmentVariable, Limit-CodexRouterBackups

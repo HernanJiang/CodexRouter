@@ -3,9 +3,12 @@ $ErrorActionPreference = 'Stop'
 
 $routerRoot = Split-Path -Parent $PSScriptRoot
 Import-Module "$routerRoot\scripts\CredentialStore.psm1" -Force
+Import-Module "$routerRoot\scripts\UserData.psm1" -Force
+$userDataRoot = Get-RouterUserDataRoot -RouterRoot $routerRoot
+$dataRoot = Get-RouterDataRoot -RouterRoot $routerRoot
 
-foreach ($directory in @('data', 'data\pids', 'data\redis', 'data\sub2api', 'logs')) {
-    [IO.Directory]::CreateDirectory((Join-Path $routerRoot $directory)) | Out-Null
+foreach ($directory in @($dataRoot, (Join-Path $dataRoot 'pids'), (Join-Path $dataRoot 'redis'), (Join-Path $dataRoot 'sub2api'), (Join-Path $routerRoot 'logs'))) {
+    [IO.Directory]::CreateDirectory($directory) | Out-Null
 }
 foreach ($requiredFile in @(
     'app\sub2api.exe',
@@ -19,15 +22,19 @@ foreach ($requiredFile in @(
 
 function New-RandomHex([int]$Bytes) {
     $buffer = [byte[]]::new($Bytes)
-    [Security.Cryptography.RandomNumberGenerator]::Fill($buffer)
-    try { return ([BitConverter]::ToString($buffer)).Replace('-', '').ToLowerInvariant() }
-    finally { [Array]::Clear($buffer, 0, $buffer.Length) }
+    $generator = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $generator.GetBytes($buffer)
+        return ([BitConverter]::ToString($buffer)).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $generator.Dispose()
+        [Array]::Clear($buffer, 0, $buffer.Length)
+    }
 }
 
 $secretSpecs = @{
     'PostgresPassword' = 24
     'RedisPassword' = 24
-    'AdminPassword' = 18
     'JwtSecret' = 32
     'TotpEncryptionKey' = 32
 }
@@ -38,7 +45,11 @@ foreach ($entry in $secretSpecs.GetEnumerator()) {
     }
 }
 
-$pgData = "$routerRoot\data\postgres"
+if ($null -eq (Get-RouterCredential -Name 'AdminPassword' -AllowMissing)) {
+    Set-RouterCredential -Name 'AdminPassword' -Secret (New-RandomHex -Bytes 24)
+}
+
+$pgData = Join-Path $dataRoot 'postgres'
 $pgVersion = "$pgData\PG_VERSION"
 if (-not (Test-Path -LiteralPath $pgVersion)) {
     if (-not (Test-Path -LiteralPath $pgData)) { New-Item -ItemType Directory -Path $pgData | Out-Null }
@@ -60,8 +71,29 @@ if (-not (Test-Path -LiteralPath $pgVersion)) {
     }
 }
 
-if (-not (Test-Path -LiteralPath "$routerRoot\data\redis")) {
-    New-Item -ItemType Directory -Path "$routerRoot\data\redis" | Out-Null
+if (-not (Test-Path -LiteralPath (Join-Path $dataRoot 'redis'))) {
+    New-Item -ItemType Directory -Path (Join-Path $dataRoot 'redis') | Out-Null
+}
+
+$aclMarker = Join-Path $dataRoot '.acl-protected-v2'
+if (-not (Test-Path -LiteralPath $aclMarker)) {
+    if (Test-RouterPathAclSupport -Path $userDataRoot) {
+        # The autostart shortcut executes scripts from this directory. Protect
+        # the package root against replacement by another local account.
+        if (Test-RouterPathAclSupport -Path $routerRoot) {
+            Protect-RouterPathAcl -Path $routerRoot
+        }
+        foreach ($resolved in @($dataRoot, (Join-Path $userDataRoot 'backups'), (Join-Path $routerRoot 'logs'))) {
+            if (Test-Path -LiteralPath $resolved) {
+                Protect-RouterPathAcl -Path $resolved -Recurse
+            }
+        }
+        $markerBytes = [Text.Encoding]::ASCII.GetBytes('current-user-only')
+        try { Write-RouterFileAtomic -Path $aclMarker -Bytes $markerBytes }
+        finally { [Array]::Clear($markerBytes, 0, $markerBytes.Length) }
+    } else {
+        Write-Warning 'ROUTER_ACL_UNSUPPORTED: The user-data drive does not support Windows ACLs. Credentials remain protected by Windows Credential Manager/DPAPI, but local database files cannot be restricted to the current user.'
+    }
 }
 
 Write-Output 'Codex Router secrets and PostgreSQL data directory are initialized.'

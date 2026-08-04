@@ -1,30 +1,32 @@
 # Codex-Router Use and Distribution Commitment
 
-Version: v1.0 (2026-08-01)
-Copyright holder: Herman_Jiang
-Sole official download: https://github.com/HernanJiang/Codex-Router
+Software version: v1.2.1
+Release date: 2026-08-04
+Terms revision: v1.1 (2026-08-01)
+Copyright holder: Hernan_Jiang
+Official release location: https://github.com/HernanJiang/Codex-Router
 
 Read this document completely before confirming. By selecting “I have read and agree,” you personally understand and agree to the following terms.
 
 ## 1. Scope and ownership
 
-These terms cover Codex-Router source code, configurator, scripts, documentation, interface design, logo, name, executables, portable packages, updates, and modified versions. Original Codex-Router material remains owned by Herman_Jiang. Source availability is for review, learning, and permitted personal use; it is not a waiver of rights or an open-source license. Sub2API, PostgreSQL, Redis, egui, and other third-party components remain subject to their own licenses and notices.
+These terms cover Codex-Router source code, desktop application, scripts, documentation, interface design, logo, name, executables, portable packages, updates, and modified versions. Original Codex-Router material remains owned by Hernan_Jiang. Source availability permits review, learning, personal use, modification, and redistribution within these terms; it is not a waiver of rights. Because commercial use remains restricted, this is a source-available license rather than an OSI-approved open-source license. Sub2API, PostgreSQL, Redis, egui, and other third-party components remain subject to their own licenses and notices.
 
 ## 2. Limited permitted use
 
-An individual may download Codex-Router only from the official GitHub repository and use it locally for personal, non-commercial learning, research, evaluation, and private use. Private modifications are allowed only for the same purpose and may not be delivered or disclosed to another person. Any broader permission requires prior express written authorization from the copyright holder.
+An individual may obtain Codex-Router from the official GitHub repository or a redistribution that complies with Section 4 and use it locally for personal, non-commercial learning, research, evaluation, and private use. Copying and modification are allowed for those purposes, and original or modified copies may be redistributed under Section 4. Any broader permission requires prior express written authorization from the copyright holder.
 
 ## 3. No commercial use or profit
 
 Without written authorization, you may not sell, license, rent, host, manage, consult on, charge for, advertise with, sponsor, bundle, preinstall, or otherwise monetize Codex-Router. It may not form part of a paid product, SaaS, API relay, managed deployment, organizational production service, paid community, course bundle, hardware product, customer-acquisition offer, or any arrangement producing direct or indirect commercial benefit.
 
-## 4. Sole distribution channel
+## 4. Permitted redistribution and official release location
 
-The copyright holder's official GitHub repository is the only authorized public download and update channel. You may share its URL, but may not send, mirror, re-upload, republish, attach, seed, package, or distribute source archives, executables, portable packages, installers, updates, modified builds, or substantial portions. Uploads to cloud drives, forums, chat groups, software sites, app stores, package registries, mirrors, social platforms, torrents, or third-party repositories are prohibited. Repacked “lite,” “enhanced,” translated, unlocked, or bundled editions are prohibited. Unauthorized copies do not grant a license.
+`https://github.com/HernanJiang/Codex-Router` is the official release, provenance-verification, and update location. Free redistribution of source code, executables, portable packages, installers, mirrors, attachments, modified builds, and repackaged editions is allowed only if every distribution page and every distributed copy prominently identifies `Hernan_Jiang` and that official GitHub URL, and preserves this license, copyright notices, and third-party notices. Modified, translated, lite, enhanced, bundled, or rebuilt editions must be clearly labeled “unofficial modified version,” describe their material changes, and must not imply release, review, support, or endorsement by Hernan_Jiang. Redistribution must be free and may not create direct or indirect commercial benefit. Third-party copies are not official releases; non-compliant copies receive no redistribution permission under these terms.
 
 ## 5. Attribution, integrity, and no false authorship
 
-You may not remove, hide, replace, or alter copyright notices, Herman_Jiang attribution, signatures, branding, logos, the Codex-Router name, official links, licenses, or third-party notices. You may not claim or imply that you authored Codex-Router or a substantial part of its code, interface, scripts, documentation, or design. Renaming, recoloring, logo replacement, obfuscation, recompilation, or minor additions do not permit presenting a derivative as independent original work. The name, logo, screenshots, or interface may not imply authorization, partnership, certification, warranty, or endorsement.
+You may not remove, hide, replace, or alter copyright notices, Hernan_Jiang attribution, signatures, branding, logos, the Codex-Router name, official links, licenses, or third-party notices. You may not claim or imply that you authored Codex-Router or a substantial part of its code, interface, scripts, documentation, or design. Renaming, recoloring, logo replacement, obfuscation, recompilation, or minor additions do not permit presenting a derivative as independent original work. The name, logo, screenshots, or interface may not imply authorization, partnership, certification, warranty, or endorsement.
 
 ## 6. Code and security boundaries
 
@@ -42,10 +44,10 @@ Each third-party component remains governed by its respective license. Do not re
 
 ## 9. Termination, responsibility, and disclaimer
 
-A breach automatically terminates the permission granted for original Codex-Router material. The breaching party must stop use and distribution and delete all Codex-Router copies, without limiting legal remedies. The software is provided “as is.” To the maximum extent permitted by law, the author disclaims warranties and liability for fitness, availability, upstream account actions, interruptions, data loss, security incidents, or third-party claims. Users remain responsible for their conduct, configuration, data, accounts, public services, and legal or contractual violations.
+A breach automatically terminates the permission granted for original Codex-Router material. The breaching party must stop using and distributing non-compliant copies and remove or correct those copies under its control, without limiting legal remedies. The software is provided “as is.” To the maximum extent permitted by law, the author disclaims warranties and liability for fitness, availability, upstream account actions, interruptions, data loss, security incidents, or third-party claims. Users remain responsible for their conduct, configuration, data, accounts, public services, and legal or contractual violations.
 
 ## 10. Authorization and updates
 
-Commercial licenses, redistribution, mirrors, integration, organizational use, or any exception require written permission obtained through the official GitHub repository. New releases may include updated terms that must be reviewed before use. No third party may modify, interpret, or grant exceptions on behalf of the copyright holder. If a provision is legally invalid or unenforceable, the remaining provisions continue to apply, subject to non-waivable law.
+Free redistribution, mirrors, and modifications that comply with Section 4 do not require separate written permission. Commercial licensing, paid distribution, organizational use, or any exception outside these terms requires written permission obtained through the official GitHub repository. New releases may include updated terms that must be reviewed before use. No third party may modify, interpret, or grant exceptions on behalf of the copyright holder. If a provision is legally invalid or unenforceable, the remaining provisions continue to apply, subject to non-waivable law.
 
 By confirming, I state that I have completely read, understood, and accepted the Codex-Router Use and Distribution Commitment and will also comply with the upstream licenses and compliance requirements of Sub2API and all other third-party components.

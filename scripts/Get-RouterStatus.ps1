@@ -1,9 +1,14 @@
+$routerRoot = Split-Path -Parent $PSScriptRoot
+Import-Module (Join-Path $PSScriptRoot 'CredentialStore.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'RouterAdmin.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'ProxyDiscovery.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'UserData.psm1') -Force
+$sub2apiBaseUri = Get-RouterBaseUri
+$sub2apiPort = ([Uri]$sub2apiBaseUri).Port
 $ports = @(
-    @{Name='Adaptive Proxy'; Port=17897},
     @{Name='PostgreSQL'; Port=15432},
     @{Name='Redis'; Port=16379},
-    @{Name='Sub2API'; Port=18080},
-    @{Name='Codex Auth Adapter'; Port=18081}
+    @{Name='Sub2API'; Port=$sub2apiPort}
 )
 
 foreach ($item in $ports) {
@@ -22,9 +27,56 @@ foreach ($item in $ports) {
     }
 }
 
+$configPath = Get-RouterConfigPath -RouterRoot $routerRoot
+$routerConfig = if (Test-Path -LiteralPath $configPath -PathType Leaf) {
+    [IO.File]::ReadAllText($configPath) | ConvertFrom-Json
+} else {
+    $null
+}
+$proxyConfig = if ($null -ne $routerConfig) {
+    $property = $routerConfig.PSObject.Properties['proxy']
+    if ($null -ne $property) { $property.Value } else { $null }
+} else {
+    $null
+}
+$proxySettings = Resolve-RouterProxySettings -ProxyConfig $proxyConfig -ProxyPassword $null
+$proxyRunning = $true
+if ($null -ne $proxySettings.ProxyUrl) {
+    $proxyUri = [Uri]$proxySettings.ProxyUrl
+    $proxyClient = [Net.Sockets.TcpClient]::new()
+    try {
+        $proxyTask = $proxyClient.ConnectAsync($proxyUri.Host, $proxyUri.Port)
+        $proxyRunning = $proxyTask.Wait(1000) -and $proxyClient.Connected
+    } catch {
+        $proxyRunning = $false
+    } finally {
+        $proxyClient.Dispose()
+    }
+}
+[pscustomobject]@{
+    Component = 'Network Path'
+    Endpoint = if ($null -eq $proxySettings.ProxyUrl) { 'direct' } else { "$($proxySettings.Source) proxy" }
+    Running = $proxyRunning
+    ProcessId = ''
+}
+
 try {
-    $response = Invoke-WebRequest -Uri 'http://127.0.0.1:18080/health' -TimeoutSec 3 -UseBasicParsing
-    [pscustomobject]@{ Component='Health'; Endpoint='/health'; Running=($response.StatusCode -eq 200); ProcessId='' }
+    $apiKey = Get-RouterCredential -Name 'LocalApiKey'
+    $request = [Net.HttpWebRequest]::Create("$sub2apiBaseUri/v1/models")
+    $request.Method = 'GET'
+    $request.Proxy = $null
+    $request.Timeout = 4000
+    $request.ReadWriteTimeout = 4000
+    $request.KeepAlive = $false
+    $request.Headers['Authorization'] = "Bearer $apiKey"
+    $response = [Net.HttpWebResponse]$request.GetResponse()
+    try {
+        [pscustomobject]@{ Component='Deep Health'; Endpoint='/v1/models'; Running=([int]$response.StatusCode -eq 200); ProcessId='' }
+    } finally {
+        $response.Dispose()
+    }
 } catch {
-    [pscustomobject]@{ Component='Health'; Endpoint='/health'; Running=$false; ProcessId='' }
+    [pscustomobject]@{ Component='Deep Health'; Endpoint='/v1/models'; Running=$false; ProcessId='' }
+} finally {
+    $apiKey = $null
 }

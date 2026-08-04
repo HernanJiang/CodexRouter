@@ -3,10 +3,10 @@
 ## 1. 文档说明
 
 - 文档日期：2026 年 7 月 31 日
-- 项目目录：`D:\Work\Tools\Codex-Router`
+- 项目目录：`<Codex-Router 根目录>`
 - 主要使用入口：Codex 桌面端
-- CC Switch 配置名称：`Own-Router`
-- 原始需求来源：`C:\Users\Haona\Documents\Codex\2026-07-31\llm-light-cc-switch-https-api\outputs\Codex统一模型路由需求说明.md`
+- CC Switch 配置名称：`Codex-Router`
+- 原始需求来源：历史需求记录（不随公开源码分发个人路径）
 
 本文档合并此前提出的全部需求，并以较晚确认的要求覆盖较早的冲突项。本文档是后续修改、排错和验收的最终需求基线，不保存或展示任何 API Key、OAuth Token、密码或本地访问密钥。
 
@@ -20,7 +20,7 @@
 4. Kimi 优先使用主 Key，必要时自动回退到备用 Key。
 5. Grok 4.5 和 DeepSeek V4 Flash 通过 OpenRouter 调用。
 6. 支持 Fast 的模型显示真实可用的 Fast 选项，不支持的模型不显示。
-7. 切换到 `Own-Router` 后仍保持现有 ChatGPT 登录状态和远端控制能力。
+7. 切换到 `Codex-Router` 后仍保持现有 ChatGPT 登录状态和远端控制能力。
 8. 所有对话应能正常完成普通和流式响应，不得持续重连后失败。
 9. 切换配置或重启 Codex 不得删除本地任务和聊天记录。
 
@@ -29,16 +29,20 @@
 Codex 用户级配置必须满足：
 
 ```toml
-model_provider = "sub2api"
+model_provider = "custom"
 model = "deepseek-v4-flash"
-model_catalog_json = 'D:\Work\Tools\Codex-Router\config\models.json'
+model_catalog_json = 'C:\path\to\Codex-Router\config\models.json'
 
-[model_providers.sub2api]
-name = "Codex Unified Router"
+[model_providers.custom]
+name = "Codex-Router"
 wire_api = "responses"
-base_url = "http://127.0.0.1:18081/v1"
+base_url = "http://127.0.0.1:18080/v1"
 requires_openai_auth = true
+experimental_bearer_token = "<当前电脑随机生成的 LocalApiKey>"
 supports_websockets = false
+
+[desktop]
+enabled-reasoning-efforts = ["low", "medium", "high", "xhigh", "ultra", "max"]
 
 [features]
 fast_mode = true
@@ -48,8 +52,8 @@ fast_mode = true
 
 - 不设置全局 `service_tier`。
 - Fast 由当前模型目录动态决定，不强制应用到所有模型。
-- `sub2api` 是非保留的自定义 provider ID，不得创建 `[model_providers.openai]` 覆盖 Codex 内置 provider。
-- `requires_openai_auth=true` 保留 ChatGPT 登录态和远端控制，`18081` 只把模型请求导向本地认证适配器。
+- `custom` 是 CC Switch 统一会话历史使用的共享第三方 Provider 桶；不得创建 `[model_providers.openai]` 覆盖 Codex 内置 Provider。
+- `requires_openai_auth=true` 保留 ChatGPT 登录态和远端控制；`experimental_bearer_token` 只使用当前电脑随机生成的本地 Router Key，把模型请求直接导向本机 `18080`。
 - `supports_websockets=false` 让当前 7 个模型使用已验证的 HTTP Responses 流，避免无 WSv2 账号时反复重连。
 - 默认模型为 `deepseek-v4-flash`。
 - 模型目录发生变化后，需要完全退出并重新打开 Codex 才能可靠刷新菜单。
@@ -171,32 +175,32 @@ fast_mode = true
 
 ## 11. ChatGPT 登录态与远端控制
 
-- 切换到 `Own-Router` 前后，`auth.json` 必须保持用户当前 ChatGPT 登录对象。
+- 切换到 `Codex-Router` 前后，`auth.json` 必须保持用户当前 ChatGPT 登录对象。
 - 安装或同步 Router 不得用 API Key 登录对象覆盖 ChatGPT 登录对象。
 - 同步前后应核对 `auth.json` 哈希不变。
 - CC Switch 保存的认证对象必须来自当前 `auth.json`，不能保存过期登录副本。
-- 本地认证适配器监听 `127.0.0.1:18081`，把 Codex 的 ChatGPT Bearer 请求转换为 Router 本地凭据请求。
-- 认证适配器不得在日志中打印 OAuth Token 或本地 API Key。
-- Provider 当前禁用 Responses WebSocket；认证适配器仍应正确保留 Upgrade 语义，便于未来启用兼容账号后复验。
+- 不启动额外 Python 认证适配器；Codex 使用本机随机 Bearer 直接访问 `127.0.0.1:18080`，减少一个进程和一层长连接故障点。
+- Router 和同步脚本不得在日志中打印 OAuth Token 或本地 API Key。
+- Provider 当前禁用 Responses WebSocket，使用经过验证的 HTTP Responses/SSE 流。
 - HTTP Responses 请求应避免有问题的长连接复用，防止持续重连。
 - 使用 Router 时必须继续保留 Codex 远端控制电脑的能力。
 
-## 12. CC Switch 的 `Own-Router`
+## 12. CC Switch 的 `Codex-Router`
 
-`Own-Router` 的职责是保存和恢复整套 Codex Router 配置，而不是日常逐模型切换。
+`Codex-Router` 的职责是保存和恢复整套 Codex Router 配置，而不是日常逐模型切换。
 
 必须满足：
 
-- `Own-Router` 可在 CC Switch 中被启用并显示“使用中”。
-- 启用后写入 `model_provider="sub2api"` 和本地 `18081` 入口。
+- `Codex-Router` 可在 CC Switch 中被启用并显示“使用中”。
+- 启用后写入 `model_provider="custom"` 和本地 `18080` 入口，并保留 ChatGPT OAuth 登录。
 - 保存配置不得包含 `[model_providers.openai]`、`[model_providers.ollama]` 或 `[model_providers.lmstudio]` 等保留 ID 覆盖块。
-- 同时恢复默认模型、模型目录路径、认证适配器和 Fast 功能开关。
+- 同时恢复默认模型、模型目录路径、本地 Bearer、完整推理档位和 Fast 功能开关。
 - 保存的 TOML 必须与当前 Codex `config.toml` 精确一致。
 - 保存的认证对象必须与当前 `auth.json` 结构一致。
 - 不向 CC Switch 配置写入任何上游 API Key。
 - 不覆盖 ChatGPT 登录状态。
-- 同步或更新 `Own-Router` 保存内容不得自动切换当前 Provider；用户需要使用时再手动启用。
-- 如果 `Own-Router` 已经显示“使用中”，不需要重复点击。
+- 同步或更新 `Codex-Router` 保存内容默认不得自动切换当前 Provider；用户需要使用时再手动启用。
+- 如果 `Codex-Router` 已经显示“使用中”，不需要重复点击。
 - 模型目录变更后，完全退出并重开 Codex 一次即可加载。
 
 ## 13. 本地任务和聊天记录
@@ -218,7 +222,6 @@ fast_mode = true
 | PostgreSQL | `127.0.0.1:15432` | Sub2API 数据库 |
 | Redis | `127.0.0.1:16379` | Sub2API 状态和缓存 |
 | Sub2API | `127.0.0.1:18080` | 统一模型路由入口 |
-| Codex Auth Adapter | `127.0.0.1:18081` | 保留 ChatGPT 登录态的 Codex 入口 |
 
 要求：
 
@@ -229,16 +232,14 @@ fast_mode = true
 - 任一组件启动失败时应给出明确错误。
 - Windows 当前用户的启动目录中必须存在 Router 开机启动项。
 
-## 15. Clash 与网络
+## 15. 代理与网络
 
-- 默认 Clash HTTP 端口为 `127.0.0.1:7897`。
-- Clash 可用时，ChatGPT Plus 优先通过 Clash。
-- Clash 不可用时，自适应代理尝试 IPv4 直连 ChatGPT。
-- 当前网络不能直连 ChatGPT 时，GPT 请求自动回退到 430123。
-- Kimi、OpenRouter 和 430123 能直连时直接连接，不跟随 ChatGPT 一起失败。
-- 用户开关 Clash 后，不需要修改 Codex、CC Switch 或 Router 配置。
-- 代理端口关闭或 Clash 重启时，Router 服务不得退出。
-- 实际运行的 `17897` 代理必须能访问 ChatGPT、Kimi、OpenRouter 和 430123。
+- 默认只读发现当前用户的环境代理或 Windows 系统代理，不硬编码开发者的代理软件、地址或端口。
+- 用户也可以显式配置 HTTP、HTTPS、SOCKS5 或 SOCKS5H 代理。
+- 国内直连及其他站点分流沿用用户自己的 Clash、Mihomo、sing-box、V2Ray 等规则和 Windows 绕过列表；Router 不修改系统代理。
+- `127.0.0.1`、`localhost` 和 `::1` 始终直连，避免本地 Sub2API、PostgreSQL 与 Redis 错误进入代理。
+- 用户开关或重启自己的代理后，不需要修改 Codex 或 CC Switch 配置；代理恢复后新连接应自动恢复。
+- 代理不可用时应显示脱敏的网络错误，但 Router 本地服务不得因此退出。
 
 ## 16. 自动恢复
 
@@ -254,7 +255,7 @@ fast_mode = true
 - 普通 Responses 和流式 Responses 都必须可用。
 - 流式请求必须收到完整结束事件。
 - 不得持续显示“正在重新连接”后最终失败。
-- 单次上游错误不得导致 Sub2API、认证适配器或代理进程退出。
+- 单次上游错误不得导致 Sub2API 或代理进程退出。
 - OpenRouter 不可用时返回明确上游错误。
 - 不支持的模型、思考档位或服务层不得伪装为可用。
 - 回退上游不能提供同一模型时，不得静默换模型。
@@ -262,8 +263,8 @@ fast_mode = true
 
 ## 18. 密钥与安全
 
-- 所有上游 Key、本地 API Key 和管理凭据存储在 Windows Credential Manager。
-- 项目脚本、模型目录、Codex 配置和 CC Switch 配置不得包含明文上游 Key。
+- 所有上游 Key、本地 API Key 和管理凭据以 Windows Credential Manager 为权威存储。
+- 项目脚本和模型目录不得包含真实 Key；Codex/CC Switch 配置只允许包含当前电脑随机生成且仅限回环地址使用的 LocalApiKey，不得包含任何上游 Key。
 - 日志不得输出完整 Key、OAuth Token、密码或认证 JSON。
 - 凭据通过本地命令式认证读取。
 - 更换 Key 时使用专用配置脚本，不需要重装 Router。
@@ -288,7 +289,7 @@ fast_mode = true
 
 ### 20.1 配置与登录
 
-- 手动切换到 `Own-Router` 后 `is_current=1`；仅同步保存内容时不得改变当前 Provider。
+- 手动切换到 `Codex-Router` 后 `is_current=1`；仅同步保存内容时不得改变当前 Provider。
 - CC Switch 中保存的 TOML 与当前 `config.toml` 精确一致。
 - CC Switch 中保存的认证对象与当前 `auth.json` 一致。
 - 安装、同步和切换前后 `auth.json` 哈希不变。
@@ -313,11 +314,11 @@ fast_mode = true
 
 ### 20.4 运行状态
 
-- `17897`、`15432`、`16379`、`18080`、`18081` 均在监听。
+- `17897`、`15432`、`16379`、`18080` 均在监听。
 - `/health` 返回成功。
 - 实际代理能够连接四个上游域名。
 - 开机启动项存在并指向统一启动脚本。
-- 认证适配器单元测试全部通过。
+- Codex 配置、模型目录和 CC Switch 离线同步测试全部通过。
 
 ### 20.5 任务记录
 
@@ -327,7 +328,7 @@ fast_mode = true
 
 ## 21. 日常使用流程
 
-1. 确认 CC Switch 中 `Own-Router` 显示“使用中”；已使用中时不要重复点击。
+1. 确认 CC Switch 中 `Codex-Router` 显示“使用中”；已使用中时不要重复点击。
 2. Router 由 Windows 启动项自动运行。
 3. 模型目录刚发生变化时，完全退出并重新打开 Codex 一次。
 4. 在 Codex 原生菜单中选择模型。
@@ -366,4 +367,4 @@ fast_mode = true
 
 本项目的最终行为定义为：
 
-> 用户在 Codex 原生菜单中选择 7 个已验证模型之一。本地 Router 在不改变模型的前提下自动选择上游账号：GPT 优先使用 ChatGPT Plus，失败后回退到 430123；Kimi 优先使用主 Key，失败后使用备用 Key；Grok 4.5 和 DeepSeek V4 Flash 通过 OpenRouter。只有 GPT-5.6 Sol、Terra、Luna 显示并实际使用 Fast priority 服务层。启用 `Own-Router` 后，Codex 保持 ChatGPT 登录态、远端控制和本地聊天记录，所有普通和流式对话均应稳定完成。
+> 用户在 Codex 原生菜单中选择 7 个已验证模型之一。本地 Router 在不改变模型的前提下自动选择上游账号：GPT 优先使用 ChatGPT Plus，失败后回退到 430123；Kimi 优先使用主 Key，失败后使用备用 Key；Grok 4.5 和 DeepSeek V4 Flash 通过 OpenRouter。只有 GPT-5.6 Sol、Terra、Luna 显示并实际使用 Fast priority 服务层。启用 `Codex-Router` 后，Codex 保持 ChatGPT 登录态、远端控制和本地聊天记录，所有普通和流式对话均应稳定完成。
