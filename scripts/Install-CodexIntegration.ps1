@@ -1,7 +1,4 @@
-param(
-    [string]$CodexHome,
-    [switch]$SkipCCSwitchSync
-)
+param([string]$CodexHome)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -17,35 +14,28 @@ if ([string]::IsNullOrWhiteSpace($CodexHome)) {
 }
 $CodexHome = [IO.Path]::GetFullPath($CodexHome)
 $codexConfig = Join-Path $CodexHome 'config.toml'
-$codexAuth = Join-Path $CodexHome 'auth.json'
-$ccSwitchDb = Join-Path $userProfile '.cc-switch\cc-switch.db'
-$ccSwitchProviderId = '84b1adc1-e565-4eed-9919-d7bc4149134f'
-$python = Join-Path $userProfile '.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'
-
-function Set-TopLevelTomlValue {
-    param(
-        [string]$Content,
-        [string]$Key,
-        [string]$Value
-    )
-
-    $pattern = '(?m)^' + [Text.RegularExpressions.Regex]::Escape($Key) + '\s*=.*$'
-    $line = "$Key = $Value"
-    if ($Content -match $pattern) {
-        return [Text.RegularExpressions.Regex]::Replace($Content, $pattern, $line, 1)
-    }
-
-    $firstTable = [Text.RegularExpressions.Regex]::Match($Content, '(?m)^\[')
-    if ($firstTable.Success) {
-        return $Content.Insert($firstTable.Index, "$line`r`n")
-    }
-    if ([string]::IsNullOrWhiteSpace($Content)) {
-        return "$line`r`n"
-    }
-    return $Content.TrimEnd() + "`r`n$line`r`n"
+Import-Module (Join-Path $PSScriptRoot 'CredentialStore.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'CodexIntegration.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'UserData.psm1') -Force
+$configLock = Enter-RouterConfigLock -RouterRoot $routerRoot -TimeoutMilliseconds 10000
+$previousLockMarker = [Environment]::GetEnvironmentVariable('CODEX_ROUTER_CONFIG_LOCK_HELD', 'Process')
+[Environment]::SetEnvironmentVariable('CODEX_ROUTER_CONFIG_LOCK_HELD', '1', 'Process')
+$localKey = $null
+try {
+$routerConfigPath = Get-RouterConfigPath -RouterRoot $routerRoot
+$routerConfig = if (Test-Path -LiteralPath $routerConfigPath) {
+    Get-Content -LiteralPath $routerConfigPath -Raw | ConvertFrom-Json
+} else {
+    $null
 }
 
-& "$routerRoot\scripts\Build-ModelCatalog.ps1" -CodexHome $CodexHome
+$catalogPath = Join-Path $routerRoot 'config\model-catalog.json'
+if ($null -ne $routerConfig) {
+    & "$routerRoot\scripts\Build-ModelCatalog.ps1" `
+        -CodexHome $CodexHome `
+        -ConfigPath $routerConfigPath `
+        -OutputPath $catalogPath
+}
 
 [IO.Directory]::CreateDirectory($CodexHome) | Out-Null
 
@@ -73,56 +63,32 @@ $localCodexRoot = Join-Path $localOpenAIRoot 'Codex'
 
 $configExisted = Test-Path -LiteralPath $codexConfig
 $text = if ($configExisted) { [IO.File]::ReadAllText($codexConfig) } else { '' }
-$text = Set-TopLevelTomlValue -Content $text -Key 'model_provider' -Value '"sub2api"'
-$text = Set-TopLevelTomlValue -Content $text -Key 'model' -Value '"deepseek-v4-flash"'
-$text = [Text.RegularExpressions.Regex]::Replace(
-    $text,
-    '(?m)^service_tier\s*=.*(?:\r?\n)?',
-    '')
-$text = [Text.RegularExpressions.Regex]::Replace(
-    $text,
-    '(?m)^disable_response_storage\s*=.*(?:\r?\n)?',
-    '')
-$text = [Text.RegularExpressions.Regex]::Replace(
-    $text,
-    '(?m)^openai_base_url\s*=.*(?:\r?\n)?',
-    '')
-
-$catalogPath = Join-Path $routerRoot 'config\models.json'
-$escapedCatalogPath = $catalogPath.Replace('\', '\\').Replace('"', '\"')
-$text = Set-TopLevelTomlValue -Content $text -Key 'model_catalog_json' -Value ('"' + $escapedCatalogPath + '"')
-
-$providerPattern = '(?ms)^\[model_providers\.(?:custom|sub2api)(?:\.[^\]]+)?\]\r?\n.*?(?=^\[|\z)'
-$text = [Text.RegularExpressions.Regex]::Replace($text, $providerPattern, '')
-$reservedProviderPattern = '(?ms)^\[model_providers\.(?:openai|ollama|lmstudio)(?:\.[^\]]+)?\]\r?\n.*?(?=^\[|\z)'
-$text = [Text.RegularExpressions.Regex]::Replace($text, $reservedProviderPattern, '')
-$providerBlock = @'
-[model_providers.sub2api]
-request_max_retries = 4
-stream_max_retries = 5
-stream_idle_timeout_ms = 720000
-name = "Codex Unified Router"
-wire_api = "responses"
-base_url = "http://127.0.0.1:18081/v1"
-requires_openai_auth = true
-supports_websockets = false
-
-'@
-$text = $text.TrimEnd() + "`r`n`r`n$providerBlock"
-
-if ($text -match '(?m)^fast_mode\s*=') {
-    $text = [Text.RegularExpressions.Regex]::Replace($text, '(?m)^fast_mode\s*=.*$', 'fast_mode = true')
-} elseif ($text -match '(?m)^\[features\]\s*$') {
-    $text = [Text.RegularExpressions.Regex]::Replace($text, '(?m)^\[features\]\s*$', "[features]`r`nfast_mode = true", 1)
+$permissionSource = Get-CodexPermissionSourceContent -CodexConfigPath $codexConfig -Content $text
+$model = Get-CodexRouterDefaultModel -RouterConfig $routerConfig
+$modelDefaults = Get-CodexRouterModelDefaults -RouterConfig $routerConfig -CatalogPath $catalogPath
+$localKey = Get-RouterCredential -Name 'LocalApiKey' -AllowMissing
+if ([string]::IsNullOrWhiteSpace($localKey)) {
+    throw 'The local Router credential is missing. Run Codex-Router.exe before installing the Codex integration.'
+}
+$sub2apiHost = if ($null -ne $routerConfig -and $routerConfig.deploy.sub2apiHost) {
+    [string]$routerConfig.deploy.sub2apiHost
 } else {
-    $text = $text.TrimEnd() + "`r`n`r`n[features]`r`nfast_mode = true`r`n"
+    'http://127.0.0.1:18080'
 }
+$text = New-CodexRouterConfig `
+    -Content $text `
+    -Model $model `
+    -CatalogPath $catalogPath `
+    -LocalApiKey $localKey `
+    -BaseUrl $sub2apiHost `
+    -ReasoningEffort $modelDefaults.ReasoningEffort `
+    -FastMode $modelDefaults.FastMode `
+    -PermissionSourceContent $permissionSource
 
-if ($text -match '(?m)^\[model_providers\.(?:openai|ollama|lmstudio)(?:\.|\])') {
-    throw 'Reserved built-in provider override remains in generated Codex configuration'
-}
-if ($text -notmatch '(?m)^model_provider\s*=\s*"sub2api"\s*$' -or
-    $text -notmatch '(?m)^model\s*=\s*"deepseek-v4-flash"\s*$' -or
+if ($text -notmatch '(?m)^model_provider\s*=\s*"custom"\s*$' -or
+    $text -notmatch ('(?m)^model\s*=\s*"' + [Text.RegularExpressions.Regex]::Escape($model) + '"\s*$') -or
+    $text -notmatch '(?m)^requires_openai_auth\s*=\s*(?:true|false)\s*$' -or
+    $text -notmatch '(?m)^experimental_bearer_token\s*=\s*".+"\s*$' -or
     $text -notmatch '(?m)^supports_websockets\s*=\s*false\s*$') {
     throw 'Generated Codex configuration is missing required router defaults'
 }
@@ -130,30 +96,30 @@ if ($text -notmatch '(?m)^model_provider\s*=\s*"sub2api"\s*$' -or
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
 $backupPath = "$codexConfig.codex-router-$timestamp.bak"
 if ($configExisted) {
-    [IO.File]::Copy($codexConfig, $backupPath, $false)
+    Write-RouterFileAtomic -Path $backupPath -Bytes ([IO.File]::ReadAllBytes($codexConfig))
+    Limit-CodexRouterBackups `
+        -Directory (Split-Path -Parent $codexConfig) `
+        -Filter 'config.toml.codex-router-*.bak' `
+        -Keep 3
 }
-[IO.File]::WriteAllText($codexConfig, $text, [Text.UTF8Encoding]::new($false))
+Write-RouterTextFileAtomic -Path $codexConfig -Text $text
 
-if (-not $SkipCCSwitchSync) {
-    if (-not (Test-Path -LiteralPath $ccSwitchDb)) {
-        Write-Warning "CC Switch database was not found; skipped synchronization: $ccSwitchDb"
-    } elseif (-not (Test-Path -LiteralPath $codexAuth)) {
-        Write-Warning "Codex auth.json was not found; skipped CC Switch synchronization until Codex login is restored"
-    } else {
-        if (-not (Test-Path -LiteralPath $python)) { throw "Bundled Python was not found: $python" }
-        & $python `
-            "$routerRoot\scripts\Sync-CCSwitchConfig.py" `
-            --db $ccSwitchDb `
-            --provider-id $ccSwitchProviderId `
-            --config $codexConfig `
-            --auth $codexAuth `
-            --backup-dir (Join-Path $userProfile '.cc-switch\backups')
-        if ($LASTEXITCODE -ne 0) { throw "CC Switch synchronization failed with exit code $LASTEXITCODE" }
-    }
+try {
+    Set-CodexUserEnvironmentVariable -Name 'CODEX_ROUTER_API_KEY' -Value $localKey
+} finally {
+    $localKey = $null
 }
 
 if ($configExisted) {
     Write-Output "Codex configuration installed in $CodexHome; backup: $backupPath"
 } else {
     Write-Output "Codex configuration created in $CodexHome"
+}
+} finally {
+    $localKey = $null
+    [Environment]::SetEnvironmentVariable(
+        'CODEX_ROUTER_CONFIG_LOCK_HELD',
+        $previousLockMarker,
+        'Process')
+    Exit-RouterConfigLock -Lock $configLock
 }

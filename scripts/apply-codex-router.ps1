@@ -1,6 +1,5 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# Backward-compatible entry point. The Rust GUI calls the same implementation
-# directly, so manual users and older shortcuts receive identical behavior.
-& (Join-Path $PSScriptRoot 'Apply-Configurator.ps1') @args
+# Stable entry point shared by the desktop app and manual deployments.
+& (Join-Path $PSScriptRoot 'Apply-Router.ps1') @args

@@ -1,10 +1,10 @@
 {
   "name": "Codex-Router",
-  "version": "0.2.0",
+  "version": "1.2.1",
   "description": "Codex + Sub2API router configuration UI and deployment helpers",
   "private": true,
   "scripts": {
-    "configurator": "python -m http.server 8080 --directory ./configurator",
+    "app": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/Start-CodexRouter.ps1",
     "start": "powershell -ExecutionPolicy Bypass -File ./scripts/Start-Router.ps1",
     "stop": "powershell -ExecutionPolicy Bypass -File ./scripts/Stop-Router.ps1",
     "status": "powershell -ExecutionPolicy Bypass -File ./scripts/Get-RouterStatus.ps1"
@@ -17,8 +17,7 @@
     "codex",
     "sub2api",
     "openai",
-    "router",
-    "cc-switch"
+    "router"
   ],
   "license": "SEE LICENSE IN LICENSE"
 }

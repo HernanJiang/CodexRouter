@@ -1,21 +1,20 @@
-Codex-Router Proprietary Non-Commercial License
-Version 1.0, 2026-08-01
+Codex-Router Source-Available Non-Commercial License
+Version 1.1, 2026-08-01
 
-Copyright (c) 2026 Herman_Jiang. All rights reserved.
+Copyright (c) 2026 Hernan_Jiang. All rights reserved.
 
 Codex-Router is source-available software, not open-source software. Subject
 to the Terms of Use included with this repository, the copyright holder grants
-an individual a limited, revocable, non-exclusive, non-transferable right to
-download Codex-Router from the official repository and use it locally for
-personal, non-commercial learning, research, and evaluation.
+an individual a limited, revocable, non-exclusive right to use, copy, modify,
+and redistribute Codex-Router for personal, non-commercial learning, research,
+evaluation, and sharing, provided every condition below is satisfied.
 
 Without the copyright holder's prior written permission, you may not:
 
 1. use Codex-Router for any commercial, revenue-generating, paid, resale,
    hosted, managed, consulting, organizational, or public-facing service;
-2. sell, sublicense, rent, lend, mirror, re-upload, redistribute, republish,
-   bundle, or provide Codex-Router, its source code, binaries, modified builds,
-   installers, portable packages, or substantial portions to another person;
+2. sell, sublicense for a fee, rent, or otherwise charge for Codex-Router,
+   its source code, binaries, modified builds, installers, or portable packages;
 3. remove or alter copyright, authorship, license, attribution, signature,
    branding, source, or third-party notices;
 4. claim or imply that Codex-Router or any substantial part of it was authored
@@ -27,14 +26,24 @@ Without the copyright holder's prior written permission, you may not:
    access controls, account restrictions, regional restrictions, or security
    safeguards.
 
-The only authorized public download and sharing channel is the official
-Codex-Router repository designated by the copyright holder:
+The authoritative official release and update location is:
 
 https://github.com/HernanJiang/Codex-Router
 
-You may share the official repository URL. You may not share a copied archive,
-binary, source snapshot, mirror, cloud-drive copy, attachment, or repackaged
-installer. An unauthorized copy does not grant its recipient a license.
+Redistribution of original or modified source code, binaries, archives,
+portable packages, mirrors, attachments, and repackaged installers is allowed
+only when all of the following conditions are met:
+
+1. the author name `Hernan_Jiang`, this license, copyright notices, and all
+   applicable third-party notices are preserved;
+2. the official GitHub URL above is displayed prominently both on the
+   distribution page and inside the distributed copy's README, About view, or
+   equivalent documentation;
+3. modified or repackaged copies are clearly labeled as unofficial, identify
+   their material changes, and do not imply authorship, approval, support, or
+   endorsement by Hernan_Jiang; and
+4. the redistribution is free of charge and is not used for direct or indirect
+   commercial benefit.
 
 Third-party components are not relicensed by this document. Sub2API is an
 independent project governed by its upstream LGPL-3.0-or-later license and
@@ -43,9 +52,10 @@ respective licenses. Where this license conflicts with a third-party license,
 the third-party license controls only for that third-party component.
 
 Any permission outside this license must be in writing from the copyright
-holder. A breach automatically terminates the rights granted here, after which
-all Codex-Router copies in the breaching party's possession must be deleted,
-without limiting any rights or remedies available to the copyright holder.
+holder. A breach automatically terminates the rights granted here. The
+breaching party must stop using and distributing non-compliant copies and
+remove those copies from its control, without limiting any rights or remedies
+available to the copyright holder.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, TO THE
 MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW. THE COPYRIGHT HOLDER IS NOT LIABLE

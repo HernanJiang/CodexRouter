@@ -1,0 +1,25 @@
+Microsoft Visual C++ Runtime notice
+===================================
+
+Codex-Router portable releases include the following unmodified x64
+Microsoft Visual C++ Runtime files as app-local redistributable code:
+
+- VCRUNTIME140.dll
+- VCRUNTIME140_1.dll
+- MSVCP140.dll
+
+These files are copied during release construction from the official
+Microsoft Visual Studio VC Redist x64 CRT payload. Their exact version and
+SHA-256 hashes are recorded in the release dependency and file manifests.
+
+Copyright (c) Microsoft Corporation. All rights reserved.
+
+Microsoft Visual Studio licensing terms and redistributable-code rights apply
+to these files. Refer to the license terms supplied with the Visual Studio
+edition used to build the release and Microsoft's current license terms:
+
+https://visualstudio.microsoft.com/license-terms/
+
+Microsoft's supported Visual C++ Redistributable deployment documentation:
+
+https://learn.microsoft.com/cpp/windows/redistributing-visual-cpp-files

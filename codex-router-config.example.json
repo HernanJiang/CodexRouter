@@ -1,52 +1,67 @@
 {
-  "version": "0.2.0",
+  "version": "1.2.1",
   "authMode": "chatgpt_oauth",
-  "localApiKey": "",
   "deploy": {
     "codexHome": "",
     "sub2apiHost": "http://127.0.0.1:18080",
-    "ccSwitchDb": "",
-    "generateIsolation": true
+    "generateIsolation": true,
+    "startWithWindows": true
   },
   "oauthFallback": {
     "enabled": true,
+    "preferOAuth": true,
     "officialPriority": 1,
     "fallbackPriority": 100
   },
+  "fallbackChannelSelections": {},
   "reasoning": {
     "mode": "auto"
   },
+  "proxy": {
+    "autoDetect": true,
+    "enabled": false,
+    "proxyType": "http",
+    "host": "127.0.0.1",
+    "port": "7890",
+    "username": "",
+    "passwordCredential": "ProxyPassword"
+  },
+  "defaultModel": "gpt-5.6-sol",
   "models": [
     {
       "model": "gpt-5.6-sol",
-      "alias": "GPT-5.6 Sol",
+      "alias": "ChatGPT-5.6-Sol",
       "baseURL": "https://api.openai.com/v1",
-      "apiKey": "<YOUR_OPENAI_KEY>",
-      "priority": 1,
+      "credentialName": "ModelApiKey-gpt-5-6-sol",
+      "priority": 10,
       "weight": 1,
       "extra": "{}",
-      "multimodal": "auto"
+      "multimodal": "auto",
+      "contextWindow": 0,
+      "autoCompactPercent": 80
     },
     {
       "model": "deepseek-v4-flash",
       "alias": "DeepSeek V4 Flash",
       "baseURL": "https://openrouter.ai/api/v1",
-      "apiKey": "<YOUR_OPENROUTER_KEY>",
-      "priority": 10,
+      "credentialName": "ModelApiKey-deepseek-v4-flash",
+      "priority": 20,
       "weight": 1,
       "extra": "{}",
-      "multimodal": "auto"
+      "multimodal": "auto",
+      "contextWindow": 0,
+      "autoCompactPercent": 80
     }
   ],
   "modelCatalog": [
     {
       "slug": "gpt-5.6-sol",
-      "display_name": "GPT-5.6 Sol",
+      "display_name": "ChatGPT-5.6-Sol",
       "description": "Example model",
       "default_reasoning_level": "low",
       "supported_reasoning_levels": [
         {
-          "effort": "low",
+          "effort": "none",
           "description": "low reasoning level"
         },
         {
@@ -64,10 +79,6 @@
         {
           "effort": "max",
           "description": "max reasoning level"
-        },
-        {
-          "effort": "ultra",
-          "description": "ultra reasoning level"
         }
       ],
       "shell_type": "shell_command",
@@ -84,21 +95,9 @@
           "description": "Faster responses with higher usage"
         }
       ],
+      "input_modalities": ["text", "image"],
+      "supports_image_detail_original": true,
       "supports_vision": true
-    }
-  ],
-  "ccSwitchProviders": [
-    {
-      "id": "codex-router-gpt-5-6-sol",
-      "name": "GPT-5.6 Sol (Codex Router)",
-      "app_type": "codex",
-      "settings": {
-        "model_provider": "sub2api",
-        "model": "gpt-5.6-sol",
-        "api_url": "http://127.0.0.1:18080/v1",
-        "api_key": "<YOUR_SUB2API_KEY>",
-        "requires_openai_auth": true
-      }
     }
   ]
 }

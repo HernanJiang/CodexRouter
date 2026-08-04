@@ -32,7 +32,7 @@ pub fn palette(name: &str) -> Palette {
             muted: egui::Color32::from_rgb(99, 113, 122),
             line: egui::Color32::from_rgb(202, 215, 222),
             action: egui::Color32::from_rgb(23, 43, 58),
-            accent: egui::Color32::from_rgb(230, 110, 70),
+            accent: egui::Color32::from_rgb(42, 91, 119),
             glass: egui::Color32::from_rgba_unmultiplied(235, 243, 246, 224),
             glass_dark: egui::Color32::from_rgba_unmultiplied(36, 55, 65, 218),
             success: egui::Color32::from_rgb(29, 130, 89),
@@ -50,7 +50,7 @@ pub fn palette(name: &str) -> Palette {
             muted: egui::Color32::from_rgb(125, 101, 84),
             line: egui::Color32::from_rgb(216, 194, 169),
             action: egui::Color32::from_rgb(61, 39, 27),
-            accent: egui::Color32::from_rgb(183, 101, 70),
+            accent: egui::Color32::from_rgb(82, 91, 67),
             glass: egui::Color32::from_rgba_unmultiplied(248, 238, 222, 224),
             glass_dark: egui::Color32::from_rgba_unmultiplied(63, 47, 38, 218),
             success: egui::Color32::from_rgb(58, 119, 83),
@@ -373,12 +373,19 @@ pub fn eyebrow(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
 }
 
 pub fn field_label(ui: &mut egui::Ui, label: &str, detail: &str, palette: &Palette) {
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label(egui::RichText::new(label).strong().color(palette.ink));
         if !detail.is_empty() {
             ui.label(egui::RichText::new(detail).small().color(palette.muted));
         }
     });
+}
+
+pub fn stacked_field_label(ui: &mut egui::Ui, label: &str, detail: &str, palette: &Palette) {
+    ui.label(egui::RichText::new(label).strong().color(palette.ink));
+    if !detail.is_empty() {
+        ui.label(egui::RichText::new(detail).small().color(palette.muted));
+    }
 }
 
 pub fn pill(ui: &mut egui::Ui, text: &str, fill: egui::Color32, color: egui::Color32) {

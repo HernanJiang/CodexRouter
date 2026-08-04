@@ -1,19 +1,10 @@
-# Codex Router Configurator
+# Codex-Router 旧版静态界面
 
-纯前端配置器，使用 Vue 3 + Tailwind CSS CDN，无需构建步骤。
+这是旧版静态界面的源码存档。它不再是受支持的配置入口，避免与正式程序产生不同的端口、认证和凭据行为。
 
 ## 使用方式
 
-```bash
-# 方式 1：PowerShell
-& ../scripts/Start-Configurator.ps1
-
-# 方式 2：Python
-cd configurator
-python -m http.server 8080
-```
-
-然后在浏览器打开 http://127.0.0.1:8080。
+运行 `../scripts/Start-CodexRouter.ps1` 或直接打开根目录的 `Codex-Router.exe`。启动脚本会进入同一个 Rust 桌面程序，不需要 Python、Node.js 或 CDN。
 
 ## 功能
 

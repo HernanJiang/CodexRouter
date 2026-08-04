@@ -1,120 +1,211 @@
 param(
-    [string]$CodexHome
+    [string]$CodexHome,
+    [string]$ConfigPath,
+    [string]$OutputPath,
+    [AllowNull()]$DiscoveredOAuthModelsByAccount
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $routerRoot = Split-Path -Parent $PSScriptRoot
-$userProfile = [Environment]::GetFolderPath('UserProfile')
-if ([string]::IsNullOrWhiteSpace($CodexHome)) {
-    if (-not [string]::IsNullOrWhiteSpace($env:CODEX_HOME)) {
-        $CodexHome = $env:CODEX_HOME
-    } else {
-        $CodexHome = Join-Path $userProfile '.codex'
-    }
+Import-Module (Join-Path $PSScriptRoot 'UserData.psm1') -Force
+if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
+    $ConfigPath = Get-RouterConfigPath -RouterRoot $routerRoot
 }
-$sourcePath = Join-Path ([IO.Path]::GetFullPath($CodexHome)) 'models_cache.json'
-$outputPath = "$routerRoot\config\models.json"
+if ([string]::IsNullOrWhiteSpace($OutputPath)) {
+    $OutputPath = Join-Path $routerRoot 'config\model-catalog.json'
+}
+if (-not (Test-Path -LiteralPath $ConfigPath)) {
+    throw "Router configuration not found: $ConfigPath"
+}
 
-if (-not (Test-Path -LiteralPath $sourcePath)) {
-    if (Test-Path -LiteralPath $outputPath) {
-        $existingCatalog = Get-Content -LiteralPath $outputPath -Raw | ConvertFrom-Json
-        $requiredSlugs = @('gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'kimi-for-coding', 'kimi-for-coding-highspeed', 'grok-4.5', 'deepseek-v4-flash')
-        $existingSlugs = @($existingCatalog.models | ForEach-Object { [string]$_.slug })
-        if (@($requiredSlugs | Where-Object { $_ -notin $existingSlugs }).Count -eq 0) {
-            Write-Output "Codex model cache was not found; kept the validated Router catalog: $outputPath"
-            return
+$config = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
+$models = @($config.models)
+foreach ($configuredModel in $models) {
+    if ([string]$configuredModel.model -eq 'gpt-5.6') {
+        $configuredModel.model = 'gpt-5.6-sol'
+        if ([string]$configuredModel.alias -in @('gpt-5.6', 'GPT-5.6 (Sol)')) {
+            $configuredModel.alias = 'ChatGPT-5.6-Sol'
         }
     }
-    throw "Codex model cache was not found and the existing Router catalog is incomplete: $sourcePath"
+}
+if ($models.Count -eq 0) { throw 'At least one model is required to build the Codex catalog.' }
+Import-Module (Join-Path $PSScriptRoot 'RouterAdmin.psm1') -Force
+$routePlan = @(Get-RouterModelRoutePlan `
+    -RouterConfig $config `
+    -DiscoveredOAuthModelsByAccount $DiscoveredOAuthModelsByAccount)
+$visibleRoutes = @($routePlan | Where-Object { $_.IncludeInCatalog })
+if ($visibleRoutes.Count -eq 0) { throw 'At least one selected model is required to build the Codex catalog.' }
+
+function Get-ReasoningSpec([string]$Model) {
+    $name = $Model.ToLowerInvariant()
+    if ($name.Contains('gpt-5.6-sol')) { return @{ Default='medium'; Levels=@('low','medium','high','xhigh','max','ultra'); Fast=$true } }
+    if ($name.Contains('gpt-5.6-terra')) { return @{ Default='medium'; Levels=@('low','medium','high','xhigh','max','ultra'); Fast=$true } }
+    if ($name.Contains('gpt-5.6-luna')) { return @{ Default='medium'; Levels=@('low','medium','high','xhigh','max'); Fast=$true } }
+    if ($name.Contains('gpt-5.5') -or $name.Contains('gpt-5.4')) { return @{ Default='medium'; Levels=@('minimal','low','medium','high','xhigh'); Fast=$true } }
+    if ($name.Contains('claude-opus-5') -or $name.Contains('claude-sonnet-5') -or $name.Contains('claude-fable-5')) { return @{ Default='high'; Levels=@('low','medium','high','xhigh','max'); Fast=$false } }
+    if ($name.Contains('gemini-3')) { return @{ Default='high'; Levels=@('minimal','low','medium','high'); Fast=$false } }
+    if ($name -eq 'k3' -or $name.StartsWith('k3-') -or $name.Contains('kimi-k3')) { return @{ Default='high'; Levels=@('low','high','max'); Fast=$false } }
+    if ($name.Contains('kimi-for-coding') -or $name.Contains('kimi-k2.7')) { return @{ Default='high'; Levels=@('high'); Fast=$false } }
+    if ($name.Contains('deepseek-v4')) { return @{ Default='high'; Levels=@('none','low','high','max'); Fast=$false } }
+    if ($name.Contains('mimo-v2.5')) { return @{ Default='high'; Levels=@('high'); Fast=$false } }
+    if ($name.Contains('deepseek')) { return @{ Default='high'; Levels=@('low','high','max'); Fast=$false } }
+    if ($name.Contains('grok-4.5')) { return @{ Default='high'; Levels=@('low','medium','high'); Fast=$false } }
+    if ($name.Contains('grok')) { return @{ Default='medium'; Levels=@('low','medium','high'); Fast=$false } }
+    return @{ Default='medium'; Levels=@('medium'); Fast=$false }
 }
 
-$source = Get-Content -LiteralPath $sourcePath -Raw | ConvertFrom-Json
-$templates = @{}
-foreach ($model in @($source.models)) { $templates[[string]$model.slug] = $model }
-
-function Copy-JsonObject {
-    param([Parameter(Mandatory)]$Value)
-    return ($Value | ConvertTo-Json -Depth 100 | ConvertFrom-Json)
+function Get-ModelReasoningSpec($ModelConfig, $LegacyReasoning) {
+    $allowed = @('none','minimal','low','medium','high','xhigh','max','ultra')
+    $modeProperty = $ModelConfig.PSObject.Properties['reasoningMode']
+    $manual = $null -ne $modeProperty -and [string]$modeProperty.Value -eq 'manual'
+    $source = $ModelConfig
+    if (-not $manual -and $null -ne $LegacyReasoning -and [string]$LegacyReasoning.mode -eq 'manual') {
+        $manual = $true
+        $source = $LegacyReasoning
+    }
+    if ($manual) {
+        $levelsProperty = if ($source -eq $ModelConfig) { $source.PSObject.Properties['reasoningLevels'] } else { $source.PSObject.Properties['levels'] }
+        $defaultProperty = if ($source -eq $ModelConfig) { $source.PSObject.Properties['defaultReasoningLevel'] } else { $source.PSObject.Properties['defaultLevel'] }
+        $fastProperty = if ($source -eq $ModelConfig) { $source.PSObject.Properties['fastSupported'] } else { $source.PSObject.Properties['supportsFast'] }
+        $levels = @()
+        if ($null -ne $levelsProperty) {
+            foreach ($value in @($levelsProperty.Value)) {
+                $normalized = ([string]$value).Trim().ToLowerInvariant()
+                if ($normalized -in $allowed -and $normalized -notin $levels) { $levels += $normalized }
+            }
+        }
+        $default = if ($null -ne $defaultProperty) { ([string]$defaultProperty.Value).Trim().ToLowerInvariant() } else { '' }
+        if ($levels.Count -gt 0) {
+            if ($default -notin $levels) { $default = $levels[0] }
+            return @{
+                Default = $default
+                Levels = $levels
+                Fast = $null -ne $fastProperty -and [bool]$fastProperty.Value
+            }
+        }
+    }
+    return Get-ReasoningSpec -Model ([string]$ModelConfig.model)
 }
 
-function New-ReasoningLevels {
-    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Efforts)
-
-    $descriptions = @{
-        none = 'No additional reasoning'
-        minimal = 'Minimal reasoning for the fastest response'
-        low = 'Fast responses with lighter reasoning'
-        medium = 'Balanced speed and reasoning depth'
-        high = 'Greater reasoning depth for complex problems'
-        xhigh = 'Extra high reasoning depth for hard problems'
-        max = 'Maximum reasoning depth for the hardest problems'
-        ultra = 'Maximum reasoning with automatic task delegation'
-    }
-    return @($Efforts | ForEach-Object {
-        [pscustomobject]@{ effort = $_; description = $descriptions[$_] }
-    })
+function Get-ContextWindow([string]$Model) {
+    $name = $Model.Trim().ToLowerInvariant()
+    if ($name.Contains('gpt-5.6-sol') -or $name.Contains('gpt-5.6-terra') -or $name.Contains('gpt-5.6-luna')) { return 272000 }
+    if ($name -eq 'k3' -or $name.Contains('kimi-k3')) { return 1048576 }
+    if ($name.Contains('claude-opus-5') -or $name.Contains('claude-sonnet-5') -or $name.Contains('claude-fable-5')) { return 1000000 }
+    if ($name.Contains('gemini-3') -or $name.Contains('mimo-v2.5') -or $name.Contains('deepseek-v4')) { return 1048576 }
+    if ($name.Contains('kimi-for-coding') -or $name.Contains('k3-256k')) { return 262144 }
+    if ($name.Contains('grok-4.5')) { return 500000 }
+    return 128000
 }
 
-$specs = @(
-    @{ Slug='gpt-5.6-sol'; Template='gpt-5.6-sol'; Name='GPT-5.6-Sol'; Description='Frontier agentic coding model.'; Default='low'; Reasoning=@('low','medium','high','xhigh','max','ultra'); Fast=$true; Context=272000; Modalities=@('text','image') },
-    @{ Slug='gpt-5.6-terra'; Template='gpt-5.6-terra'; Name='GPT-5.6-Terra'; Description='Balanced agentic coding model for everyday work.'; Default='medium'; Reasoning=@('low','medium','high','xhigh','max','ultra'); Fast=$true; Context=272000; Modalities=@('text','image') },
-    @{ Slug='gpt-5.6-luna'; Template='gpt-5.6-luna'; Name='GPT-5.6-Luna'; Description='Fast and affordable agentic coding model.'; Default='medium'; Reasoning=@('low','medium','high','xhigh','max'); Fast=$true; Context=272000; Modalities=@('text','image') },
-    @{ Slug='kimi-for-coding'; Template='gpt-5.4-mini'; Name='Kimi for Coding'; Description='Kimi Coding Plan default model.'; Default='medium'; Reasoning=@(); Fast=$false; Context=262144; Modalities=@('text') },
-    @{ Slug='kimi-for-coding-highspeed'; Template='gpt-5.4-mini'; Name='Kimi for Coding HighSpeed'; Description='Separate high-speed Kimi Coding Plan model.'; Default='medium'; Reasoning=@(); Fast=$false; Context=262144; Modalities=@('text') },
-    @{ Slug='grok-4.5'; Template='gpt-5.4'; Name='Grok 4.5'; Description='Grok 4.5 through OpenRouter.'; Default='medium'; Reasoning=@('minimal','low','medium','high','xhigh'); Fast=$false; Context=500000; Modalities=@('text','image') },
-    @{ Slug='deepseek-v4-flash'; Template='gpt-5.4'; Name='DeepSeek V4 Flash'; Description='DeepSeek V4 Flash through OpenRouter.'; Default='medium'; Reasoning=@('minimal','low','medium','high','xhigh'); Fast=$false; Context=1048576; Modalities=@('text') }
-)
+function Get-MultimodalDefault([string]$Model) {
+    $name = $Model.Trim().ToLowerInvariant()
+    $visionMarkers = @('vision','multimodal','qwen-vl','qwen2-vl','qwen2.5-vl','qwen3-vl','glm-4v','glm-4.1v','glm-4.5v','glm-4.6v','cogvlm','janus','pixtral')
+    foreach ($marker in $visionMarkers) { if ($name.Contains($marker)) { return $true } }
+    if ($name.EndsWith('-vl') -or $name.Contains('/vl-') -or $name.Contains('_vl')) { return $true }
+    if ($name.Contains('deepseek') -or $name.Contains('glm')) { return $false }
+    if ($name.Contains('qwen') -and ($name.Contains('coder') -or $name.Contains('code'))) { return $false }
+    if ($name.Contains('mimo-v2.5-pro')) { return $false }
+    if ($name.Contains('gpt-') -or $name.Contains('grok-4') -or $name.Contains('claude-') -or $name.Contains('gemini') -or $name.Contains('kimi') -or $name.Contains('moonshot') -or $name.Contains('mimo-v2.5') -or $name -eq 'k3' -or $name.StartsWith('k3-')) { return $true }
+    return $false
+}
 
-$models = [Collections.Generic.List[object]]::new()
-for ($index = 0; $index -lt $specs.Count; $index++) {
-    $spec = $specs[$index]
-    if (-not $templates.ContainsKey($spec.Template)) {
-        throw "Model template is missing from the Codex cache: $($spec.Template)"
-    }
+$templatePath = @(
+    (Join-Path $routerRoot 'config\models.json'),
+    (Join-Path $routerRoot 'config\model-catalog.example.json')
+) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+if ([string]::IsNullOrWhiteSpace([string]$templatePath)) {
+    throw 'A complete Codex model catalog template is required.'
+}
+$templateDocument = Get-Content -LiteralPath $templatePath -Raw | ConvertFrom-Json
+$templateModels = if ($null -ne $templateDocument.PSObject.Properties['models']) {
+    @($templateDocument.models)
+} else {
+    @($templateDocument)
+}
+$modelTemplate = @($templateModels | Where-Object {
+    -not [string]::IsNullOrWhiteSpace([string]$_.base_instructions) -and $null -ne $_.model_messages
+}) | Select-Object -First 1
+if ($null -eq $modelTemplate) {
+    throw "Codex model catalog template is incomplete: $templatePath"
+}
 
-    $model = Copy-JsonObject -Value $templates[$spec.Template]
-    $model.slug = $spec.Slug
-    $model.display_name = $spec.Name
-    $model.description = $spec.Description
-    $model.default_reasoning_level = $spec.Default
-    $model.supported_reasoning_levels = @(New-ReasoningLevels -Efforts $spec.Reasoning)
-    $model.visibility = 'list'
-    $model.supported_in_api = $true
-    $model.priority = $index + 1
-    if ($spec.Slug -ne $spec.Template) {
-        $model.upgrade = $null
-    }
-    if ($spec.Fast) {
-        $model.additional_speed_tiers = [string[]]@('fast')
-        $model.service_tiers = [object[]]@(
-            [pscustomobject]@{ id='priority'; name='Fast'; description='1.5x speed, increased usage' }
-        )
+$catalogModels = @(for ($index = 0; $index -lt $visibleRoutes.Count; $index++) {
+    $route = $visibleRoutes[$index]
+    $model = $route.Model
+    # Reasoning is owned by each model. The retired global override caused one
+    # profile's manual value to silently replace every model's documented preset.
+    $reasoning = Get-ModelReasoningSpec -ModelConfig $model -LegacyReasoning $null
+    $multimodalProperty = $model.PSObject.Properties['multimodal']
+    $supportsImages = if ($null -ne $multimodalProperty -and [string]$multimodalProperty.Value -eq 'true') {
+        $true
+    } elseif ($null -ne $multimodalProperty -and [string]$multimodalProperty.Value -eq 'false') {
+        $false
     } else {
-        $model.additional_speed_tiers = [string[]]@()
-        $model.service_tiers = [object[]]@()
+        Get-MultimodalDefault -Model ([string]$model.model)
     }
-    $model.context_window = $spec.Context
-    $model.max_context_window = $spec.Context
-    $model.input_modalities = @($spec.Modalities)
-    if ($spec.Slug -notlike 'gpt-*') {
-        $model.use_responses_lite = $false
-        $model.supports_image_detail_original = $false
+    $contextProperty = $model.PSObject.Properties['contextWindow']
+    $contextWindow = if ($null -ne $contextProperty -and [long]$contextProperty.Value -gt 0) {
+        [long]$contextProperty.Value
+    } else {
+        Get-ContextWindow -Model ([string]$model.model)
     }
-    $models.Add($model)
-}
-
-$duplicates = $models | Group-Object slug | Where-Object Count -gt 1
-if ($duplicates) { throw "Duplicate model slugs: $($duplicates.Name -join ', ')" }
-if ($models.Count -ne 7) { throw "Expected 7 models, generated $($models.Count)." }
+    $compactProperty = $model.PSObject.Properties['autoCompactPercent']
+    $compactPercent = if ($null -ne $compactProperty -and [int]$compactProperty.Value -ge 60 -and [int]$compactProperty.Value -le 90) {
+        [int]$compactProperty.Value
+    } else {
+        80
+    }
+    $displayName = Get-RouterModelDisplayName -Model $model -Route $route
+    $inputModalities = @('text')
+    if ($supportsImages) { $inputModalities = @('text', 'image') }
+    $speedTiers = @()
+    if ($reasoning.Fast) { $speedTiers = @('fast') }
+    $serviceTiers = @()
+    if ($reasoning.Fast) {
+        $serviceTiers = @([ordered]@{
+            id = 'priority'
+            name = 'Fast'
+            description = '1.5x speed, increased usage'
+        })
+    }
+    $catalogModel = $modelTemplate | ConvertTo-Json -Depth 100 | ConvertFrom-Json
+    $catalogModel.slug = [string]$route.PublicModelId
+    $catalogModel.display_name = $displayName
+    $catalogModel.description = "Codex-Router model #$($index + 1)"
+    $catalogModel.default_reasoning_level = [string]$reasoning.Default
+    $catalogModel.supported_reasoning_levels = @($reasoning.Levels | ForEach-Object {
+        [ordered]@{ effort = $_; description = "$_ reasoning level" }
+    })
+    $catalogModel.input_modalities = $inputModalities
+    $catalogModel.supports_image_detail_original = $supportsImages
+    $catalogModel.context_window = $contextWindow
+    $catalogModel.max_context_window = $contextWindow
+    $catalogModel.effective_context_window_percent = $compactPercent
+    $catalogModel.shell_type = 'shell_command'
+    $catalogModel.visibility = 'list'
+    $catalogModel.supported_in_api = $true
+    $catalogModel.priority = [int]$model.priority
+    $catalogModel.additional_speed_tiers = $speedTiers
+    $catalogModel.service_tiers = $serviceTiers
+    $catalogModel.availability_nux = $null
+    $catalogModel.upgrade = $null
+    $catalogModel
+})
 
 $catalog = [ordered]@{
     fetched_at = [DateTime]::UtcNow.ToString('o')
-    etag = 'codex-router-local-v1'
-    client_version = [string]$source.client_version
-    models = $models
+    etag = 'codex-router-local-v2'
+    client_version = [string]$config.version
+    models = @($catalogModels)
 }
-$json = $catalog | ConvertTo-Json -Depth 100
-[IO.File]::WriteAllText($outputPath, $json, [Text.UTF8Encoding]::new($false))
-Write-Output "Codex model catalog generated: $outputPath ($($models.Count) models)"
+$parent = Split-Path -Parent ([IO.Path]::GetFullPath($OutputPath))
+[IO.Directory]::CreateDirectory($parent) | Out-Null
+[IO.File]::WriteAllText(
+    [IO.Path]::GetFullPath($OutputPath),
+    ($catalog | ConvertTo-Json -Depth 100),
+    [Text.UTF8Encoding]::new($false)
+)
+Write-Output "Codex model catalog generated: $OutputPath ($($catalogModels.Count) models)"

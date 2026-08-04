@@ -4,7 +4,7 @@ from scripts.codex_auth_adapter import AdapterError, rewrite_request_head
 
 
 class RewriteRequestHeadTests(unittest.TestCase):
-    def test_replaces_oauth_bearer_and_forces_connection_close(self) -> None:
+    def test_replaces_oauth_bearer_without_forcing_connection_close(self) -> None:
         request = (
             b"POST /v1/responses HTTP/1.1\r\n"
             b"Host: 127.0.0.1:18081\r\n"
@@ -19,7 +19,7 @@ class RewriteRequestHeadTests(unittest.TestCase):
             rewritten,
         )
         self.assertNotIn(b"chatgpt-oauth-token", rewritten)
-        self.assertIn(b"Connection: close\r\n", rewritten)
+        self.assertNotIn(b"Connection: close\r\n", rewritten)
 
     def test_adds_authorization_when_missing(self) -> None:
         request = b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n"

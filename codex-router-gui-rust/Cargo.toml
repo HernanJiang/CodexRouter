@@ -1,12 +1,12 @@
 [package]
-name = "codex-router-configurator"
-version = "0.3.0"
+name = "codex-router"
+version = "1.2.1"
 edition = "2021"
 
 [dependencies]
-eframe = { version = "0.35", default-features = false, features = ["default", "persistence"] }
+eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow", "persistence"] }
 egui = "0.35"
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["ico", "png"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tray-icon = "0.19"
@@ -14,7 +14,13 @@ anyhow = "1.0"
 chrono = "0.4"
 dirs = "5.0"
 rfd = "0.15"
-rusqlite = { version = "0.33", features = ["bundled"] }
+regex = "1.11"
+url = "2.5"
+sha2 = "0.10"
+toml_edit = "0.22"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
 
 [build-dependencies]
 windres = "0.2"

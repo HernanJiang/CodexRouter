@@ -2,6 +2,15 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $routerRoot = Split-Path -Parent $PSScriptRoot
+Import-Module "$routerRoot\scripts\CredentialStore.psm1" -Force
+Import-Module "$routerRoot\scripts\UserData.psm1" -Force
+$dataRoot = Get-RouterDataRoot -RouterRoot $routerRoot
+$lifecycleLock = Enter-RouterLifecycleLock `
+    -RouterRoot $routerRoot `
+    -TimeoutMilliseconds 10000 `
+    -Operation 'Launch ChatGPT OAuth'
+$process = $null
+try {
 $port = Get-NetTCPConnection -LocalPort 1455 -State Listen -ErrorAction SilentlyContinue
 if ($port) { throw 'OAuth callback port 1455 is already in use.' }
 
@@ -21,8 +30,11 @@ $process = Start-Process `
     -RedirectStandardOutput "$routerRoot\logs\oauth-stdout.log" `
     -RedirectStandardError "$routerRoot\logs\oauth-stderr.log" `
     -PassThru
+Set-Content -LiteralPath (Join-Path $dataRoot 'pids\oauth.pid') -Value $process.Id -Encoding ascii
+} finally {
+    Exit-RouterLifecycleLock -Lock $lifecycleLock
+}
 
-Set-Content -LiteralPath "$routerRoot\data\pids\oauth.pid" -Value $process.Id -Encoding ascii
 [pscustomobject]@{
     Started = $true
     ProcessId = $process.Id

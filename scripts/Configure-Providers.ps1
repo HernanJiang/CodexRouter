@@ -7,9 +7,14 @@ Import-Module "$routerRoot\scripts\RouterAdmin.psm1" -Force
 
 function New-RandomLocalKey {
     $buffer = [byte[]]::new(32)
-    [Security.Cryptography.RandomNumberGenerator]::Fill($buffer)
-    try { return 'sk-local-' + ([BitConverter]::ToString($buffer)).Replace('-', '').ToLowerInvariant() }
-    finally { [Array]::Clear($buffer, 0, $buffer.Length) }
+    $generator = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $generator.GetBytes($buffer)
+        return 'sk-local-' + ([BitConverter]::ToString($buffer)).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $generator.Dispose()
+        [Array]::Clear($buffer, 0, $buffer.Length)
+    }
 }
 
 function New-IdentityMapping([string[]]$Models) {
@@ -70,14 +75,12 @@ $session = New-RouterAdminSession
 $complianceResponse = Invoke-RouterApi -Session $session -Method GET -Path '/api/v1/admin/compliance'
 $compliance = Get-RouterResponseData -Response $complianceResponse
 if ($compliance.required) { throw 'Complete the Sub2API compliance confirmation in the local admin page first.' }
-$localProxy = Set-RouterLocalAdaptiveProxy -Session $session
-
 $gptModels = @(
     'gpt-5.6-luna',
     'gpt-5.6-sol',
     'gpt-5.6-terra'
 )
-$kimiModels = @('kimi-for-coding', 'kimi-for-coding-highspeed')
+$kimiModels = @('kimi-for-coding', 'kimi-for-coding-highspeed', 'k3', 'k3-256k')
 $openRouterModels = @('grok-4.5', 'deepseek-v4-flash')
 $publicModels = @($gptModels + $kimiModels + $openRouterModels)
 
@@ -111,7 +114,6 @@ $groupId = [long]$group.id
 $accounts = @(Get-RouterAccounts -Session $session)
 $plusAccount = $accounts | Where-Object { $_.name -eq 'ChatGPT Plus OAuth' } | Select-Object -First 1
 if ($plusAccount) {
-    Set-RouterAccountProxy -Session $session -AccountId ([long]$plusAccount.id) -ProxyId $localProxy.Id
     $plusRecoveryPlanId = Set-RouterScheduledRecovery `
         -Session $session `
         -AccountId ([long]$plusAccount.id) `
@@ -134,7 +136,11 @@ try {
             api_key = $relayKey
             model_mapping = (New-IdentityMapping -Models $gptModels)
         } `
-        -Extra @{} `
+        -Extra @{
+            openai_responses_mode = 'force_responses'
+            openai_responses_supported = $true
+            openai_compact_supported = $true
+        } `
         -ProbeModel 'gpt-5.6-sol'))
 
     $kimiMapping = New-IdentityMapping -Models $kimiModels
@@ -150,7 +156,10 @@ try {
             model_mapping = $kimiMapping
             openai_capabilities = @('chat_completions')
         } `
-        -Extra @{ openai_responses_mode = 'force_chat_completions' } `
+        -Extra @{
+            openai_responses_mode = 'force_chat_completions'
+            openai_compact_supported = $false
+        } `
         -ProbeModel 'kimi-for-coding'))
 
     $results.Add((Set-RouterApiAccount `
@@ -165,7 +174,10 @@ try {
             model_mapping = $kimiMapping
             openai_capabilities = @('chat_completions')
         } `
-        -Extra @{ openai_responses_mode = 'force_chat_completions' } `
+        -Extra @{
+            openai_responses_mode = 'force_chat_completions'
+            openai_compact_supported = $false
+        } `
         -ProbeModel 'kimi-for-coding'))
 
     $results.Add((Set-RouterApiAccount `
@@ -181,9 +193,11 @@ try {
                 'grok-4.5' = 'x-ai/grok-4.5'
                 'deepseek-v4-flash' = 'deepseek/deepseek-v4-flash'
             }
-            openai_capabilities = @('chat_completions')
         } `
-        -Extra @{ openai_responses_mode = 'force_chat_completions' } `
+        -Extra @{
+            openai_responses_mode = 'auto'
+            openai_compact_supported = $false
+        } `
         -ProbeModel 'grok-4.5'))
 
 } finally {
@@ -232,12 +246,10 @@ if ((Get-RouterCredential -Name 'LocalApiKey' -AllowMissing) -ne $localKey) {
     Models = $publicModels.Count
     LocalApiKey = 'stored in Windows Credential Manager'
 } | Format-List
-$localProxy | Format-List
 if ($plusAccount) {
     [pscustomobject]@{
         Account = [string]$plusAccount.name
         AccountId = [long]$plusAccount.id
-        ProxyId = $localProxy.Id
         RecoveryPlanId = $plusRecoveryPlanId
     } | Format-List
 }
