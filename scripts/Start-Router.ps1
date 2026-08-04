@@ -589,6 +589,7 @@ if ($databaseProbe.Output -ne '1') {
 
 $redisCli = "$routerRoot\redis\Redis-8.10.0-Windows-x64-msys2\redis-cli.exe"
 $redisServer = "$routerRoot\redis\Redis-8.10.0-Windows-x64-msys2\redis-server.exe"
+$redisConfig = "$routerRoot\config\redis.conf"
 $authenticatedPing = Get-RedisPing -Password $redisPassword
 if ($authenticatedPing -ne 'PONG') {
     $anonymousPing = Get-RedisPing -Password ''
@@ -598,7 +599,7 @@ if ($authenticatedPing -ne 'PONG') {
         }
         $redisProcess = Start-Process `
             -FilePath $redisServer `
-            -ArgumentList @('../../config/redis.conf') `
+            -ArgumentList @($redisConfig) `
             -WorkingDirectory (Join-Path $dataRoot 'redis') `
             -WindowStyle Hidden `
             -RedirectStandardOutput "$routerRoot\logs\redis-stdout.log" `
