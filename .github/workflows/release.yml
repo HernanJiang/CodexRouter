@@ -1,0 +1,102 @@
+name: Release Windows portable package
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+jobs:
+  windows-release:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: clippy,rustfmt
+
+      - name: Verify tag and source version
+        shell: pwsh
+        run: |
+          $tagVersion = '${{ github.ref_name }}'.TrimStart('v')
+          $manifest = Get-Content codex-router-gui-rust/Cargo.toml -Raw
+          if ($manifest -notmatch '(?m)^version\s*=\s*"([^"]+)"') {
+            throw 'Cargo package version is missing.'
+          }
+          if ($Matches[1] -ne $tagVersion) {
+            throw "Tag version $tagVersion does not match Cargo version $($Matches[1])."
+          }
+
+      - name: Test and lint
+        shell: pwsh
+        run: |
+          cargo fmt --manifest-path codex-router-gui-rust/Cargo.toml -- --check
+          cargo test --locked --manifest-path codex-router-gui-rust/Cargo.toml
+          cargo clippy --locked --manifest-path codex-router-gui-rust/Cargo.toml --all-targets -- -D warnings
+
+      - name: Wait for locally verified release asset
+        id: package
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $asset = $null
+          for ($attempt = 0; $attempt -lt 60 -and $null -eq $asset; $attempt++) {
+            $releaseJson = gh release view '${{ github.ref_name }}' --repo '${{ github.repository }}' --json assets 2>$null
+            if ($LASTEXITCODE -eq 0) {
+              $release = $releaseJson | ConvertFrom-Json
+              $asset = @($release.assets | Where-Object {
+                $_.name -like 'Codex-Router-Portable-*.zip' -and [long]$_.size -gt 0
+              }) | Select-Object -First 1
+            }
+            if ($null -eq $asset) { Start-Sleep -Seconds 10 }
+          }
+          if ($null -eq $asset) {
+            throw 'The release was tagged without a verified portable ZIP asset.'
+          }
+          "asset=$($asset.name)" >> $env:GITHUB_OUTPUT
+
+      - name: Download and validate published package
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $download = Join-Path $env:RUNNER_TEMP 'published-release'
+          $expanded = Join-Path $env:RUNNER_TEMP 'published-stage'
+          New-Item -ItemType Directory -Path $download,$expanded -Force | Out-Null
+          gh release download '${{ github.ref_name }}' --repo '${{ github.repository }}' --pattern '${{ steps.package.outputs.asset }}' --dir $download
+          if ($LASTEXITCODE -ne 0) { throw 'Could not download the published asset.' }
+          $archive = Join-Path $download '${{ steps.package.outputs.asset }}'
+          Expand-Archive -LiteralPath $archive -DestinationPath $expanded
+          $roots = @(Get-ChildItem -LiteralPath $expanded -Directory)
+          if ($roots.Count -ne 1) { throw 'The release archive must contain exactly one root directory.' }
+          & ./scripts/Build-PortableRelease.ps1 -ValidateStage $roots[0].FullName
+          if ($LASTEXITCODE -ne 0) { throw 'The published release failed manifest validation.' }
+
+      - name: Smoke test first OAuth preparation
+        shell: pwsh
+        run: |
+          $expanded = Join-Path $env:RUNNER_TEMP 'published-stage'
+          $roots = @(Get-ChildItem -LiteralPath $expanded -Directory)
+          if ($roots.Count -ne 1) { throw 'The published stage root is unavailable.' }
+          $root = $roots[0].FullName
+          $env:CODEX_ROUTER_PORTABLE_STATE = '1'
+          try {
+            $output = & (Join-Path $root 'scripts/Start-ProviderOAuth.ps1') `
+              -Provider openai `
+              -PrepareOnly `
+              -TimeoutSeconds 360
+            if ($LASTEXITCODE -ne 0) { throw 'First OAuth preparation exited unsuccessfully.' }
+            $result = $output | Select-Object -Last 1 | ConvertFrom-Json
+            if ([string]$result.status -ne 'ready' -or [string]$result.code -ne 'ok') {
+              throw "First OAuth preparation was not ready (stage=$($result.stage), code=$($result.code))."
+            }
+          } finally {
+            & (Join-Path $root 'scripts/Stop-Router.ps1') -NoRestoreCodexConfig
+          }
+
