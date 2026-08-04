@@ -435,9 +435,12 @@ Export-ModuleMember -Function Get-RouterBaseUri
         -Message 'Start is missing bounded, verified PostgreSQL recovery'
     Assert-Test `
         -Condition ($startSource.Contains('$redisConfig = "$routerRoot\config\redis.conf"') -and
-            $startSource.Contains('-ArgumentList @($redisConfig)') -and
+            $startSource.Contains("`$redisRuntimeConfig = Join-Path `$dataRoot 'redis\redis.conf'") -and
+            $startSource.Contains('-Bytes ([IO.File]::ReadAllBytes($redisConfig))') -and
+            $startSource.Contains("-ArgumentList @('redis.conf')") -and
+            $startSource.Contains('$redisProcess.HasExited') -and
             -not $startSource.Contains('../../config/redis.conf')) `
-        -Message 'Redis configuration is not resolved from the portable package root'
+        -Message 'Redis configuration is not staged safely across portable and user-data drives'
     Assert-Test `
         -Condition ($monitorSource.Contains('/v1/models') -and
             $monitorSource.Contains('-RepairUnhealthy')) `

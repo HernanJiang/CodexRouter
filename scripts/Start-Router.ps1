@@ -590,6 +590,7 @@ if ($databaseProbe.Output -ne '1') {
 $redisCli = "$routerRoot\redis\Redis-8.10.0-Windows-x64-msys2\redis-cli.exe"
 $redisServer = "$routerRoot\redis\Redis-8.10.0-Windows-x64-msys2\redis-server.exe"
 $redisConfig = "$routerRoot\config\redis.conf"
+$redisRuntimeConfig = Join-Path $dataRoot 'redis\redis.conf'
 $authenticatedPing = Get-RedisPing -Password $redisPassword
 if ($authenticatedPing -ne 'PONG') {
     $anonymousPing = Get-RedisPing -Password ''
@@ -597,18 +598,33 @@ if ($authenticatedPing -ne 'PONG') {
         if (Wait-TcpPort -Port 16379 -TimeoutSeconds 1) {
             throw 'Redis is running with an unknown password. Stop the verified local Redis process before restarting the router.'
         }
+        Write-RouterFileAtomic `
+            -Path $redisRuntimeConfig `
+            -Bytes ([IO.File]::ReadAllBytes($redisConfig))
         $redisProcess = Start-Process `
             -FilePath $redisServer `
-            -ArgumentList @($redisConfig) `
+            -ArgumentList @('redis.conf') `
             -WorkingDirectory (Join-Path $dataRoot 'redis') `
             -WindowStyle Hidden `
             -RedirectStandardOutput "$routerRoot\logs\redis-stdout.log" `
             -RedirectStandardError "$routerRoot\logs\redis-stderr.log" `
             -PassThru
+        $redisStarted = $false
+        $redisDeadline = [DateTime]::UtcNow.AddSeconds(30)
+        do {
+            $redisProcess.Refresh()
+            if ($redisProcess.HasExited) {
+                throw "Redis exited before listening on port 16379 (exit code $($redisProcess.ExitCode))."
+            }
+            if (Wait-TcpPort -Port 16379 -TimeoutSeconds 1) {
+                $redisStarted = $true
+                break
+            }
+        } while ([DateTime]::UtcNow -lt $redisDeadline)
+        if (-not $redisStarted) { throw 'Redis failed to listen on port 16379.' }
         Write-RouterFileAtomic `
             -Path (Join-Path $dataRoot 'pids\redis.pid') `
             -Bytes ([Text.Encoding]::ASCII.GetBytes([string]$redisProcess.Id))
-        if (-not (Wait-TcpPort -Port 16379 -TimeoutSeconds 30)) { throw 'Redis failed to listen on port 16379.' }
     }
     Set-RedisRequirePass -Password $redisPassword
     $authenticatedPing = Get-RedisPing -Password $redisPassword
