@@ -1,6 +1,7 @@
 use super::{
-    theme, CloseBehavior, CodexRouterApp, IsolationKind, IsolationProfile, ModelConfig,
-    OAuthAccountSummary, Page, UsageAccount, UsageWindow, APP_VERSION, OFFICIAL_GITHUB_URL,
+    ensure_full_ui_fonts, theme, CloseBehavior, CodexRouterApp, IsolationKind, IsolationProfile,
+    ModelConfig, OAuthAccountSummary, Page, UsageAccount, UsageWindow, APP_VERSION,
+    OFFICIAL_GITHUB_URL,
 };
 use eframe::egui;
 
@@ -65,14 +66,21 @@ fn page_scroll_min_height(page: Page) -> Option<f32> {
         Page::Welcome | Page::Project | Page::Auth | Page::Model | Page::Proxy | Page::Finish => {
             Some(540.0)
         }
-        Page::Profiles | Page::Monitor => Some(620.0),
+        // Monitor packs its own header + scrollable card grid; forcing a tall
+        // min height here only leaves a large empty band under the cards.
+        Page::Profiles => Some(620.0),
+        Page::Monitor => None,
         Page::OAuth => Some(720.0),
         Page::Dashboard => None,
     }
 }
 
 fn dashboard_uses_wide_layout(available_width: f32, available_height: f32) -> bool {
-    available_width >= 1080.0 && available_height >= 520.0
+    available_width >= 980.0 && available_height >= 500.0
+}
+
+fn usage_monitor_uses_two_columns(available_width: f32) -> bool {
+    available_width >= 920.0
 }
 
 fn paint_chiral_mark(ui: &mut egui::Ui, size: f32, palette: &theme::Palette) {
@@ -134,8 +142,8 @@ mod ordering_tests {
     use super::{
         dashboard_panel_heights, dashboard_uses_wide_layout, fit_dialog_size, friendly_error,
         move_list_item, oauth_terms_confirmation_ready, remaining_quota_percent, shell_metrics,
-        topbar_control_size, APP_VERSION, DIALOG_VIEWPORT_GUTTER, TERMS_EN, TERMS_ZH,
-        TOPBAR_CONTROL_HEIGHT, TOPBAR_CONTROL_WIDTH,
+        topbar_control_size, usage_monitor_uses_two_columns, APP_VERSION, DIALOG_VIEWPORT_GUTTER,
+        TERMS_EN, TERMS_ZH, TOPBAR_CONTROL_HEIGHT, TOPBAR_CONTROL_WIDTH,
     };
 
     #[test]
@@ -170,6 +178,20 @@ mod ordering_tests {
             assert!((312.0..=320.0).contains(&model_panel));
             assert!((216.0..=224.0).contains(&model_list));
             assert_eq!(log, 90.0);
+        }
+    }
+
+    #[test]
+    fn short_windows_shrink_the_model_panel_so_the_log_stays_visible() {
+        // On a short window the model panel must give way; otherwise the
+        // activity log is pushed below the taskbar.
+        for available_height in [300.0_f32, 360.0, 420.0] {
+            let (model_panel, model_list, log) = dashboard_panel_heights(available_height);
+            assert!(
+                model_panel + log + 72.0 <= available_height + 0.5,
+                "panels overflow at {available_height}: {model_panel} + {log}"
+            );
+            assert!(model_list <= model_panel);
         }
     }
 
@@ -225,8 +247,67 @@ mod ordering_tests {
     #[test]
     fn dashboard_wide_mode_requires_width_and_height() {
         assert!(dashboard_uses_wide_layout(1280.0, 620.0));
+        assert!(dashboard_uses_wide_layout(1000.0, 520.0));
         assert!(!dashboard_uses_wide_layout(1280.0, 480.0));
-        assert!(!dashboard_uses_wide_layout(960.0, 620.0));
+        assert!(!dashboard_uses_wide_layout(900.0, 620.0));
+        assert!(usage_monitor_uses_two_columns(960.0));
+        assert!(!usage_monitor_uses_two_columns(800.0));
+    }
+
+    #[test]
+    fn quota_plan_accounts_include_oauth_and_windowed_coding_plans() {
+        let oauth = super::UsageAccount {
+            kind: "oauth".into(),
+            ..Default::default()
+        };
+        assert!(super::CodexRouterApp::usage_account_is_quota_plan(&oauth));
+
+        let coding_plan = super::UsageAccount {
+            kind: "apikey".into(),
+            windows: vec![super::UsageWindow {
+                kind: "weekly".into(),
+                used_percent: Some(20.0),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(super::CodexRouterApp::usage_account_is_quota_plan(
+            &coding_plan
+        ));
+
+        let five_hour_plan = super::UsageAccount {
+            kind: "apikey".into(),
+            windows: vec![super::UsageWindow {
+                kind: "fiveHour".into(),
+                used_percent: Some(0.0),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(super::CodexRouterApp::usage_account_is_quota_plan(
+            &five_hour_plan
+        ));
+
+        let metered = super::UsageAccount {
+            kind: "apikey".into(),
+            ..Default::default()
+        };
+        assert!(!super::CodexRouterApp::usage_account_is_quota_plan(
+            &metered
+        ));
+
+        let model_window_only = super::UsageAccount {
+            kind: "apikey".into(),
+            windows: vec![super::UsageWindow {
+                kind: "model".into(),
+                used_percent: Some(50.0),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(!super::CodexRouterApp::usage_account_is_quota_plan(
+            &model_window_only
+        ));
     }
 
     #[test]
@@ -357,11 +438,33 @@ fn remaining_quota_percent(used_percent: Option<f32>) -> Option<f32> {
 
 fn friendly_error(raw: &str, zh: bool) -> String {
     let normalized = raw.to_ascii_lowercase();
-    if normalized.contains("connection_refused") {
+    if normalized.contains("router_oauth_accounts_unavailable")
+        || normalized.contains("connection_refused")
+        || normalized.contains("connection_closed")
+        || normalized.contains("lifecycle_busy")
+        || normalized.contains("lifecycle_deferred")
+    {
         t(
             zh,
-            "本地服务未响应。请确认 Codex-Router 正在后台运行，然后重试。",
-            "The local service did not respond. Keep Codex-Router running, then try again.",
+            "本地服务未响应。请确认 Codex-Router 正在后台运行，然后点击「刷新」。",
+            "The local service did not respond. Keep Codex-Router running, then click Refresh.",
+        )
+        .to_owned()
+    } else if normalized.contains("router_oauth_accounts_parse") {
+        t(
+            zh,
+            "OAuth 账号清单暂时无法解析。请点击「刷新」；若仍失败，请重启后再试。",
+            "The OAuth account list could not be parsed. Click Refresh; if it still fails, restart and try again.",
+        )
+        .to_owned()
+    } else if normalized.contains("authentication")
+        || normalized.contains("status=401")
+        || normalized.contains("unauthorized")
+    {
+        t(
+            zh,
+            "管理会话未就绪或已过期。请稍候再点「刷新」；若仍失败，请重启 Codex-Router。",
+            "The admin session is not ready or has expired. Wait a moment and click Refresh; if it still fails, restart Codex-Router.",
         )
         .to_owned()
     } else if normalized.contains("upstream_timeout") || normalized.contains("timeout") {
@@ -371,18 +474,11 @@ fn friendly_error(raw: &str, zh: bool) -> String {
             "The upstream request timed out. Your configuration was not changed; try again later.",
         )
         .to_owned()
-    } else if normalized.contains("network_unavailable") {
+    } else if normalized.contains("network_unavailable") || normalized.contains("class=network") {
         t(
             zh,
             "当前无法连接网络。请检查系统代理或网络连接后重试。",
             "The network is unavailable. Check the system proxy or connection, then try again.",
-        )
-        .to_owned()
-    } else if normalized.contains("status=401") || normalized.contains("unauthorized") {
-        t(
-            zh,
-            "上游授权已失效。请重新登录或更新该渠道的凭据。",
-            "The upstream authorization expired. Sign in again or update this channel's credentials.",
         )
         .to_owned()
     } else if normalized.contains("status=503") {
@@ -390,6 +486,15 @@ fn friendly_error(raw: &str, zh: bool) -> String {
             zh,
             "上游服务暂时不可用。当前配置未被更改，请稍后重试。",
             "The upstream service is temporarily unavailable. Your configuration was not changed; try again later.",
+        )
+        .to_owned()
+    } else if normalized.contains("class=request_failure")
+        || normalized.contains("class=unclassified_error")
+    {
+        t(
+            zh,
+            "暂时无法读取 OAuth 账号。请确认本地服务已启动，然后点击「刷新」。",
+            "Could not load OAuth accounts right now. Make sure the local service is running, then click Refresh.",
         )
         .to_owned()
     } else {
@@ -434,8 +539,13 @@ fn log_excerpt(text: &str, max_lines: usize, max_chars: usize) -> String {
 
 fn dashboard_panel_heights(layout_height: f32) -> (f32, f32, f32) {
     const LOG_CONTENT_HEIGHT: f32 = 90.0;
-    let model_content_height = (layout_height - LOG_CONTENT_HEIGHT - 72.0).clamp(312.0, 320.0);
-    let model_list_height = (model_content_height - 96.0).clamp(216.0, 224.0);
+    // Chrome around both panels: log frame, spacing, and the footer strip.
+    const RESERVED: f32 = 72.0;
+    let available_for_models = layout_height - LOG_CONTENT_HEIGHT - RESERVED;
+    // Prefer ~2.5 model rows, but never claim more than the window can show or
+    // the activity log gets pushed under the taskbar.
+    let model_content_height = available_for_models.clamp(0.0, 320.0);
+    let model_list_height = (model_content_height - 96.0).clamp(0.0, 224.0);
     (model_content_height, model_list_height, LOG_CONTENT_HEIGHT)
 }
 
@@ -449,8 +559,10 @@ impl eframe::App for CodexRouterApp {
         self.process_app_events(ctx);
         if !self.exit_shutdown_in_progress {
             self.process_router_health_protection(ctx);
+            self.process_codex_binding_watch(ctx);
             self.process_scheduled_usage_refresh(ctx);
             self.process_scheduled_oauth_recovery(ctx);
+            self.process_scheduled_oauth_account_refresh(ctx);
         }
         self.handle_close_request(ctx);
         self.handle_native_minimize(ctx);
@@ -458,6 +570,19 @@ impl eframe::App for CodexRouterApp {
 
     fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root_ui.ctx().clone();
+        // Any visible dialog while the process is still marked lightweight must
+        // restore CJK fonts first. Otherwise the UI becomes tofu boxes.
+        let needs_full_fonts = self.close_prompt_open
+            || self.apply_success_dialog_open
+            || self.oauth_priority_target.is_some()
+            || self.oauth_revoke_target.is_some()
+            || self.update_dialog_open
+            || self.terms_open
+            || !self.exit_shutdown_error.is_empty()
+            || (!self.tray_lightweight_mode && ctx.input(|i| i.viewport().minimized != Some(true)));
+        if needs_full_fonts && !self.fonts_loaded {
+            ensure_full_ui_fonts(self, &ctx);
+        }
         let palette = theme::palette(&self.config.ui_theme);
         let viewport_height = ctx.content_rect().height();
         let compact_layout = viewport_height < 700.0;
@@ -590,6 +715,9 @@ impl eframe::App for CodexRouterApp {
         }
         if self.oauth_revoke_target.is_some() {
             self.show_oauth_revoke_dialog(&ctx, &palette);
+        }
+        if self.oauth_priority_target.is_some() {
+            self.show_oauth_priority_dialog(&ctx, &palette);
         }
         if self.oauth_manual_model_target.is_some() {
             self.show_oauth_manual_model_dialog(&ctx, &palette);
@@ -762,70 +890,92 @@ impl CodexRouterApp {
         let zh = self.ui_language == "zh";
         let compact = ctx.content_rect().height() < 500.0;
         let mut acknowledged = false;
+        // Keep enough height for the title, two body paragraphs, and the primary
+        // action button on short high-DPI windows. fixed_size alone used to clip
+        // the "Got it" button under the window chrome.
         let dialog_size = fit_dialog_size(
             ctx.content_rect().size(),
-            egui::vec2(560.0, if compact { 300.0 } else { 250.0 }),
-            egui::vec2(400.0, 220.0),
+            egui::vec2(580.0, if compact { 360.0 } else { 320.0 }),
+            egui::vec2(420.0, 300.0),
         );
         egui::Window::new(t(zh, "配置已应用", "Configuration applied"))
             .id(egui::Id::new("apply-success-dialog"))
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .fixed_size(dialog_size)
             .collapsible(false)
             .resizable(false)
-            .vscroll(true)
-            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+            .default_size(dialog_size)
+            .min_size(dialog_size)
+            .max_size(dialog_size)
             .show(ctx, |ui| {
-                ui.label(
-                    egui::RichText::new(t(
-                        zh,
-                        "请完全退出并重新启动 ChatGPT / Codex 应用",
-                        "Fully quit and restart the ChatGPT / Codex app",
-                    ))
-                    .size(if compact { 17.0 } else { 19.0 })
-                    .strong()
-                    .color(palette.ink),
-                );
-                ui.add_space(if compact { 4.0 } else { 8.0 });
-                ui.label(
-                    egui::RichText::new(if compact {
-                        t(
-                            zh,
-                            "请保持 Codex-Router 在系统托盘运行，否则本地转发将停止。",
-                            "Keep Codex-Router running in the tray, otherwise local forwarding stops.",
-                        )
-                    } else {
-                        t(
-                            zh,
-                            "使用过程中请保持 Codex-Router 在后台或系统托盘运行，否则本地转发将不可用。",
-                            "Keep Codex-Router running in the background or system tray while using it, otherwise local forwarding will be unavailable.",
-                        )
-                    })
-                    .color(palette.ink_soft),
-                );
-                ui.add_space(if compact { 3.0 } else { 6.0 });
-                ui.label(
-                    egui::RichText::new(if compact {
-                        t(
-                            zh,
-                            "托盘轻量模式会暂停界面、日志和用量刷新，仅保留低频健康检查、OAuth 必要恢复与连接恢复。",
-                            "Lightweight tray mode pauses UI, logs, and usage refresh, keeping only low-frequency health checks, essential OAuth recovery, and connection recovery.",
-                        )
-                    } else {
-                        t(
-                            zh,
-                            "进入托盘后会自动启用轻量模式，暂停界面刷新、日志跟随和用量刷新，只保留低频健康检查、OAuth 必要恢复与连接恢复，不会持续占用计算资源。",
-                            "Tray mode automatically pauses UI updates, log following, and usage refresh. Only low-frequency health checks, essential OAuth recovery, and connection recovery remain, so it does not continuously consume computing resources.",
-                        )
-                    })
-                    .small()
-                    .color(palette.muted),
-                );
-                ui.add_space(if compact { 8.0 } else { 18.0 });
+                ui.set_min_size(dialog_size);
+                ui.set_max_size(dialog_size);
+                let button_reserve = 64.0;
+                let body_height = (ui.available_height() - button_reserve).max(140.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("apply-success-body")
+                    .max_height(body_height)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(t(
+                                zh,
+                                "建议流程：Codex 先登录 → 再应用 Router → 完全重启 Codex",
+                                "Recommended: sign in to Codex first → apply Router → fully restart Codex",
+                            ))
+                            .size(if compact { 16.0 } else { 18.0 })
+                            .strong()
+                            .color(palette.ink),
+                        );
+                        ui.add_space(if compact { 6.0 } else { 10.0 });
+                        ui.label(
+                            egui::RichText::new(t(
+                                zh,
+                                "请完全退出并重新启动 ChatGPT / Codex。未登录时也会写入本地 Router（第三方 API）；已登录账号会保留，模型列表来自本机路由目录。",
+                                "Fully quit and restart ChatGPT / Codex. Without a login, local Router API mode is still written; an existing login is kept, and models come from the local catalog.",
+                            ))
+                            .color(palette.ink_soft),
+                        );
+                        ui.add_space(if compact { 4.0 } else { 8.0 });
+                        ui.label(
+                            egui::RichText::new(if compact {
+                                t(
+                                    zh,
+                                    "请保持 Codex-Router 在系统托盘运行，否则本地转发将停止。",
+                                    "Keep Codex-Router running in the tray, otherwise local forwarding stops.",
+                                )
+                            } else {
+                                t(
+                                    zh,
+                                    "使用过程中请保持 Codex-Router 在后台或系统托盘运行，否则本地转发将不可用。",
+                                    "Keep Codex-Router running in the background or system tray while using it, otherwise local forwarding will be unavailable.",
+                                )
+                            })
+                            .color(palette.ink_soft),
+                        );
+                        ui.add_space(if compact { 4.0 } else { 8.0 });
+                        ui.label(
+                            egui::RichText::new(if compact {
+                                t(
+                                    zh,
+                                    "托盘轻量模式会暂停界面、日志和用量刷新，仅保留低频健康检查、OAuth 必要恢复与连接恢复。",
+                                    "Lightweight tray mode pauses UI, logs, and usage refresh, keeping only low-frequency health checks, essential OAuth recovery, and connection recovery.",
+                                )
+                            } else {
+                                t(
+                                    zh,
+                                    "进入托盘后会自动启用轻量模式，暂停界面刷新、日志跟随和用量刷新，只保留低频健康检查、OAuth 必要恢复与连接恢复，不会持续占用计算资源。",
+                                    "Tray mode automatically pauses UI updates, log following, and usage refresh. Only low-frequency health checks, essential OAuth recovery, and connection recovery remain, so it does not continuously consume computing resources.",
+                                )
+                            })
+                            .small()
+                            .color(palette.muted),
+                        );
+                    });
+                ui.add_space(10.0);
                 ui.vertical_centered(|ui| {
                     if ui
                         .add_sized(
-                            [142.0, 46.0],
+                            [160.0, 46.0],
                             egui::Button::new(
                                 egui::RichText::new(t(zh, "知道了", "Got it"))
                                     .strong()
@@ -2194,23 +2344,35 @@ impl CodexRouterApp {
                                 }
                             });
                         columns[1].add_space(10.0);
-                        let login_response = columns[1]
-                            .add_enabled_ui(!this.provider_oauth_running, |ui| {
-                                theme::primary_button(
-                                    ui,
-                                    egui::RichText::new(if this.provider_oauth_running {
-                                        t(zh, "正在等待 OAuth…", "Waiting for OAuth…")
-                                    } else {
-                                        t(zh, "登录选中平台", "Sign in to selected provider")
-                                    })
-                                    .strong()
-                                    .color(egui::Color32::WHITE),
-                                    palette,
-                                )
-                            })
-                            .inner;
-                        if login_response.clicked() {
-                            login_provider = Some(this.oauth_provider_draft.clone());
+                        if this.provider_oauth_running {
+                            columns[1].horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(t(zh, "正在等待 OAuth…", "Waiting for OAuth…"));
+                            });
+                            if theme::secondary_button(
+                                &mut columns[1],
+                                t(zh, "取消 OAuth", "Cancel OAuth"),
+                                palette,
+                            )
+                            .clicked()
+                            {
+                                this.cancel_provider_oauth();
+                            }
+                        } else {
+                            let login_response = theme::primary_button(
+                                &mut columns[1],
+                                egui::RichText::new(t(
+                                    zh,
+                                    "登录选中平台",
+                                    "Sign in to selected provider",
+                                ))
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                                palette,
+                            );
+                            if login_response.clicked() {
+                                login_provider = Some(this.oauth_provider_draft.clone());
+                            }
                         }
                         let oauth_count =
                             this.config.oauth_account_ids.as_ref().map_or(0, Vec::len);
@@ -2465,6 +2627,16 @@ impl CodexRouterApp {
                                     this.temp_model.alias_customized = Some(true);
                                 }
                             }
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(super::logic::model_routing_explanation(
+                                    &this.config,
+                                    &this.temp_model,
+                                    zh,
+                                ))
+                                .small()
+                                .color(palette.ink_soft),
+                            );
                             if two_columns {
                                 ui.columns(2, |columns| {
                                     theme::field_label(
@@ -2622,13 +2794,22 @@ impl CodexRouterApp {
                                 {
                                     this.temp_model.context_window = if documented_default {
                                         0
-                                    } else {
+                                    } else if this.temp_model.context_window <= 0 {
                                         context_defaults.window
+                                    } else {
+                                        this.temp_model.context_window
                                     };
                                 }
                                 if documented_default {
-                                    columns[0].label(format!("{} tokens", context_defaults.window));
+                                    columns[0].label(format!(
+                                        "{} tokens ({})",
+                                        context_defaults.window,
+                                        t(zh, "文档默认", "documented default")
+                                    ));
                                 } else {
+                                    if this.temp_model.context_window <= 0 {
+                                        this.temp_model.context_window = context_defaults.window;
+                                    }
                                     let context_response = columns[0].add(
                                         egui::DragValue::new(&mut this.temp_model.context_window)
                                             .range(16_000..=4_000_000)
@@ -2636,6 +2817,11 @@ impl CodexRouterApp {
                                             .suffix(" tokens"),
                                     );
                                     theme::ascii_response(&mut columns[0], &context_response);
+                                    columns[0].label(t(
+                                        zh,
+                                        "点击数字可直接键盘输入自定义上下文窗口",
+                                        "Click the number to type a custom context window",
+                                    ));
                                 }
 
                                 theme::stacked_field_label(
@@ -3707,44 +3893,15 @@ impl CodexRouterApp {
 
     fn show_codex_account_mode_card(&mut self, ui: &mut egui::Ui, palette: &theme::Palette) {
         let zh = self.ui_language == "zh";
-        let account_mode = self.codex_account_mode_status.mode;
-        let target_account_mode = if account_mode == super::profiles::CodexAccountMode::ApiOnly
-            || (account_mode == super::profiles::CodexAccountMode::Unavailable
-                && self.codex_account_mode_status.official_snapshot_available)
-        {
-            super::profiles::CodexAccountMode::Official
-        } else {
-            super::profiles::CodexAccountMode::ApiOnly
-        };
-        let can_switch_account = !self.codex_account_mode_switching
-            && !self.applying
-            && !self.router_mode_switching
-            && (target_account_mode != super::profiles::CodexAccountMode::Official
-                || self.codex_account_mode_status.official_snapshot_available)
-            && (target_account_mode != super::profiles::CodexAccountMode::ApiOnly
-                || (self.router_mode_enabled
-                    && account_mode == super::profiles::CodexAccountMode::Official));
-        let mut switch_account = false;
-
         theme::paper_frame(palette).show(ui, |ui| {
-            theme::eyebrow(ui, "01 / ACCOUNT MODE", palette.muted);
-            ui.heading(t(zh, "Codex 账号模式", "Codex account mode"));
+            theme::eyebrow(ui, "01 / CODEX LOGIN", palette.muted);
+            ui.heading(t(zh, "Codex 登录状态", "Codex sign-in"));
             ui.label(
-                egui::RichText::new(match account_mode {
-                    super::profiles::CodexAccountMode::Official => t(
-                        zh,
-                        "当前：Codex 账号登录",
-                        "Current: Codex account sign-in",
-                    ),
-                    super::profiles::CodexAccountMode::ApiOnly => {
-                        t(zh, "当前：API 登录", "Current: API sign-in")
-                    }
-                    super::profiles::CodexAccountMode::Unavailable => t(
-                        zh,
-                        "当前：等待可恢复的登录状态",
-                        "Current: waiting for a restorable sign-in",
-                    ),
-                })
+                egui::RichText::new(t(
+                    zh,
+                    "当前：保持你的 Codex 账号登录",
+                    "Current: keep your Codex account sign-in",
+                ))
                 .strong()
                 .color(palette.ink_soft),
             );
@@ -3753,46 +3910,24 @@ impl CodexRouterApp {
                 egui::Label::new(
                     egui::RichText::new(t(
                         zh,
-                        "登录 Codex 账号可以使用远程控制；使用 API 登录通常可以在额度用完后避免“额度已用完”的提醒。",
-                        "Signing in with a Codex account enables remote control. API sign-in usually avoids the quota-exhausted notice after the account quota is used.",
+                        "保存并应用只会增量写入本地 Router 与模型目录，不会切换成第三方 API 登录，也不会删除 auth.json 或聊天记录。",
+                        "Save & Apply only writes the local Router route and model catalog. It never switches to third-party API sign-in and never deletes auth.json or chats.",
                     ))
                     .color(palette.ink),
                 )
                 .wrap(),
             );
-            ui.add_space(10.0);
-            let response = ui.add_enabled_ui(can_switch_account, |ui| {
-                theme::primary_button(
-                    ui,
-                    egui::RichText::new(
-                        if target_account_mode == super::profiles::CodexAccountMode::Official {
-                            t(zh, "登录 Codex 账号", "Sign in with Codex account")
-                        } else {
-                            t(zh, "切换到 API 登录", "Switch to API sign-in")
-                        },
-                    )
-                    .strong()
-                    .color(egui::Color32::WHITE),
-                    palette,
-                )
-            });
-            if response.inner.clicked() {
-                switch_account = true;
-            }
+            ui.add_space(6.0);
             ui.label(
                 egui::RichText::new(t(
                     zh,
-                    "切换前会使用 Windows 当前用户 DPAPI 加密保存可恢复的 Codex 登录。切换后请完全重启 Codex。",
-                    "The restorable Codex sign-in is encrypted with Windows per-user DPAPI before switching. Fully restart Codex afterward.",
+                    "请先在 Codex 中完成账号登录，再应用 Router；应用后完全重启 Codex 即可看到全部模型。",
+                    "Sign in to Codex first, then apply Router. Fully restart Codex afterward to load the full model list.",
                 ))
                 .small()
                 .color(palette.muted),
             );
         });
-
-        if switch_account {
-            self.switch_codex_account_mode(target_account_mode);
-        }
     }
 
     fn show_profiles(&mut self, ui: &mut egui::Ui, palette: &theme::Palette) {
@@ -3894,6 +4029,8 @@ impl CodexRouterApp {
             );
         }
         ui.add_space(10.0);
+        self.show_share_codex_state_toggle(ui, palette, zh);
+        ui.add_space(10.0);
 
         egui::ScrollArea::vertical()
             .id_salt("configuration-profiles-scroll")
@@ -3906,42 +4043,14 @@ impl CodexRouterApp {
                         egui::vec2(content_width * 0.39, content_height),
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
-                    self.show_codex_account_mode_card(ui, palette);
-
+                    // First card: name + create profile (required before first apply).
                     theme::paper_frame(palette).show(ui, |ui| {
-                        theme::eyebrow(ui, "02 / CODEX", palette.muted);
-                        ui.heading(t(zh, "官方登录配置", "Official login"));
-                        ui.label(t(
-                            zh,
-                            "恢复 Router 首次介入前的 Codex 配置与登录状态。若旧版本没有完整快照，会优先使用最早的 config.toml 备份并保留安全的 Windows 沙箱设置。",
-                            "Restore the Codex configuration and login captured before Router first changed it. Older installs fall back to the earliest config.toml backup.",
-                        ));
-                        ui.add_space(10.0);
-                        let response = ui.add_enabled_ui(!self.applying, |ui| {
-                            theme::primary_button(
-                                ui,
-                                egui::RichText::new(t(
-                                    zh,
-                                    "恢复 Codex 默认登录",
-                                    "Restore official Codex",
-                                ))
-                                .strong()
-                                .color(egui::Color32::WHITE),
-                                palette,
-                            )
-                        });
-                        if response.inner.clicked() {
-                            restore_original = true;
-                        }
-                    });
-
-                    theme::paper_frame(palette).show(ui, |ui| {
-                        theme::eyebrow(ui, "03 / LOCAL", palette.muted);
+                        theme::eyebrow(ui, "01 / LOCAL", palette.muted);
                         ui.heading(t(zh, "应用前配置与本地隔离", "Previous & local"));
                         ui.label(t(
                             zh,
-                            "一键返回最近一次应用前状态，或新建完全由 Codex-Router 管理的本地配置。不同配置使用不同的 API Key 凭据名称。",
-                            "Return to the most recent pre-apply state or create a Router-managed local profile with isolated API credentials.",
+                            "首次保存前请先命名配置分组。建议：先在 Codex 登录账号 → 在此命名并应用 → 完全重启 Codex。未登录 Codex 时也会写入本地 Router（第三方 API 模式）。",
+                            "Name a profile before the first save. Recommended: sign in to Codex first → name and apply here → fully restart Codex. Without a Codex login, Router still writes local API mode.",
                         ));
                         ui.add_space(8.0);
                         let response = ui.add_enabled_ui(
@@ -3974,7 +4083,7 @@ impl CodexRouterApp {
                         theme::input(
                             ui,
                             &mut self.local_profile_name_input,
-                            t(zh, "输入新配置名称", "New profile name"),
+                            t(zh, "输入新配置名称（例如 工作）", "New profile name (e.g. Work)"),
                             false,
                             palette,
                         );
@@ -4001,11 +4110,40 @@ impl CodexRouterApp {
                             ));
                         }
                     });
+
+                    self.show_codex_account_mode_card(ui, palette);
+
+                    theme::paper_frame(palette).show(ui, |ui| {
+                        theme::eyebrow(ui, "03 / CODEX", palette.muted);
+                        ui.heading(t(zh, "初始化 Codex 默认配置", "Reset Codex defaults"));
+                        ui.label(t(
+                            zh,
+                            "移除 Codex-Router 写入的模型提供方、模型目录与推理默认值，让 Codex 回到自己的默认配置与登录流程。你的登录状态、聊天记录、插件、MCP 与权限设置不会被改动，也不会写入任何 Windows 沙箱设置。",
+                            "Remove the model provider, model catalog, and reasoning defaults written by Codex-Router so Codex returns to its own defaults and login flow. Your sign-in, chats, plugins, MCP servers, and permissions are left untouched, and no Windows sandbox value is written.",
+                        ));
+                        ui.add_space(10.0);
+                        let response = ui.add_enabled_ui(!self.applying, |ui| {
+                            theme::primary_button(
+                                ui,
+                                egui::RichText::new(t(
+                                    zh,
+                                    "初始化 Codex 默认配置",
+                                    "Reset Codex defaults",
+                                ))
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                                palette,
+                            )
+                        });
+                        if response.inner.clicked() {
+                            restore_original = true;
+                        }
+                    });
                         },
                     );
                     ui.add_space(14.0);
                     ui.allocate_ui_with_layout(
-                        egui::vec2(content_width * 0.61 - 14.0, content_height),
+                        egui::vec2(content_width * 0.61 - 14.0, 0.0),
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
                 theme::glass_frame(palette).show(ui, |ui| {
@@ -4053,37 +4191,51 @@ impl CodexRouterApp {
                             .corner_radius(egui::CornerRadius::same(8))
                             .inner_margin(egui::Margin::symmetric(14, 10))
                             .show(ui, |ui| {
-                                ui.horizontal_top(|ui| {
-                                    let action_width = 132.0;
+                                ui.set_min_width(ui.available_width());
+                                // Reserve the action button first, then let the
+                                // name wrap in the remaining width. Both sides get
+                                // an explicit height so the row cannot stretch to
+                                // fill the panel.
+                                let action_width = if active { 150.0_f32 } else { 104.0_f32 };
+                                let row_height = 44.0_f32;
+                                ui.horizontal(|ui| {
+                                    // Text takes the left side; the action button is
+                                    // pushed to the right edge of the card.
+                                    let full_width = ui.available_width();
                                     let text_width =
-                                        (ui.available_width() - action_width - 10.0).max(140.0);
+                                        (full_width - action_width - 12.0).max(120.0);
                                     ui.allocate_ui_with_layout(
-                                        egui::vec2(text_width, 58.0),
+                                        egui::vec2(text_width, row_height),
                                         egui::Layout::top_down(egui::Align::Min),
                                         |ui| {
-                                        ui.set_max_width(text_width);
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(&profile.name)
-                                                    .strong()
-                                                    .color(palette.ink),
-                                            )
-                                            .wrap(),
-                                        );
-                                        ui.label(
-                                            egui::RichText::new(t(
-                                                zh,
-                                                "Codex-Router 本地隔离",
-                                                "Codex-Router local isolation",
-                                            ))
-                                            .small()
-                                            .color(palette.muted),
-                                        );
+                                            ui.set_max_width(text_width);
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(&profile.name)
+                                                        .strong()
+                                                        .color(palette.ink),
+                                                )
+                                                .truncate(),
+                                            );
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(t(
+                                                        zh,
+                                                        "Codex-Router 本地隔离",
+                                                        "Codex-Router local isolation",
+                                                    ))
+                                                    .small()
+                                                    .color(palette.muted),
+                                                )
+                                                .truncate(),
+                                            );
                                         },
                                     );
-                                    ui.add_space(10.0);
                                     ui.allocate_ui_with_layout(
-                                        egui::vec2(action_width, 58.0),
+                                        egui::vec2(
+                                            (ui.available_width()).max(action_width),
+                                            row_height,
+                                        ),
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
                                             let response = ui.add_enabled_ui(
@@ -5053,6 +5205,153 @@ impl CodexRouterApp {
         }
     }
 
+    fn show_oauth_priority_dialog(&mut self, ctx: &egui::Context, palette: &theme::Palette) {
+        let zh = self.ui_language == "zh";
+        let Some(account) = self.oauth_priority_target.clone() else {
+            return;
+        };
+        let peers = self
+            .oauth_accounts
+            .iter()
+            .filter(|peer| peer.platform.eq_ignore_ascii_case(&account.platform))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut open = true;
+        let mut save = false;
+        let mut cancel = false;
+        let dialog_size = fit_dialog_size(
+            ctx.content_rect().size(),
+            egui::vec2(560.0, 420.0),
+            egui::vec2(420.0, 320.0),
+        );
+        egui::Window::new(t(
+            zh,
+            "同平台 OAuth 调度优先级",
+            "Same-platform OAuth priority",
+        ))
+        .id(egui::Id::new("oauth-priority-dialog"))
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .default_size(dialog_size)
+        .min_size(dialog_size)
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.set_min_width(dialog_size.x - 24.0);
+            ui.label(
+                egui::RichText::new(if zh {
+                    format!(
+                        "账号：{}（{}）\n数值越小，同平台调度时越优先。修改后立即写入 Sub2API，无需重新部署。",
+                        account.name, account.platform
+                    )
+                } else {
+                    format!(
+                        "Account: {} ({})\nLower numbers are preferred when the same platform has multiple accounts. Changes are written to Sub2API immediately.",
+                        account.name, account.platform
+                    )
+                })
+                .color(palette.ink_soft),
+            );
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.label(t(zh, "优先级", "Priority"));
+                ui.add(
+                    egui::DragValue::new(&mut self.oauth_priority_draft)
+                        .range(1..=999)
+                        .speed(1.0)
+                        .prefix("P"),
+                );
+            });
+            ui.add_space(8.0);
+            if peers.len() > 1 {
+                ui.label(
+                    egui::RichText::new(t(
+                        zh,
+                        "同平台账号一览",
+                        "Accounts on this platform",
+                    ))
+                    .strong()
+                    .color(palette.ink),
+                );
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .max_height(160.0)
+                    .show(ui, |ui| {
+                        for peer in &peers {
+                            let marker = if peer.id == account.id { "→ " } else { "  " };
+                            let label = if peer.email.is_empty() {
+                                format!(
+                                    "{marker}P{}  {}{}",
+                                    peer.priority.max(1),
+                                    peer.name,
+                                    if peer.id == account.id {
+                                        if zh {
+                                            "（当前）"
+                                        } else {
+                                            " (current)"
+                                        }
+                                    } else {
+                                        ""
+                                    }
+                                )
+                            } else {
+                                format!(
+                                    "{marker}P{}  {} · {}{}",
+                                    peer.priority.max(1),
+                                    peer.name,
+                                    peer.email,
+                                    if peer.id == account.id {
+                                        if zh {
+                                            "（当前）"
+                                        } else {
+                                            " (current)"
+                                        }
+                                    } else {
+                                        ""
+                                    }
+                                )
+                            };
+                            ui.label(
+                                egui::RichText::new(label)
+                                    .small()
+                                    .color(if peer.id == account.id {
+                                        palette.action
+                                    } else {
+                                        palette.muted
+                                    }),
+                            );
+                        }
+                    });
+            }
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                let save_response = ui.add_enabled_ui(!self.oauth_priority_saving, |ui| {
+                    theme::primary_button(
+                        ui,
+                        egui::RichText::new(t(zh, "保存优先级", "Save priority"))
+                            .strong()
+                            .color(egui::Color32::WHITE),
+                        palette,
+                    )
+                });
+                if save_response.inner.clicked() {
+                    save = true;
+                }
+                if theme::secondary_button(ui, t(zh, "取消", "Cancel"), palette).clicked() {
+                    cancel = true;
+                }
+                if self.oauth_priority_saving {
+                    ui.spinner();
+                }
+            });
+        });
+        if save {
+            self.save_oauth_account_priority();
+        } else if (cancel || !open) && !self.oauth_priority_saving {
+            self.oauth_priority_target = None;
+        }
+    }
+
     fn show_grok_sso_dialog(&mut self, ctx: &egui::Context, palette: &theme::Palette) {
         let zh = self.ui_language == "zh";
         let mut open = true;
@@ -5174,7 +5473,7 @@ impl CodexRouterApp {
             .models
             .iter()
             .filter(|model| model.source == "oauth" && model.oauth_account_id == account_id)
-            .map(|model| super::logic::canonical_route_model_id(&model.model))
+            .map(|model| model.model.clone())
             .collect::<Vec<_>>();
         let mut base_urls = Vec::new();
         for model in self
@@ -5183,7 +5482,10 @@ impl CodexRouterApp {
             .iter()
             .filter(|model| model.source != "oauth")
         {
-            if !oauth_model_ids.contains(&super::logic::canonical_route_model_id(&model.model)) {
+            if !oauth_model_ids
+                .iter()
+                .any(|oauth_id| super::logic::same_model_identity(oauth_id, &model.model))
+            {
                 continue;
             }
             if !super::logic::is_fallback_channel_selected(&self.config, model) {
@@ -5533,6 +5835,7 @@ impl CodexRouterApp {
         let mut selection_changed = false;
         let mut import_model = None;
         let mut revoke_account = None;
+        let mut priority_account = None;
         let mut manual_model_account = None;
         let mut fallback_picker_account = None;
         let content_height = ui.available_height().max(320.0);
@@ -5606,6 +5909,26 @@ impl CodexRouterApp {
                             "Waiting for the current OAuth login",
                         ));
                     });
+                    if ui
+                        .add_sized(
+                            [ui.available_width(), 34.0],
+                            egui::Button::new(
+                                egui::RichText::new(t(zh, "取消 OAuth", "Cancel OAuth"))
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                            )
+                            .fill(palette.danger)
+                            .corner_radius(egui::CornerRadius::same(6)),
+                        )
+                        .on_hover_text(t(
+                            zh,
+                            "关闭浏览器标签后点此取消，避免一直卡在等待状态",
+                            "Cancel after closing the browser tab so the UI does not stay stuck",
+                        ))
+                        .clicked()
+                    {
+                        self.cancel_provider_oauth();
+                    }
                 }
                 if ui
                     .add_sized(
@@ -5845,7 +6168,7 @@ impl CodexRouterApp {
             .max_height(account_height)
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for account in accounts {
+                for account in &accounts {
                     let usage_account = self
                         .usage_snapshot
                         .as_ref()
@@ -5894,12 +6217,47 @@ impl CodexRouterApp {
                                         palette.danger
                                     },
                                 );
-                                theme::pill(
-                                    ui,
-                                    &format!("P{}", account.priority),
-                                    palette.paper_alt,
-                                    palette.ink_soft,
-                                );
+                                let peer_count = accounts
+                                    .iter()
+                                    .filter(|peer| {
+                                        peer.platform.eq_ignore_ascii_case(&account.platform)
+                                    })
+                                    .count();
+                                let priority_label = format!("P{}", account.priority.max(1));
+                                let priority_response = ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new(&priority_label)
+                                                .small()
+                                                .strong()
+                                                .color(palette.ink),
+                                        )
+                                        .fill(palette.paper_alt)
+                                        .stroke(egui::Stroke::new(1.0, palette.line))
+                                        .corner_radius(egui::CornerRadius::same(99)),
+                                    )
+                                    .on_hover_text(if zh {
+                                        if peer_count > 1 {
+                                            format!(
+                                                "点击调整同平台（{}）多账号调度优先级。数值越小越优先，当前同平台 {} 个账号。",
+                                                account.platform, peer_count
+                                            )
+                                        } else {
+                                            "点击设置此 OAuth 账号的调度优先级（数值越小越优先）"
+                                                .to_owned()
+                                        }
+                                    } else if peer_count > 1 {
+                                        format!(
+                                            "Click to set scheduling priority among {} {} accounts. Lower numbers are preferred.",
+                                            peer_count, account.platform
+                                        )
+                                    } else {
+                                        "Click to set this OAuth account's scheduling priority (lower numbers are preferred)"
+                                            .to_owned()
+                                    });
+                                if priority_response.clicked() {
+                                    priority_account = Some(account.clone());
+                                }
                             });
                             ui.add_space(6.0);
                             let mut selected = selected_ids.contains(&account.id);
@@ -5962,7 +6320,7 @@ impl CodexRouterApp {
                                 && selected
                                 && self.show_oauth_routing_status(
                                     ui,
-                                    &account,
+                                    account,
                                     usage_account.as_ref(),
                                     &backup_urls,
                                     palette,
@@ -6047,6 +6405,9 @@ impl CodexRouterApp {
         });
         if let Some(account) = revoke_account {
             self.oauth_revoke_target = Some(account);
+        }
+        if let Some(account) = priority_account {
+            self.open_oauth_priority_editor(account);
         }
         if let Some(account) = manual_model_account {
             self.oauth_manual_model_target = Some(account);
@@ -6133,7 +6494,7 @@ impl CodexRouterApp {
         let Some(account) = self.oauth_fallback_picker_target.clone() else {
             return;
         };
-        let mut active_models = Vec::<(String, String)>::new();
+        let mut active_models = Vec::<(String, String, String)>::new();
         for model in self
             .config
             .models
@@ -6141,7 +6502,7 @@ impl CodexRouterApp {
             .filter(|model| model.source == "oauth" && model.oauth_account_id == account.id)
         {
             let canonical = super::logic::canonical_route_model_id(&model.model);
-            if active_models.iter().any(|(id, _)| id == &canonical) {
+            if active_models.iter().any(|(id, _, _)| id == &canonical) {
                 continue;
             }
             let display_name = if model.alias.trim().is_empty() {
@@ -6149,11 +6510,11 @@ impl CodexRouterApp {
             } else {
                 model.alias.clone()
             };
-            active_models.push((canonical, display_name));
+            active_models.push((canonical, model.model.clone(), display_name));
         }
 
         let mut candidates = std::collections::BTreeMap::new();
-        for (canonical, _) in &active_models {
+        for (canonical, oauth_model_id, _) in &active_models {
             let matching = self
                 .config
                 .models
@@ -6161,7 +6522,7 @@ impl CodexRouterApp {
                 .enumerate()
                 .filter(|(_, model)| {
                     model.source != "oauth"
-                        && super::logic::canonical_route_model_id(&model.model) == *canonical
+                        && super::logic::same_model_identity(&model.model, oauth_model_id)
                 })
                 .map(|(index, model)| {
                     (
@@ -6275,7 +6636,7 @@ impl CodexRouterApp {
                                         .color(palette.muted),
                                     );
                                 }
-                                for (canonical, display_name) in &active_models {
+                                for (canonical, _, display_name) in &active_models {
                                     let matching = candidates
                                         .get(canonical)
                                         .map(Vec::as_slice)
@@ -6304,8 +6665,8 @@ impl CodexRouterApp {
                                                     &mut automatic,
                                                     t(
                                                         zh,
-                                                        "自动匹配全部同名条目",
-                                                        "Automatically match all same-name entries",
+                                                        "自动匹配展示候选与真实 ID 均一致的条目",
+                                                        "Automatically match entries whose display candidate and real ID both agree",
                                                     ),
                                                 )
                                                 .changed()
@@ -6326,8 +6687,8 @@ impl CodexRouterApp {
                                                 ui.label(
                                                     egui::RichText::new(t(
                                                         zh,
-                                                        "没有找到同名 API 条目",
-                                                        "No same-name API entry was found",
+                                                        "没有找到展示候选与真实 ID 均一致的 API 条目",
+                                                        "No API entry matched both the display candidate and real ID",
                                                     ))
                                                     .small()
                                                     .color(palette.muted),
@@ -6414,7 +6775,7 @@ impl CodexRouterApp {
             });
 
         if save {
-            for (canonical, _) in &active_models {
+            for (canonical, _, _) in &active_models {
                 match self
                     .oauth_fallback_picker_draft
                     .get(canonical)
@@ -6864,27 +7225,32 @@ impl CodexRouterApp {
             .shadow(theme::soft_card_shadow())
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
+                ui.set_max_width(ui.available_width());
                 let drag_handle = ui
                     .horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(
-                            egui::RichText::new(&account.name)
-                                .font(egui::FontId::new(19.0, theme::display_family()))
-                                .color(palette.ink),
-                        );
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{} · #{} · {} · {}",
-                                account.platform.to_uppercase(),
-                                account.id,
-                                account.kind.to_uppercase(),
-                                account.status.to_uppercase(),
-                            ))
-                            .small()
-                            .color(palette.muted),
-                        );
-                    });
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.vertical(|ui| {
+                            ui.set_max_width((ui.available_width() - 96.0).max(120.0));
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&account.name)
+                                        .font(egui::FontId::new(17.0, theme::display_family()))
+                                        .color(palette.ink),
+                                )
+                                .wrap(),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} · #{} · {} · {}",
+                                    account.platform.to_uppercase(),
+                                    account.id,
+                                    account.kind.to_uppercase(),
+                                    account.status.to_uppercase(),
+                                ))
+                                .small()
+                                .color(palette.muted),
+                            );
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                             let drag_handle = ui
                                 .add(
                                     egui::Button::new(
@@ -7025,6 +7391,101 @@ impl CodexRouterApp {
         (card.response, card.inner)
     }
 
+    /// Quota-window accounts (OAuth subscriptions and Coding Plan style API
+    /// channels) share the 5-hour / weekly / monthly window cards. Plain
+    /// pay-as-you-go API channels have no such windows and are listed separately.
+    fn usage_account_is_quota_plan(account: &UsageAccount) -> bool {
+        account.kind == "oauth"
+            || account
+                .windows
+                .iter()
+                .any(|window| matches!(window.kind.as_str(), "fiveHour" | "weekly" | "monthly"))
+    }
+
+    fn show_usage_account_grid(
+        ui: &mut egui::Ui,
+        accounts: &[&UsageAccount],
+        palette: &theme::Palette,
+        zh: bool,
+        subscription: bool,
+        two_columns: bool,
+    ) -> Option<(UsageOrderSection, i64, i64)> {
+        let mut usage_reorder = None;
+        let gap = 10.0;
+        // Edge gutter keeps the right column off the scrollbar; never force a
+        // floor width that would overflow and wrap into a blank second row.
+        let edge_gutter = 8.0;
+        let usable_width = (ui.available_width() - edge_gutter).max(0.0);
+        let columns = if two_columns && usable_width >= 560.0 {
+            2usize
+        } else {
+            1usize
+        };
+        let card_width = if columns == 2 {
+            ((usable_width - gap) / 2.0).max(0.0)
+        } else {
+            usable_width.max(0.0)
+        };
+        let mut index = 0usize;
+        while index < accounts.len() {
+            ui.horizontal_top(|ui| {
+                for offset in 0..columns {
+                    let Some(account) = accounts.get(index + offset) else {
+                        break;
+                    };
+                    if offset > 0 {
+                        ui.add_space(gap);
+                    }
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(card_width, 0.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            let account_section = if account.kind == "oauth" {
+                                UsageOrderSection::Subscription
+                            } else {
+                                UsageOrderSection::Api
+                            };
+                            let (card, handle) = Self::show_usage_account(
+                                ui,
+                                account,
+                                palette,
+                                zh,
+                                subscription || account.kind == "oauth",
+                            );
+                            handle.dnd_set_drag_payload(UsageOrderDrag {
+                                section: account_section,
+                                account_id: account.id,
+                            });
+                            if let Some(payload) = card.dnd_hover_payload::<UsageOrderDrag>() {
+                                if payload.section == account_section
+                                    && payload.account_id != account.id
+                                {
+                                    ui.painter().rect_stroke(
+                                        card.rect,
+                                        egui::CornerRadius::same(7),
+                                        egui::Stroke::new(2.0, palette.action),
+                                        egui::StrokeKind::Outside,
+                                    );
+                                }
+                            }
+                            if let Some(payload) = card.dnd_release_payload::<UsageOrderDrag>() {
+                                if payload.section == account_section {
+                                    usage_reorder =
+                                        Some((account_section, payload.account_id, account.id));
+                                }
+                            }
+                        },
+                    );
+                }
+            });
+            index += columns;
+            if index < accounts.len() {
+                ui.add_space(gap);
+            }
+        }
+        usage_reorder
+    }
+
     fn show_usage_monitor(&mut self, ui: &mut egui::Ui, palette: &theme::Palette) {
         let zh = self.ui_language == "zh";
         ui.horizontal(|ui| {
@@ -7064,7 +7525,7 @@ impl CodexRouterApp {
                 }
             });
         });
-        ui.add_space(14.0);
+        ui.add_space(10.0);
 
         if self.usage_loading {
             ui.horizontal(|ui| {
@@ -7078,7 +7539,7 @@ impl CodexRouterApp {
                     .color(palette.paper),
                 );
             });
-            ui.add_space(8.0);
+            ui.add_space(6.0);
         }
         if !self.usage_error.is_empty() {
             egui::Frame::new()
@@ -7148,12 +7609,20 @@ impl CodexRouterApp {
             return;
         };
 
+        let quota_plan_count = snapshot.subscriptions.len()
+            + snapshot
+                .api_channels
+                .iter()
+                .filter(|account| Self::usage_account_is_quota_plan(account))
+                .count();
+        let metered_count =
+            snapshot.api_channels.len() + snapshot.subscriptions.len() - quota_plan_count;
         let compact_summary = ui.available_width() < 1000.0;
         egui::Frame::new()
             .fill(palette.glass)
             .stroke(egui::Stroke::new(1.0, palette.line))
             .corner_radius(egui::CornerRadius::same(8))
-            .inner_margin(egui::Margin::symmetric(20, 15))
+            .inner_margin(egui::Margin::symmetric(16, 12))
             .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.vertical(|ui| {
@@ -7170,9 +7639,11 @@ impl CodexRouterApp {
                     });
                     ui.separator();
                     ui.label(format!(
-                        "{} OAuth · {} API",
-                        snapshot.subscriptions.len(),
-                        snapshot.api_channels.len()
+                        "{} {} · {} {}",
+                        quota_plan_count,
+                        t(zh, "订阅/套餐", "plan"),
+                        metered_count,
+                        t(zh, "按量", "metered")
                     ));
                     ui.separator();
                     ui.label(format!(
@@ -7197,7 +7668,7 @@ impl CodexRouterApp {
                     }
                 });
                 if compact_summary {
-                    ui.add_space(6.0);
+                    ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(
@@ -7213,102 +7684,86 @@ impl CodexRouterApp {
                     });
                 }
             });
-        ui.add_space(12.0);
+        ui.add_space(8.0);
 
         let mut usage_reorder = None;
+        let two_columns = usage_monitor_uses_two_columns(ui.available_width());
+        // Merge OAuth subscriptions and Coding Plan style API channels into one
+        // quota-window group; plain pay-as-you-go channels form the second group.
+        let mut quota_accounts: Vec<&UsageAccount> = snapshot.subscriptions.iter().collect();
+        quota_accounts.extend(
+            snapshot
+                .api_channels
+                .iter()
+                .filter(|account| Self::usage_account_is_quota_plan(account)),
+        );
+        let metered_accounts: Vec<&UsageAccount> = snapshot
+            .api_channels
+            .iter()
+            .filter(|account| !Self::usage_account_is_quota_plan(account))
+            .collect();
+        // Shrink to content so short snapshots do not leave a tall empty band;
+        // still scroll when the card stack exceeds the remaining viewport.
+        let cards_budget = ui.available_height().max(96.0);
         egui::ScrollArea::vertical()
             .id_salt("usage-monitor-scroll")
-            .auto_shrink([false, false])
-            .max_height(ui.available_height().max(96.0))
+            .auto_shrink([false, true])
+            .max_height(cards_budget)
             .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
                 theme::eyebrow(
                     ui,
-                    t(zh, "订阅 / OAUTH", "SUBSCRIPTIONS / OAUTH"),
+                    t(zh, "订阅 / 套餐额度", "SUBSCRIPTIONS / PLAN QUOTAS"),
                     palette.paper,
                 );
-                if snapshot.subscriptions.is_empty() {
+                ui.add_space(4.0);
+                if quota_accounts.is_empty() {
                     ui.label(
                         egui::RichText::new(t(
                             zh,
-                            "当前配置没有已激活的 OAuth 订阅账号。",
-                            "The active profile has no OAuth subscription accounts.",
+                            "当前配置没有订阅或套餐窗口账号。",
+                            "The active profile has no subscription or quota-window accounts.",
                         ))
                         .color(palette.paper),
                     );
-                }
-                for account in &snapshot.subscriptions {
-                    let (card, handle) = Self::show_usage_account(ui, account, palette, zh, true);
-                    handle.dnd_set_drag_payload(UsageOrderDrag {
-                        section: UsageOrderSection::Subscription,
-                        account_id: account.id,
-                    });
-                    if let Some(payload) = card.dnd_hover_payload::<UsageOrderDrag>() {
-                        if payload.section == UsageOrderSection::Subscription
-                            && payload.account_id != account.id
-                        {
-                            ui.painter().rect_stroke(
-                                card.rect,
-                                egui::CornerRadius::same(7),
-                                egui::Stroke::new(2.0, palette.action),
-                                egui::StrokeKind::Outside,
-                            );
-                        }
-                    }
-                    if let Some(payload) = card.dnd_release_payload::<UsageOrderDrag>() {
-                        if payload.section == UsageOrderSection::Subscription {
-                            usage_reorder = Some((
-                                UsageOrderSection::Subscription,
-                                payload.account_id,
-                                account.id,
-                            ));
-                        }
-                    }
-                    ui.add_space(10.0);
+                } else {
+                    usage_reorder = usage_reorder.or(Self::show_usage_account_grid(
+                        ui,
+                        &quota_accounts,
+                        palette,
+                        zh,
+                        true,
+                        two_columns,
+                    ));
                 }
 
-                ui.add_space(8.0);
+                ui.add_space(10.0);
                 theme::eyebrow(
                     ui,
-                    t(zh, "第三方 API", "THIRD-PARTY API CHANNELS"),
+                    t(zh, "按量付费 API", "PAY-AS-YOU-GO API"),
                     palette.paper,
                 );
-                if snapshot.api_channels.is_empty() {
+                ui.add_space(4.0);
+                if metered_accounts.is_empty() {
                     ui.label(
                         egui::RichText::new(t(
                             zh,
-                            "当前配置没有已部署的 API Key 渠道。",
-                            "The active profile has no deployed API-key channels.",
+                            "当前配置没有按量付费的 API Key 渠道。",
+                            "The active profile has no pay-as-you-go API-key channels.",
                         ))
                         .color(palette.paper),
                     );
+                } else {
+                    usage_reorder = usage_reorder.or(Self::show_usage_account_grid(
+                        ui,
+                        &metered_accounts,
+                        palette,
+                        zh,
+                        false,
+                        two_columns,
+                    ));
                 }
-                for account in &snapshot.api_channels {
-                    let (card, handle) = Self::show_usage_account(ui, account, palette, zh, false);
-                    handle.dnd_set_drag_payload(UsageOrderDrag {
-                        section: UsageOrderSection::Api,
-                        account_id: account.id,
-                    });
-                    if let Some(payload) = card.dnd_hover_payload::<UsageOrderDrag>() {
-                        if payload.section == UsageOrderSection::Api
-                            && payload.account_id != account.id
-                        {
-                            ui.painter().rect_stroke(
-                                card.rect,
-                                egui::CornerRadius::same(7),
-                                egui::Stroke::new(2.0, palette.action),
-                                egui::StrokeKind::Outside,
-                            );
-                        }
-                    }
-                    if let Some(payload) = card.dnd_release_payload::<UsageOrderDrag>() {
-                        if payload.section == UsageOrderSection::Api {
-                            usage_reorder =
-                                Some((UsageOrderSection::Api, payload.account_id, account.id));
-                        }
-                    }
-                    ui.add_space(10.0);
-                }
-                ui.add_space(18.0);
+                ui.add_space(8.0);
             });
         if let Some((section, source_id, target_id)) = usage_reorder {
             let accounts = match (section, self.usage_snapshot.as_mut()) {
@@ -7337,6 +7792,9 @@ impl CodexRouterApp {
     }
 
     pub(crate) fn active_route_config_name(&self, zh: bool) -> String {
+        if self.applying || self.router_mode_switching {
+            return t(zh, "正在应用…", "Applying…").to_owned();
+        }
         self.isolation_profiles
             .iter()
             .find(|profile| profile.id == self.active_profile_id)
@@ -7365,14 +7823,18 @@ impl CodexRouterApp {
         let compact_header = header_width < 1080.0;
         let narrow_header = header_width < 900.0;
         ui.horizontal(|ui| {
+            // English labels are noticeably wider, so the title column needs more
+            // room before the share/action controls begin.
             ui.allocate_ui_with_layout(
                 egui::vec2(
                     if narrow_header {
-                        if zh { 180.0 } else { 210.0 }
+                        if zh { 180.0 } else { 200.0 }
                     } else if zh {
                         230.0
+                    } else if compact_header {
+                        250.0
                     } else {
-                        310.0
+                        275.0
                     },
                     72.0,
                 ),
@@ -7388,17 +7850,27 @@ impl CodexRouterApp {
                         palette.paper,
                     );
                     ui.label(
-                        egui::RichText::new(t(zh, "路由控制台", "ROUTER CONSOLE"))
-                            .font(egui::FontId::new(
-                                if narrow_header { 27.0 } else { 34.0 },
-                                theme::display_family(),
-                            ))
-                            .color(egui::Color32::WHITE),
+                        egui::RichText::new(if zh {
+                            "路由控制台"
+                        } else if narrow_header {
+                            "CONSOLE"
+                        } else {
+                            "ROUTER CONSOLE"
+                        })
+                        .font(egui::FontId::new(
+                            if narrow_header {
+                                27.0
+                            } else if zh {
+                                34.0
+                            } else {
+                                30.0
+                            },
+                            theme::display_family(),
+                        ))
+                        .color(egui::Color32::WHITE),
                     );
                 },
             );
-            let mut share_switch_clicked = false;
-            let mut share_container_clicked = false;
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let action_width = if narrow_header {
                     104.0
@@ -7406,13 +7878,6 @@ impl CodexRouterApp {
                     142.0
                 } else {
                     180.0
-                };
-                let share_width = if narrow_header {
-                    150.0
-                } else if compact_header {
-                    180.0
-                } else {
-                    230.0
                 };
                 if ui
                     .add_sized(
@@ -7451,74 +7916,7 @@ impl CodexRouterApp {
                 {
                     self.open_usage_monitor();
                 }
-                let shared_state = ui
-                    .allocate_ui_with_layout(
-                        egui::vec2(share_width, 42.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            egui::Frame::new()
-                                .fill(palette.paper)
-                                .stroke(egui::Stroke::new(1.0, palette.line))
-                                .corner_radius(egui::CornerRadius::same(8))
-                                .inner_margin(egui::Margin::symmetric(10, 7))
-                                .show(ui, |ui| {
-                                    ui.set_width((share_width - 20.0).max(120.0));
-                                    ui.horizontal(|ui| {
-                                            ui.label(
-                                            egui::RichText::new(if narrow_header {
-                                                t(zh, "共享", "Share")
-                                            } else if compact_header {
-                                                t(zh, "共享会话", "Share tasks")
-                                            } else {
-                                                t(
-                                                    zh,
-                                                    "共享会话与设置",
-                                                    "Share tasks & settings",
-                                                )
-                                            })
-                                            .strong()
-                                            .color(palette.ink),
-                                        );
-                                        share_switch_clicked = Self::dashboard_route_switch(
-                                            ui,
-                                            self.share_codex_state,
-                                            false,
-                                            palette,
-                                        )
-                                        .clicked();
-                                    });
-                                });
-                        },
-                    )
-                    .response
-                    .interact(egui::Sense::click())
-                    .on_hover_text(t(
-                        zh,
-                        "默认开启。同一 Codex 账号下切换官方路由或 Router 本地配置时，共享会话记录、登录状态和个人设置；检测到不同账号时自动隔离。",
-                        "On by default. Official and local Router profiles share tasks, login state, and personal settings for the same Codex account. Different accounts stay isolated.",
-                    ));
-                share_container_clicked = shared_state.clicked();
             });
-            if share_switch_clicked || share_container_clicked {
-                let previous = self.share_codex_state;
-                self.share_codex_state = !self.share_codex_state;
-                if self.persist_ui_preferences() {
-                    self.status_text = if zh {
-                        if self.share_codex_state {
-                            "已开启共享：同一 Codex 账号的会话、登录状态与个人设置会在配置间保持一致"
-                        } else {
-                            "已关闭共享：配置切换将恢复各自的完整 Codex 快照"
-                        }
-                    } else if self.share_codex_state {
-                        "Sharing enabled: tasks, login state, and personal settings stay consistent for the same Codex account"
-                    } else {
-                        "Sharing disabled: switching profiles restores each complete Codex snapshot"
-                    }
-                    .to_owned();
-                } else {
-                    self.share_codex_state = previous;
-                }
-            }
         });
         ui.add_space(14.0);
         let panel_height = ui.available_height();
@@ -7548,6 +7946,79 @@ impl CodexRouterApp {
                     ui.add_space(16.0);
                     self.dashboard_models(ui, palette, 720.0);
                 });
+        }
+    }
+
+    fn show_share_codex_state_toggle(
+        &mut self,
+        ui: &mut egui::Ui,
+        palette: &theme::Palette,
+        zh: bool,
+    ) {
+        let mut switch_clicked = false;
+        let card = egui::Frame::new()
+            .fill(palette.paper)
+            .stroke(egui::Stroke::new(1.0, palette.line))
+            .corner_radius(egui::CornerRadius::same(8))
+            .inner_margin(egui::Margin::symmetric(16, 12))
+            .shadow(theme::soft_card_shadow())
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_max_width((ui.available_width() - 80.0).max(180.0));
+                        ui.label(
+                            egui::RichText::new(t(zh, "共享会话与设置", "Share tasks & settings"))
+                                .strong()
+                                .color(palette.ink),
+                        );
+                        ui.label(
+                            egui::RichText::new(t(
+                                zh,
+                                "默认开启。同一 Codex 账号下切换官方路由或 Router 本地配置时，共享会话记录、登录状态和个人设置；检测到不同账号时自动隔离。",
+                                "On by default. Official and local Router profiles share tasks, login state, and personal settings for the same Codex account. Different accounts stay isolated.",
+                            ))
+                            .small()
+                            .color(palette.muted),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        switch_clicked = Self::dashboard_route_switch(
+                            ui,
+                            self.share_codex_state,
+                            false,
+                            palette,
+                        )
+                        .clicked();
+                    });
+                });
+            })
+            .response
+            .interact(egui::Sense::click())
+            .on_hover_text(t(
+                zh,
+                "在切换配置分组时生效：控制是否在配置之间共享 Codex 会话与设置",
+                "Applies when switching configuration groups: controls whether Codex tasks and settings are shared across profiles",
+            ));
+        if switch_clicked || card.clicked() {
+            let previous = self.share_codex_state;
+            self.share_codex_state = !self.share_codex_state;
+            if self.persist_ui_preferences() {
+                self.status_text = if zh {
+                    if self.share_codex_state {
+                        "已开启共享：同一 Codex 账号的会话、登录状态与个人设置会在配置间保持一致"
+                    } else {
+                        "已关闭共享：配置切换将恢复各自的完整 Codex 快照"
+                    }
+                } else if self.share_codex_state {
+                    "Sharing enabled: tasks, login state, and personal settings stay consistent for the same Codex account"
+                } else {
+                    "Sharing disabled: switching profiles restores each complete Codex snapshot"
+                }
+                .to_owned();
+            } else {
+                self.share_codex_state = previous;
+            }
         }
     }
 
@@ -7657,28 +8128,42 @@ impl CodexRouterApp {
                             .color(palette.ink_soft),
                     );
                 });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(108.0, 58.0),
-                        egui::Layout::top_down(egui::Align::Max),
-                        |ui| {
-                            ui.label(
-                                egui::RichText::new(t(zh, "当前配置", "CURRENT CONFIG"))
-                                    .small()
-                                    .strong()
-                                    .color(palette.muted),
-                            );
+                ui.add_space(16.0);
+                ui.vertical(|ui| {
+                    ui.set_max_width((ui.available_width()).clamp(96.0, 160.0));
+                    ui.label(
+                        egui::RichText::new(t(zh, "当前配置", "CURRENT CONFIG"))
+                            .small()
+                            .strong()
+                            .color(palette.muted),
+                    );
+                    if self.applying {
+                        // Show the apply progress here instead of adding a row to
+                        // the models panel, which used to push the activity log
+                        // below the window edge.
+                        ui.horizontal(|ui| {
+                            ui.spinner();
                             ui.add(
                                 egui::Label::new(
-                                    egui::RichText::new(&active_config_name)
-                                        .size(14.0)
+                                    egui::RichText::new(t(zh, "正在应用…", "Applying…"))
+                                        .size(13.0)
                                         .strong()
                                         .color(palette.ink),
                                 )
-                                .wrap(),
+                                .truncate(),
                             );
-                        },
-                    );
+                        });
+                    } else {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&active_config_name)
+                                    .size(14.0)
+                                    .strong()
+                                    .color(palette.ink),
+                            )
+                            .wrap(),
+                        );
+                    }
                 });
             });
             ui.add_space(6.0);
@@ -7832,18 +8317,33 @@ impl CodexRouterApp {
             ui.set_min_width(ui.available_width());
             ui.set_min_height(model_content_height);
             ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    theme::eyebrow(
-                        ui,
-                        t(zh, "模型渠道", "MODEL CHANNELS"),
-                        palette.background_dark,
-                    );
-                    ui.label(
-                        egui::RichText::new(t(zh, "你的路由配置", "YOUR ROUTING EDITION"))
-                            .font(egui::FontId::new(25.0, theme::display_family()))
-                        .color(palette.ink),
-                    );
-                });
+                // Reserve the action row first so the heading can never be
+                // overlapped by it. English action labels are wider than Chinese.
+                let actions_width = if zh { 430.0_f32 } else { 520.0_f32 };
+                let title_width = (ui.available_width() - actions_width).max(168.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(title_width, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_max_width(title_width);
+                        theme::eyebrow(
+                            ui,
+                            t(zh, "模型渠道", "MODEL CHANNELS"),
+                            palette.background_dark,
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(t(zh, "你的路由配置", "Router Configuration"))
+                                    .font(egui::FontId::new(
+                                        if zh { 24.0 } else { 18.0 },
+                                        theme::display_family(),
+                                    ))
+                                    .color(palette.ink),
+                            )
+                            .truncate(),
+                        );
+                    },
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if theme::accent_button(
                         ui,
@@ -7917,8 +8417,8 @@ impl CodexRouterApp {
                         )
                         .on_hover_text(t(
                             zh,
-                            "查看 OpenAI、Claude、OpenCode Go、OpenRouter、Kimi、MiMo 等常见 API 渠道；推荐平台单独展示",
-                            "Choose OpenAI, Claude, OpenCode Go, OpenRouter, Kimi, MiMo, and other common APIs; recommended platforms are listed separately",
+                            "查看 OpenAI、Claude、OpenRouter、Kimi、MiMo 等常见 API 渠道；推荐平台单独展示",
+                            "Choose OpenAI, Claude, OpenRouter, Kimi, MiMo, and other common APIs; recommended platforms are listed separately",
                         ))
                         .clicked()
                     {
@@ -7926,20 +8426,17 @@ impl CodexRouterApp {
                     }
                 });
             });
-            if self.applying {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(t(zh, "正在应用配置…", "Applying configuration…"));
-                });
+            // Apply progress lives in the sidebar / activity log only. Do not
+            // render a status line under the model-channel heading — it left a
+            // leftover subtitle and pushed the card list down.
+            if self
+                .status_expires_at
+                .is_some_and(|deadline| std::time::Instant::now() > deadline)
+            {
+                self.status_text.clear();
+                self.status_expires_at = None;
             }
-            if !self.status_text.is_empty() {
-                ui.label(
-                    egui::RichText::new(&self.status_text)
-                        .small()
-                        .color(palette.ink_soft),
-                );
-            }
-            ui.add_space(12.0);
+            ui.add_space(10.0);
             let mut edit = None;
             let mut delete = None;
             let mut set_default = None;
@@ -7962,13 +8459,16 @@ impl CodexRouterApp {
                             .shadow(theme::soft_card_shadow())
                             .inner_margin(egui::Margin::symmetric(18, 15))
                             .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new(format!("{:02}", index + 1))
-                                            .font(egui::FontId::new(23.0, theme::display_family()))
-                                            .color(palette.accent),
-                                    );
-                                    ui.vertical(|ui| {
+                                ui.vertical(|ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!("{:02}", index + 1))
+                                                .font(egui::FontId::new(
+                                                    23.0,
+                                                    theme::display_family(),
+                                                ))
+                                                .color(palette.accent),
+                                        );
                                         ui.label(
                                             egui::RichText::new(if model.alias.is_empty() {
                                                 &model.model
@@ -7976,108 +8476,137 @@ impl CodexRouterApp {
                                                 &model.alias
                                             })
                                             .font(egui::FontId::new(19.0, theme::display_family()))
-                                            .color(palette.ink),
+                                            .color(palette.ink)
+                                            .strong(),
+                                        );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                let drag_handle = ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            egui::RichText::new("≡")
+                                                                .size(18.0)
+                                                                .color(palette.ink_soft),
+                                                        )
+                                                        .fill(palette.paper_alt)
+                                                        .stroke(egui::Stroke::new(
+                                                            1.0,
+                                                            palette.line,
+                                                        ))
+                                                        .corner_radius(egui::CornerRadius::same(5))
+                                                        .sense(egui::Sense::drag()),
+                                                    )
+                                                    .on_hover_text(t(
+                                                        zh,
+                                                        "长按此手柄并拖到其他模型卡片上排序",
+                                                        "Hold this handle and drag onto another model card to reorder",
+                                                    ));
+                                                drag_handle.dnd_set_drag_payload(ModelOrderDrag {
+                                                    source_index: index,
+                                                });
+                                                if ui
+                                                    .small_button(t(zh, "删除", "Delete"))
+                                                    .clicked()
+                                                {
+                                                    delete = Some(index);
+                                                }
+                                                if ui
+                                                    .small_button(t(zh, "编辑", "Edit"))
+                                                    .clicked()
+                                                {
+                                                    edit = Some(index);
+                                                }
+                                                if ui
+                                                    .selectable_label(
+                                                        is_default,
+                                                        if is_default {
+                                                            t(zh, "默认模型", "Default model")
+                                                        } else {
+                                                            t(zh, "设为默认", "Make default")
+                                                        },
+                                                    )
+                                                    .on_hover_text(t(
+                                                        zh,
+                                                        "新建 Codex 窗口和任务时默认使用此模型",
+                                                        "Use this model for new Codex windows and threads",
+                                                    ))
+                                                    .clicked()
+                                                {
+                                                    set_default = Some(model.model.clone());
+                                                }
+                                            },
+                                        );
+                                    });
+                                    ui.add_space(6.0);
+                                    ui.horizontal_wrapped(|ui| {
+                                        theme::pill(
+                                            ui,
+                                            &format!(
+                                                "{}K / {}%",
+                                                super::logic::resolve_context_window(model) / 1000,
+                                                model.auto_compact_percent.clamp(60, 90)
+                                            ),
+                                            palette.paper_alt,
+                                            palette.ink_soft,
+                                        );
+                                        theme::pill(
+                                            ui,
+                                            if model.source == "oauth" {
+                                                "OAUTH"
+                                            } else if super::logic::is_oauth_fallback_model(
+                                                &self.config,
+                                                model,
+                                            ) {
+                                                "FALLBACK"
+                                            } else {
+                                                "API KEY"
+                                            },
+                                            palette.paper_alt,
+                                            palette.ink_soft,
+                                        );
+                                        theme::pill(
+                                            ui,
+                                            if vision {
+                                                t(zh, "视觉", "VISION")
+                                            } else {
+                                                t(zh, "文本", "TEXT")
+                                            },
+                                            palette.paper_alt,
+                                            if vision {
+                                                palette.success
+                                            } else {
+                                                palette.muted
+                                            },
                                         );
                                         ui.label(
+                                            egui::RichText::new(
+                                                super::logic::model_routing_explanation(
+                                                    &self.config,
+                                                    model,
+                                                    zh,
+                                                ),
+                                            )
+                                            .small()
+                                            .color(palette.ink_soft),
+                                        );
+                                        // Endpoint belongs on the same line as the
+                                        // route description so the card stays compact.
+                                        ui.label(
                                             egui::RichText::new(if model.source == "oauth" {
-                                                t(zh, "Sub2API 托管 OAuth", "Sub2API-managed OAuth")
+                                                t(
+                                                    zh,
+                                                    "Sub2API 托管 OAuth",
+                                                    "Sub2API-managed OAuth",
+                                                )
+                                                .to_owned()
                                             } else {
-                                                &model.base_url
+                                                model.base_url.clone()
                                             })
                                             .small()
                                             .color(palette.background_dark),
                                         );
                                     });
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            let drag_handle = ui
-                                                .add(
-                                                    egui::Button::new(
-                                                        egui::RichText::new("≡")
-                                                            .size(18.0)
-                                                            .color(palette.ink_soft),
-                                                    )
-                                                    .fill(palette.paper_alt)
-                                                    .stroke(egui::Stroke::new(1.0, palette.line))
-                                                    .corner_radius(egui::CornerRadius::same(5))
-                                                    .sense(egui::Sense::drag()),
-                                                )
-                                                .on_hover_text(t(
-                                                    zh,
-                                                    "长按此手柄并拖到其他模型卡片上排序",
-                                                    "Hold this handle and drag onto another model card to reorder",
-                                                ));
-                                            drag_handle.dnd_set_drag_payload(ModelOrderDrag {
-                                                source_index: index,
-                                            });
-                                            if ui.small_button(t(zh, "删除", "Delete")).clicked()
-                                            {
-                                                delete = Some(index);
-                                            }
-                                            if ui.small_button(t(zh, "编辑", "Edit")).clicked() {
-                                                edit = Some(index);
-                                            }
-                                            if ui
-                                        .selectable_label(
-                                            is_default,
-                                            if is_default {
-                                                t(zh, "默认模型", "Default model")
-                                            } else {
-                                                t(zh, "设为默认", "Make default")
-                                            },
-                                        )
-                                        .on_hover_text(t(
-                                            zh,
-                                            "新建 Codex 窗口和任务时默认使用此模型",
-                                            "Use this model for new Codex windows and threads",
-                                        ))
-                                        .clicked()
-                                    {
-                                        set_default = Some(model.model.clone());
-                                    }
-                                            theme::pill(
-                                                ui,
-                                                if vision {
-                                                    t(zh, "视觉", "VISION")
-                                                } else {
-                                                    t(zh, "文本", "TEXT")
-                                                },
-                                                palette.paper_alt,
-                                                if vision {
-                                                    palette.success
-                                                } else {
-                                                    palette.muted
-                                                },
-                                            );
-                                            theme::pill(
-                                                ui,
-                                                if model.source == "oauth" {
-                                                    "OAUTH"
-                                                } else if super::logic::is_oauth_fallback_model(
-                                                    &self.config,
-                                                    model,
-                                                ) {
-                                                    "FALLBACK"
-                                                } else {
-                                                    "API KEY"
-                                                },
-                                                palette.paper_alt,
-                                                palette.ink_soft,
-                                            );
-                                            theme::pill(
-                                                ui,
-                                                &format!(
-                                                    "{}K / {}%",
-                                                    super::logic::resolve_context_window(model)
-                                                        / 1000,
-                                                    model.auto_compact_percent.clamp(60, 90)
-                                                ),
-                                                palette.paper_alt,
-                                                palette.ink_soft,
-                                            );
-                                        },
-                                    );
                                 });
                             });
                         if response.response.hovered() {
@@ -8123,7 +8652,7 @@ impl CodexRouterApp {
                     } else {
                         match self
                             .config
-                            .save(&self.router_root.join("codex-router-config.json"))
+                            .save(&crate::user_data::config_path(&self.router_root))
                         {
                             Ok(()) => {
                                 self.status_text = t(
@@ -8255,7 +8784,16 @@ impl CodexRouterApp {
                         });
                     let at_bottom = scroll.state.offset.y + scroll.inner_rect.height()
                         >= scroll.content_size.y - 4.0;
-                    if self.log_follow_latest && !at_bottom {
+                    // Keep "Follow latest" on by default. Only drop it when the
+                    // user intentionally scrolls this log away from the bottom.
+                    let pointer_over_log = ui.rect_contains_pointer(scroll.inner_rect);
+                    let scrolled_up = ui.input(|input| input.smooth_scroll_delta.y > 0.5);
+                    if self.log_follow_latest
+                        && !at_bottom
+                        && pointer_over_log
+                        && scrolled_up
+                        && !self.log_scroll_to_bottom
+                    {
                         self.log_follow_latest = false;
                     }
                     self.log_scroll_to_bottom = false;

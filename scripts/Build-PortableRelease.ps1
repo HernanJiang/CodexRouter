@@ -34,13 +34,13 @@ $runtimeScripts = @(
     'Import-GrokSSO.ps1',
     'Initialize-Router.ps1',
     'Install-CodexIntegration.ps1',
-    'Install-OpenCodeIntegration.ps1',
     'Invoke-OAuthRecovery.ps1',
     'Launch-ChatGPTOAuth.ps1',
     'ProxyDiscovery.psm1',
     'Register-Autostart.ps1',
     'Remove-OAuthAccount.ps1',
     'RouterAdmin.psm1',
+    'Set-OAuthAccountPriority.ps1',
     'Set-ProviderKeys.ps1',
     'Start-ChatGPTOAuth.ps1',
     'Start-CodexRouter.ps1',
@@ -66,7 +66,7 @@ $staticLicenseFiles = @(
     'MSYS2-Runtime-LICENSES.txt',
     'Redis-8.10.0-LICENSES.txt',
     'Rust-SPDX-LICENSE-TEXTS.txt',
-    'sub2api-0.1.170-codex-router.2.patch'
+    'sub2api-0.1.168-codex-router.3.patch'
 )
 
 $generatedLicenseFiles = @(

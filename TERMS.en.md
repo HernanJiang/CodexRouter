@@ -1,7 +1,7 @@
 # Codex-Router Use and Distribution Commitment
 
-Software version: v1.2.1
-Release date: 2026-08-04
+Software version: v1.3.10
+Release date: 2026-08-06
 Terms revision: v1.1 (2026-08-01)
 Copyright holder: Hernan_Jiang
 Official release location: https://github.com/HernanJiang/Codex-Router

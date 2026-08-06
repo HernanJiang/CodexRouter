@@ -62,7 +62,30 @@ function Invoke-LoopbackRestMethod {
                 $requestStream.Dispose()
             }
         }
-        $response = [Net.HttpWebResponse]$request.GetResponse()
+        try {
+            $response = [Net.HttpWebResponse]$request.GetResponse()
+        } catch [Net.WebException] {
+            $webException = [Net.WebException]$_.Exception
+            if ($null -ne $webException.Response) {
+                $errorResponse = [Net.HttpWebResponse]$webException.Response
+                try {
+                    $errorStream = $errorResponse.GetResponseStream()
+                    $errorText = ''
+                    if ($null -ne $errorStream) {
+                        $errorReader = [IO.StreamReader]::new($errorStream, [Text.Encoding]::UTF8)
+                        try { $errorText = $errorReader.ReadToEnd() } finally { $errorReader.Dispose(); $errorStream.Dispose() }
+                    }
+                    $statusCode = [int]$errorResponse.StatusCode
+                    $detail = ($errorText -replace '\s+', ' ').Trim()
+                    if ($detail.Length -gt 600) { $detail = $detail.Substring(0, 600) }
+                    $suffix = if ($detail) { ": $detail" } else { '' }
+                    throw "Sub2API request failed ($statusCode): $Method $($Uri.AbsolutePath)$suffix"
+                } finally {
+                    $errorResponse.Dispose()
+                }
+            }
+            throw
+        }
         $stream = $response.GetResponseStream()
         if ($null -eq $stream) { return $null }
         $reader = [IO.StreamReader]::new($stream, [Text.Encoding]::UTF8)
@@ -80,19 +103,89 @@ function Invoke-LoopbackRestMethod {
     }
 }
 
+function Get-RouterAdminSessionCachePath {
+    $stateDir = Join-Path (Get-RouterDataRoot -RouterRoot $script:RouterRoot) 'state'
+    [IO.Directory]::CreateDirectory($stateDir) | Out-Null
+    return Join-Path $stateDir 'admin-session.cache.json'
+}
+
+function Read-RouterAdminSessionCache {
+    $path = Get-RouterAdminSessionCachePath
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+    try {
+        $raw = Get-Content -LiteralPath $path -Raw -ErrorAction Stop
+        $doc = ConvertFrom-Json -InputObject $raw
+        $token = [string]$doc.accessToken
+        $expiresAtText = [string]$doc.expiresAtUtc
+        if ([string]::IsNullOrWhiteSpace($token) -or [string]::IsNullOrWhiteSpace($expiresAtText)) {
+            return $null
+        }
+        $expiresAt = [DateTimeOffset]::Parse($expiresAtText, [Globalization.CultureInfo]::InvariantCulture)
+        # Refresh one minute early so UI loads do not race expiry.
+        if ($expiresAt -le [DateTimeOffset]::UtcNow.AddMinutes(1)) { return $null }
+        return [pscustomobject]@{
+            BaseUri = $script:BaseUri
+            Headers = @{ Authorization = "Bearer $token" }
+            ExpiresAtUtc = $expiresAt
+        }
+    } catch {
+        return $null
+    }
+}
+
+function Write-RouterAdminSessionCache {
+    param(
+        [Parameter(Mandatory)][string]$AccessToken,
+        [Parameter(Mandatory)][DateTimeOffset]$ExpiresAtUtc
+    )
+    $path = Get-RouterAdminSessionCachePath
+    $doc = [ordered]@{
+        accessToken = $AccessToken
+        expiresAtUtc = $ExpiresAtUtc.UtcDateTime.ToString('o')
+        baseUri = $script:BaseUri
+    } | ConvertTo-Json -Compress
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($doc)
+    try {
+        Write-RouterFileAtomic -Path $path -Bytes $bytes
+    } finally {
+        [Array]::Clear($bytes, 0, $bytes.Length)
+    }
+}
+
+function Test-RouterAdminSession {
+    param([Parameter(Mandatory)]$Session)
+    try {
+        $null = Invoke-LoopbackRestMethod `
+            -Method GET `
+            -Uri "$($Session.BaseUri)/api/v1/admin/groups/all?include_inactive=true" `
+            -Headers $Session.Headers `
+            -TimeoutSec 8
+        return $true
+    } catch {
+        return $false
+    }
+}
+
 function New-RouterAdminSession {
+    $cached = Read-RouterAdminSessionCache
+    if ($null -ne $cached -and (Test-RouterAdminSession -Session $cached)) {
+        return $cached
+    }
+
     $password = Get-RouterCredential -Name 'AdminPassword'
     try {
-        $candidates = @(
-            @{ email = 'admin@admin.com'; password = $password },
-            @{ email = 'admin@admin.com'; password = 'adminadmin' },
-            @{ email = 'admin@sub2api.local'; password = $password },
-            # Legacy defaults are retained only so upgrades can migrate them.
-            @{ email = 'admin@admin.com'; password = 'admin123' },
-            @{ email = 'admin@sub2api.local'; password = 'admin123' }
-        )
+        # Prefer the stored admin password only. Legacy defaults are a single
+        # fallback pair so failed UI loads cannot burn the login rate limit.
+        $candidates = [System.Collections.Generic.List[object]]::new()
+        if (-not [string]::IsNullOrWhiteSpace([string]$password)) {
+            [void]$candidates.Add(@{ email = 'admin@admin.com'; password = $password })
+            [void]$candidates.Add(@{ email = 'admin@sub2api.local'; password = $password })
+        }
+        [void]$candidates.Add(@{ email = 'admin@admin.com'; password = 'adminadmin' })
+
         $token = $null
         $attempted = @{}
+        $rateLimited = $false
         foreach ($candidate in $candidates) {
             $candidateKey = "$($candidate.email)`0$($candidate.password)"
             if ($attempted.ContainsKey($candidateKey)) { continue }
@@ -115,10 +208,27 @@ function New-RouterAdminSession {
                 if (-not $token) { $token = $login.access_token }
                 if ($token) { break }
             } catch {
+                $message = [string]$_.Exception.Message
+                if ($message -match '(?i)\(429\)|too many requests|rate.?limit') {
+                    $rateLimited = $true
+                    break
+                }
                 $login = $null
             }
         }
-        if (-not $token) { throw 'Sub2API admin login returned no access token.' }
+        if (-not $token) {
+            if ($rateLimited) {
+                throw 'Sub2API admin login is rate-limited. Wait a few seconds and retry.'
+            }
+            throw 'Sub2API admin login returned no access token.'
+        }
+
+        $expiresAt = [DateTimeOffset]::UtcNow.AddHours(12)
+        try {
+            Write-RouterAdminSessionCache -AccessToken ([string]$token) -ExpiresAtUtc $expiresAt
+        } catch {
+            # Cache is best-effort; a valid session is still returned.
+        }
 
         return [pscustomobject]@{
             BaseUri = $script:BaseUri
@@ -290,7 +400,7 @@ function Get-RouterOAuthRecoveryState {
     # Reuse the passive quota snapshot already collected by the usage monitor.
     # If either active quota window is exhausted, the account stays outside the
     # request path until every exhausted window has reset. No extra quota call is
-    # made here; missing reset data falls back to one recovery probe per hour.
+    # made here; missing reset data falls back to one recovery probe per five hours.
     $extra = Get-RouterObjectValue -Object $Account -Name 'extra'
     $usageUpdatedAt = ConvertTo-RouterResetAtUtc -Value (
         Get-RouterObjectValue -Object $extra -Name 'codex_usage_updated_at')
@@ -365,7 +475,7 @@ function Get-RouterOAuthRecoveryState {
         return [pscustomobject][ordered]@{
             Action = 'probe'
             ShouldIsolate = $true
-            NextCheckSeconds = 3600L
+            NextCheckSeconds = 18000L
             ResetAt = if ($null -eq $resetAt) { '' } else { $resetAt.UtcDateTime.ToString('o') }
             Reason = if ($reason) { $reason } elseif ($resetReached) { 'quota reset time reached' } else { 'quota exhausted without a reset time' }
         }
@@ -374,7 +484,7 @@ function Get-RouterOAuthRecoveryState {
     return [pscustomobject][ordered]@{
         Action = 'healthy'
         ShouldIsolate = $false
-        NextCheckSeconds = 3600L
+        NextCheckSeconds = 18000L
         ResetAt = ''
         Reason = ''
     }
@@ -453,6 +563,88 @@ function Get-RouterCanonicalModelId {
     return $value
 }
 
+function Get-RouterModelIdentity {
+    param([Parameter(Mandatory)][string]$ModelId)
+    $raw = $ModelId.Trim().ToLowerInvariant()
+    $leaf = Get-RouterCanonicalModelId -ModelId $raw
+    $provider = switch -Regex ($raw) {
+        '^(openai|chatgpt)/' { 'openai'; break }
+        '^(anthropic|claude)/' { 'anthropic'; break }
+        '^(google|gemini)/' { 'google'; break }
+        '^(x-ai|xai|grok)/' { 'x-ai'; break }
+        '^deepseek/' { 'deepseek'; break }
+        '^(moonshotai|moonshot|kimi)/' { 'moonshot'; break }
+        default {
+            switch -Regex ($leaf) {
+                '^(gpt-|chatgpt-|codex-)' { 'openai'; break }
+                '^claude-' { 'anthropic'; break }
+                '^gemini-' { 'google'; break }
+                '^grok-' { 'x-ai'; break }
+                '^deepseek-' { 'deepseek'; break }
+                '^(kimi-|k3(?:-|$))' { 'moonshot'; break }
+                default {
+                    if ($raw.Contains('/')) { 'unknown-' + $raw.Substring(0, $raw.IndexOf('/')) }
+                    else { 'unknown' }
+                }
+            }
+        }
+    }
+    # These separator aliases are documented provider spellings, not fuzzy matching.
+    if ($provider -eq 'google') { $leaf = $leaf -replace '^gemini-(\d+)-(\d+)-', 'gemini-$1.$2-' }
+    if ($provider -eq 'anthropic') { $leaf = $leaf -replace '^(claude-[a-z]+-\d+)-(\d+)(-|$)', '$1.$2$3' }
+    $display = Get-RouterRecommendedDisplayName -ModelId $ModelId
+    $displayKey = [Text.RegularExpressions.Regex]::Replace($display.ToLowerInvariant(), '[^a-z0-9]+', '')
+    return [pscustomobject][ordered]@{
+        Provider = $provider
+        RealId = $leaf
+        IdentityKey = "$provider`:$leaf"
+        DisplayCandidate = $display
+        DisplayKey = $displayKey
+    }
+}
+
+function Test-RouterSameModel {
+    param([Parameter(Mandatory)][string]$LeftModelId, [Parameter(Mandatory)][string]$RightModelId)
+    $left = Get-RouterModelIdentity -ModelId $LeftModelId
+    $right = Get-RouterModelIdentity -ModelId $RightModelId
+    return $left.DisplayKey -eq $right.DisplayKey -and $left.IdentityKey -eq $right.IdentityKey
+}
+
+function Test-RouterCodingPlanChannel {
+    param(
+        [AllowEmptyString()][string]$BaseUrl,
+        [AllowEmptyString()][string]$ModelId,
+        [AllowEmptyString()][string]$Extra = '{}'
+    )
+    try {
+        $extraObject = $Extra | ConvertFrom-Json
+        $kindProperty = $extraObject.PSObject.Properties['codex_router_channel_kind']
+        if ($null -ne $kindProperty) {
+            return ([string]$kindProperty.Value).Trim().ToLowerInvariant() -eq 'coding_plan'
+        }
+    } catch { }
+    $uri = $null
+    if (-not [Uri]::TryCreate($BaseUrl.Trim(), [UriKind]::Absolute, [ref]$uri)) { return $false }
+    if ($uri.Scheme -ne 'https') { return $false }
+    $host = $uri.DnsSafeHost.ToLowerInvariant()
+    $path = $uri.AbsolutePath.TrimEnd('/').ToLowerInvariant()
+    $model = $ModelId.Trim().ToLowerInvariant()
+    return ($host -eq 'api.kimi.com' -and $path.StartsWith('/coding')) -or
+        ($host -eq 'api.moonshot.ai' -and $path.StartsWith('/coding')) -or
+        ($path.Contains('/coding') -and $model -match 'coding|code')
+}
+
+function Get-RouterChannelTier {
+    param([Parameter(Mandatory)]$Model)
+    if ((Get-RouterModelSource -Model $Model) -eq 'oauth') { return 0 }
+    $extraProperty = $Model.PSObject.Properties['extra']
+    $extra = if ($null -eq $extraProperty) { '{}' } else { [string]$extraProperty.Value }
+    if (Test-RouterCodingPlanChannel -BaseUrl ([string]$Model.baseURL) -ModelId ([string]$Model.model) -Extra $extra) {
+        return 1
+    }
+    return 2
+}
+
 function Get-RouterRecommendedDisplayName {
     param([Parameter(Mandatory)][string]$ModelId)
     $canonical = Get-RouterCanonicalModelId -ModelId $ModelId
@@ -513,7 +705,8 @@ function Get-RouterRecommendedDisplayName {
         '^kimi-for-coding' { return 'Kimi-For-Coding' }
         '^kimi-k2\.7' { return 'Kimi-K2.7-Code' }
         '^mimo-v2\.5-pro' { return 'MiMo-V2.5-Pro' }
-        '^deepseek-v4-(pro|flash)' { return 'DeepSeek-V4-Flash' }
+        '^deepseek-v4-pro' { return 'DeepSeek-V4-Pro' }
+        '^deepseek-v4-flash' { return 'DeepSeek-V4-Flash' }
         '^deepseek-v3\.2' { return 'DeepSeek-V3.2' }
         '^deepseek-v3\.1' { return 'DeepSeek-V3.1' }
         '^deepseek-v3(?:-|$)' { return 'DeepSeek-V3' }
@@ -554,7 +747,8 @@ function Test-RouterModelAliasCustomized {
         $automaticNames += $recommended.Substring(4) + '(OAuth)'
     }
     if ((Get-RouterCanonicalModelId -ModelId $modelId) -eq 'deepseek-v4-pro') {
-        $automaticNames += @('DeepSeek V4 Pro', 'DeepSeek-V4-Pro')
+        # Include the previous incorrect Flash recommendation so Apply can refresh it.
+        $automaticNames += @('DeepSeek V4 Pro', 'DeepSeek-V4-Pro', 'DeepSeek-V4-Flash', 'DeepSeek V4 Flash')
     }
     $normalizedAutomaticNames = @($automaticNames | ForEach-Object { & $normalize ([string]$_) })
     return $normalizedAutomaticNames -notcontains $normalizedAlias
@@ -682,6 +876,7 @@ function Get-RouterModelRoutePlan {
                 ModelId = $modelId
                 Source = $source
                 CanonicalModelId = Get-RouterCanonicalModelId -ModelId $modelId
+                Identity = Get-RouterModelIdentity -ModelId $modelId
                 Selected = $selected
                 Discovered = $false
             }
@@ -708,6 +903,7 @@ function Get-RouterModelRoutePlan {
                     ModelId = $modelId
                     Source = 'oauth'
                     CanonicalModelId = Get-RouterCanonicalModelId -ModelId $modelId
+                    Identity = Get-RouterModelIdentity -ModelId $modelId
                     Selected = $true
                     Discovered = $true
                 }
@@ -718,13 +914,13 @@ function Get-RouterModelRoutePlan {
     $plan = @(
         foreach ($descriptor in $descriptors) {
             $matchingOAuth = @($selectedOAuth | Where-Object {
-                $_.CanonicalModelId -eq $descriptor.CanonicalModelId
+                (Test-RouterSameModel -LeftModelId $_.ModelId -RightModelId $descriptor.ModelId)
             })
             $isOAuth = $descriptor.Source -eq 'oauth'
             $matchingSelectedApiFallbacks = if ($isOAuth -and $fallbackEnabled) {
                 @($descriptors | Where-Object {
                     $_.Source -ne 'oauth' -and
-                    $_.CanonicalModelId -eq $descriptor.CanonicalModelId -and
+                    (Test-RouterSameModel -LeftModelId $_.ModelId -RightModelId $descriptor.ModelId) -and
                     (Test-RouterFallbackChannelSelected `
                         -Selections $selections `
                         -ModelId $_.ModelId `
@@ -745,6 +941,7 @@ function Get-RouterModelRoutePlan {
                     -ModelId $descriptor.ModelId `
                     -BaseUrl ([string]$descriptor.Model.baseURL)
                 $joinRouter = $isFallback
+                $publicModelId = [string]$matchingOAuth[0].ModelId
                 $hasExplicitMatchingOAuth = @($matchingOAuth | Where-Object {
                     -not [bool]$_.Discovered
                 }).Count -gt 0
@@ -754,7 +951,6 @@ function Get-RouterModelRoutePlan {
                     # With an implicit OAuth binding there is no OAuth model row
                     # to represent the merged route in the Codex catalog. Reuse
                     # the first API row's metadata while exposing the OAuth ID.
-                    $publicModelId = [string]$matchingOAuth[0].ModelId
                     $includeInCatalog = $catalogIds.Add($publicModelId)
                 }
                 if ($isFallback) {
@@ -762,7 +958,7 @@ function Get-RouterModelRoutePlan {
                 }
             } elseif (-not $fallbackEnabled) {
                 $sameCanonicalCount = @($descriptors | Where-Object {
-                    $_.Selected -and $_.CanonicalModelId -eq $descriptor.CanonicalModelId
+                    $_.Selected -and (Test-RouterSameModel -LeftModelId $_.ModelId -RightModelId $descriptor.ModelId)
                 }).Count
                 if ($sameCanonicalCount -gt 1) {
                     $publicModelId = Get-RouterSplitPublicModelId -Model $descriptor.Model
@@ -778,6 +974,8 @@ function Get-RouterModelRoutePlan {
                 Model = $descriptor.Model
                 Source = $descriptor.Source
                 CanonicalModelId = $descriptor.CanonicalModelId
+                IdentityKey = [string]$descriptor.Identity.IdentityKey
+                IdentityDisplayCandidate = [string]$descriptor.Identity.DisplayCandidate
                 PublicModelId = $publicModelId
                 RequestModelIds = @($requestModelIds)
                 IncludeInCatalog = [bool]$includeInCatalog
@@ -877,10 +1075,388 @@ function Get-RouterOAuthModelSuggestions {
         }
         'antigravity' {
             return @(
-                [pscustomobject][ordered]@{ id = 'gemini-3.6-flash'; displayName = 'Gemini-3.6-Flash' }
+                [pscustomobject][ordered]@{ id = 'gemini-3-flash'; displayName = 'Gemini-3-Flash' }
+                [pscustomobject][ordered]@{ id = 'gemini-3.1-pro-high'; displayName = 'Gemini-3.1-Pro-High' }
+                [pscustomobject][ordered]@{ id = 'gemini-3.1-pro-low'; displayName = 'Gemini-3.1-Pro-Low' }
+                [pscustomobject][ordered]@{ id = 'gemini-3-pro-high'; displayName = 'Gemini-3-Pro-High' }
+                [pscustomobject][ordered]@{ id = 'claude-sonnet-4-5'; displayName = 'Claude-Sonnet-4.5' }
+                [pscustomobject][ordered]@{ id = 'claude-opus-4-6'; displayName = 'Claude-Opus-4.6' }
+            )
+        }
+        'grok' {
+            return @(
+                [pscustomobject][ordered]@{ id = 'grok-4.5'; displayName = 'Grok-4.5' }
+                [pscustomobject][ordered]@{ id = 'grok-4.3'; displayName = 'Grok-4.3' }
             )
         }
         default { return @() }
+    }
+}
+
+function Get-RouterAccountPlatformMap {
+    param([Parameter(Mandatory)]$Session)
+    $map = @{}
+    foreach ($account in @(Get-RouterAccounts -Session $Session)) {
+        $accountId = 0
+        try { $accountId = [long]$account.id } catch { continue }
+        if ($accountId -le 0) { continue }
+        $platform = ''
+        $platformProperty = $account.PSObject.Properties['platform']
+        if ($null -ne $platformProperty) {
+            $platform = ([string]$platformProperty.Value).Trim().ToLowerInvariant()
+        }
+        if ([string]::IsNullOrWhiteSpace($platform)) { continue }
+        $map[[string]$accountId] = $platform
+    }
+    return $map
+}
+
+function Get-RouterCompositeTargetPlatform {
+    param(
+        [Parameter(Mandatory)]$Model,
+        [AllowNull()]$AccountPlatformById
+    )
+
+    $source = Get-RouterModelSource -Model $Model
+    if ($source -ne 'oauth') { return 'openai' }
+
+    $platformProperty = $Model.PSObject.Properties['oauthPlatform']
+    if ($null -eq $platformProperty) {
+        $platformProperty = $Model.PSObject.Properties['oauth_platform']
+    }
+    $platform = if ($null -eq $platformProperty) {
+        ''
+    } else {
+        ([string]$platformProperty.Value).Trim().ToLowerInvariant()
+    }
+    if (-not [string]::IsNullOrWhiteSpace($platform)) {
+        if ($platform -eq 'google_one' -or $platform -eq 'gemini') { return 'gemini' }
+        return $platform
+    }
+
+    $accountIdProperty = $Model.PSObject.Properties['oauthAccountId']
+    if ($null -eq $accountIdProperty) {
+        $accountIdProperty = $Model.PSObject.Properties['oauth_account_id']
+    }
+    if ($null -ne $accountIdProperty -and $null -ne $AccountPlatformById) {
+        try {
+            $accountId = [long]$accountIdProperty.Value
+            $key = [string]$accountId
+            if ($AccountPlatformById -is [Collections.IDictionary]) {
+                if ($AccountPlatformById.Contains($key)) { return [string]$AccountPlatformById[$key] }
+                if ($AccountPlatformById.Contains($accountId)) { return [string]$AccountPlatformById[$accountId] }
+            } else {
+                $lookup = $AccountPlatformById.PSObject.Properties[$key]
+                if ($null -ne $lookup -and -not [string]::IsNullOrWhiteSpace([string]$lookup.Value)) {
+                    return ([string]$lookup.Value).Trim().ToLowerInvariant()
+                }
+            }
+        } catch { }
+    }
+    return 'openai'
+}
+
+function Get-RouterOpenRouterUpstreamModelId {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$ModelId)
+    $value = $ModelId.Trim()
+    if ([string]::IsNullOrWhiteSpace($value)) { return $value }
+    if ($value -match '^(?i)claude/') {
+        return 'anthropic/' + $value.Substring(7)
+    }
+    if ($value -match '^(?i)claude-' -and $value -notmatch '/') {
+        return 'anthropic/' + $value
+    }
+    return $value
+}
+
+function Get-RouterUpstreamModelId {
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$ModelId,
+        [AllowEmptyString()][string]$BaseUrl = ''
+    )
+    $value = $ModelId.Trim()
+    if ([string]::IsNullOrWhiteSpace($value)) { return $value }
+    $hostName = ''
+    try {
+        $uri = $null
+        if ([Uri]::TryCreate($BaseUrl.Trim(), [UriKind]::Absolute, [ref]$uri)) {
+            $hostName = $uri.Host.ToLowerInvariant()
+        }
+    } catch { }
+    if ($hostName -eq 'openrouter.ai' -or $hostName.EndsWith('.openrouter.ai')) {
+        return Get-RouterOpenRouterUpstreamModelId -ModelId $value
+    }
+    return $value
+}
+
+function Get-RouterServableCatalogRoutes {
+    param(
+        [Parameter(Mandatory)][AllowNull()][object[]]$RoutePlan,
+        [AllowNull()][Collections.IDictionary]$IsolatedOAuthAccountIds,
+        [AllowNull()][object]$OAuthAccountIds,
+        [bool]$OAuthSelectionInitialized = $false
+    )
+
+    $selectedOAuthIds = @()
+    if ($OAuthSelectionInitialized -and $null -ne $OAuthAccountIds) {
+        $selectedOAuthIds = @($OAuthAccountIds | ForEach-Object { [long]$_ } | Where-Object { $_ -gt 0 })
+    }
+    $isolated = @{}
+    if ($null -ne $IsolatedOAuthAccountIds) {
+        foreach ($key in @($IsolatedOAuthAccountIds.Keys)) {
+            try { $isolated[[long]$key] = $true } catch {
+                try { $isolated[[long][string]$key] = $true } catch { }
+            }
+        }
+    }
+
+    $joinedApiIdentities = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($route in @($RoutePlan)) {
+        if ((Get-RouterModelSource -Model $route.Model) -eq 'oauth') { continue }
+        if (-not [bool]$route.JoinRouter) { continue }
+        $identityProperty = $route.PSObject.Properties['IdentityKey']
+        $identityKey = if ($null -eq $identityProperty) {
+            [string](Get-RouterModelIdentity -ModelId ([string]$route.Model.model)).IdentityKey
+        } else { [string]$identityProperty.Value }
+        [void]$joinedApiIdentities.Add($identityKey)
+    }
+
+    $catalogIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $servable = @(
+        foreach ($route in @($RoutePlan)) {
+            if (-not [bool]$route.IncludeInCatalog) { continue }
+            $source = Get-RouterModelSource -Model $route.Model
+            $publicModelId = ([string]$route.PublicModelId).Trim()
+            if ([string]::IsNullOrWhiteSpace($publicModelId)) { continue }
+
+            if ($source -eq 'oauth') {
+                $oauthId = 0
+                try { $oauthId = [long]$route.Model.oauthAccountId } catch { $oauthId = 0 }
+                $accountSelected = -not $OAuthSelectionInitialized -or (
+                    $oauthId -gt 0 -and $selectedOAuthIds -contains $oauthId)
+                $accountIsolated = $oauthId -gt 0 -and $isolated.ContainsKey($oauthId)
+                $identityProperty = $route.PSObject.Properties['IdentityKey']
+                $identityKey = if ($null -eq $identityProperty) {
+                    [string](Get-RouterModelIdentity -ModelId ([string]$route.Model.model)).IdentityKey
+                } else { [string]$identityProperty.Value }
+                $hasApiFallback = $joinedApiIdentities.Contains($identityKey)
+                if (-not $accountSelected) { continue }
+                if ($accountIsolated -and -not $hasApiFallback) { continue }
+            }
+
+            if (-not $catalogIds.Add($publicModelId)) { continue }
+            [pscustomobject][ordered]@{
+                Index = [int]$route.Index
+                Model = $route.Model
+                Source = $source
+                CanonicalModelId = [string]$route.CanonicalModelId
+                IdentityKey = if ($null -eq $route.PSObject.Properties['IdentityKey']) {
+                    [string](Get-RouterModelIdentity -ModelId ([string]$route.Model.model)).IdentityKey
+                } else { [string]$route.IdentityKey }
+                PublicModelId = $publicModelId
+                RequestModelIds = @($route.RequestModelIds)
+                IncludeInCatalog = $true
+                JoinRouter = [bool]$route.JoinRouter
+                IsOAuthFallback = [bool]$route.IsOAuthFallback
+                IsMergedOAuthRoute = [bool]$route.IsMergedOAuthRoute
+            }
+        }
+    )
+    return @($servable)
+}
+
+function Get-RouterCompositeRoutePlan {
+    param(
+        [Parameter(Mandatory)][object[]]$RoutePlan,
+        [AllowNull()]$AccountPlatformById
+    )
+
+    $byRouteTarget = [ordered]@{}
+    foreach ($route in @($RoutePlan)) {
+        if (-not [bool]$route.IncludeInCatalog -and -not [bool]$route.JoinRouter) { continue }
+        $publicModelId = ([string]$route.PublicModelId).Trim()
+        if ([string]::IsNullOrWhiteSpace($publicModelId)) { continue }
+        $upstreamModelId = ([string]$route.Model.model).Trim()
+        if ([string]::IsNullOrWhiteSpace($upstreamModelId)) { $upstreamModelId = $publicModelId }
+        $targetPlatform = Get-RouterCompositeTargetPlatform `
+            -Model $route.Model `
+            -AccountPlatformById $AccountPlatformById
+        # OpenAI-compatible API channels always schedule through the openai
+        # platform, even when the public id looks like another vendor.
+        if ((Get-RouterModelSource -Model $route.Model) -ne 'oauth') {
+            $targetPlatform = 'openai'
+        }
+
+        $routeKey = $publicModelId.ToLowerInvariant() + '|' + $targetPlatform.ToLowerInvariant()
+        if ($byRouteTarget.Contains($routeKey)) { continue }
+
+        $byRouteTarget[$routeKey] = [pscustomobject][ordered]@{
+            PublicModelId = $publicModelId
+            UpstreamModelId = $upstreamModelId
+            TargetPlatform = $targetPlatform
+            Priority = if ((Get-RouterModelSource -Model $route.Model) -eq 'oauth') { 1 } else { 100 }
+        }
+    }
+    return @($byRouteTarget.Values)
+}
+
+function Sync-RouterCompositeRoutes {
+    param(
+        [Parameter(Mandatory)]$Session,
+        [Parameter(Mandatory)][long]$GroupId,
+        [Parameter(Mandatory)][object[]]$CompositeRoutes
+    )
+
+    $desired = @{}
+    foreach ($route in @($CompositeRoutes)) {
+        $publicModelId = ([string]$route.PublicModelId).Trim()
+        $upstreamModelId = ([string]$route.UpstreamModelId).Trim()
+        $targetPlatform = ([string]$route.TargetPlatform).Trim().ToLowerInvariant()
+        if ([string]::IsNullOrWhiteSpace($publicModelId) -or
+            [string]::IsNullOrWhiteSpace($targetPlatform)) {
+            continue
+        }
+        if ([string]::IsNullOrWhiteSpace($upstreamModelId)) {
+            $upstreamModelId = $publicModelId
+        }
+        $routeKey = $publicModelId.ToLowerInvariant() + '|' + $targetPlatform
+        $priorityProperty = $route.PSObject.Properties['Priority']
+        $desired[$routeKey] = [pscustomobject][ordered]@{
+            PublicModelId = $publicModelId
+            UpstreamModelId = $upstreamModelId
+            TargetPlatform = $targetPlatform
+            Priority = if ($null -eq $priorityProperty) { 100 } else { [int]$priorityProperty.Value }
+        }
+    }
+
+    $existing = @()
+    try {
+        $existingData = Get-RouterResponseData (Invoke-RouterApi `
+            -Session $Session `
+            -Method GET `
+            -Path "/api/v1/admin/groups/$GroupId/composite-routes" `
+            -TimeoutSec 15)
+        if ($null -eq $existingData) {
+            $existing = @()
+        } elseif ($existingData -is [System.Array]) {
+            $existing = @($existingData)
+        } elseif ($null -ne $existingData.PSObject.Properties['items']) {
+            $existing = @($existingData.items)
+        } elseif ($null -ne $existingData.PSObject.Properties['id']) {
+            $existing = @($existingData)
+        } else {
+            $existing = @($existingData)
+        }
+    } catch {
+        Write-Warning "Could not list composite routes for group ${GroupId}: $($_.Exception.Message)"
+        $existing = @()
+    }
+
+    $existingByTarget = @{}
+    foreach ($route in $existing) {
+        $publicModelId = ''
+        $publicProperty = $route.PSObject.Properties['public_model']
+        if ($null -ne $publicProperty) { $publicModelId = ([string]$publicProperty.Value).Trim() }
+        if ([string]::IsNullOrWhiteSpace($publicModelId)) { continue }
+        $existingPlatform = ([string]$route.target_platform).Trim().ToLowerInvariant()
+        $routeKey = $publicModelId.ToLowerInvariant() + '|' + $existingPlatform
+        if (-not $existingByTarget.ContainsKey($routeKey)) {
+            $existingByTarget[$routeKey] = [System.Collections.ArrayList]::new()
+        }
+        [void]$existingByTarget[$routeKey].Add($route)
+    }
+
+    $created = 0
+    $updated = 0
+    $removed = 0
+    foreach ($routeKey in @($desired.Keys)) {
+        $want = $desired[$routeKey]
+        $matches = if ($existingByTarget.ContainsKey($routeKey)) {
+            @($existingByTarget[$routeKey])
+        } else {
+            @()
+        }
+        $primary = $matches | Select-Object -First 1
+        $body = @{
+            public_model = [string]$want.PublicModelId
+            upstream_model = [string]$want.UpstreamModelId
+            target_platform = [string]$want.TargetPlatform
+            match_type = 'exact'
+            endpoint = 'any'
+            priority = [int]$want.Priority
+            enabled = $true
+        }
+        if ($null -eq $primary) {
+            [void](Invoke-RouterApi `
+                -Session $Session `
+                -Method POST `
+                -Path "/api/v1/admin/groups/$GroupId/composite-routes" `
+                -Body $body)
+            $created++
+        } else {
+            $routeId = [long]$primary.id
+            $currentUpstream = ''
+            $currentPlatform = ''
+            $currentMatch = ''
+            $currentEnabled = $true
+            $currentPriority = 0
+            $upstreamProperty = $primary.PSObject.Properties['upstream_model']
+            if ($null -ne $upstreamProperty) { $currentUpstream = [string]$upstreamProperty.Value }
+            $platformProperty = $primary.PSObject.Properties['target_platform']
+            if ($null -ne $platformProperty) { $currentPlatform = [string]$platformProperty.Value }
+            $matchProperty = $primary.PSObject.Properties['match_type']
+            if ($null -ne $matchProperty) { $currentMatch = [string]$matchProperty.Value }
+            $enabledProperty = $primary.PSObject.Properties['enabled']
+            if ($null -ne $enabledProperty) { $currentEnabled = [bool]$enabledProperty.Value }
+            $priorityProperty = $primary.PSObject.Properties['priority']
+            if ($null -ne $priorityProperty) { $currentPriority = [int]$priorityProperty.Value }
+            $needsUpdate = -not [string]::Equals($currentUpstream, [string]$want.UpstreamModelId, [StringComparison]::OrdinalIgnoreCase) -or
+                -not [string]::Equals($currentPlatform, [string]$want.TargetPlatform, [StringComparison]::OrdinalIgnoreCase) -or
+                -not [string]::Equals($currentMatch, 'exact', [StringComparison]::OrdinalIgnoreCase) -or
+                $currentPriority -ne [int]$want.Priority -or
+                -not $currentEnabled
+            if ($needsUpdate) {
+                [void](Invoke-RouterApi `
+                    -Session $Session `
+                    -Method PUT `
+                    -Path "/api/v1/admin/groups/$GroupId/composite-routes/$routeId" `
+                    -Body $body)
+                $updated++
+            }
+            foreach ($duplicate in @($matches | Select-Object -Skip 1)) {
+                try {
+                    [void](Invoke-RouterApi `
+                        -Session $Session `
+                        -Method DELETE `
+                        -Path "/api/v1/admin/groups/$GroupId/composite-routes/$([long]$duplicate.id)")
+                    $removed++
+                } catch {
+                    Write-Warning "Could not remove duplicate composite route $([long]$duplicate.id): $($_.Exception.Message)"
+                }
+            }
+        }
+    }
+
+    foreach ($routeKey in @($existingByTarget.Keys)) {
+        if ($desired.ContainsKey($routeKey)) { continue }
+        foreach ($route in @($existingByTarget[$routeKey])) {
+            try {
+                [void](Invoke-RouterApi `
+                    -Session $Session `
+                    -Method DELETE `
+                    -Path "/api/v1/admin/groups/$GroupId/composite-routes/$([long]$route.id)")
+                $removed++
+            } catch {
+                Write-Warning "Could not remove stale composite route $([long]$route.id): $($_.Exception.Message)"
+            }
+        }
+    }
+
+    return [pscustomobject][ordered]@{
+        Created = $created
+        Updated = $updated
+        Removed = $removed
+        Desired = $desired.Count
     }
 }
 
@@ -1182,6 +1758,10 @@ Export-ModuleMember -Function `
     Set-RouterAccountGroupMembership, `
     Get-RouterOAuthRoutingPriorities, `
     Get-RouterCanonicalModelId, `
+    Get-RouterModelIdentity, `
+    Test-RouterSameModel, `
+    Test-RouterCodingPlanChannel, `
+    Get-RouterChannelTier, `
     Get-RouterRecommendedDisplayName, `
     Test-RouterModelAliasCustomized, `
     Get-RouterModelDisplayName, `
@@ -1193,6 +1773,13 @@ Export-ModuleMember -Function `
     Test-RouterFallbackChannelSelected, `
     Get-RouterEffectiveApiPriority, `
     Get-RouterOAuthModelSuggestions, `
+    Get-RouterAccountPlatformMap, `
+    Get-RouterOpenRouterUpstreamModelId, `
+    Get-RouterUpstreamModelId, `
+    Get-RouterServableCatalogRoutes, `
+    Get-RouterCompositeTargetPlatform, `
+    Get-RouterCompositeRoutePlan, `
+    Sync-RouterCompositeRoutes, `
     Set-RouterAccountProxy, `
     Sync-RouterManagedProxy, `
     Get-RouterOpenAIChannelPolicy, `

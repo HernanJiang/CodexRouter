@@ -39,7 +39,7 @@ try {
     if (@($catalog.models[0].input_modalities) -notcontains 'image') { throw 'Auto multimodal was not enabled.' }
     if (@($catalog.models[1].input_modalities) -contains 'image') { throw 'Explicit text-only override was ignored.' }
     if (@((@($catalog.models) | Where-Object slug -eq 'deepseek/deepseek-v4-pro').input_modalities) -contains 'image') { throw 'DeepSeek was incorrectly marked as multimodal.' }
-    if ((@($catalog.models) | Where-Object slug -eq 'deepseek/deepseek-v4-pro').display_name -ne 'DeepSeek-V4-Flash') { throw 'DeepSeek recommended display name was not applied.' }
+    if ((@($catalog.models) | Where-Object slug -eq 'deepseek/deepseek-v4-pro').display_name -ne 'DeepSeek-V4-Pro') { throw 'DeepSeek Pro recommended display name was not applied.' }
     if (@((@($catalog.models) | Where-Object slug -eq 'mimo-v2.5-pro').input_modalities) -contains 'image') { throw 'MiMo V2.5 Pro was incorrectly marked as multimodal.' }
     if (@((@($catalog.models) | Where-Object slug -eq 'gemini-3.6-flash').input_modalities) -notcontains 'image') { throw 'Gemini 3.6 Flash image support was not detected.' }
     if (@((@($catalog.models) | Where-Object slug -eq 'claude-opus-5').input_modalities) -notcontains 'image') { throw 'Claude Opus 5 image support was not detected.' }

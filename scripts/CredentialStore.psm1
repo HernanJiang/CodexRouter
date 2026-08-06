@@ -393,6 +393,8 @@ function Protect-RouterPathAcl {
                 [Security.AccessControl.AccessControlType]::Allow)
             [void]$acl.AddAccessRule($rule)
         }
+        # Use Set-Acl on every supported host. FileSystemAclExtensions is not
+        # reliably available under Windows PowerShell 5.1, which the GUI uses.
         Set-Acl -LiteralPath $Target -AclObject $acl
     }
 

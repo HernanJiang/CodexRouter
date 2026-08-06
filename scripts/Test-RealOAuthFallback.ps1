@@ -11,6 +11,7 @@ $ProgressPreference = 'SilentlyContinue'
 $routerRoot = Split-Path -Parent $PSScriptRoot
 Import-Module (Join-Path $PSScriptRoot 'CredentialStore.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'RouterAdmin.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'UserData.psm1') -Force
 
 if ($Model -notmatch '^[A-Za-z0-9._:/-]{1,160}$') {
     throw 'Model contains unsupported characters.'
@@ -132,7 +133,7 @@ $testStartedAt = [DateTimeOffset]::UtcNow
 try {
     $accounts = @(Get-RouterAccounts -Session $session)
     if ($OAuthAccountId -le 0) {
-        $configured = Get-Content -LiteralPath (Join-Path $routerRoot 'codex-router-config.json') -Raw | ConvertFrom-Json
+        $configured = Get-Content -LiteralPath (Get-RouterConfigPath -RouterRoot $routerRoot) -Raw | ConvertFrom-Json
         $OAuthAccountId = @($configured.oauthAccountIds | ForEach-Object { [long]$_ }) | Select-Object -First 1
     }
     if ($OAuthAccountId -le 0) { throw 'No selected OAuth account is available for the fallback test.' }
@@ -236,13 +237,13 @@ try {
     }
 
     $startedSql = $testStartedAt.UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss.ffffff+00')
-    $usageRows = Invoke-PostgresRows -Query @"
+    $usageRows = @(Invoke-PostgresRows -Query @"
 SELECT account_id || '|' || COALESCE(upstream_endpoint, '') || '|' || COALESCE(first_token_ms, 0) || '|' || duration_ms
 FROM usage_logs
 WHERE created_at >= TIMESTAMPTZ '$startedSql'
   AND model = '$Model'
 ORDER BY id;
-"@
+"@)
     if ($usageRows.Count -lt 2) { throw 'The two fallback requests were not recorded in usage logs.' }
     $fallbackIds = @($fallbackAccounts | ForEach-Object { [long]$_.id })
     foreach ($row in $usageRows[-2..-1]) {

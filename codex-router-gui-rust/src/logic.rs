@@ -75,16 +75,6 @@ const CHANNEL_PRESETS: &[ChannelPreset] = &[
         docs_url: "https://api.430123.xyz/chiral",
     },
     ChannelPreset {
-        id: "opencode-go",
-        label_zh: "OpenCode Go / 官方编程模型订阅",
-        label_en: "OpenCode Go / Official coding subscription",
-        base_url: "https://opencode.ai/zen/go/v1",
-        model: "gpt-5.6-luna",
-        alias: "ChatGPT-5.6-Luna",
-        website_url: "https://opencode.ai/zen",
-        docs_url: "https://opencode.ai/docs/go/",
-    },
-    ChannelPreset {
         id: "openrouter",
         label_zh: "OpenRouter",
         label_en: "OpenRouter",
@@ -115,6 +105,26 @@ const CHANNEL_PRESETS: &[ChannelPreset] = &[
         docs_url: "https://www.kimi.com/code/docs/en/third-party-tools/codex.html",
     },
     ChannelPreset {
+        id: "ark-coding",
+        label_zh: "字节跳动 火山方舟 Coding Plan",
+        label_en: "ByteDance Volcengine Ark Coding Plan",
+        base_url: "https://ark.cn-beijing.volces.com/api/coding/v3",
+        model: "ark-code-latest",
+        alias: "Ark-Code-Latest",
+        website_url: "https://console.volcengine.com/ark",
+        docs_url: "https://www.volcengine.com/docs/82379/2556056",
+    },
+    ChannelPreset {
+        id: "ark-plan",
+        label_zh: "字节跳动 火山方舟 Agent Plan",
+        label_en: "ByteDance Volcengine Ark Agent Plan",
+        base_url: "https://ark.cn-beijing.volces.com/api/plan/v3",
+        model: "ark-code-latest",
+        alias: "Ark-Code-Latest",
+        website_url: "https://console.volcengine.com/ark",
+        docs_url: "https://www.volcengine.com/docs/82379/2556056",
+    },
+    ChannelPreset {
         id: "mimo",
         label_zh: "Xiaomi MiMo Token Plan",
         label_en: "Xiaomi MiMo Token Plan",
@@ -130,7 +140,7 @@ const CHANNEL_PRESETS: &[ChannelPreset] = &[
         label_en: "DeepSeek official API",
         base_url: "https://api.deepseek.com/v1",
         model: "deepseek-v4-pro",
-        alias: "DeepSeek-V4-Flash",
+        alias: "DeepSeek-V4-Pro",
         website_url: "https://platform.deepseek.com/",
         docs_url: "https://api-docs.deepseek.com/",
     },
@@ -301,6 +311,17 @@ pub fn detect_reasoning(model_name: &str) -> ReasoningSpec {
             "K2.7 Code has no adjustable reasoning_effort; high is used for compatibility",
         );
     }
+    if name.starts_with("ark-code") || name.contains("doubao-seed-code") {
+        return ReasoningSpec::new(
+            &["high"],
+            "high",
+            false,
+            "火山方舟 Coding Plan",
+            "Volcengine Ark Coding Plan",
+            "方舟 Coding Plan 走 OpenAI 兼容端点；未公布可调档位，采用固定兼容值",
+            "Ark Coding Plan uses the OpenAI-compatible endpoint with no documented adjustable tiers",
+        );
+    }
     if name.contains("deepseek-v4") {
         return ReasoningSpec::new(
             &["none", "low", "high", "max"],
@@ -462,6 +483,13 @@ pub fn detect_multimodal_defaults(model_name: &str) -> MultimodalDefaults {
             source_en: "Model id explicitly identifies a Vision / VL / V variant",
         };
     }
+    if name.starts_with("ark-code") || name.contains("doubao-seed-code") {
+        return MultimodalDefaults {
+            supported: false,
+            source_zh: "方舟 Coding Plan 为编程语言模型；多模态需改用 Agent Plan 视觉模型",
+            source_en: "Ark Coding Plan ships code language models; vision needs Agent Plan models",
+        };
+    }
     if name.contains("deepseek") {
         return MultimodalDefaults {
             supported: false,
@@ -548,6 +576,162 @@ pub fn canonical_route_model_id(model_id: &str) -> String {
     value
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelIdentity {
+    pub provider: String,
+    pub real_id: String,
+    pub display_candidate: String,
+}
+
+pub fn model_identity(model_id: &str) -> ModelIdentity {
+    let raw = model_id.trim().to_ascii_lowercase();
+    let mut real_id = canonical_route_model_id(&raw);
+    let provider = if raw.starts_with("openai/")
+        || raw.starts_with("chatgpt/")
+        || real_id.starts_with("gpt-")
+        || real_id.starts_with("codex-")
+    {
+        "openai"
+    } else if raw.starts_with("anthropic/")
+        || raw.starts_with("claude/")
+        || real_id.starts_with("claude-")
+    {
+        "anthropic"
+    } else if raw.starts_with("google/")
+        || raw.starts_with("gemini/")
+        || real_id.starts_with("gemini-")
+    {
+        "google"
+    } else if raw.starts_with("x-ai/")
+        || raw.starts_with("xai/")
+        || raw.starts_with("grok/")
+        || real_id.starts_with("grok-")
+    {
+        "x-ai"
+    } else if raw.starts_with("deepseek/") || real_id.starts_with("deepseek-") {
+        "deepseek"
+    } else if raw.starts_with("moonshotai/")
+        || raw.starts_with("moonshot/")
+        || raw.starts_with("kimi/")
+        || real_id.starts_with("kimi-")
+        || real_id == "k3"
+        || real_id.starts_with("k3-")
+    {
+        "moonshot"
+    } else {
+        return ModelIdentity {
+            provider: raw
+                .split_once('/')
+                .map(|(namespace, _)| format!("unknown-{namespace}"))
+                .unwrap_or_else(|| "unknown".to_owned()),
+            real_id,
+            display_candidate: recommended_model_display_name(model_id),
+        };
+    }
+    .to_owned();
+    if provider == "google" {
+        let parts = real_id.split('-').collect::<Vec<_>>();
+        if parts.len() >= 4
+            && parts[0] == "gemini"
+            && parts[1].chars().all(|c| c.is_ascii_digit())
+            && parts[2].chars().all(|c| c.is_ascii_digit())
+        {
+            real_id = format!("gemini-{}.{}-{}", parts[1], parts[2], parts[3..].join("-"));
+        }
+    }
+    if provider == "anthropic" {
+        let parts = real_id.split('-').collect::<Vec<_>>();
+        if parts.len() >= 4
+            && parts[0] == "claude"
+            && parts[2].chars().all(|c| c.is_ascii_digit())
+            && parts[3].chars().all(|c| c.is_ascii_digit())
+        {
+            let mut normalized = format!("claude-{}-{}.{}", parts[1], parts[2], parts[3]);
+            if parts.len() > 4 {
+                normalized.push('-');
+                normalized.push_str(&parts[4..].join("-"));
+            }
+            real_id = normalized;
+        }
+    }
+    ModelIdentity {
+        provider,
+        real_id,
+        display_candidate: recommended_model_display_name(model_id),
+    }
+}
+
+pub fn same_model_identity(left: &str, right: &str) -> bool {
+    let left = model_identity(left);
+    let right = model_identity(right);
+    normalized_display_name(&left.display_candidate)
+        == normalized_display_name(&right.display_candidate)
+        && left.provider == right.provider
+        && left.real_id == right.real_id
+}
+
+pub fn api_channel_tier(model: &ModelConfig) -> i32 {
+    if model.source == "oauth" {
+        return 0;
+    }
+    let explicit_coding_plan = serde_json::from_str::<serde_json::Value>(&model.extra)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("codex_router_channel_kind")
+                .and_then(|kind| kind.as_str())
+                .map(str::to_owned)
+        })
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("coding_plan"));
+    let coding_endpoint = url::Url::parse(model.base_url.trim())
+        .ok()
+        .is_some_and(|url| {
+            url.scheme() == "https"
+                && ((url.host_str() == Some("api.kimi.com") && url.path().starts_with("/coding"))
+                    || (url.host_str() == Some("api.moonshot.ai")
+                        && url.path().starts_with("/coding"))
+                    // ByteDance Volcengine Ark subscription plans: /api/coding/v3
+                    // (Coding Plan) and /api/plan/v3 (Agent Plan).
+                    || (url
+                        .host_str()
+                        .is_some_and(|host| host.ends_with(".volces.com"))
+                        && (url.path().starts_with("/api/coding")
+                            || url.path().starts_with("/api/plan"))))
+        });
+    if explicit_coding_plan || coding_endpoint {
+        1
+    } else {
+        2
+    }
+}
+
+pub fn model_routing_explanation(cfg: &RouterConfig, model: &ModelConfig, zh: bool) -> String {
+    let matched = cfg.models.iter().any(|candidate| {
+        !std::ptr::eq(candidate, model)
+            && candidate.model != model.model
+            && candidate.source != model.source
+            && same_model_identity(&candidate.model, &model.model)
+    });
+    let oauth = model.source == "oauth";
+    if matched {
+        if zh {
+            "同名模型：OAuth 优先，API 自动兜底".to_owned()
+        } else {
+            "Same model: OAuth first, API fallback".to_owned()
+        }
+    } else if oauth {
+        if zh {
+            "OAuth 独立路由".to_owned()
+        } else {
+            "Standalone OAuth route".to_owned()
+        }
+    } else if zh {
+        "API 独立渠道".to_owned()
+    } else {
+        "Standalone API channel".to_owned()
+    }
+}
+
 pub fn recommended_model_display_name(model_id: &str) -> String {
     let canonical = canonical_route_model_id(model_id);
     if let Some(suffix) = canonical.strip_prefix("gpt-") {
@@ -625,7 +809,7 @@ pub fn recommended_model_display_name(model_id: &str) -> String {
         ("kimi-for-coding", "Kimi-For-Coding"),
         ("kimi-k2.7", "Kimi-K2.7-Code"),
         ("mimo-v2.5-pro", "MiMo-V2.5-Pro"),
-        ("deepseek-v4-pro", "DeepSeek-V4-Flash"),
+        ("deepseek-v4-pro", "DeepSeek-V4-Pro"),
         ("deepseek-v4-flash", "DeepSeek-V4-Flash"),
         ("deepseek-v3.2", "DeepSeek-V3.2"),
         ("deepseek-v3.1", "DeepSeek-V3.1"),
@@ -638,6 +822,9 @@ pub fn recommended_model_display_name(model_id: &str) -> String {
         ("composer-2.5", "Composer-2.5"),
         ("glm-5.2", "GLM-5.2"),
         ("glm-5-2", "GLM-5.2"),
+        ("ark-code-latest", "Ark-Code-Latest"),
+        ("ark-code", "Ark-Code"),
+        ("doubao-seed-code", "Doubao-Seed-Code"),
     ] {
         if canonical.starts_with(prefix) {
             return display.to_owned();
@@ -690,14 +877,13 @@ pub fn is_oauth_fallback_model(cfg: &RouterConfig, candidate: &ModelConfig) -> b
     {
         return false;
     }
-    let canonical = canonical_route_model_id(&candidate.model);
     cfg.models.iter().any(|model| {
         model.source == "oauth"
             && cfg
                 .oauth_account_ids
                 .as_ref()
                 .is_none_or(|ids| ids.contains(&model.oauth_account_id))
-            && canonical_route_model_id(&model.model) == canonical
+            && same_model_identity(&model.model, &candidate.model)
     })
 }
 
@@ -730,6 +916,9 @@ pub fn is_model_alias_customized(model: &ModelConfig) -> bool {
     if canonical_route_model_id(&model.model) == "deepseek-v4-pro" {
         automatic.push("DeepSeek V4 Pro".to_owned());
         automatic.push("DeepSeek-V4-Pro".to_owned());
+        // Previous releases incorrectly recommended Flash for Pro.
+        automatic.push("DeepSeek-V4-Flash".to_owned());
+        automatic.push("DeepSeek V4 Flash".to_owned());
     }
     let alias = normalized_display_name(&model.alias);
     !automatic
@@ -745,11 +934,10 @@ pub fn resolved_model_display_name(cfg: &RouterConfig, model: &ModelConfig) -> S
     if model.source != "oauth" {
         return recommended;
     }
-    let canonical = canonical_route_model_id(&model.model);
     let merged = cfg.oauth_fallback.enabled
         && cfg.models.iter().any(|candidate| {
             candidate.source != "oauth"
-                && canonical_route_model_id(&candidate.model) == canonical
+                && same_model_identity(&candidate.model, &model.model)
                 && is_fallback_channel_selected(cfg, candidate)
         });
     if merged {
@@ -810,6 +998,13 @@ pub fn detect_context_defaults(model_name: &str) -> ContextDefaults {
             window: 1_048_576,
             source_zh: "MiMo V2.5 官方模型页",
             source_en: "official MiMo V2.5 model page",
+        };
+    }
+    if name.starts_with("ark-code") || name.contains("doubao-seed-code") {
+        return ContextDefaults {
+            window: 262_144,
+            source_zh: "方舟 Coding Plan 文档",
+            source_en: "Ark Coding Plan documentation",
         };
     }
     if name.contains("kimi-for-coding") || name.contains("k3-256k") {
@@ -974,8 +1169,21 @@ pub fn build_channel_manifest(cfg: &RouterConfig) -> Vec<serde_json::Value> {
 
 pub fn write_all_files(cfg: &RouterConfig, router_root: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(router_root.join("config"))?;
-    let config_path = router_root.join("codex-router-config.json");
-    let catalog_path = router_root.join("config").join("model-catalog.json");
+    // The deployment scripts resolve the Router config through
+    // `Get-RouterConfigPath`, which points at the persistent user-data root for
+    // packaged releases. Writing it next to the executable would leave
+    // Apply-Router.ps1 deploying a stale config from a previous session.
+    let config_path = crate::user_data::config_path(router_root);
+    // The catalog and channel manifest stay beside the executable because the
+    // scripts read them from `$routerRoot\config`.
+    let catalog_path = {
+        let stable = crate::user_data::state_root(router_root).join("model-catalog.json");
+        if stable != router_root.join("model-catalog.json") {
+            stable
+        } else {
+            router_root.join("config").join("model-catalog.json")
+        }
+    };
     let channels_path = router_root.join("config").join("sub2api-channels.json");
     let writes = vec![
         (
@@ -1234,10 +1442,19 @@ pub fn isolate_profile_credentials(
             if model.credential_name.trim().is_empty() {
                 bail!("ROUTER_PROFILE_CREDENTIAL_MISSING");
             }
-            read_router_credential(&model.credential_name)
-                .context("ROUTER_PROFILE_CREDENTIAL_READ_FAILED")?
-                .filter(|value| !value.0.is_empty())
-                .context("ROUTER_PROFILE_CREDENTIAL_MISSING")?
+            let mut secret = None;
+            for attempt in 0..3 {
+                secret = read_router_credential(&model.credential_name)
+                    .context("ROUTER_PROFILE_CREDENTIAL_READ_FAILED")?
+                    .filter(|value| !value.0.is_empty());
+                if secret.is_some() {
+                    break;
+                }
+                if attempt < 2 {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
+            secret.context("ROUTER_PROFILE_CREDENTIAL_MISSING")?
         } else {
             SecretWide(model.api_key.encode_utf16().collect())
         };
@@ -1604,6 +1821,10 @@ pub fn run_stop_router_script(router_root: &Path) -> anyhow::Result<()> {
     )
 }
 
+fn is_router_provider_id(provider_id: &str) -> bool {
+    matches!(provider_id, "codex_router" | "custom" | "sub2api")
+}
+
 pub(crate) fn codex_config_uses_router(config_text: &str, router_base_url: &str) -> bool {
     let Ok(document) = config_text.parse::<DocumentMut>() else {
         return false;
@@ -1611,19 +1832,33 @@ pub(crate) fn codex_config_uses_router(config_text: &str, router_base_url: &str)
     let Some(provider_id) = document
         .get("model_provider")
         .and_then(Item::as_str)
-        .filter(|value| matches!(*value, "custom" | "sub2api"))
+        .filter(|value| is_router_provider_id(value))
     else {
         return false;
     };
     let expected_base = format!("{}/v1", router_base_url.trim_end_matches('/'));
-    document
+    let Some(provider) = document
         .get("model_providers")
         .and_then(Item::as_table_like)
         .and_then(|providers| providers.get(provider_id))
         .and_then(Item::as_table_like)
-        .and_then(|provider| provider.get("base_url"))
+    else {
+        return false;
+    };
+    let base_matches = provider
+        .get("base_url")
         .and_then(Item::as_str)
-        .is_some_and(|value| value.trim_end_matches('/') == expected_base)
+        .is_some_and(|value| value.trim_end_matches('/') == expected_base);
+    if !base_matches {
+        return false;
+    }
+    // Reject third-party profiles that reuse the custom id but point at a local
+    // URL while naming themselves something other than Codex-Router.
+    match provider.get("name").and_then(Item::as_str) {
+        None | Some("Codex-Router") => true,
+        Some(_) if provider_id == "codex_router" => true,
+        Some(_) => false,
+    }
 }
 
 fn local_router_health_available(router_base_url: &str) -> bool {
@@ -1684,7 +1919,111 @@ pub fn codex_router_mode_active(cfg: &RouterConfig) -> bool {
 
 pub fn load_oauth_accounts(router_root: &Path) -> anyhow::Result<Vec<crate::OAuthAccountSummary>> {
     let script = router_root.join("scripts").join("Get-OAuthAccounts.ps1");
-    let output = Command::new("powershell.exe")
+    let mut last_failure = "ROUTER_OAUTH_ACCOUNTS_UNAVAILABLE".to_owned();
+    // Prefer PowerShell 7 when present: JSON arrays and StrictMode edge cases
+    // are substantially more reliable than Windows PowerShell 5.1.
+    let shell = prefer_powershell_executable();
+    let mut attempted_repair = false;
+    for attempt in 0..4 {
+        if attempt == 0 {
+            // Soft wait for the local admin API without failing the whole load.
+            for _ in 0..6 {
+                if local_router_health_available("http://127.0.0.1:18080") {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+        // When admin login is rate-limited or services are from an older package
+        // folder, repair once from the current install root before retrying.
+        if !attempted_repair
+            && attempt > 0
+            && oauth_accounts_failure_needs_router_repair(&last_failure)
+        {
+            attempted_repair = true;
+            let _ = ensure_router_healthy(router_root);
+            std::thread::sleep(Duration::from_millis(800));
+        }
+        let output_result = Command::new(&shell)
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&script)
+            .current_dir(router_root)
+            .stdin(Stdio::null())
+            .creation_flags(0x08000000)
+            .output();
+
+        match output_result {
+            Ok(output) if output.status.success() => {
+                let text = String::from_utf8_lossy(&output.stdout);
+                let trimmed = extract_json_payload(text.as_ref());
+                if trimmed.is_empty() || trimmed == "null" {
+                    return Ok(Vec::new());
+                }
+                let parsed = if trimmed.starts_with('[') {
+                    serde_json::from_str::<Vec<crate::OAuthAccountSummary>>(trimmed)
+                        .map_err(|error| error.to_string())
+                } else {
+                    serde_json::from_str::<crate::OAuthAccountSummary>(trimmed)
+                        .map(|account| vec![account])
+                        .map_err(|error| error.to_string())
+                };
+                match parsed {
+                    Ok(accounts) => return Ok(accounts),
+                    Err(error) => {
+                        last_failure = format!(
+                            "ROUTER_OAUTH_ACCOUNTS_PARSE: {}",
+                            crate::runtime_logs::summarize_error_for_display(&error)
+                        );
+                    }
+                }
+            }
+            Ok(output) => {
+                last_failure = oauth_accounts_process_failure_summary(&output);
+            }
+            Err(error) => {
+                last_failure = format!(
+                    "ROUTER_OAUTH_ACCOUNTS_UNAVAILABLE: {}",
+                    crate::runtime_logs::summarize_error_for_display(&format!(
+                        "oauth accounts process start failed: {error}"
+                    ))
+                );
+            }
+        }
+
+        if attempt + 1 < 4 && oauth_accounts_failure_is_retryable(&last_failure) {
+            std::thread::sleep(Duration::from_millis(500 + attempt as u64 * 400));
+        } else {
+            break;
+        }
+    }
+    bail!("{last_failure}")
+}
+
+fn oauth_accounts_failure_needs_router_repair(summary: &str) -> bool {
+    let lower = summary.to_ascii_lowercase();
+    lower.contains("rate-limited")
+        || lower.contains("429")
+        || lower.contains("no access token")
+        || lower.contains("503")
+        || lower.contains("install_root")
+        || lower.contains("health check failed")
+        || lower.contains("connection_refused")
+}
+
+fn ensure_router_healthy(router_root: &Path) -> bool {
+    let script = router_root.join("scripts").join("Ensure-RouterHealthy.ps1");
+    if !script.is_file() {
+        return false;
+    }
+    let shell = prefer_powershell_executable();
+    Command::new(shell)
         .args([
             "-NoLogo",
             "-NoProfile",
@@ -1698,24 +2037,79 @@ pub fn load_oauth_accounts(router_root: &Path) -> anyhow::Result<Vec<crate::OAut
         .stdin(Stdio::null())
         .creation_flags(0x08000000)
         .output()
-        .with_context(|| format!("无法读取 OAuth 账号: {}", script.display()))?;
-    if !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        bail!(
-            "无法读取 OAuth 账号: {}",
-            crate::runtime_logs::summarize_error_for_display(&message)
-        );
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn prefer_powershell_executable() -> String {
+    let candidates = [
+        r"C:\Program Files\PowerShell\7\pwsh.exe",
+        r"C:\Program Files\PowerShell\7-preview\pwsh.exe",
+    ];
+    for candidate in candidates {
+        if Path::new(candidate).is_file() {
+            return candidate.to_owned();
+        }
     }
-    let text = String::from_utf8(output.stdout).context("OAuth 账号清单不是 UTF-8")?;
+    "powershell.exe".to_owned()
+}
+
+fn extract_json_payload(text: &str) -> &str {
     let trimmed = text.trim();
-    if trimmed.is_empty() || trimmed == "null" {
-        return Ok(Vec::new());
+    if trimmed.is_empty() {
+        return "";
     }
-    if trimmed.starts_with('[') {
-        return serde_json::from_str(trimmed).context("无法解析 OAuth 账号清单");
+    if let Some(start) = trimmed.find(['[', '{']) {
+        let payload = trimmed[start..].trim();
+        if payload.starts_with('[') || payload.starts_with('{') {
+            return payload;
+        }
     }
-    let account = serde_json::from_str(trimmed).context("无法解析 OAuth 账号清单")?;
-    Ok(vec![account])
+    trimmed
+}
+
+fn oauth_accounts_process_failure_summary(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let combined = [stderr.trim(), stdout.trim()]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let detail = if combined.is_empty() {
+        "oauth accounts script failed without output".to_owned()
+    } else {
+        combined
+    };
+    format!(
+        "ROUTER_OAUTH_ACCOUNTS_UNAVAILABLE: {}",
+        crate::runtime_logs::summarize_error_for_display(&detail)
+    )
+}
+
+fn oauth_accounts_failure_is_retryable(summary: &str) -> bool {
+    [
+        "class=connection_refused",
+        "class=connection_closed",
+        "class=timeout",
+        "class=lifecycle_busy",
+        "class=lifecycle_deferred",
+        "class=process_failure",
+        "class=empty_response",
+        "class=authentication",
+        "router_oauth_accounts_unavailable",
+        "admin session",
+        "health check failed",
+        "actively refused",
+        "connection refused",
+        "no access token",
+        "rate-limited",
+        "429",
+        "503",
+        "install_root",
+    ]
+    .iter()
+    .any(|needle| summary.to_ascii_lowercase().contains(needle))
 }
 
 pub fn load_usage_snapshot(
@@ -1870,6 +2264,59 @@ pub fn import_grok_sso(router_root: &Path, authorization: &str) -> anyhow::Resul
     Ok("Grok authorization imported".to_owned())
 }
 
+pub fn set_oauth_account_priority(
+    router_root: &Path,
+    account_id: i64,
+    priority: i32,
+) -> anyhow::Result<i32> {
+    if account_id <= 0 {
+        bail!("OAuth 账号 ID 无效");
+    }
+    if !(1..=999).contains(&priority) {
+        bail!("OAuth 优先级必须在 1 到 999 之间");
+    }
+    let script = router_root
+        .join("scripts")
+        .join("Set-OAuthAccountPriority.ps1");
+    let shell = prefer_powershell_executable();
+    let output = Command::new(&shell)
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(&script)
+        .args([
+            "-AccountId",
+            &account_id.to_string(),
+            "-Priority",
+            &priority.to_string(),
+        ])
+        .current_dir(router_root)
+        .stdin(Stdio::null())
+        .creation_flags(0x08000000)
+        .output()
+        .with_context(|| format!("无法更新 OAuth 优先级: {}", script.display()))?;
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        bail!(
+            "无法更新 OAuth 优先级: {}",
+            crate::runtime_logs::summarize_error_for_display(&message)
+        );
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let trimmed = extract_json_payload(text.as_ref());
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(saved) = value.get("priority").and_then(|v| v.as_i64()) {
+            return Ok(saved as i32);
+        }
+    }
+    Ok(priority)
+}
+
 pub fn revoke_oauth_account(router_root: &Path, account_id: i64) -> anyhow::Result<()> {
     if account_id <= 0 {
         bail!("OAuth 账号 ID 无效");
@@ -1943,56 +2390,35 @@ pub fn enroll_unseen_oauth_accounts(
     added
 }
 
-/// Router profiles must never inherit the elevated Windows sandbox setting.
-/// That setting starts Codex's UAC-backed installer on every launch; on
-/// machines where the default profile is protected, the installer loops
-/// forever after the user accepts the prompt. Keep the profile self-contained
-/// by normalizing only the exact `[windows] sandbox` key.
+/// Restore must not invent a `[windows] sandbox` value. Codex's desktop client
+/// runs a one-time Windows setup step; forcing `unelevated` (or adding the
+/// table at all) makes that step fail with "Windows 安装未完成" and loops the UAC
+/// prompt. Router only removes a value it wrote itself in older releases and
+/// otherwise keeps the user's own setting untouched.
 pub fn normalize_windows_sandbox_config(text: &str) -> String {
     let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
     let had_trailing_newline = text.ends_with('\n') || text.ends_with('\r');
     let mut lines = Vec::new();
     let mut in_windows = false;
-    let mut found_windows = false;
-    let mut found_sandbox = false;
 
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
-            if in_windows && !found_sandbox {
-                lines.push("sandbox = \"unelevated\"".to_owned());
-                found_sandbox = true;
-            }
             in_windows = trimmed == "[windows]";
-            if in_windows {
-                found_windows = true;
-                found_sandbox = false;
-            }
         }
 
         if in_windows {
             let key = trimmed.split('=').next().unwrap_or_default().trim();
             if key == "sandbox" {
-                if !found_sandbox {
-                    lines.push("sandbox = \"unelevated\"".to_owned());
-                    found_sandbox = true;
+                let value = trimmed.split_once('=').map(|(_, v)| v.trim()).unwrap_or("");
+                // Drop only the legacy Router-forced downgrade. Any other value
+                // is the user's own Codex permission and must survive restore.
+                if value.trim_matches('"') == "unelevated" {
+                    continue;
                 }
-                continue;
             }
         }
         lines.push(line.to_owned());
-    }
-
-    if in_windows && !found_sandbox {
-        lines.push("sandbox = \"unelevated\"".to_owned());
-        // no further state is needed after appending the missing key
-    }
-    if !found_windows {
-        if !lines.is_empty() && !lines.last().is_some_and(|line| line.trim().is_empty()) {
-            lines.push(String::new());
-        }
-        lines.push("[windows]".to_owned());
-        lines.push("sandbox = \"unelevated\"".to_owned());
     }
 
     let mut result = lines.join(newline);
@@ -2022,26 +2448,50 @@ mod tests {
 
     #[test]
     fn router_mode_requires_the_selected_provider_and_matching_local_url() {
-        let config = r#"model_provider = "custom"
+        let config = r#"model_provider = "codex_router"
 model = "gpt-5.6-sol"
 
-[model_providers.custom]
+[model_providers.codex_router]
 name = "Codex-Router"
 base_url = "http://127.0.0.1:18080/v1"
 "#;
         assert!(codex_config_uses_router(config, "http://127.0.0.1:18080"));
         assert!(!codex_config_uses_router(config, "http://127.0.0.1:19090"));
         assert!(!codex_config_uses_router(
-            &config.replace("model_provider = \"custom\"", "model_provider = \"openai\""),
+            &config.replace(
+                "model_provider = \"codex_router\"",
+                "model_provider = \"openai\""
+            ),
             "http://127.0.0.1:18080"
         ));
 
+        let legacy_custom = r#"model_provider = "custom"
+model = "gpt-5.6-sol"
+
+[model_providers.custom]
+name = "Codex-Router"
+base_url = "http://127.0.0.1:18080/v1"
+"#;
+        assert!(codex_config_uses_router(
+            legacy_custom,
+            "http://127.0.0.1:18080"
+        ));
+
+        let chiral = r#"model_provider = "custom"
+model = "grok-4.5"
+
+[model_providers.custom]
+name = "micu"
+base_url = "https://api.430123.xyz/v1"
+"#;
+        assert!(!codex_config_uses_router(chiral, "http://127.0.0.1:18080"));
+
         let legacy = config
             .replace(
-                "model_provider = \"custom\"",
+                "model_provider = \"codex_router\"",
                 "model_provider = \"sub2api\"",
             )
-            .replace("model_providers.custom", "model_providers.sub2api");
+            .replace("model_providers.codex_router", "model_providers.sub2api");
         assert!(codex_config_uses_router(&legacy, "http://127.0.0.1:18080"));
     }
 
@@ -2066,8 +2516,9 @@ base_url = "http://127.0.0.1:18080/v1"
         cfg.deploy.sub2api_host = "http://127.0.0.1:1".into();
         std::fs::write(
             root.join("config.toml"),
-            "model_provider = \"custom\"\n\
-             [model_providers.custom]\n\
+            "model_provider = \"codex_router\"\n\
+             [model_providers.codex_router]\n\
+             name = \"Codex-Router\"\n\
              base_url = \"http://127.0.0.1:1/v1\"\n",
         )
         .unwrap();
@@ -2112,7 +2563,8 @@ base_url = "http://127.0.0.1:18080/v1"
             ("claude-sonnet-4-6-20260501", "Claude-Sonnet-4.6"),
             ("google/gemini-3-1-pro", "Gemini-3.1-Pro"),
             ("gemini-3-pro-image-preview", "Gemini-3-Pro-Image-Preview"),
-            ("deepseek/deepseek-v4-pro", "DeepSeek-V4-Flash"),
+            ("deepseek/deepseek-v4-pro", "DeepSeek-V4-Pro"),
+            ("deepseek/deepseek-v4-flash", "DeepSeek-V4-Flash"),
             ("deepseek/deepseek-v3.2", "DeepSeek-V3.2"),
             ("x-ai/grok-4.5", "Grok-4.5"),
             ("cursor-composer-2.5", "Composer-2.5"),
@@ -2175,12 +2627,13 @@ base_url = "http://127.0.0.1:18080/v1"
     fn channel_presets_keep_current_supported_model_defaults() {
         let expected = [
             ("chiral", "gpt-5.6-sol"),
-            ("opencode-go", "gpt-5.6-luna"),
             ("openai", "gpt-5.6-sol"),
             ("anthropic", "claude-opus-5"),
             ("openrouter", "openai/gpt-5.6-sol"),
             ("kimi-open", "kimi-k3"),
             ("kimi", "kimi-for-coding"),
+            ("ark-coding", "ark-code-latest"),
+            ("ark-plan", "ark-code-latest"),
             ("mimo", "mimo-v2.5-pro"),
             ("deepseek", "deepseek-v4-pro"),
             ("gemini", "gemini-3.6-flash"),
@@ -2193,6 +2646,45 @@ base_url = "http://127.0.0.1:18080/v1"
                 .unwrap_or_else(|| panic!("missing channel preset: {id}"));
             assert_eq!(preset.model, model, "stale default model for {id}");
         }
+    }
+
+    #[test]
+    fn ark_coding_plan_presets_are_quick_selectable_and_ranked_as_coding_plan() {
+        let common = common_channel_presets()
+            .map(|preset| preset.id)
+            .collect::<Vec<_>>();
+        assert!(common.contains(&"ark-coding"));
+        assert!(common.contains(&"ark-plan"));
+
+        for (id, expected_url) in [
+            (
+                "ark-coding",
+                "https://ark.cn-beijing.volces.com/api/coding/v3",
+            ),
+            ("ark-plan", "https://ark.cn-beijing.volces.com/api/plan/v3"),
+        ] {
+            let preset = channel_presets()
+                .iter()
+                .find(|preset| preset.id == id)
+                .unwrap_or_else(|| panic!("missing Ark preset: {id}"));
+            assert_eq!(preset.base_url, expected_url);
+
+            let mut model = ModelConfig::default();
+            assert!(apply_channel_preset(&mut model, id));
+            assert_eq!(model.model, "ark-code-latest");
+            assert_eq!(model.base_url, expected_url);
+            // Subscription plans outrank pay-as-you-go third-party APIs.
+            assert_eq!(api_channel_tier(&model), 1);
+        }
+
+        assert_eq!(
+            recommended_model_display_name("ark-code-latest"),
+            "Ark-Code-Latest"
+        );
+        assert_eq!(detect_context_defaults("ark-code-latest").window, 262_144);
+        let reasoning = detect_reasoning("ark-code-latest");
+        assert_eq!(reasoning.default_level, "high");
+        assert!(!reasoning.supports_fast);
     }
 
     #[test]
@@ -2294,6 +2786,8 @@ base_url = "http://127.0.0.1:18080/v1"
             "glm-4.6",
             "qwen3-coder",
             "mimo-v2.5-pro",
+            "ark-code-latest",
+            "doubao-seed-code",
             "unknown-model",
         ] {
             assert!(
@@ -2382,6 +2876,36 @@ base_url = "http://127.0.0.1:18080/v1"
             "gpt-5.6-sol"
         );
         assert_eq!(canonical_route_model_id("gpt-5.6"), "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn model_identity_requires_display_and_real_id_equivalence() {
+        for (left, right) in [
+            ("gpt-5.6-sol", "openai/gpt-5.6"),
+            ("claude-opus-5", "anthropic/claude-opus-5"),
+            ("gemini-3.6-flash", "google/gemini-3-6-flash"),
+            ("grok-4.5", "x-ai/grok-4.5"),
+            ("deepseek-v4-flash", "deepseek/deepseek-v4-flash"),
+            ("claude-opus-4-6", "anthropic/claude-opus-4.6"),
+        ] {
+            assert!(
+                same_model_identity(left, right),
+                "{left} should match {right}"
+            );
+        }
+        for (left, right) in [
+            ("grok-4.5", "openai/grok-4.5"),
+            ("claude-opus-5", "claude-opus-5-fast"),
+            ("gemini-3.1-pro-high", "gemini-3.1-pro-low"),
+            ("kimi-for-coding", "kimi-for-coding-highspeed"),
+            ("kimi-k3", "k3-256k"),
+            ("vendor-a/model-x", "vendor-b/model-x"),
+        ] {
+            assert!(
+                !same_model_identity(left, right),
+                "{left} must not match {right}"
+            );
+        }
     }
 
     #[test]
@@ -2641,10 +3165,29 @@ base_url = "http://127.0.0.1:18080/v1"
         assert_eq!(catalog["models"][0]["auto_compact_token_limit"], 102_400);
         assert_eq!(catalog["models"][0]["input_modalities"], json!(["text"]));
         assert!(!raw.contains("must-not-be-written"));
-        assert!(
-            !std::fs::read_to_string(root.join("codex-router-config.json"))
-                .unwrap()
-                .contains("must-not-be-written")
+        // The deployment scripts read the Router config through
+        // `Get-RouterConfigPath`, so it must land on the user-data path rather
+        // than beside the executable.
+        let config_path = crate::user_data::config_path(&root);
+        assert!(!std::fs::read_to_string(&config_path)
+            .unwrap()
+            .contains("must-not-be-written"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn packaged_layout_keeps_the_deployment_config_out_of_the_release_folder() {
+        // A packaged release must never treat the extracted folder as the config
+        // location: Apply-Router.ps1 resolves it through the user-data root, so a
+        // release-relative write would deploy a stale configuration.
+        if std::env::var_os("CODEX_ROUTER_USER_DATA_ROOT").is_some() {
+            return;
+        }
+        let root = temporary_test_dir("packaged-config-path");
+        std::fs::write(root.join("release-manifest.json"), "{}").unwrap();
+        assert_ne!(
+            crate::user_data::config_path(&root),
+            root.join("codex-router-config.json")
         );
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -2668,6 +3211,33 @@ base_url = "http://127.0.0.1:18080/v1"
         assert!(error.contains("class=unclassified_error"));
         assert!(!error.contains("stdout-only deployment detail"));
         assert!(displayed.iter().all(|line| !line.contains("stdout-only")));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deployment_failure_keeps_the_stable_marker_for_the_user_facing_message() {
+        let root = temporary_test_dir("apply-marker-error");
+        let scripts = root.join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::write(
+            scripts.join("apply-codex-router.ps1"),
+            "[Console]::Error.WriteLine('ROUTER_DEPLOY_NO_MODELS: none in C:\\secret-user\\config.json')\nexit 1\n",
+        )
+        .unwrap();
+
+        let mut displayed = Vec::new();
+        let error = run_apply_script(&root, |line| displayed.push(line))
+            .unwrap_err()
+            .to_string();
+
+        // The marker has to reach the UI so the failure can be explained, while
+        // the surrounding detail must still be dropped.
+        assert!(error.contains("marker=ROUTER_DEPLOY_NO_MODELS"), "{error}");
+        assert!(!error.contains("secret-user"));
+        assert!(displayed
+            .iter()
+            .any(|line| line.contains("marker=ROUTER_DEPLOY_NO_MODELS")));
+        assert!(displayed.iter().all(|line| !line.contains("secret-user")));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2901,10 +3471,18 @@ exit 1
 
     #[test]
     fn windows_sandbox_normalization_disables_elevated_setup_loop() {
+        // The user's own elevated setting must survive: Codex needs it for its
+        // one-time Windows setup step.
         let input = "model = \"test\"\r\n\r\n[windows]\r\nsandbox = \"elevated\"\r\n";
         let output = normalize_windows_sandbox_config(input);
-        assert!(output.contains("[windows]\r\nsandbox = \"unelevated\"\r\n"));
-        assert!(!output.contains("sandbox = \"elevated\""));
+        assert!(output.contains("[windows]\r\nsandbox = \"elevated\"\r\n"));
+        assert!(!output.contains("sandbox = \"unelevated\""));
+
+        // Only a legacy Router-forced downgrade is removed.
+        let legacy = "model = \"test\"\n\n[windows]\nsandbox = \"unelevated\"\n";
+        let cleaned = normalize_windows_sandbox_config(legacy);
+        assert!(!cleaned.contains("sandbox ="));
+        assert!(cleaned.contains("[windows]"));
     }
 
     #[test]
@@ -2912,6 +3490,8 @@ exit 1
         let input = "model_provider = \"sub2api\"\n\nsandbox_mode = \"danger-full-access\"\n";
         let output = normalize_windows_sandbox_config(input);
         assert!(output.contains("sandbox_mode = \"danger-full-access\""));
-        assert!(output.ends_with("[windows]\nsandbox = \"unelevated\"\n"));
+        // Restore must never invent a [windows] table.
+        assert!(!output.contains("[windows]"));
+        assert_eq!(output, input);
     }
 }

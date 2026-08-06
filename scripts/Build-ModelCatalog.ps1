@@ -2,7 +2,8 @@ param(
     [string]$CodexHome,
     [string]$ConfigPath,
     [string]$OutputPath,
-    [AllowNull()]$DiscoveredOAuthModelsByAccount
+    [AllowNull()]$DiscoveredOAuthModelsByAccount,
+    [AllowNull()][object[]]$RoutePlan
 )
 
 Set-StrictMode -Version Latest
@@ -30,12 +31,16 @@ foreach ($configuredModel in $models) {
         }
     }
 }
-if ($models.Count -eq 0) { throw 'At least one model is required to build the Codex catalog.' }
+if ($models.Count -eq 0) {
+    throw "ROUTER_DEPLOY_NO_MODELS: at least one model is required to build the Codex catalog, but $ConfigPath has none."
+}
 Import-Module (Join-Path $PSScriptRoot 'RouterAdmin.psm1') -Force
-$routePlan = @(Get-RouterModelRoutePlan `
-    -RouterConfig $config `
-    -DiscoveredOAuthModelsByAccount $DiscoveredOAuthModelsByAccount)
-$visibleRoutes = @($routePlan | Where-Object { $_.IncludeInCatalog })
+if ($null -eq $RoutePlan) {
+    $RoutePlan = @(Get-RouterModelRoutePlan `
+        -RouterConfig $config `
+        -DiscoveredOAuthModelsByAccount $DiscoveredOAuthModelsByAccount)
+}
+$visibleRoutes = @($RoutePlan | Where-Object { $_.IncludeInCatalog })
 if ($visibleRoutes.Count -eq 0) { throw 'At least one selected model is required to build the Codex catalog.' }
 
 function Get-ReasoningSpec([string]$Model) {

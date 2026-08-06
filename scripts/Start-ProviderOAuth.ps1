@@ -219,39 +219,116 @@ function Send-CallbackResponse {
     }
 }
 
+function Clear-StaleOAuthCallbackPort {
+    param([Parameter(Mandatory)][int]$Port)
+    $owners = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty OwningProcess -Unique)
+    foreach ($processId in $owners) {
+        if ($processId -le 4) { continue }
+        $process = Get-CimInstance Win32_Process -Filter "ProcessId=$processId" -ErrorAction SilentlyContinue
+        if ($null -eq $process) { continue }
+        $commandLine = [string]$process.CommandLine
+        if ($commandLine -match 'Start-ProviderOAuth|ProviderOAuth|Codex-Router') {
+            try {
+                Stop-Process -Id $processId -Force -ErrorAction Stop
+                Write-Host "Stopped stale OAuth helper on port ${Port} (PID $processId)." -ForegroundColor Yellow
+            } catch { }
+        }
+    }
+    Start-Sleep -Milliseconds 300
+}
+
+function Start-OAuthCallbackListeners {
+    param([Parameter(Mandatory)][int]$Port)
+
+    Clear-StaleOAuthCallbackPort -Port $Port
+    $listeners = [System.Collections.Generic.List[Net.Sockets.TcpListener]]::new()
+    $bindErrors = [System.Collections.Generic.List[string]]::new()
+    foreach ($address in @([Net.IPAddress]::Loopback, [Net.IPAddress]::IPv6Loopback)) {
+        try {
+            $listener = [Net.Sockets.TcpListener]::new($address, $Port)
+            $listener.Start()
+            $listeners.Add($listener)
+        } catch {
+            [void]$bindErrors.Add(("$($address): $($_.Exception.Message)"))
+        }
+    }
+    if ($listeners.Count -eq 0) {
+        throw ("ROUTER_OAUTH_PORT_IN_USE: could not bind callback port {0}. {1}" -f $Port, ($bindErrors -join ' | '))
+    }
+    return @($listeners)
+}
+
+function Stop-OAuthCallbackListeners {
+    param([AllowNull()][object[]]$Listeners)
+    foreach ($listener in @($Listeners)) {
+        if ($null -eq $listener) { continue }
+        try { $listener.Stop() } catch { }
+    }
+}
+
 function Receive-OAuthCallback {
     param(
-        [Parameter(Mandatory)][Net.Sockets.TcpListener]$Listener,
-        [Parameter(Mandatory)][int]$Timeout
+        [Parameter(Mandatory)][object[]]$Listeners,
+        [Parameter(Mandatory)][int]$Timeout,
+        [AllowEmptyString()][string]$CancelMarkerPath = ''
     )
-    $acceptTask = $Listener.AcceptTcpClientAsync()
-    if (-not $acceptTask.Wait([TimeSpan]::FromSeconds($Timeout))) {
-        throw "OAuth callback timed out after $Timeout seconds."
+    $tasks = [System.Collections.Generic.List[System.Threading.Tasks.Task[Net.Sockets.TcpClient]]]::new()
+    foreach ($listener in @($Listeners)) {
+        if ($null -eq $listener) { continue }
+        [void]$tasks.Add($listener.AcceptTcpClientAsync())
     }
-    $client = $acceptTask.Result
-    try {
-        $reader = [IO.StreamReader]::new($client.GetStream(), [Text.Encoding]::ASCII, $false, 4096, $true)
-        try {
-            $requestLine = $reader.ReadLine()
-            while ($reader.ReadLine()) { }
-        } finally {
-            $reader.Dispose()
-        }
-        if ($requestLine -notmatch '^GET\s+(\S+)\s+HTTP/') {
-            throw 'OAuth callback request was not recognized.'
-        }
-        $callback = [Uri]("http://localhost" + $Matches[1])
-        $query = [Web.HttpUtility]::ParseQueryString($callback.Query)
-        if ($query['error']) { throw "OAuth authorization failed: $($query['error'])" }
-        if (-not $query['code']) { throw 'OAuth callback did not contain an authorization code.' }
-        Send-CallbackResponse -Client $client -Message 'Authorization received successfully.'
-        return [pscustomobject]@{
-            Code = [string]$query['code']
-            State = [string]$query['state']
-        }
-    } finally {
-        $client.Dispose()
+    if ($tasks.Count -eq 0) {
+        throw 'OAuth callback listener was not started.'
     }
+
+    $deadline = [DateTime]::UtcNow.AddSeconds([Math]::Max(5, $Timeout))
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if ($CancelMarkerPath -and (Test-Path -LiteralPath $CancelMarkerPath)) {
+            throw 'ROUTER_OAUTH_CANCELLED: OAuth login was cancelled.'
+        }
+        for ($index = 0; $index -lt $tasks.Count; $index++) {
+            $task = $tasks[$index]
+            if (-not $task.IsCompleted) { continue }
+            if ($task.IsFaulted) {
+                throw ("OAuth callback listener failed: {0}" -f $task.Exception.GetBaseException().Message)
+            }
+            $client = $task.Result
+            try {
+                $reader = [IO.StreamReader]::new($client.GetStream(), [Text.Encoding]::ASCII, $false, 4096, $true)
+                try {
+                    $requestLine = $reader.ReadLine()
+                    while ($reader.ReadLine()) { }
+                } finally {
+                    $reader.Dispose()
+                }
+                if ($requestLine -notmatch '^GET\s+(\S+)\s+HTTP/') {
+                    throw 'OAuth callback request was not recognized.'
+                }
+                $callback = [Uri]("http://localhost" + $Matches[1])
+                $query = [Web.HttpUtility]::ParseQueryString($callback.Query)
+                if ($query['error']) {
+                    $description = [string]$query['error_description']
+                    if ([string]::IsNullOrWhiteSpace($description)) {
+                        throw "OAuth authorization failed: $($query['error'])"
+                    }
+                    throw "OAuth authorization failed: $($query['error']) ($description)"
+                }
+                if (-not $query['code']) {
+                    throw 'OAuth callback did not contain an authorization code.'
+                }
+                Send-CallbackResponse -Client $client -Message 'Authorization received successfully.'
+                return [pscustomobject]@{
+                    Code = [string]$query['code']
+                    State = [string]$query['state']
+                }
+            } finally {
+                $client.Dispose()
+            }
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    throw "ROUTER_OAUTH_CALLBACK_TIMEOUT: OAuth callback timed out after $Timeout seconds. Close the browser tab and click Cancel, then retry."
 }
 
 function Copy-Fields {
@@ -326,11 +403,14 @@ try {
     if (-not $routerHealthy) {
         $prepareStage = 'router_start'
         & (Join-Path $PSScriptRoot 'Initialize-Router.ps1') | Out-Null
-        & (Join-Path $PSScriptRoot 'Start-Router.ps1') | Out-Null
+        # Same recovery path as Ensure-RouterHealthy: first-run OAuth prepare and
+        # interrupted startups can leave a half-ready listener that plain Start
+        # would refuse to touch. RepairUnhealthy only heals local Router state.
+        & (Join-Path $PSScriptRoot 'Start-Router.ps1') -RepairUnhealthy | Out-Null
     }
 $prepareStage = 'admin_login'
 $session = New-RouterAdminSession
-$listener = $null
+$callbackListeners = @()
 $credentials = $null
 $tokenMap = $null
 try {
@@ -362,10 +442,10 @@ try {
         Select-Object -First 1
     if (-not $group) {
         $group = Get-RouterResponseData (
-            Invoke-RouterApi -Session $session -Method POST -Path '/api/v1/admin/groups' -IdempotencyKey 'codex-router-oauth-onboarding-group-v1' -Body @{
+            Invoke-RouterApi -Session $session -Method POST -Path '/api/v1/admin/groups' -IdempotencyKey 'codex-router-oauth-onboarding-group-v2-composite' -Body @{
                 name = 'Codex-Router'
                 description = 'Single-user local Codex multi-model router managed by Codex-Router.'
-                platform = 'openai'
+                platform = 'composite'
                 rate_multiplier = 1.0
                 is_exclusive = $false
                 subscription_type = 'standard'
@@ -383,6 +463,27 @@ try {
     if (Test-Path -LiteralPath $configPath) {
         $routerConfig = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
         $priority = [int](Get-RouterOAuthRoutingPriorities -OAuthFallback $routerConfig.oauthFallback).OAuthPriority
+    }
+    # Same-platform multi-account: place the new login after existing peers so the
+    # user can raise it later from the OAuth page priority control.
+    $samePlatformPriorities = @()
+    $samePlatformNames = @()
+    foreach ($existingAccount in @(Get-RouterAccounts -Session $session)) {
+        $existingPlatform = Get-OptionalString -Object $existingAccount -Name 'platform'
+        $existingType = Get-OptionalString -Object $existingAccount -Name 'type'
+        if ($existingType -ne 'oauth') { continue }
+        if (-not [string]::Equals($existingPlatform, $Provider, [StringComparison]::OrdinalIgnoreCase)) { continue }
+        $samePlatformNames += (Get-OptionalString -Object $existingAccount -Name 'name')
+        $priorityProperty = $existingAccount.PSObject.Properties['priority']
+        if ($null -ne $priorityProperty -and $null -ne $priorityProperty.Value) {
+            try { $samePlatformPriorities += [int]$priorityProperty.Value } catch { }
+        }
+    }
+    $forceAccountChooser = $samePlatformNames.Count -gt 0
+    if ($samePlatformPriorities.Count -gt 0) {
+        $priority = ([int](($samePlatformPriorities | Measure-Object -Maximum).Maximum)) + 1
+        if ($priority -gt 999) { $priority = 999 }
+        if ($priority -lt 1) { $priority = 1 }
     }
 
     $geminiOAuthType = 'google_one'
@@ -434,17 +535,19 @@ try {
         'grok' { 56121 }
         default { 0 }
     }
+    # OpenAI's public OAuth client only allows http://localhost:1455/auth/callback.
+    # Using 127.0.0.1 here produces authorize_hydra_invalid_request. Listen on
+    # both IPv4 and IPv6 loopback so Windows localhost resolution always works.
+    $callbackRedirectUri = "http://localhost:${callbackPort}/auth/callback"
+    $callbackListeners = @()
     if ($automaticCallback) {
-        # OAuth callbacks are local-only. Binding to all interfaces can trigger
-        # a Windows Firewall consent dialog and is unnecessary here.
-        $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, $callbackPort)
-        $listener.Start()
+        $callbackListeners = @(Start-OAuthCallbackListeners -Port $callbackPort)
     }
 
     $authRequest = switch ($Provider) {
         'openai' {
             Invoke-RouterApi -Session $session -Method POST -Path '/api/v1/admin/openai/generate-auth-url' -Body @{
-                redirect_uri = 'http://localhost:1455/auth/callback'
+                redirect_uri = $callbackRedirectUri
             }
         }
         'anthropic' {
@@ -469,6 +572,27 @@ try {
     if (-not $auth.auth_url -or -not $auth.session_id) {
         throw "Sub2API returned an incomplete $Provider OAuth authorization response."
     }
+    # When this machine already has accounts for the same provider, force the
+    # identity provider to show a fresh login / account chooser. Without this,
+    # the browser silently reuses the previous session and multi-account login
+    # appears broken (no device/account prompt).
+    if ($forceAccountChooser) {
+        try {
+            $originalUrl = [string]$auth.auth_url
+            $separator = if ($originalUrl.Contains('?')) { '&' } else { '?' }
+            if ($originalUrl -notmatch '(?i)(?:\?|&)prompt=') {
+                $promptValue = if ($Provider -in @('gemini', 'antigravity')) { 'select_account' } else { 'login' }
+                $originalUrl = $originalUrl + $separator + 'prompt=' + [Uri]::EscapeDataString($promptValue)
+                $separator = '&'
+            }
+            if ($Provider -in @('openai', 'grok') -and $originalUrl -notmatch '(?i)(?:\?|&)max_age=') {
+                $originalUrl = $originalUrl + $separator + 'max_age=0'
+            }
+            $auth.auth_url = $originalUrl
+        } catch {
+            # Keep the original URL if it cannot be rewritten.
+        }
+    }
 
     if ($ProbeOnly) {
         $authUri = [Uri][string]$auth.auth_url
@@ -488,14 +612,37 @@ try {
     }
     Write-Host ''
     Write-Host "Opened the official $Provider authorization page." -ForegroundColor Cyan
+    if ($forceAccountChooser) {
+        Write-Host "This machine already has $($samePlatformNames.Count) $Provider OAuth account(s)." -ForegroundColor Yellow
+        Write-Host 'If the browser stays on the previous account, use "Switch account" / "Use another account" on the provider page.' -ForegroundColor Yellow
+    }
     if ($automaticCallback) {
         Write-Host 'Complete login in the browser. Codex-Router will receive the callback automatically.'
-        $callback = Receive-OAuthCallback -Listener $listener -Timeout $TimeoutSeconds
+        Write-Host 'If you close the browser tab, return to Codex-Router and click Cancel OAuth, then retry.'
+        if ($Provider -eq 'grok') {
+            Write-Host 'xAI uses browser OAuth (not a device code). Stay on this window until the callback returns.'
+        }
+        $cancelMarker = Join-Path ([IO.Path]::GetTempPath()) ("codex-router-oauth-cancel-$PID.marker")
+        Remove-Item -LiteralPath $cancelMarker -Force -ErrorAction SilentlyContinue
+        try {
+            $callback = Receive-OAuthCallback `
+                -Listeners $callbackListeners `
+                -Timeout ([Math]::Min(300, [Math]::Max(60, $TimeoutSeconds))) `
+                -CancelMarkerPath $cancelMarker
+        } finally {
+            Stop-OAuthCallbackListeners -Listeners $callbackListeners
+            Remove-Item -LiteralPath $cancelMarker -Force -ErrorAction SilentlyContinue
+        }
         $code = $callback.Code
         $state = if ($callback.State) { $callback.State } else { Get-OptionalString -Object $auth -Name 'state' }
     } else {
-        Write-Host 'Complete login in the browser, copy the authorization code shown by the provider,'
-        Write-Host 'then paste it below. The code is used only for this local OAuth exchange.'
+        Write-Host ''
+        Write-Host '=== Manual authorization code required ===' -ForegroundColor Cyan
+        Write-Host "Provider: $Provider"
+        Write-Host '1. Finish sign-in in the browser window that just opened.'
+        Write-Host '2. Copy the authorization code / one-time code shown by the provider.'
+        Write-Host '3. Paste it below and press Enter. The code never leaves this machine except for the local token exchange.'
+        Write-Host ''
         $code = Read-Host 'Authorization code'
         $state = Get-OptionalString -Object $auth -Name 'state'
     }
@@ -503,12 +650,18 @@ try {
 
     if ($Provider -eq 'openai') {
         if ([string]::IsNullOrWhiteSpace($state)) { throw 'OpenAI callback did not contain state.' }
+        $openaiName = 'ChatGPT OAuth'
+        $suffix = 2
+        while ($samePlatformNames -contains $openaiName) {
+            $openaiName = "ChatGPT OAuth $suffix"
+            $suffix++
+        }
         $accountResponse = Invoke-RouterApi -Session $session -Method POST -Path '/api/v1/admin/openai/create-from-oauth' -Body @{
             session_id = [string]$auth.session_id
             code = $code
             state = $state
-            redirect_uri = 'http://localhost:1455/auth/callback'
-            name = 'ChatGPT OAuth'
+            redirect_uri = $callbackRedirectUri
+            name = $openaiName
             concurrency = 3
             priority = $priority
             group_ids = @([long]$group.id)
@@ -594,6 +747,22 @@ try {
             'antigravity' { 'Antigravity OAuth' }
             'grok' { 'Grok OAuth' }
         }
+        # Distinguish multi-account cards instead of colliding on the same label.
+        $baseDisplayName = $displayName
+        $suffix = 2
+        while ($samePlatformNames -contains $displayName) {
+            $displayName = "$baseDisplayName $suffix"
+            $suffix++
+        }
+        $accountEmail = ''
+        if ($credentials.Contains('email')) { $accountEmail = [string]$credentials['email'] }
+        elseif ($extra.Contains('email')) { $accountEmail = [string]$extra['email'] }
+        if ($accountEmail) {
+            $emailLabel = "$baseDisplayName ($accountEmail)"
+            if ($samePlatformNames -notcontains $emailLabel) {
+                $displayName = $emailLabel
+            }
+        }
         $accountResponse = Invoke-RouterApi -Session $session -Method POST -Path '/api/v1/admin/accounts' -Body @{
             name = $displayName
             notes = 'Created by Codex-Router direct OAuth flow.'
@@ -625,7 +794,8 @@ try {
     }
     exit 1
 } finally {
-    if ($listener) { $listener.Stop() }
+    Stop-OAuthCallbackListeners -Listeners $callbackListeners
+    $callbackListeners = @()
     $code = $null
     $state = $null
     if ($credentials) { $credentials.Clear() }

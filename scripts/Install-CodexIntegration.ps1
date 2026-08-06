@@ -29,12 +29,18 @@ $routerConfig = if (Test-Path -LiteralPath $routerConfigPath) {
     $null
 }
 
-$catalogPath = Join-Path $routerRoot 'config\model-catalog.json'
+$catalogPath = Join-Path (Get-RouterUserDataRoot -RouterRoot $routerRoot) 'model-catalog.json'
+$packageCatalogPath = Join-Path $routerRoot 'config\model-catalog.json'
 if ($null -ne $routerConfig) {
     & "$routerRoot\scripts\Build-ModelCatalog.ps1" `
         -CodexHome $CodexHome `
         -ConfigPath $routerConfigPath `
         -OutputPath $catalogPath
+    [IO.Directory]::CreateDirectory((Split-Path -Parent $packageCatalogPath)) | Out-Null
+    Copy-Item -LiteralPath $catalogPath -Destination $packageCatalogPath -Force
+}
+if (-not (Test-Path -LiteralPath $catalogPath -PathType Leaf)) {
+    throw "Codex model catalog is missing: $catalogPath. Apply a named Router configuration before installing the Codex integration."
 }
 
 [IO.Directory]::CreateDirectory($CodexHome) | Out-Null
@@ -66,6 +72,7 @@ $text = if ($configExisted) { [IO.File]::ReadAllText($codexConfig) } else { '' }
 $permissionSource = Get-CodexPermissionSourceContent -CodexConfigPath $codexConfig -Content $text
 $model = Get-CodexRouterDefaultModel -RouterConfig $routerConfig
 $modelDefaults = Get-CodexRouterModelDefaults -RouterConfig $routerConfig -CatalogPath $catalogPath
+$model = [string]$modelDefaults.Model
 $localKey = Get-RouterCredential -Name 'LocalApiKey' -AllowMissing
 if ([string]::IsNullOrWhiteSpace($localKey)) {
     throw 'The local Router credential is missing. Run Codex-Router.exe before installing the Codex integration.'
@@ -83,13 +90,16 @@ $text = New-CodexRouterConfig `
     -BaseUrl $sub2apiHost `
     -ReasoningEffort $modelDefaults.ReasoningEffort `
     -FastMode $modelDefaults.FastMode `
-    -PermissionSourceContent $permissionSource
+    -RequireOpenAiAuth $true `
+    -PermissionSourceContent $permissionSource `
+    -CodexHome $CodexHome
 
-if ($text -notmatch '(?m)^model_provider\s*=\s*"custom"\s*$' -or
+if ($text -notmatch '(?m)^model_provider\s*=\s*"codex_router"\s*$' -or
     $text -notmatch ('(?m)^model\s*=\s*"' + [Text.RegularExpressions.Regex]::Escape($model) + '"\s*$') -or
-    $text -notmatch '(?m)^requires_openai_auth\s*=\s*(?:true|false)\s*$' -or
+    $text -notmatch '(?ms)^\[model_providers\.codex_router\].*?^requires_openai_auth\s*=\s*(?:true|false)\s*$' -or
     $text -notmatch '(?m)^experimental_bearer_token\s*=\s*".+"\s*$' -or
-    $text -notmatch '(?m)^supports_websockets\s*=\s*false\s*$') {
+    $text -notmatch '(?m)^supports_websockets\s*=\s*false\s*$' -or
+    $text -notmatch '(?m)^base_url\s*=\s*"http://(?:127\.0\.0\.1|localhost):\d+/v1"\s*$') {
     throw 'Generated Codex configuration is missing required router defaults'
 }
 
@@ -104,11 +114,7 @@ if ($configExisted) {
 }
 Write-RouterTextFileAtomic -Path $codexConfig -Text $text
 
-try {
-    Set-CodexUserEnvironmentVariable -Name 'CODEX_ROUTER_API_KEY' -Value $localKey
-} finally {
-    $localKey = $null
-}
+$localKey = $null
 
 if ($configExisted) {
     Write-Output "Codex configuration installed in $CodexHome; backup: $backupPath"

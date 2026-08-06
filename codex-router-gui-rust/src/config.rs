@@ -95,6 +95,11 @@ pub struct UiPreferences {
     pub monitor_api_order: Vec<i64>,
     #[serde(default = "default_true")]
     pub share_codex_state: bool,
+    /// User intent for the dashboard Codex route switch. Kept separately from
+    /// the live config.toml probe so third-party tools that rewrite
+    /// model_providers.custom cannot silently flip the switch off.
+    #[serde(default)]
+    pub prefer_router_mode: bool,
 }
 
 impl Default for UiPreferences {
@@ -106,6 +111,7 @@ impl Default for UiPreferences {
             monitor_subscription_order: Vec::new(),
             monitor_api_order: Vec::new(),
             share_codex_state: true,
+            prefer_router_mode: false,
         }
     }
 }
@@ -676,6 +682,7 @@ mod tests {
             monitor_subscription_order: vec![8, 3],
             monitor_api_order: vec![4, 1],
             share_codex_state: false,
+            prefer_router_mode: true,
         };
         let json = serde_json::to_string(&preferences).unwrap();
         assert!(json.contains(r#""closeBehavior":"minimize_to_tray""#));
@@ -686,6 +693,10 @@ mod tests {
         assert_eq!(restored.monitor_subscription_order, vec![8, 3]);
         assert_eq!(restored.monitor_api_order, vec![4, 1]);
         assert!(!restored.share_codex_state);
+        assert!(restored.prefer_router_mode);
+        let legacy_no_prefer: UiPreferences =
+            serde_json::from_str(r#"{"shareCodexState":true}"#).unwrap();
+        assert!(!legacy_no_prefer.prefer_router_mode);
     }
 
     #[test]

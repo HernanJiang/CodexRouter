@@ -41,6 +41,24 @@ Assert-Equal 1 $disabled.OAuthPriority 'Disabled fallback changed standalone OAu
 Assert-Equal 10 $disabled.ApiPriority 'Disabled fallback changed the legacy API default.'
 
 Assert-Equal 'gpt-5.6-sol' (Get-RouterCanonicalModelId -ModelId 'OpenAI/GPT-5.6') 'Legacy Sol model normalization changed.'
+Assert-Equal $true (Test-RouterSameModel -LeftModelId 'gpt-5.6-sol' -RightModelId 'openai/gpt-5.6') 'OpenRouter OpenAI identity did not match.'
+Assert-Equal $true (Test-RouterSameModel -LeftModelId 'claude-opus-5' -RightModelId 'anthropic/claude-opus-5') 'OpenRouter Anthropic identity did not match.'
+Assert-Equal $true (Test-RouterSameModel -LeftModelId 'gemini-3.6-flash' -RightModelId 'google/gemini-3-6-flash') 'OpenRouter Gemini separator identity did not match.'
+Assert-Equal $true (Test-RouterSameModel -LeftModelId 'grok-4.5' -RightModelId 'x-ai/grok-4.5') 'OpenRouter Grok identity did not match.'
+Assert-Equal $true (Test-RouterSameModel -LeftModelId 'deepseek-v4-flash' -RightModelId 'deepseek/deepseek-v4-flash') 'OpenRouter DeepSeek identity did not match.'
+Assert-Equal $false (Test-RouterSameModel -LeftModelId 'grok-4.5' -RightModelId 'openai/grok-4.5') 'A false provider namespace was accepted.'
+Assert-Equal $false (Test-RouterSameModel -LeftModelId 'claude-opus-5' -RightModelId 'claude-opus-5-fast') 'Fast and standard Claude variants were merged.'
+Assert-Equal $false (Test-RouterSameModel -LeftModelId 'gemini-3.1-pro-high' -RightModelId 'gemini-3.1-pro-low') 'Gemini reasoning variants were merged.'
+Assert-Equal $false (Test-RouterSameModel -LeftModelId 'kimi-for-coding' -RightModelId 'kimi-for-coding-highspeed') 'Kimi highspeed and standard variants were merged.'
+Assert-Equal $false (Test-RouterSameModel -LeftModelId 'kimi-k3' -RightModelId 'k3-256k') 'Kimi context variants were merged by display name only.'
+Assert-Equal $false (Test-RouterSameModel -LeftModelId 'vendor-a/model-x' -RightModelId 'vendor-b/model-x') 'Unknown provider namespaces were merged by leaf ID.'
+Assert-Equal $true (Test-RouterSameModel -LeftModelId 'claude-opus-4-6' -RightModelId 'anthropic/claude-opus-4.6') 'Anthropic separator aliases did not match.'
+Assert-Equal $true (Test-RouterCodingPlanChannel -BaseUrl 'https://api.kimi.com/coding/v1' -ModelId 'kimi-for-coding') 'Kimi Coding Plan endpoint was not recognized.'
+Assert-Equal $false (Test-RouterCodingPlanChannel -BaseUrl 'https://openrouter.ai/api/v1' -ModelId 'kimi-for-coding') 'OpenRouter was misclassified as a Coding Plan.'
+Assert-Equal $true (Test-RouterCodingPlanChannel -BaseUrl 'https://vendor.example/v1' -ModelId 'model-x' -Extra '{"codex_router_channel_kind":"coding_plan"}') 'Explicit Coding Plan marker was ignored.'
+Assert-Equal 0 (Get-RouterChannelTier -Model ([pscustomobject]@{ model='gpt-5.6-sol'; source='oauth'; baseURL='' })) 'OAuth tier is wrong.'
+Assert-Equal 1 (Get-RouterChannelTier -Model ([pscustomobject]@{ model='kimi-for-coding'; source='apikey'; baseURL='https://api.kimi.com/coding/v1'; extra='{}' })) 'Coding Plan tier is wrong.'
+Assert-Equal 2 (Get-RouterChannelTier -Model ([pscustomobject]@{ model='gpt-5.6-sol'; source='apikey'; baseURL='https://openrouter.ai/api/v1'; extra='{}' })) 'Third-party API tier is wrong.'
 
 $cursorStyleNames = [ordered]@{
     'openai/gpt-5.6-sol-fast' = 'ChatGPT-5.6-Sol-Fast'
@@ -51,6 +69,8 @@ $cursorStyleNames = [ordered]@{
     'google/gemini-3-1-pro' = 'Gemini-3.1-Pro'
     'gemini-3-pro-image-preview' = 'Gemini-3-Pro-Image-Preview'
     'deepseek/deepseek-v3.2' = 'DeepSeek-V3.2'
+    'deepseek/deepseek-v4-pro' = 'DeepSeek-V4-Pro'
+    'deepseek/deepseek-v4-flash' = 'DeepSeek-V4-Flash'
     'x-ai/grok-4.5' = 'Grok-4.5'
     'cursor-composer-2.5' = 'Composer-2.5'
     'z-ai/glm-5.2' = 'GLM-5.2'
@@ -79,6 +99,7 @@ foreach ($apiRoute in @($mergedPlan | Where-Object Source -eq 'apikey')) {
     Assert-Equal $true $apiRoute.IsOAuthFallback 'Matching API route was not marked as OAuth fallback.'
     Assert-Equal $true $apiRoute.JoinRouter 'Automatic matching did not join a fallback API route.'
     Assert-Equal 'gpt-5.6-sol' ([string]$apiRoute.RequestModelIds[0]) 'Fallback API route does not accept the OAuth model ID.'
+    Assert-Equal 'gpt-5.6-sol' $apiRoute.PublicModelId 'Fallback API route does not share the OAuth public model ID.'
 }
 
 $implicitConfig = ('{
@@ -236,14 +257,14 @@ $usageUnknownResetState = Get-RouterOAuthRecoveryState -Account ([pscustomobject
     extra = @{ codex_7d_used_percent = 100 }
 }) -NowUtc $now
 Assert-Equal 'probe' $usageUnknownResetState.Action 'Known exhaustion without a reset was not scheduled for probing.'
-Assert-Equal 3600 $usageUnknownResetState.NextCheckSeconds 'Known exhaustion without a reset was queried too often.'
+Assert-Equal 18000 $usageUnknownResetState.NextCheckSeconds 'Known exhaustion without a reset was not limited to one probe per five hours.'
 
 $unknownResetState = Get-RouterOAuthRecoveryState -Account ([pscustomobject]@{
     schedulable = $false
     temp_unschedulable_reason = 'usage limit exceeded'
 }) -NowUtc $now
 Assert-Equal 'probe' $unknownResetState.Action 'An exhausted OAuth account without reset time was not scheduled for probing.'
-Assert-Equal 3600 $unknownResetState.NextCheckSeconds 'Unknown-reset OAuth recovery is not hourly.'
+Assert-Equal 18000 $unknownResetState.NextCheckSeconds 'Unknown-reset OAuth recovery is not limited to one probe per five hours.'
 
 $healthyState = Get-RouterOAuthRecoveryState -Account ([pscustomobject]@{
     schedulable = $true
@@ -268,9 +289,122 @@ foreach ($requiredModel in @(
     }
 }
 
+$antigravitySuggestions = @(Get-RouterOAuthModelSuggestions -Platform antigravity)
+foreach ($requiredModel in @('gemini-3-flash', 'gemini-3.1-pro-high')) {
+    if ($antigravitySuggestions.id -notcontains $requiredModel) {
+        throw "Antigravity OAuth discovery suggestion is missing '$requiredModel'."
+    }
+}
+if ($antigravitySuggestions.id -contains 'gemini-3.6-flash') {
+    throw 'Antigravity suggestions still advertise gemini-3.6-flash, which Antigravity does not expose.'
+}
+
+$grokSuggestions = @(Get-RouterOAuthModelSuggestions -Platform grok)
+if ($grokSuggestions.id -notcontains 'grok-4.5') {
+    throw 'Grok OAuth discovery suggestion is missing grok-4.5.'
+}
+
+$compositePlan = @(Get-RouterCompositeRoutePlan -RoutePlan @(
+    [pscustomobject]@{
+        IncludeInCatalog = $true
+        JoinRouter = $true
+        PublicModelId = 'grok-4.5'
+        Model = [pscustomobject]@{ model = 'grok-4.5'; source = 'oauth'; oauthPlatform = 'grok'; oauthAccountId = 5 }
+    }
+    [pscustomobject]@{
+        IncludeInCatalog = $true
+        JoinRouter = $true
+        PublicModelId = 'gpt-5.6-sol'
+        Model = [pscustomobject]@{ model = 'gpt-5.6-sol'; source = 'apikey'; baseURL = 'https://api.openai.com/v1' }
+    }
+    [pscustomobject]@{
+        IncludeInCatalog = $true
+        JoinRouter = $true
+        PublicModelId = 'gemini-3-flash'
+        Model = [pscustomobject]@{ model = 'gemini-3-flash'; source = 'oauth'; oauthPlatform = 'antigravity'; oauthAccountId = 4 }
+    }
+) -AccountPlatformById @{ '5' = 'grok'; '4' = 'antigravity' })
+Assert-equal 'grok' (@($compositePlan | Where-Object PublicModelId -eq 'grok-4.5')[0].TargetPlatform) 'Grok OAuth composite target platform is wrong.'
+Assert-equal 'openai' (@($compositePlan | Where-Object PublicModelId -eq 'gpt-5.6-sol')[0].TargetPlatform) 'API channel composite target platform is wrong.'
+Assert-equal 'antigravity' (@($compositePlan | Where-Object PublicModelId -eq 'gemini-3-flash')[0].TargetPlatform) 'Antigravity OAuth composite target platform is wrong.'
+
+$fallbackCompositePlan = @(Get-RouterCompositeRoutePlan -RoutePlan @(
+    [pscustomobject]@{
+        IncludeInCatalog = $true
+        JoinRouter = $true
+        PublicModelId = 'grok-4.5'
+        Model = [pscustomobject]@{ model = 'grok-4.5'; source = 'oauth'; oauthPlatform = 'grok'; oauthAccountId = 5 }
+    }
+    [pscustomobject]@{
+        IncludeInCatalog = $false
+        JoinRouter = $true
+        PublicModelId = 'grok-4.5'
+        Model = [pscustomobject]@{ model = 'x-ai/grok-4.5'; source = 'apikey'; baseURL = 'https://openrouter.ai/api/v1' }
+    }
+) -AccountPlatformById @{ '5' = 'grok' })
+Assert-Equal 2 $fallbackCompositePlan.Count 'Cross-platform OAuth/API fallback did not produce two composite routes.'
+Assert-Equal 1 (@($fallbackCompositePlan | Where-Object TargetPlatform -eq 'grok')[0].Priority) 'OAuth composite route priority is wrong.'
+Assert-Equal 100 (@($fallbackCompositePlan | Where-Object TargetPlatform -eq 'openai')[0].Priority) 'API fallback composite route priority is wrong.'
+
+Assert-equal 'anthropic/claude-opus-5' (Get-RouterOpenRouterUpstreamModelId -ModelId 'claude/claude-opus-5') 'OpenRouter Claude id normalization failed.'
+Assert-equal 'anthropic/claude-opus-5' (Get-RouterUpstreamModelId -ModelId 'claude-opus-5' -BaseUrl 'https://openrouter.ai/api/v1') 'OpenRouter bare Claude id normalization failed.'
+Assert-equal 'claude-opus-5' (Get-RouterUpstreamModelId -ModelId 'claude-opus-5' -BaseUrl 'https://api.anthropic.com/v1') 'Non-OpenRouter Claude ids should stay unchanged.'
+
+$servable = @(Get-RouterServableCatalogRoutes -RoutePlan @(
+    [pscustomobject]@{
+        IncludeInCatalog = $true
+        JoinRouter = $true
+        PublicModelId = 'gpt-5.6-sol'
+        CanonicalModelId = 'gpt-5.6-sol'
+        Source = 'oauth'
+        Model = [pscustomobject]@{ model = 'gpt-5.6-sol'; source = 'oauth'; oauthAccountId = 1 }
+        RequestModelIds = @('gpt-5.6-sol')
+        IsOAuthFallback = $false
+        IsMergedOAuthRoute = $true
+        Index = 0
+    }
+    [pscustomobject]@{
+        IncludeInCatalog = $false
+        JoinRouter = $true
+        PublicModelId = 'gpt-5.6-sol'
+        CanonicalModelId = 'gpt-5.6-sol'
+        Source = 'apikey'
+        Model = [pscustomobject]@{ model = 'gpt-5.6-sol'; source = 'apikey'; baseURL = 'https://api.example/v1' }
+        RequestModelIds = @('gpt-5.6-sol')
+        IsOAuthFallback = $true
+        IsMergedOAuthRoute = $false
+        Index = 1
+    }
+    [pscustomobject]@{
+        IncludeInCatalog = $true
+        JoinRouter = $true
+        PublicModelId = 'gpt-5.6-terra'
+        CanonicalModelId = 'gpt-5.6-terra'
+        Source = 'oauth'
+        Model = [pscustomobject]@{ model = 'gpt-5.6-terra'; source = 'oauth'; oauthAccountId = 1 }
+        RequestModelIds = @('gpt-5.6-terra')
+        IsOAuthFallback = $false
+        IsMergedOAuthRoute = $false
+        Index = 2
+    }
+) -IsolatedOAuthAccountIds @{ 1 = 'quota' } -OAuthAccountIds @(1) -OAuthSelectionInitialized $true)
+Assert-Equal 1 @($servable).Count 'Isolated OAuth-only models were not removed from the live catalog.'
+Assert-equal 'gpt-5.6-sol' $servable[0].PublicModelId 'API fallback model was dropped while OAuth was isolated.'
+
 $applySource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Apply-Router.ps1') -Raw
 if ($applySource -notmatch 'Get-RouterOAuthRoutingPriorities') {
     throw 'Apply-Router.ps1 does not use the tested OAuth routing priority resolver.'
+}
+if ($applySource -notmatch "platform = 'composite'" -or
+    $applySource -notmatch 'Sync-RouterCompositeRoutes') {
+    throw 'Apply-Router.ps1 does not deploy a composite Codex-Router group with composite model routes.'
+}
+if ($applySource -notmatch 'Get-RouterServableCatalogRoutes' -or
+    $applySource -notmatch 'isolatedOAuthAccountIds') {
+    throw 'Apply-Router.ps1 does not filter catalog models for isolated OAuth accounts.'
+}
+if ($applySource -notmatch 'Get-RouterUpstreamModelId') {
+    throw 'Apply-Router.ps1 does not normalize upstream model IDs for OpenRouter channels.'
 }
 if ($applySource -notmatch 'Test-RouterFallbackChannelSelected' -or
     $applySource -notmatch '\$shouldJoinRouter') {

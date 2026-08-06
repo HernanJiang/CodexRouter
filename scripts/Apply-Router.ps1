@@ -6,6 +6,11 @@ $routerRoot = Split-Path -Parent $PSScriptRoot
 Import-Module (Join-Path $PSScriptRoot 'UserData.psm1') -Force
 $configPath = Get-RouterConfigPath -RouterRoot $routerRoot
 $dataRoot = Get-RouterDataRoot -RouterRoot $routerRoot
+# Stable catalog path: package folders change between releases, but Codex must
+# keep reading the same model menu after Apply/restart. Resolve it here, while
+# UserData.psm1 is still imported in this scope.
+$catalogPath = Join-Path (Get-RouterUserDataRoot -RouterRoot $routerRoot) 'model-catalog.json'
+$packageCatalogPath = Join-Path $routerRoot 'config\model-catalog.json'
 if (-not (Test-Path -LiteralPath $configPath)) { throw "Configuration not found: $configPath" }
 
 Import-Module (Join-Path $PSScriptRoot 'CredentialStore.psm1') -Force
@@ -59,7 +64,9 @@ if ($null -ne $proxySettings.ProxyUrl -and [bool]$proxySettings.HasCredentials) 
     throw 'ROUTER_PROXY_CREDENTIAL_STORAGE_UNSUPPORTED: The detected proxy uses authentication. This release will not copy proxy credentials into the Sub2API database.'
 }
 $models = @($config.models)
-if ($models.Count -eq 0) { throw 'At least one model is required.' }
+if ($models.Count -eq 0) {
+    throw "ROUTER_DEPLOY_NO_MODELS: at least one model is required, but $configPath has none."
+}
 foreach ($configuredModel in $models) {
     if ([string]$configuredModel.model -eq 'gpt-5.6') {
         $configuredModel.model = 'gpt-5.6-sol'
@@ -71,7 +78,6 @@ foreach ($configuredModel in $models) {
 if ([string]$config.defaultModel -eq 'gpt-5.6') { $config.defaultModel = 'gpt-5.6-sol' }
 $routePlan = @(Get-RouterModelRoutePlan -RouterConfig $config)
 $defaultModel = Get-RouterDefaultPublicModelId -RouterConfig $config -RoutePlan $routePlan
-$catalogPath = Join-Path $routerRoot 'config\model-catalog.json'
 
 function New-RandomLocalKey {
     $buffer = [byte[]]::new(32)
@@ -199,6 +205,8 @@ $defaultModel = Get-RouterDefaultPublicModelId -RouterConfig $config -RoutePlan 
     -ConfigPath $configPath `
     -OutputPath $catalogPath `
     -DiscoveredOAuthModelsByAccount $discoveredOAuthModelsByAccount | Write-Output
+[IO.Directory]::CreateDirectory((Split-Path -Parent $packageCatalogPath)) | Out-Null
+Copy-Item -LiteralPath $catalogPath -Destination $packageCatalogPath -Force
 
 $modelNames = @($routePlan | Where-Object { $_.IncludeInCatalog } | ForEach-Object {
     [string]$_.PublicModelId
@@ -210,7 +218,10 @@ $group = $groups | Where-Object { $_.name -eq $groupName } | Select-Object -Firs
 $groupBody = @{
     name = $groupName
     description = 'Single-user local Codex multi-model router managed by Codex-Router.'
-    platform = 'openai'
+    # Sub2API schedules OAuth accounts by group platform. A single openai group
+    # cannot select grok/antigravity/gemini OAuth accounts, so the Router group
+    # is composite and each public model gets an explicit composite route.
+    platform = 'composite'
     rate_multiplier = 1.0
     is_exclusive = $false
     subscription_type = 'standard'
@@ -223,9 +234,23 @@ $groupBody = @{
 if ($group) {
     $group = Get-RouterResponseData (Invoke-RouterApi -Session $session -Method PUT -Path "/api/v1/admin/groups/$($group.id)" -Body $groupBody)
 } else {
-    $group = Get-RouterResponseData (Invoke-RouterApi -Session $session -Method POST -Path '/api/v1/admin/groups' -Body $groupBody -IdempotencyKey 'codex-router-group-v2')
+    $group = Get-RouterResponseData (Invoke-RouterApi -Session $session -Method POST -Path '/api/v1/admin/groups' -Body $groupBody -IdempotencyKey 'codex-router-group-v3-composite')
 }
 $groupId = [long]$group.id
+$accountPlatformById = Get-RouterAccountPlatformMap -Session $session
+$compositeRoutes = @(Get-RouterCompositeRoutePlan `
+    -RoutePlan $routePlan `
+    -AccountPlatformById $accountPlatformById)
+$compositeSync = Sync-RouterCompositeRoutes `
+    -Session $session `
+    -GroupId $groupId `
+    -CompositeRoutes $compositeRoutes
+Write-Output (
+    'Composite routes: desired={0}; created={1}; updated={2}; removed={3}' -f
+    [int]$compositeSync.Desired,
+    [int]$compositeSync.Created,
+    [int]$compositeSync.Updated,
+    [int]$compositeSync.Removed)
 $managedAccountNames = @()
 $managedAccountTargets = @{}
 $directReachabilityByTarget = @{}
@@ -243,23 +268,32 @@ for ($modelIndex = 0; $modelIndex -lt $models.Count; $modelIndex++) {
         $accountName = 'Codex-Router / ' + $(if ($model.alias) { [string]$model.alias } else { [string]$model.model })
         $managedAccountNames += $accountName
         $managedAccountTargets[$accountName] = ([string]$model.baseURL).TrimEnd('/')
+        $upstreamModelId = Get-RouterUpstreamModelId `
+            -ModelId ([string]$model.model) `
+            -BaseUrl ([string]$model.baseURL)
         $mapping = [ordered]@{}
         foreach ($requestModelId in @($route.RequestModelIds)) {
-            $mapping[[string]$requestModelId] = [string]$model.model
+            $mapping[[string]$requestModelId] = $upstreamModelId
+        }
+        # Also accept the raw configured id when normalization rewrites it
+        # (for example OpenRouter claude/* -> anthropic/*).
+        if (-not $mapping.Contains([string]$model.model)) {
+            $mapping[[string]$model.model] = $upstreamModelId
         }
         $canonicalModelID = Get-RouterCanonicalModelId -ModelId ([string]$model.model)
         $isOAuthFallback = [bool]$route.IsOAuthFallback
         $shouldJoinRouter = [bool]$route.JoinRouter
         $effectivePriority = [Math]::Max(1, [int]$model.priority)
         if ($isOAuthFallback) {
-            $matchingSelectedPriorities = @($models | Where-Object {
+            $matchingSelectedModels = @($models | Where-Object {
                 (Get-ModelSource $_) -ne 'oauth' -and
-                (Get-RouterCanonicalModelId -ModelId ([string]$_.model)) -eq $canonicalModelID -and
+                (Test-RouterSameModel -LeftModelId ([string]$_.model) -RightModelId ([string]$model.model)) -and
                 (Test-RouterFallbackChannelSelected `
                     -Selections $fallbackChannelSelections `
                     -ModelId ([string]$_.model) `
                     -BaseUrl ([string]$_.baseURL))
-            } | ForEach-Object { [Math]::Max(1, [int]$_.priority) })
+            })
+            $matchingSelectedPriorities = @($matchingSelectedModels | ForEach-Object { [Math]::Max(1, [int]$_.priority) })
             $minimumMatchingPriority = [int](
                 $matchingSelectedPriorities | Measure-Object -Minimum).Minimum
             $effectivePriority = Get-RouterEffectiveApiPriority `
@@ -269,6 +303,9 @@ for ($modelIndex = 0; $modelIndex -lt $models.Count; $modelIndex++) {
                 -OAuthPriority $officialPriority `
                 -PreferOAuth ([bool]$routePriorities.PreferOAuth)
         }
+        # Preserve user order inside each tier while enforcing subscription
+        # OAuth -> Coding Plan -> third-party API across all route shapes.
+        $effectivePriority += 1000 * (Get-RouterChannelTier -Model $model)
         $existing = $existingAccounts | Where-Object { $_.name -eq $accountName } | Select-Object -First 1
         $channelGroupIds = @()
         if ($existing) {
@@ -376,6 +413,7 @@ $proxyReplaced = 0
 $proxyCleared = 0
 $proxyCustomPreserved = 0
 $proxyBypassed = 0
+$isolatedOAuthAccountIds = @{}
 foreach ($accountSummary in $existingAccounts) {
     $accountID = [long]$accountSummary.id
     # The list endpoint intentionally returns a compact account summary and
@@ -395,11 +433,27 @@ foreach ($accountSummary in $existingAccounts) {
         if (-not $oauthSelectionInitialized) { continue }
         $selectedByConfig = $oauthAccountIds -contains $accountID
         $recoveryState = Get-RouterOAuthRecoveryState -Account $account
+        if ($selectedByConfig -and [bool]$recoveryState.ShouldIsolate) {
+            $isolatedOAuthAccountIds[$accountID] = [string]$recoveryState.Reason
+        }
         $selected = $selectedByConfig -and -not [bool]$recoveryState.ShouldIsolate
         $nextGroups = @($groupIds | Where-Object { $_ -ne $groupId })
         if ($selected) { $nextGroups += $groupId }
+        # Keep each OAuth account's own scheduler priority so multi-account
+        # same-platform ordering (P1/P2/...) survives Apply. Only fall back to
+        # the profile OAuth priority when the account has no usable value.
+        $accountPriority = $officialPriority
+        $priorityProperty = $account.PSObject.Properties['priority']
+        if ($null -ne $priorityProperty -and $null -ne $priorityProperty.Value) {
+            try {
+                $parsedPriority = [int]$priorityProperty.Value
+                if ($parsedPriority -ge 1 -and $parsedPriority -le 999) {
+                    $accountPriority = $parsedPriority
+                }
+            } catch { }
+        }
         $oauthUpdate = @{
-            priority = $officialPriority
+            priority = $accountPriority
             group_ids = @($nextGroups | Select-Object -Unique)
             confirm_mixed_channel_risk = $true
         }
@@ -470,10 +524,53 @@ Write-Output (
     $proxyCustomPreserved,
     $proxyBypassed)
 
+# Drop catalog/composite entries that no live account can serve (for example
+# ChatGPT OAuth models while that account is quota-isolated). Keep public ids
+# that still have a joined API fallback channel.
+$servableRoutes = @(Get-RouterServableCatalogRoutes `
+    -RoutePlan $routePlan `
+    -IsolatedOAuthAccountIds $isolatedOAuthAccountIds `
+    -OAuthAccountIds $oauthAccountIds `
+    -OAuthSelectionInitialized:$oauthSelectionInitialized)
+$servableModelNames = @($servableRoutes | ForEach-Object { [string]$_.PublicModelId } | Where-Object { $_ } | Select-Object -Unique)
+$removedUnavailable = @($modelNames | Where-Object { $servableModelNames -notcontains $_ })
+if ($removedUnavailable.Count -gt 0 -or (@($servableModelNames).Count -ne @($modelNames).Count)) {
+    Write-Output (
+        'Catalog availability filter: kept={0}; removed-unavailable={1}' -f
+        $servableModelNames.Count,
+        ($(if ($removedUnavailable.Count -gt 0) { $removedUnavailable -join ', ' } else { 'none' }))
+    )
+    $groupBody.models_list_config = @{ enabled = $true; models = @($servableModelNames) }
+    $group = Get-RouterResponseData (Invoke-RouterApi -Session $session -Method PUT -Path "/api/v1/admin/groups/$groupId" -Body $groupBody)
+    $compositeRoutes = @(Get-RouterCompositeRoutePlan `
+        -RoutePlan $servableRoutes `
+        -AccountPlatformById $accountPlatformById)
+    $compositeSync = Sync-RouterCompositeRoutes `
+        -Session $session `
+        -GroupId $groupId `
+        -CompositeRoutes $compositeRoutes
+    Write-Output (
+        'Composite routes (servable): desired={0}; created={1}; updated={2}; removed={3}' -f
+        [int]$compositeSync.Desired,
+        [int]$compositeSync.Created,
+        [int]$compositeSync.Updated,
+        [int]$compositeSync.Removed)
+    $defaultModel = Get-RouterDefaultPublicModelId -RouterConfig $config -RoutePlan $servableRoutes
+    & (Join-Path $PSScriptRoot 'Build-ModelCatalog.ps1') `
+        -ConfigPath $configPath `
+        -OutputPath $catalogPath `
+        -DiscoveredOAuthModelsByAccount $discoveredOAuthModelsByAccount `
+        -RoutePlan $servableRoutes | Write-Output
+    [IO.Directory]::CreateDirectory((Split-Path -Parent $packageCatalogPath)) | Out-Null
+    Copy-Item -LiteralPath $catalogPath -Destination $packageCatalogPath -Force
+    $modelNames = @($servableModelNames)
+}
+
 # Sub2API honors provider reset timestamps when a rate-limit response includes
-# one. The hourly auto-recovery probe covers providers that do not publish a
-# reset time, so an exhausted OAuth account stays out of the request path until
-# it can serve traffic again instead of delaying every request before fallback.
+# one. Codex-Router owns OAuth recovery probes and only runs them on app start
+# and when the user opens the usage monitor / OAuth pages — never as an extra
+# hop on every chat request. Disable any leftover Sub2API scheduled plans so
+# they cannot inject probes into the live request path.
 foreach ($oauthAccountID in $oauthAccountIds) {
     $configuredOAuthModels = @($selectedOAuthModels | Where-Object {
         [long]$_.oauthAccountId -eq $oauthAccountID
@@ -499,7 +596,7 @@ foreach ($oauthAccountID in $oauthAccountIds) {
             continue
         }
         if ($availableModelIDs.Count -eq 0) {
-            Write-Warning "OAuth account $oauthAccountID returned no discoverable models; hourly recovery was not configured."
+            Write-Warning "OAuth account $oauthAccountID returned no discoverable models; on-demand recovery was not configured."
             continue
         }
 
@@ -515,9 +612,9 @@ foreach ($oauthAccountID in $oauthAccountIds) {
         $disabledPlanCount = Disable-RouterScheduledRecoveryPlans `
             -Session $session `
             -AccountId $oauthAccountID
-        Write-Output "OAuth hourly recovery delegated to Codex-Router: account $oauthAccountID / $($probeModel[0]) / disabled overlapping plans $disabledPlanCount"
+        Write-Output "OAuth on-demand recovery delegated to Codex-Router: account $oauthAccountID / $($probeModel[0]) / disabled overlapping plans $disabledPlanCount"
     } catch {
-        Write-Warning "Could not configure hourly recovery for OAuth account $oauthAccountID`: $($_.Exception.Message)"
+        Write-Warning "Could not configure on-demand recovery for OAuth account $oauthAccountID`: $($_.Exception.Message)"
     }
 }
 
@@ -549,6 +646,8 @@ $modelDefaults = Get-CodexRouterModelDefaults `
 $text = if (Test-Path -LiteralPath $codexConfig) { [IO.File]::ReadAllText($codexConfig) } else { '' }
 $permissionSource = Get-CodexPermissionSourceContent -CodexConfigPath $codexConfig -Content $text
 $sub2apiHost = if ($config.deploy.sub2apiHost) { [string]$config.deploy.sub2apiHost } else { 'http://127.0.0.1:18080' }
+# Always keep Codex account/sign-in mode. Never force API-only login, never
+# rewrite auth.json. Local Router auth stays on experimental_bearer_token.
 $text = New-CodexRouterConfig `
     -Content $text `
     -Model $defaultModel `
@@ -557,7 +656,9 @@ $text = New-CodexRouterConfig `
     -BaseUrl $sub2apiHost `
     -ReasoningEffort $modelDefaults.ReasoningEffort `
     -FastMode $modelDefaults.FastMode `
-    -PermissionSourceContent $permissionSource
+    -RequireOpenAiAuth $true `
+    -PermissionSourceContent $permissionSource `
+    -CodexHome $codexHome
 if (Test-Path -LiteralPath $codexConfig) {
     $backup = "$codexConfig.codex-router-$(Get-Date -Format 'yyyyMMdd-HHmmss-fff').bak"
     [IO.File]::Copy($codexConfig, $backup, $false)
@@ -567,15 +668,8 @@ if (Test-Path -LiteralPath $codexConfig) {
         -Keep 3
 }
 Write-RouterTextFileAtomic -Path $codexConfig -Text $text
-Set-CodexUserEnvironmentVariable -Name 'CODEX_ROUTER_API_KEY' -Value $localKey
 
-try {
-    & (Join-Path $PSScriptRoot 'Install-OpenCodeIntegration.ps1') `
-        -RouterConfigPath $configPath `
-        -BaseUrl $sub2apiHost | Write-Output
-} catch {
-    Write-Warning "OpenCode integration was not updated: $($_.Exception.Message)"
-}
+# OpenCode is outside product scope: never rewrite the user's OpenCode config.
 
 $startWithWindows = $true
 $autostartProperty = $config.deploy.PSObject.Properties['startWithWindows']

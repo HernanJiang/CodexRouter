@@ -406,7 +406,6 @@ try {
             'Test-CredentialStore.ps1',
             'Test-OAuthRouting.ps1',
             'Test-OpenAIChannelPolicy.ps1',
-            'Test-OpenCodeIntegration.ps1',
             'Test-ManagedProxy.ps1',
             'Test-ProxyDiscovery.ps1',
             'Test-RouterBaseUri.ps1',

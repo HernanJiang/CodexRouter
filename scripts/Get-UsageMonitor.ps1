@@ -197,18 +197,36 @@ function ConvertFrom-ZenMuxCodingPlanUsage {
     return @($windows)
 }
 
+function Get-CodingPlanEndpoint {
+    param([Parameter(Mandatory)][string]$BaseUrl)
+    $uri = $null
+    if (-not [Uri]::TryCreate($BaseUrl.TrimEnd('/'), [UriKind]::Absolute, [ref]$uri) -or
+        $uri.Scheme -ne 'https' -or
+        -not [string]::IsNullOrEmpty($uri.UserInfo)) {
+        return $null
+    }
+    $endpointHost = $uri.IdnHost.ToLowerInvariant()
+    switch ($endpointHost) {
+        'api.kimi.com' { return [pscustomobject]@{ Provider = 'Kimi Coding Plan'; Uri = 'https://api.kimi.com/coding/v1/usages' } }
+        'open.bigmodel.cn' { return [pscustomobject]@{ Provider = 'Zhipu GLM Coding Plan'; Uri = 'https://open.bigmodel.cn/api/monitor/usage/quota/limit' } }
+        'bigmodel.cn' { return [pscustomobject]@{ Provider = 'Zhipu GLM Coding Plan'; Uri = 'https://open.bigmodel.cn/api/monitor/usage/quota/limit' } }
+        'api.z.ai' { return [pscustomobject]@{ Provider = 'Zhipu GLM Coding Plan'; Uri = 'https://api.z.ai/api/monitor/usage/quota/limit' } }
+        'api.minimaxi.com' { return [pscustomobject]@{ Provider = 'MiniMax Coding Plan'; Uri = 'https://api.minimaxi.com/v1/api/openplatform/coding_plan/remains' } }
+        'api.minimax.io' { return [pscustomobject]@{ Provider = 'MiniMax Coding Plan'; Uri = 'https://api.minimax.io/v1/api/openplatform/coding_plan/remains' } }
+        'api.zenmux.ai' { return [pscustomobject]@{ Provider = 'ZenMux Coding Plan'; Uri = $uri.AbsoluteUri.TrimEnd('/') } }
+        'zenmux.ai' { return [pscustomobject]@{ Provider = 'ZenMux Coding Plan'; Uri = $uri.AbsoluteUri.TrimEnd('/') } }
+        'ark.cn-beijing.volces.com' { return [pscustomobject]@{ Provider = 'Volcengine Coding Plan'; Uri = '' } }
+        default { return $null }
+    }
+}
+
 function Get-CodingPlanUsage {
     param([Parameter(Mandatory)]$Channel)
     $baseUrl = (Get-SafeString -InputObject $Channel -Name 'baseUrl').TrimEnd('/')
     $credentialName = Get-SafeString -InputObject $Channel -Name 'credentialName'
-    $lower = $baseUrl.ToLowerInvariant()
-    $provider = if ($lower.Contains('api.kimi.com/coding')) { 'Kimi Coding Plan' }
-        elseif ($lower.Contains('open.bigmodel.cn') -or $lower.Contains('bigmodel.cn') -or $lower.Contains('api.z.ai')) { 'Zhipu GLM Coding Plan' }
-        elseif ($lower.Contains('api.minimaxi.com') -or $lower.Contains('api.minimax.io')) { 'MiniMax Coding Plan' }
-        elseif ($lower.Contains('zenmux')) { 'ZenMux Coding Plan' }
-        elseif ($lower.Contains('volces.com/api/coding')) { 'Volcengine Coding Plan' }
-        else { '' }
-    if (-not $provider) { return $null }
+    $endpoint = Get-CodingPlanEndpoint -BaseUrl $baseUrl
+    if ($null -eq $endpoint) { return $null }
+    $provider = [string]$endpoint.Provider
     if ($provider -eq 'Volcengine Coding Plan') {
         return [pscustomobject]@{ provider = $provider; windows = @(); note = 'Volcengine quota requires separate control-plane AK/SK credentials; the inference API key cannot query it.' }
     }
@@ -220,18 +238,7 @@ function Get-CodingPlanUsage {
         $headers = @{ Accept = 'application/json' }
         if ($provider -eq 'Zhipu GLM Coding Plan') { $headers.Authorization = $apiKey }
         else { $headers.Authorization = "Bearer $apiKey" }
-        $uri = switch ($provider) {
-            'Kimi Coding Plan' { 'https://api.kimi.com/coding/v1/usages' }
-            'Zhipu GLM Coding Plan' {
-                if ($lower.Contains('bigmodel.cn')) { 'https://open.bigmodel.cn/api/monitor/usage/quota/limit' }
-                else { 'https://api.z.ai/api/monitor/usage/quota/limit' }
-            }
-            'MiniMax Coding Plan' {
-                if ($lower.Contains('api.minimaxi.com')) { 'https://api.minimaxi.com/v1/api/openplatform/coding_plan/remains' }
-                else { 'https://api.minimax.io/v1/api/openplatform/coding_plan/remains' }
-            }
-            'ZenMux Coding Plan' { $baseUrl }
-        }
+        $uri = [string]$endpoint.Uri
         $body = Invoke-RestMethod -Method GET -Uri $uri -Headers $headers -TimeoutSec 15
         $windows = switch ($provider) {
             'Kimi Coding Plan' { ConvertFrom-KimiCodingPlanUsage -Body $body }
@@ -344,7 +351,7 @@ function Get-AccountRecord {
     }
     if ($kind -eq 'oauth') {
         try {
-            $usageTimeout = if ($platform -eq 'grok') { 4 } else { 10 }
+            $usageTimeout = if ($platform -eq 'grok') { 20 } else { 10 }
             $usageData = Get-RouterResponseData (Invoke-RouterApi -Session $Session -Method GET -Path "/api/v1/admin/accounts/$accountId/usage" -TimeoutSec $usageTimeout)
         } catch {
             if (-not $queryNote) {
@@ -395,13 +402,64 @@ function Get-AccountRecord {
 
     if ($kind -eq 'oauth' -and $platform -eq 'grok') {
         try {
-            $quota = Get-RouterResponseData (Invoke-RouterApi -Session $Session -Method GET -Path "/api/v1/admin/grok/accounts/$accountId/quota" -TimeoutSec 4)
-            foreach ($property in @($quota.PSObject.Properties)) {
-                if ($property.Name -notmatch 'hour|week|month|quota|window') { continue }
-                Add-UsageWindow -Target $windows -Kind 'other' -Window $property.Value -DisplayName $property.Name
+            $quota = Get-RouterResponseData (Invoke-RouterApi -Session $Session -Method GET -Path "/api/v1/admin/grok/accounts/$accountId/quota" -TimeoutSec 20)
+            # The Grok billing probe nests real quota under `billing`:
+            #   usage_percent + period_type/period_end  -> subscription window
+            #   used_percent  + billing_period_end      -> monthly spend window
+            #   product_usage[]                         -> per-product windows
+            $billing = Get-SafeValue -InputObject $quota -Name 'billing'
+            if ($null -eq $billing) { $billing = $quota }
+
+            $periodType = Get-SafeString -InputObject $billing -Name 'period_type'
+            $subscriptionKind = switch ($periodType) {
+                'weekly' { 'weekly' }
+                'monthly' { 'monthly' }
+                'daily' { 'other' }
+                default { 'weekly' }
+            }
+            $subscriptionPercent = Get-SafeValue -InputObject $billing -Name 'usage_percent'
+            if ($null -ne $subscriptionPercent) {
+                Add-UsageWindow -Target $windows -Kind $subscriptionKind -Window ([ordered]@{
+                    used_percent = $subscriptionPercent
+                    resets_at = (Get-SafeValue -InputObject $billing -Name 'period_end')
+                }) -DisplayName (Get-SafeString -InputObject $billing -Name 'plan')
+            }
+
+            $monthlyPercent = Get-SafeValue -InputObject $billing -Name 'used_percent'
+            if ($null -ne $monthlyPercent -and $subscriptionKind -ne 'monthly') {
+                $usedCents = [long](Get-SafeNumber -InputObject $billing -Name 'used_cents')
+                $limitCents = [long](Get-SafeNumber -InputObject $billing -Name 'monthly_limit_cents')
+                $monthlyLabel = if ($limitCents -gt 0) {
+                    '月度额度 ${0:N2} / ${1:N2}' -f ($usedCents / 100), ($limitCents / 100)
+                } else {
+                    '月度额度'
+                }
+                Add-UsageWindow -Target $windows -Kind 'monthly' -Window ([ordered]@{
+                    used_percent = $monthlyPercent
+                    resets_at = (Get-SafeValue -InputObject $billing -Name 'billing_period_end')
+                }) -DisplayName $monthlyLabel
+            }
+
+            foreach ($product in @(Get-SafeValue -InputObject $billing -Name 'product_usage')) {
+                if ($null -eq $product) { continue }
+                $productPercent = Get-SafeValue -InputObject $product -Name 'usage_percent'
+                if ($null -eq $productPercent) { continue }
+                $productName = Get-SafeString -InputObject $product -Name 'product'
+                if (-not $productName) { $productName = 'Grok' }
+                Add-UsageWindow -Target $windows -Kind 'model' -Window ([ordered]@{
+                    used_percent = $productPercent
+                    resets_at = (Get-SafeValue -InputObject $billing -Name 'period_end')
+                }) -DisplayName $productName
+            }
+
+            if (@($windows).Count -eq 0) {
+                $statusCode = [long](Get-SafeNumber -InputObject $quota -Name 'status_code')
+                if ($statusCode -gt 0 -and $statusCode -ne 200) {
+                    $queryNote = "Grok quota probe returned status $statusCode; showing passive usage."
+                }
             }
         } catch {
-            if (-not $queryNote) { $queryNote = 'Grok live quota timed out; showing the latest passive usage.' }
+            if (-not $queryNote) { $queryNote = 'Grok live quota unavailable; showing the latest passive usage.' }
         }
     }
 
@@ -542,11 +600,18 @@ try {
                 ConvertTo-RouterResetAtUtc -Value $_.resetAt
             } | Where-Object { $null -ne $_ } | Sort-Object)
             $resetAt = if ($resetTimes.Count -gt 0) { $resetTimes[-1].UtcDateTime.ToString('o') } else { '' }
+            $prior = if ($observations.ContainsKey([long]$record.id)) { $observations[[long]$record.id] } else { $null }
+            $priorLastProbe = if ($null -eq $prior) { $null } else { $prior.PSObject.Properties['lastProbeAt'] }
+            $priorNextProbe = if ($null -eq $prior) { $null } else { $prior.PSObject.Properties['nextProbeAt'] }
+            $priorError = if ($null -eq $prior) { $null } else { $prior.PSObject.Properties['recentError'] }
             $observations[[long]$record.id] = [pscustomobject][ordered]@{
                 accountId = [long]$record.id
                 exhausted = $true
                 resetAt = $resetAt
                 observedAt = [DateTime]::UtcNow.ToString('o')
+                lastProbeAt = if ($null -eq $priorLastProbe) { '' } else { [string]$priorLastProbe.Value }
+                nextProbeAt = if ($null -eq $priorNextProbe) { '' } else { [string]$priorNextProbe.Value }
+                recentError = if ($null -eq $priorError) { '' } else { [string]$priorError.Value }
             }
             if ($routerGroupId -gt 0) {
                 [void](Set-RouterAccountGroupMembership -Session $session -AccountId ([long]$record.id) `

@@ -23,7 +23,8 @@ $requiredFunctions = @(
     'ConvertFrom-KimiCodingPlanUsage',
     'ConvertFrom-ZhipuCodingPlanUsage',
     'ConvertFrom-MiniMaxCodingPlanUsage',
-    'ConvertFrom-ZenMuxCodingPlanUsage'
+    'ConvertFrom-ZenMuxCodingPlanUsage',
+    'Get-CodingPlanEndpoint'
 )
 foreach ($name in $requiredFunctions) {
     $definition = $ast.FindAll({
@@ -106,4 +107,52 @@ Assert-True ($zenmux.Count -eq 2) 'ZenMux Coding Plan windows were not parsed.'
 Assert-True ([double]$zenmux[0].usedPercent -eq 25.0) 'ZenMux five-hour ratio was not converted to percent.'
 Assert-True ([double]$zenmux[1].usedPercent -eq 80.0) 'ZenMux weekly ratio was not converted to percent.'
 
+$safeZenMux = Get-CodingPlanEndpoint -BaseUrl 'https://api.zenmux.ai/api/v1'
+Assert-True ($safeZenMux.Provider -eq 'ZenMux Coding Plan') 'The exact ZenMux host was rejected.'
+Assert-True ($null -eq (Get-CodingPlanEndpoint -BaseUrl 'https://attacker.example/zenmux')) `
+    'A host containing the ZenMux name could receive a selected credential.'
+Assert-True ($null -eq (Get-CodingPlanEndpoint -BaseUrl 'https://api.zenmux.ai.attacker.example/v1')) `
+    'A suffix-confusion ZenMux host could receive a selected credential.'
+Assert-True ($null -eq (Get-CodingPlanEndpoint -BaseUrl 'http://api.zenmux.ai/v1')) `
+    'A coding-plan credential could be sent over plaintext HTTP.'
+Assert-True ($null -eq (Get-CodingPlanEndpoint -BaseUrl 'https://user@api.zenmux.ai/v1')) `
+    'A URL containing userinfo was accepted for a credential-bearing request.'
+
 Write-Output 'Usage monitor parsing tests passed.'
+
+# Grok billing-probe shape: real quota lives under `billing`, not at the root.
+$grokWindows = [System.Collections.ArrayList]::new()
+$grokBilling = [pscustomobject]@{
+    period_type = 'weekly'
+    usage_percent = 100
+    period_end = '2026-08-11T19:33:07.739361+08:00'
+    plan = 'SuperGrok'
+    used_percent = 30.88
+    used_cents = 4632
+    monthly_limit_cents = 15000
+    billing_period_end = '2026-09-01T08:00:00+08:00'
+    product_usage = @([pscustomobject]@{ product = 'GrokBuild'; usage_percent = 100 })
+}
+Add-UsageWindow -Target $grokWindows -Kind 'weekly' -Window ([ordered]@{
+    used_percent = $grokBilling.usage_percent
+    resets_at = $grokBilling.period_end
+}) -DisplayName $grokBilling.plan
+Add-UsageWindow -Target $grokWindows -Kind 'monthly' -Window ([ordered]@{
+    used_percent = $grokBilling.used_percent
+    resets_at = $grokBilling.billing_period_end
+}) -DisplayName 'monthly'
+Add-UsageWindow -Target $grokWindows -Kind 'model' -Window ([ordered]@{
+    used_percent = $grokBilling.product_usage[0].usage_percent
+    resets_at = $grokBilling.period_end
+}) -DisplayName $grokBilling.product_usage[0].product
+Assert-True ($grokWindows.Count -eq 3) 'Grok billing windows were not parsed.'
+Assert-True ($grokWindows[0].kind -eq 'weekly' -and [double]$grokWindows[0].usedPercent -eq 100.0) 'Grok weekly subscription usage is incorrect.'
+Assert-True ($grokWindows[0].displayName -eq 'SuperGrok') 'Grok plan name was not shown on the weekly window.'
+Assert-True ($grokWindows[1].kind -eq 'monthly' -and [double]$grokWindows[1].usedPercent -eq 30.88) 'Grok monthly spend usage is incorrect.'
+Assert-True ($grokWindows[2].kind -eq 'model' -and $grokWindows[2].displayName -eq 'GrokBuild') 'Grok per-product window was dropped.'
+Assert-True ($grokWindows[0].resetAt -ne '' -and $grokWindows[1].resetAt -ne '') 'Grok reset times were not parsed.'
+
+$grokSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Get-UsageMonitor.ps1') -Raw
+Assert-True ($grokSource -match "Name 'billing'") 'Grok quota parsing no longer reads the billing payload.'
+Assert-True ($grokSource -notmatch 'quota" -TimeoutSec 4') 'Grok quota probe still uses the too-aggressive 4s timeout.'
+Assert-True ($grokSource -match 'product_usage') 'Grok per-product quota parsing was removed.'
