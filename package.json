@@ -1,6 +1,6 @@
 {
   "name": "Codex-Router",
-  "version": "1.3.10",
+  "version": "1.3.12",
   "description": "Codex + Sub2API router configuration UI and deployment helpers",
   "private": true,
   "scripts": {

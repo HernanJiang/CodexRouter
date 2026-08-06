@@ -100,6 +100,10 @@ pub struct UiPreferences {
     /// model_providers.custom cannot silently flip the switch off.
     #[serde(default)]
     pub prefer_router_mode: bool,
+    /// After first successful post-setup OAuth login, the "add models" tip is
+    /// shown once and then suppressed.
+    #[serde(default)]
+    pub oauth_model_hint_seen: bool,
 }
 
 impl Default for UiPreferences {
@@ -112,6 +116,7 @@ impl Default for UiPreferences {
             monitor_api_order: Vec::new(),
             share_codex_state: true,
             prefer_router_mode: false,
+            oauth_model_hint_seen: false,
         }
     }
 }
@@ -683,6 +688,7 @@ mod tests {
             monitor_api_order: vec![4, 1],
             share_codex_state: false,
             prefer_router_mode: true,
+            oauth_model_hint_seen: true,
         };
         let json = serde_json::to_string(&preferences).unwrap();
         assert!(json.contains(r#""closeBehavior":"minimize_to_tray""#));

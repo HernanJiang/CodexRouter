@@ -882,34 +882,11 @@ function Get-RouterModelRoutePlan {
             }
         }
     )
+    # Only OAuth model rows the user explicitly added participate in routing.
+    # Enrolling an OAuth account alone must not invent primary OAuth routes or
+    # force same-name third-party channels into fallback-only mode.
     $selectedOAuth = @($descriptors | Where-Object { $_.Source -eq 'oauth' -and $_.Selected })
-    if ($oauthSelectionInitialized -and $fallbackEnabled) {
-        foreach ($accountId in $oauthAccountIds) {
-            $hasExplicitModelsForAccount = @($selectedOAuth | Where-Object {
-                [long]$_.Model.oauthAccountId -eq $accountId
-            }).Count -gt 0
-            if ($hasExplicitModelsForAccount) { continue }
-
-            foreach ($modelId in @(Get-RouterDiscoveredOAuthModelsForAccount `
-                -DiscoveredOAuthModelsByAccount $DiscoveredOAuthModelsByAccount `
-                -AccountId $accountId)) {
-                $selectedOAuth += [pscustomobject][ordered]@{
-                    Index = -1
-                    Model = [pscustomobject][ordered]@{
-                        model = $modelId
-                        source = 'oauth'
-                        oauthAccountId = $accountId
-                    }
-                    ModelId = $modelId
-                    Source = 'oauth'
-                    CanonicalModelId = Get-RouterCanonicalModelId -ModelId $modelId
-                    Identity = Get-RouterModelIdentity -ModelId $modelId
-                    Selected = $true
-                    Discovered = $true
-                }
-            }
-        }
-    }
+    $null = $DiscoveredOAuthModelsByAccount
     $catalogIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $plan = @(
         foreach ($descriptor in $descriptors) {

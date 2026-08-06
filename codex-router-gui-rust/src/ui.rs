@@ -574,6 +574,7 @@ impl eframe::App for CodexRouterApp {
         // restore CJK fonts first. Otherwise the UI becomes tofu boxes.
         let needs_full_fonts = self.close_prompt_open
             || self.apply_success_dialog_open
+            || self.oauth_post_login_prompt_open
             || self.oauth_priority_target.is_some()
             || self.oauth_revoke_target.is_some()
             || self.update_dialog_open
@@ -706,6 +707,9 @@ impl eframe::App for CodexRouterApp {
         }
         if self.apply_success_dialog_open {
             self.show_apply_success_dialog(&ctx, &palette);
+        }
+        if self.oauth_post_login_prompt_open {
+            self.show_oauth_post_login_prompt(&ctx, &palette);
         }
         if self.sub2api_intro_open {
             self.show_sub2api_intro(&ctx, &palette);
@@ -884,6 +888,115 @@ impl CodexRouterApp {
             .stroke(egui::Stroke::new(1.0, palette.line))
             .corner_radius(egui::CornerRadius::same(10)),
         )
+    }
+
+    fn show_oauth_post_login_prompt(&mut self, ctx: &egui::Context, palette: &theme::Palette) {
+        let zh = self.ui_language == "zh";
+        let mut open_oauth = false;
+        let mut dismissed = false;
+        let dialog_size = fit_dialog_size(
+            ctx.content_rect().size(),
+            egui::vec2(520.0, 340.0),
+            egui::vec2(400.0, 280.0),
+        );
+        egui::Window::new("")
+            .id(egui::Id::new("oauth-post-login-prompt"))
+            .title_bar(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(egui::Color32::TRANSPARENT)
+                    .inner_margin(egui::Margin::ZERO),
+            )
+            .default_size(dialog_size)
+            .min_size(dialog_size)
+            .max_size(dialog_size)
+            .show(ctx, |ui| {
+                theme::glass_frame(palette).show(ui, |ui| {
+                    ui.set_width(dialog_size.x - 8.0);
+                    ui.horizontal(|ui| {
+                        theme::eyebrow(
+                            ui,
+                            t(zh, "OAUTH · 下一步", "OAUTH · NEXT STEP"),
+                            palette.muted,
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("×")
+                                            .size(18.0)
+                                            .color(palette.ink_soft),
+                                    )
+                                    .fill(egui::Color32::TRANSPARENT)
+                                    .stroke(egui::Stroke::NONE),
+                                )
+                                .on_hover_text(t(zh, "关闭", "Close"))
+                                .clicked()
+                            {
+                                dismissed = true;
+                            }
+                        });
+                    });
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(t(zh, "登录成功", "Signed in"))
+                            .font(egui::FontId::new(28.0, theme::display_family()))
+                            .color(palette.ink),
+                    );
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new(t(
+                            zh,
+                            "请在本页选择要使用的模型，并加入当前配置的模型列表。",
+                            "Choose the models you want on this page and add them to the active profile list.",
+                        ))
+                        .size(15.5)
+                        .strong()
+                        .color(palette.ink),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(t(
+                            zh,
+                            "仅完成账号认证不会改写路由。加入模型并保存应用后，才会按 OAuth 优先、第三方兜底生效；若暂不加入，将继续使用模型列表中的第三方渠道。",
+                            "Signing in alone does not change routing. After you add models and Save & apply, OAuth is preferred with third-party fallback. Skip for now and existing API channels keep serving.",
+                        ))
+                        .color(palette.ink_soft),
+                    );
+                    ui.add_space(20.0);
+                    ui.horizontal(|ui| {
+                        if theme::primary_button(
+                            ui,
+                            egui::RichText::new(t(zh, "去选择模型", "Choose models"))
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                            palette,
+                        )
+                        .clicked()
+                        {
+                            open_oauth = true;
+                        }
+                        ui.add_space(8.0);
+                        if theme::secondary_button(ui, t(zh, "知道了", "Got it"), palette).clicked()
+                        {
+                            dismissed = true;
+                        }
+                    });
+                });
+            });
+        if open_oauth || dismissed {
+            self.oauth_post_login_prompt_open = false;
+            if !self.oauth_model_hint_seen {
+                self.oauth_model_hint_seen = true;
+                let _ = self.persist_ui_preferences();
+            }
+            if open_oauth {
+                self.open_oauth_manager();
+            }
+        }
     }
 
     fn show_apply_success_dialog(&mut self, ctx: &egui::Context, palette: &theme::Palette) {

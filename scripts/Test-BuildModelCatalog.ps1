@@ -154,8 +154,8 @@ try {
         -DiscoveredOAuthModelsByAccount @{'42' = @('gpt-5.6-sol')} | Out-Null
     $implicitMergedCatalog = Get-Content -LiteralPath $outputPath -Raw | ConvertFrom-Json
     if (@($implicitMergedCatalog.models).Count -ne 1 -or
-        $implicitMergedCatalog.models[0].slug -ne 'gpt-5.6-sol') {
-        throw 'Implicit OAuth discovery did not produce one stable merged catalog route.'
+        $implicitMergedCatalog.models[0].slug -ne 'openai/gpt-5.6-sol') {
+        throw 'Account-only OAuth enrollment rewrote the configured API catalog route.'
     }
 
     $splitConfig = $mergedConfig | ConvertTo-Json -Depth 10 | ConvertFrom-Json

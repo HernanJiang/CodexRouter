@@ -658,6 +658,8 @@ struct CodexRouterApp {
     oauth_return_page: Page,
     oauth_provider_draft: String,
     provider_oauth_running: bool,
+    oauth_post_login_prompt_open: bool,
+    oauth_model_hint_seen: bool,
     pending_oauth_provider: Option<String>,
     provider_oauth_preparing: bool,
     provider_oauth_preparing_provider: Option<String>,
@@ -1941,6 +1943,7 @@ impl CodexRouterApp {
         let monitor_subscription_order = ui_preferences.monitor_subscription_order;
         let monitor_api_order = ui_preferences.monitor_api_order;
         let share_codex_state = ui_preferences.share_codex_state;
+        let oauth_model_hint_seen = ui_preferences.oauth_model_hint_seen;
         let isolation_profiles = profiles::list_profiles(&router_root).unwrap_or_default();
         let config_path = user_data::config_path(&router_root);
         let (mut config, mut page, configured) = match RouterConfig::load(&config_path) {
@@ -2187,6 +2190,8 @@ impl CodexRouterApp {
             oauth_return_page: Page::Dashboard,
             oauth_provider_draft: "openai".to_owned(),
             provider_oauth_running: false,
+            oauth_post_login_prompt_open: false,
+            oauth_model_hint_seen,
             pending_oauth_provider: None,
             provider_oauth_preparing: false,
             provider_oauth_preparing_provider: None,
@@ -2619,6 +2624,8 @@ impl CodexRouterApp {
             oauth_return_page: Page::Dashboard,
             oauth_provider_draft: "openai".to_owned(),
             provider_oauth_running: false,
+            oauth_post_login_prompt_open: false,
+            oauth_model_hint_seen: false,
             pending_oauth_provider: None,
             provider_oauth_preparing: false,
             provider_oauth_preparing_provider: None,
@@ -2817,6 +2824,7 @@ impl CodexRouterApp {
             monitor_api_order: self.monitor_api_order.clone(),
             share_codex_state: self.share_codex_state,
             prefer_router_mode: self.router_mode_enabled,
+            oauth_model_hint_seen: self.oauth_model_hint_seen,
         };
         match preferences.save(&path) {
             Ok(()) => true,
@@ -3209,34 +3217,57 @@ impl CodexRouterApp {
 
     /// Codex only reloads `config.toml` and the model catalog on a cold start.
     /// Restarting the desktop client here saves the user from doing it manually
-    /// after every apply. Only processes inside the installed Codex/ChatGPT
-    /// package are touched, and a failure never fails the apply.
+    /// after every apply. Only ChatGPT / Codex desktop processes are touched,
+    /// and a failure never fails the apply.
     fn restart_codex_desktop(&mut self) {
         let zh = self.ui_language == "zh";
         let script = r#"
 $ErrorActionPreference = 'SilentlyContinue'
-$targets = @('ChatGPT.exe', 'codex.exe')
-$packageMarkers = @('\WindowsApps\OpenAI.Codex', '\OpenAI\Codex\', '\Programs\ChatGPT\')
-$procs = @(Get-CimInstance Win32_Process | Where-Object {
-  $_.Name -in $targets -and $_.ExecutablePath
-})
+$names = @('ChatGPT', 'codex', 'ChatGPT.exe', 'codex.exe')
 $matched = @()
-foreach ($p in $procs) {
-  foreach ($marker in $packageMarkers) {
-    if ($p.ExecutablePath -like "*$marker*") { $matched += $p; break }
+$seen = @{}
+foreach ($proc in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) {
+  $name = [string]$proc.Name
+  if ([string]::IsNullOrWhiteSpace($name)) { continue }
+  $base = [IO.Path]::GetFileNameWithoutExtension($name)
+  if ($names -notcontains $name -and $names -notcontains $base) { continue }
+  $path = [string]$proc.ExecutablePath
+  if ([string]::IsNullOrWhiteSpace($path)) {
+    try { $path = [string](Get-Process -Id $proc.ProcessId -ErrorAction Stop).Path } catch { $path = '' }
+  }
+  $key = [string]$proc.ProcessId
+  if ($seen.ContainsKey($key)) { continue }
+  $seen[$key] = $true
+  $matched += [pscustomobject]@{ ProcessId = [int]$proc.ProcessId; Name = $name; ExecutablePath = $path }
+}
+if ($matched.Count -eq 0) {
+  foreach ($proc in @(Get-Process -Name 'ChatGPT','codex' -ErrorAction SilentlyContinue)) {
+    $path = ''
+    try { $path = [string]$proc.Path } catch { $path = '' }
+    $matched += [pscustomobject]@{ ProcessId = [int]$proc.Id; Name = [string]$proc.ProcessName; ExecutablePath = $path }
   }
 }
 if ($matched.Count -eq 0) { 'codex-router:codex-not-running'; exit 0 }
-$launch = @($matched | Where-Object { $_.Name -eq 'ChatGPT.exe' } | ForEach-Object { $_.ExecutablePath } | Select-Object -First 1)
-if ($launch.Count -eq 0) { $launch = @($matched | ForEach-Object { $_.ExecutablePath } | Select-Object -First 1) }
-foreach ($p in $matched) { Stop-Process -Id $p.ProcessId -Force }
-Start-Sleep -Seconds 3
-if ($launch.Count -gt 0 -and (Test-Path -LiteralPath $launch[0])) {
-  Start-Process -FilePath $launch[0]
-  'codex-router:codex-restarted'
-} else {
-  'codex-router:codex-relaunch-skipped'
+$launch = @($matched | Where-Object { $_.Name -like 'ChatGPT*' -and -not [string]::IsNullOrWhiteSpace($_.ExecutablePath) } | ForEach-Object { $_.ExecutablePath } | Select-Object -First 1)
+if ($launch.Count -eq 0) {
+  $launch = @($matched | Where-Object { -not [string]::IsNullOrWhiteSpace($_.ExecutablePath) } | ForEach-Object { $_.ExecutablePath } | Select-Object -First 1)
 }
+foreach ($p in $matched) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
+Start-Sleep -Seconds 2
+$relaunched = $false
+if ($launch.Count -gt 0 -and (Test-Path -LiteralPath $launch[0])) {
+  try { Start-Process -FilePath $launch[0]; $relaunched = $true } catch { }
+}
+if (-not $relaunched) {
+  $pkg = @(Get-AppxPackage -Name '*OpenAI*ChatGPT*','*OpenAI*Codex*','*ChatGPT*' -ErrorAction SilentlyContinue | Select-Object -First 1)
+  if ($pkg.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace([string]$pkg[0].PackageFamilyName)) {
+    try {
+      Start-Process -FilePath "$env:SystemRoot\explorer.exe" -ArgumentList ("shell:AppsFolder\" + $pkg[0].PackageFamilyName + "!App")
+      $relaunched = $true
+    } catch { }
+  }
+}
+if ($relaunched) { 'codex-router:codex-restarted' } else { 'codex-router:codex-relaunch-skipped' }
 "#;
         let tx = self.event_tx.clone();
         std::thread::spawn(move || {
@@ -3903,6 +3934,33 @@ if ($launch.Count -gt 0 -and (Test-Path -LiteralPath $launch[0])) {
                 }
                 AppEvent::ProviderOAuthFinished => {
                     self.provider_oauth_running = false;
+                    // Wizard / first-run access never shows the tip. After the
+                    // product is configured, the first successful OAuth add
+                    // from a post-setup surface shows it once.
+                    let wizard_surface = matches!(
+                        self.page,
+                        Page::Welcome
+                            | Page::Project
+                            | Page::Auth
+                            | Page::Model
+                            | Page::Proxy
+                            | Page::Finish
+                    ) || matches!(
+                        self.oauth_return_page,
+                        Page::Welcome
+                            | Page::Project
+                            | Page::Auth
+                            | Page::Model
+                            | Page::Proxy
+                            | Page::Finish
+                    );
+                    if self.configured
+                        && !wizard_surface
+                        && !self.oauth_model_hint_seen
+                        && !self.ui_audit_mode
+                    {
+                        self.oauth_post_login_prompt_open = true;
+                    }
                     self.status_text = if zh {
                         "OAuth 登录成功，正在自动同步到当前配置与用量统计…"
                     } else {

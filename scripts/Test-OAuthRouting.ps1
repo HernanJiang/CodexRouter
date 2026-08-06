@@ -121,11 +121,11 @@ $implicitPlan = @(Get-RouterModelRoutePlan `
 $implicitFallback = @($implicitPlan | Where-Object {
     $_.CanonicalModelId -eq 'gpt-5.6-sol'
 }) | Select-Object -First 1
-Assert-Equal $true $implicitFallback.IsOAuthFallback 'Implicit same-name API route was not marked as OAuth fallback.'
-Assert-Equal $true $implicitFallback.JoinRouter 'Implicit same-name API route did not join the Router group.'
-Assert-Equal $true $implicitFallback.IncludeInCatalog 'Implicit OAuth binding lost its catalog representative.'
-Assert-Equal 'gpt-5.6-sol' $implicitFallback.PublicModelId 'Implicit OAuth binding did not expose the discovered OAuth model ID.'
-Assert-Equal 'gpt-5.6-sol' ([string]$implicitFallback.RequestModelIds[0]) 'Implicit fallback mapping does not accept the discovered OAuth model ID.'
+Assert-equal $false $implicitFallback.IsOAuthFallback 'Account-only OAuth enrollment forced an API route into fallback mode.'
+Assert-equal $true $implicitFallback.JoinRouter 'Configured API route left the Router group without an OAuth model import.'
+Assert-equal $true $implicitFallback.IncludeInCatalog 'Configured API route disappeared from the catalog without an OAuth model import.'
+Assert-equal 'openai/gpt-5.6-sol' $implicitFallback.PublicModelId 'Configured API public model id was rewritten by discovery-only OAuth enrollment.'
+Assert-equal 'openai/gpt-5.6-sol' ([string]$implicitFallback.RequestModelIds[0]) 'Configured API request model id was rewritten by discovery-only OAuth enrollment.'
 $differentNameRoute = @($implicitPlan | Where-Object {
     $_.CanonicalModelId -eq 'deepseek-v4-pro'
 }) | Select-Object -First 1

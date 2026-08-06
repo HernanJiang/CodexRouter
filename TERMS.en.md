@@ -1,6 +1,6 @@
 # Codex-Router Use and Distribution Commitment
 
-Software version: v1.3.10
+Software version: v1.3.12
 Release date: 2026-08-06
 Terms revision: v1.1 (2026-08-01)
 Copyright holder: Hernan_Jiang

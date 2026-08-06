@@ -178,24 +178,10 @@ if ([bool]$routePriorities.Enabled) {
     }
 }
 
-# Older profiles selected OAuth accounts but did not persist one OAuth model row
-# per account. Discovery is runtime-only: it repairs fallback pairing without
-# mutating the user's profile, and explicit rows remain authoritative.
+# Only manually imported OAuth model rows route or recover. Account enrollment
+# alone keeps the credential available in the OAuth manager without overriding
+# the user's configured third-party model list.
 $selectedOAuthModels = @($explicitSelectedOAuthModels)
-foreach ($oauthAccountId in $oauthAccountIds) {
-    if (@($explicitSelectedOAuthModels | Where-Object {
-        [long]$_.oauthAccountId -eq $oauthAccountId
-    }).Count -gt 0) { continue }
-    foreach ($modelId in @(Get-RouterDiscoveredOAuthModelsForAccount `
-        -DiscoveredOAuthModelsByAccount $discoveredOAuthModelsByAccount `
-        -AccountId $oauthAccountId)) {
-        $selectedOAuthModels += [pscustomobject][ordered]@{
-            model = $modelId
-            source = 'oauth'
-            oauthAccountId = $oauthAccountId
-        }
-    }
-}
 
 $routePlan = @(Get-RouterModelRoutePlan `
     -RouterConfig $config `
@@ -432,11 +418,17 @@ foreach ($accountSummary in $existingAccounts) {
     if ([string]$account.type -eq 'oauth') {
         if (-not $oauthSelectionInitialized) { continue }
         $selectedByConfig = $oauthAccountIds -contains $accountID
+        $hasExplicitOAuthModels = @($explicitSelectedOAuthModels | Where-Object {
+            [long]$_.oauthAccountId -eq $accountID
+        }).Count -gt 0
         $recoveryState = Get-RouterOAuthRecoveryState -Account $account
-        if ($selectedByConfig -and [bool]$recoveryState.ShouldIsolate) {
+        if ($selectedByConfig -and $hasExplicitOAuthModels -and [bool]$recoveryState.ShouldIsolate) {
             $isolatedOAuthAccountIds[$accountID] = [string]$recoveryState.Reason
         }
-        $selected = $selectedByConfig -and -not [bool]$recoveryState.ShouldIsolate
+        # Join the live Router group only when the profile actually imported
+        # OAuth models for this account. Otherwise third-party channels remain
+        # the sole request path.
+        $selected = $selectedByConfig -and $hasExplicitOAuthModels -and -not [bool]$recoveryState.ShouldIsolate
         $nextGroups = @($groupIds | Where-Object { $_ -ne $groupId })
         if ($selected) { $nextGroups += $groupId }
         # Keep each OAuth account's own scheduler priority so multi-account

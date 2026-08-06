@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner-1.3.10.png" alt="Codex-Router - One Router. Every Model." width="100%">
+  <img src="assets/release/codex-router-logo.png" alt="Codex-Router Logo" width="128">
 </p>
 
 <h1 align="center">Codex-Router</h1>
@@ -7,24 +7,54 @@
 <p align="center"><strong>一个入口，接入你的全部 Codex 模型、API 与订阅账号</strong></p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-1.3.10-0969da">
-  <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078d4">
-  <img alt="Architecture" src="https://img.shields.io/badge/architecture-x64-555555">
-  <img alt="Runtime" src="https://img.shields.io/badge/runtime-portable-2ea44f">
+  <img src="assets/release/codex-router-banner.png" alt="Codex-Router 项目横幅" width="100%">
 </p>
 
 <p align="center">
-  <a href="#下载与安装">下载</a> ·
+  <img src="https://img.shields.io/badge/version-1.3.12-0969da" alt="Version 1.3.12">
+  <img src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078d4" alt="Windows 10/11">
+  <img src="https://img.shields.io/badge/architecture-x64-555555" alt="x64">
+  <img src="https://img.shields.io/badge/runtime-portable-2ea44f" alt="Portable">
+</p>
+
+<p align="center">
+  <a href="#下载与安装">下载与安装</a> ·
   <a href="#核心能力">核心能力</a> ·
   <a href="#实际效果">实际效果</a> ·
+  <a href="#v1312-更新">v1.3.12 更新</a> ·
   <a href="#密钥安全">安全说明</a>
 </p>
 
-Codex-Router 是面向 Windows 单用户的 Codex 本地多模型路由器。它把不同 AI 服务商、订阅账号、API Key 和模型统一接入 Codex，并按你设定的优先级自动切换与兜底。核心路由基于 Sub2API，桌面控制台使用 Rust + egui；PostgreSQL、Redis 和 Sub2API 已全部包含在便携包内。
+Codex-Router 是面向 Windows 单用户的 Codex 本地多模型路由器。它把不同 AI 服务商、订阅账号、API Key 和模型统一接入 Codex，按你设定的优先级自动切换与兜底。核心路由基于 Sub2API，桌面控制台使用 Rust + egui；PostgreSQL、Redis 和 Sub2API 已全部包含在便携包内。
 
-> 当前版本：**v1.3.10**。解压即用，无需安装 Python、Node.js、Rust、PostgreSQL 或 Redis。
+> **当前版本：v1.3.12**。解压即用，无需安装 Python、Node.js、Rust、PostgreSQL 或 Redis；程序只监听本机回环地址。
+>
+> 官方发布与更新地址：<https://github.com/HernanJiang/Codex-Router>。允许按许可证分发，但分发页面和副本必须醒目标注作者 `Hernan_Jiang` 及此官方 GitHub 地址；第三方副本不代表官方发布。
 
-官方发布与更新地址：<https://github.com/HernanJiang/Codex-Router>。允许按许可证分发，但分发页面和副本必须醒目标注作者 `Hernan_Jiang` 及此官方 GitHub 地址；第三方副本不代表官方发布。
+## 下载与安装
+
+前往 [GitHub Releases](https://github.com/HernanJiang/Codex-Router/releases/tag/v1.3.12) 下载：
+
+`Codex-Router-Portable-1.3.12-windows-x64.zip`
+
+支持 Windows 10/11 x64，不支持 ARM64。
+
+```text
+文件名：Codex-Router-Portable-1.3.12-windows-x64.zip
+大小：82,630,622 字节（约 78.8 MiB）
+SHA-256：EFA5B0D0B7727142FE306691B098987AE2F1DCE4B9AD3E18A2B741A5792542A3
+```
+
+## 使用方法
+
+1. 解压完整的便携包，不要只把 `Codex-Router.exe` 单独移出文件夹。
+2. 双击 `Codex-Router.exe`。
+3. 按向导填写第一个模型的名称、Base URL、API Key，并选择多模态与网络代理。
+4. 完整阅读内置的《Codex-Router 使用与分发承诺》，滚动到底并由你本人点击同意，然后点击“一键完成配置”。程序不会替你静默接受该承诺。
+5. 程序会自动初始化本地环境、创建 Sub2API 模型渠道、写入 Codex 配置并启动路由。
+6. 以后增加模型或修改代理时，直接在控制台内编辑并点击“保存并应用全部配置”。
+
+首次初始化和首次启动可能需要几十秒；程序只监听 `127.0.0.1`。
 
 ## 核心能力
 
@@ -37,24 +67,25 @@ Codex-Router 是面向 Windows 单用户的 Codex 本地多模型路由器。它
 | 代理与网络适配 | 支持 HTTP、HTTPS、SOCKS5、SOCKS5H，并兼容现有 Clash、Mihomo、sing-box、V2Ray 规则。 |
 | 本地安全存储 | API Key、代理密码和本地路由密钥写入 Windows 凭据管理器，OAuth 令牌由 Sub2API 管理。 |
 
-## 下载与安装
+## 实际效果
 
-前往 [GitHub Releases](https://github.com/HernanJiang/Codex-Router/releases/tag/v1.3.10) 下载：
+桌面控制台集中管理模型、订阅账号、额度、路由状态和网络代理：
 
-`Codex-Router-Portable-1.3.10-windows-x64-20260806-105323-965.zip`
+<p align="center">
+  <img src="assets/release/screenshot-console.png" alt="Codex-Router 桌面控制台效果" width="900">
+</p>
 
-支持 Windows 10/11 x64，不支持 ARM64。
+在 Codex 中直接切换经过 Router 汇总的不同服务商、订阅账号与 API 模型，原有工作流无需改变：
 
-## 使用方法
+<p align="center">
+  <img src="assets/release/screenshot-codex.png" alt="Codex 内多模型切换效果" width="900">
+</p>
 
-1. 解压完整的 `Codex-Router-Portable.zip`，不要只把 EXE 单独移出文件夹。
-2. 双击 `Codex-Router.exe`。
-3. 按向导填写第一个模型的名称、Base URL、API Key，并选择多模态与网络代理。
-4. 完整阅读内置的《Codex-Router 使用与分发承诺》（其中包含 Sub2API 专项合规条款），滚动到底并由你本人点击同意，然后点击“一键完成配置”。程序不会替你静默接受该承诺。
-5. 程序会自动初始化本地环境、创建 Sub2API 模型渠道、写入 Codex 配置并启动路由。
-6. 以后增加模型或修改代理时，直接在控制台内编辑并点击“保存并应用全部配置”。
+v1.3.12 支持逐模型调节思考强度，快速切换不同档位：
 
-无需安装 Python、Node.js、Rust、PostgreSQL 或 Redis。首次初始化和首次启动可能需要几十秒；程序只监听 `127.0.0.1`。
+<p align="center">
+  <img src="assets/release/feature-thinking-intensity.png" alt="可调节思考强度" width="620">
+</p>
 
 ## 功能
 
@@ -72,16 +103,21 @@ Codex-Router 是面向 Windows 单用户的 Codex 本地多模型路由器。它
 - 本地 OAuth 快照只保存为 Windows 当前用户可解密的 DPAPI 数据，不把 `auth.json` 明文复制进配置档案。
 - Codex 模型目录按公开模型 ID 去重；同一模型可继续由多个后端渠道容错，但右下角只显示一个模型菜单项。GPT-5.6 Sol/Terra 提供 `low` 到 `max` 及 `ultra`，Luna 提供 `low` 到 `max`。
 - 自适应无滚动向导界面，输入框使用明确的高对比文字与焦点状态。
-- 内置“蓝天 / 白”和“咖啡 / 米白”两套雾面杂志主题；默认使用蓝天 / 白，可在顶栏即时切换。
+- 内置“蓝天 / 白”和“咖啡 / 米白”两套雾面玻璃主题；默认使用蓝天 / 白，可在顶栏即时切换。
 - 相同 Logo 用于 EXE、窗口、界面和系统托盘。
 - 第一次关闭窗口会说明：完全退出将停止连接检测和自动恢复，建议最小化到托盘。托盘轻量模式暂停日志跟随、用量刷新、OAuth 定时维护与界面刷新，只保留每 60 秒一次的原生健康检查和连续失败后的无窗口恢复；托盘右键仍可打开控制台、选择或应用配置、启动或关闭转发、关闭配置窗口和退出软件。偏好独立保存在 `codex-router-ui-preferences.json`，不会触发 Router 重新部署。
 
-## 实际效果
+## v1.3.12 更新
 
-在 Codex 中直接切换通过 Codex-Router 汇总的不同服务商、订阅账号与 API 模型，原有工作流无需改变。
+- OAuth 账号登录不再自动把平台发现模型写入当前路由；只有你主动加入配置的 OAuth 模型才会参与路由和兜底，避免账号认证意外改写第三方模型列表。
+- OAuth 登录成功后显示一次性“选择模型”提示，明确告知仅完成认证不会改变路由。
+- 优化桌面客户端重启逻辑，覆盖 ChatGPT 与 Codex 桌面进程的更多安装形式，并在无法定位可执行文件时尝试通过应用包重新拉起。
+- 蓝天与咖啡两套主题升级为更通透的雾面玻璃质感，界面层次和焦点状态更清晰。
+
+## 项目宣传
 
 <p align="center">
-  <img src="assets/screenshot-model-selection.png" alt="Codex-Router 多模型切换效果" width="900">
+  <img src="assets/release/promotion.png" alt="Codex-Router 宣传图" width="100%">
 </p>
 
 ## 密钥安全
@@ -98,7 +134,7 @@ Codex-Router 是面向 Windows 单用户的 Codex 本地多模型路由器。它
 
 ## Sub2API 本地管理
 
-Sub2API 默认仅监听 `127.0.0.1:18080`。端口不是协议常量：需要避开本机端口冲突时，可在高级 JSON 中把 `deploy.sub2apiHost` 改为其他本机 HTTP 端口并重启路由；程序会让启动、健康检查、OAuth 与 Codex 共用这个地址，并拒绝远程主机和 HTTPS 管理地址。管理员邮箱为 `admin@admin.com`，密码在首次初始化时随机生成并保存在当前用户的 Windows 凭据管理器中，不写入说明文字或登录页。控制台会先显示说明，再打开完整管理页；登录信息与本机 Router Key 均可通过界面复制，OAuth token 不提供导出。
+Sub2API 默认仅监听 `127.0.0.1:18080`。端口不是协议常量：需要避开本机端口冲突时，可在高级 JSON 中把 `deploy.sub2apiHost` 改为其他本机 HTTP 端口并重启路由；程序会让启动、健康检查、OAuth、Codex 与 OpenCode 共用这个地址，并拒绝远程主机和 HTTPS 管理地址。管理员邮箱为 `admin@admin.com`，密码在首次初始化时随机生成并保存在当前用户的 Windows 凭据管理器中，不写入说明文字或登录页。控制台会先显示说明，再打开完整管理页；登录信息与本机 Router Key 均可通过界面复制，OAuth token 不提供导出。
 
 构建 GitHub Release 时运行 `scripts/Build-PortableRelease.ps1 -OutputRoot <输出目录>`。脚本从 Release EXE、必要运行时和白名单配置重新组装全新便携包，明确排除 `data/`、`logs/`、`backups/`、实际 Router 配置、OAuth 数据库和本机 UI 偏好，并在压缩前扫描用户绝对路径与常见密钥格式。不要直接压缩正在使用的 Codex-Router 目录。
 
