@@ -81,6 +81,20 @@ try {
     $gptSolSpeedTiers = (@($catalog.models) | Where-Object slug -eq 'gpt-5.6-sol').additional_speed_tiers
     if (@($gptSolSpeedTiers) -notcontains 'fast') { throw 'GPT-5.6 Sol did not advertise Fast.' }
     if ((@($catalog.models) | Where-Object slug -eq 'gpt-5.6-sol').default_reasoning_level -ne 'medium') { throw 'Legacy global reasoning incorrectly replaced the per-model official default.' }
+    $oauthConfig = @{
+        version = 'oauth-tool-compat-test'
+        models = @(
+            @{ model = 'gemini-3.1-pro-high'; alias = 'Gemini OAuth'; priority = 1; source = 'oauth'; oauthAccountId = 4; oauthPlatform = 'antigravity'; multimodal = 'auto' }
+        )
+    }
+    [IO.File]::WriteAllText($configPath, ($oauthConfig | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
+    & (Join-Path $PSScriptRoot 'Build-ModelCatalog.ps1') -ConfigPath $configPath -OutputPath $outputPath | Out-Null
+    $oauthCatalog = Get-Content -LiteralPath $outputPath -Raw | ConvertFrom-Json
+    $oauthGemini = @($oauthCatalog.models) | Where-Object slug -eq 'gemini-3.1-pro-high' | Select-Object -First 1
+    if (@($oauthGemini.input_modalities) -notcontains 'image') { throw 'Gemini OAuth lost image input support.' }
+    if ([bool]$oauthGemini.supports_search_tool) { throw 'Gemini OAuth still advertises the incompatible built-in search tool.' }
+    if ($null -ne $oauthGemini.PSObject.Properties['web_search_tool_type']) { throw 'Gemini OAuth still advertises a web search tool type.' }
+    if ([bool]$oauthGemini.use_responses_lite) { throw 'Gemini OAuth must not use Responses Lite.' }
     if ((@($catalog.models) | Where-Object slug -eq 'claude-opus-5').context_window -ne 1000000) { throw 'Claude Opus 5 context window is stale.' }
     foreach ($slug in @('deepseek/deepseek-v4-pro','gemini-3.6-flash','mimo-v2.5-pro')) {
         if ((@($catalog.models) | Where-Object slug -eq $slug).context_window -ne 1048576) { throw "Context window is stale for $slug." }

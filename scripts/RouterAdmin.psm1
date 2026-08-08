@@ -457,7 +457,7 @@ function Get-RouterOAuthRecoveryState {
         }
     }
     $looksExhausted = $ObservedExhausted.IsPresent -or $usageExhausted -or
-        $reason -match '(?i)quota|usage limit|rate.?limit|billing cycle|exhaust'
+        $reason -match '(?i)quota|usage limit|rate.?limit|billing|payment|insufficient|exhaust|402|credit'
 
     if ($null -ne $resetAt -and $resetAt -gt $NowUtc) {
         $seconds = [Math]::Max(1L, [long][Math]::Ceiling(($resetAt - $NowUtc).TotalSeconds))
@@ -631,6 +631,8 @@ function Test-RouterCodingPlanChannel {
     $model = $ModelId.Trim().ToLowerInvariant()
     return ($host -eq 'api.kimi.com' -and $path.StartsWith('/coding')) -or
         ($host -eq 'api.moonshot.ai' -and $path.StartsWith('/coding')) -or
+        ($host -eq 'ark.cn-beijing.volces.com' -and
+            ($path.StartsWith('/api/coding') -or $path.StartsWith('/api/plan'))) -or
         ($path.Contains('/coding') -and $model -match 'coding|code')
 }
 
@@ -766,6 +768,14 @@ function Get-RouterModelDisplayName {
     }
     $displayName = Get-RouterRecommendedDisplayName -ModelId ([string]$Model.model)
     $source = Get-RouterModelSource -Model $Model
+    # The suffix reflects which quota actually serves this model after Apply, so
+    # Codex shows "(OAuth)" only while the subscription is the live route.
+    $servedByProperty = if ($null -eq $Route) { $null } else { $Route.PSObject.Properties['ServedBy'] }
+    if ($null -ne $servedByProperty) {
+        $servedBy = ([string]$servedByProperty.Value).Trim().ToLowerInvariant()
+        if ($servedBy -eq 'oauth') { return $displayName + '(OAuth)' }
+        if ($servedBy -eq 'api') { return $displayName }
+    }
     $mergedOAuth = $null -ne $Route -and
         $null -ne $Route.PSObject.Properties['IsMergedOAuthRoute'] -and
         [bool]$Route.IsMergedOAuthRoute
@@ -1143,6 +1153,12 @@ function Get-RouterOpenRouterUpstreamModelId {
     if ($value -match '^(?i)claude-' -and $value -notmatch '/') {
         return 'anthropic/' + $value
     }
+    # OpenRouter exposes Gemini 3.1 Pro as preview variants, not the
+    # Antigravity subscription alias "high". The regular preview supports tools
+    # and has broader regional availability than the custom-tools variant.
+    if ($value -ieq 'google/gemini-3.1-pro-high') {
+        return 'google/gemini-3.1-pro-preview'
+    }
     return $value
 }
 
@@ -1222,6 +1238,13 @@ function Get-RouterServableCatalogRoutes {
             }
 
             if (-not $catalogIds.Add($publicModelId)) { continue }
+            $servedBy = if ($source -ne 'oauth') {
+                'api'
+            } else {
+                $oauthId = 0
+                try { $oauthId = [long]$route.Model.oauthAccountId } catch { $oauthId = 0 }
+                if ($oauthId -gt 0 -and $isolated.ContainsKey($oauthId)) { 'api' } else { 'oauth' }
+            }
             [pscustomobject][ordered]@{
                 Index = [int]$route.Index
                 Model = $route.Model
@@ -1236,18 +1259,81 @@ function Get-RouterServableCatalogRoutes {
                 JoinRouter = [bool]$route.JoinRouter
                 IsOAuthFallback = [bool]$route.IsOAuthFallback
                 IsMergedOAuthRoute = [bool]$route.IsMergedOAuthRoute
+                ServedBy = $servedBy
             }
         }
     )
     return @($servable)
 }
 
+# Routing (not catalog) view of the same plan. Composite routes must keep every
+# platform that can still serve a public model, including API fallback rows that
+# are deliberately hidden from the Codex menu. Filtering the composite sync by
+# catalog-only routes used to delete the cross-platform fallback route (for
+# example gemini-3.1-pro-high|openai) right after Apply created it.
+function Get-RouterServableRoutingRoutes {
+    param(
+        [Parameter(Mandatory)][AllowNull()][object[]]$RoutePlan,
+        [AllowNull()][Collections.IDictionary]$IsolatedOAuthAccountIds,
+        [AllowNull()][object]$OAuthAccountIds,
+        [bool]$OAuthSelectionInitialized = $false
+    )
+
+    $catalog = @(Get-RouterServableCatalogRoutes `
+        -RoutePlan $RoutePlan `
+        -IsolatedOAuthAccountIds $IsolatedOAuthAccountIds `
+        -OAuthAccountIds $OAuthAccountIds `
+        -OAuthSelectionInitialized:$OAuthSelectionInitialized)
+    $servablePublicIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($route in $catalog) {
+        [void]$servablePublicIds.Add([string]$route.PublicModelId)
+    }
+
+    $isolated = @{}
+    if ($null -ne $IsolatedOAuthAccountIds) {
+        foreach ($key in @($IsolatedOAuthAccountIds.Keys)) {
+            try { $isolated[[long]$key] = $true } catch {
+                try { $isolated[[long][string]$key] = $true } catch { }
+            }
+        }
+    }
+    $selectedOAuthIds = @()
+    if ($OAuthSelectionInitialized -and $null -ne $OAuthAccountIds) {
+        $selectedOAuthIds = @($OAuthAccountIds | ForEach-Object { [long]$_ } | Where-Object { $_ -gt 0 })
+    }
+
+    $extra = @(
+        foreach ($route in @($RoutePlan)) {
+            if ([bool]$route.IncludeInCatalog) { continue }
+            if (-not [bool]$route.JoinRouter) { continue }
+            $publicModelId = ([string]$route.PublicModelId).Trim()
+            if ([string]::IsNullOrWhiteSpace($publicModelId)) { continue }
+            if (-not $servablePublicIds.Contains($publicModelId)) { continue }
+            $source = Get-RouterModelSource -Model $route.Model
+            if ($source -eq 'oauth') {
+                $oauthId = 0
+                try { $oauthId = [long]$route.Model.oauthAccountId } catch { $oauthId = 0 }
+                if ($OAuthSelectionInitialized -and ($oauthId -le 0 -or $selectedOAuthIds -notcontains $oauthId)) { continue }
+                if ($oauthId -gt 0 -and $isolated.ContainsKey($oauthId)) { continue }
+            }
+            $route
+        }
+    )
+    return @(@($catalog) + @($extra))
+}
+
 function Get-RouterCompositeRoutePlan {
     param(
         [Parameter(Mandatory)][object[]]$RoutePlan,
-        [AllowNull()]$AccountPlatformById
+        [AllowNull()]$AccountPlatformById,
+        [AllowNull()][object]$ExcludedOAuthAccountIds
     )
 
+    $excluded = @{}
+    foreach ($id in @($ExcludedOAuthAccountIds)) {
+        if ($null -eq $id) { continue }
+        try { $excluded[[long]$id] = $true } catch { }
+    }
     $byRouteTarget = [ordered]@{}
     foreach ($route in @($RoutePlan)) {
         if (-not [bool]$route.IncludeInCatalog -and -not [bool]$route.JoinRouter) { continue }
@@ -1255,23 +1341,37 @@ function Get-RouterCompositeRoutePlan {
         if ([string]::IsNullOrWhiteSpace($publicModelId)) { continue }
         $upstreamModelId = ([string]$route.Model.model).Trim()
         if ([string]::IsNullOrWhiteSpace($upstreamModelId)) { $upstreamModelId = $publicModelId }
+        $routeSource = Get-RouterModelSource -Model $route.Model
+        # An OAuth account that is out of quota is not in the Router group, so its
+        # platform route would only produce "no available accounts" 503 responses.
+        if ($routeSource -eq 'oauth' -and $excluded.Count -gt 0) {
+            $routeAccountId = 0
+            try { $routeAccountId = [long]$route.Model.oauthAccountId } catch { $routeAccountId = 0 }
+            if ($routeAccountId -gt 0 -and $excluded.ContainsKey($routeAccountId)) { continue }
+        }
         $targetPlatform = Get-RouterCompositeTargetPlatform `
             -Model $route.Model `
             -AccountPlatformById $AccountPlatformById
         # OpenAI-compatible API channels always schedule through the openai
         # platform, even when the public id looks like another vendor.
-        if ((Get-RouterModelSource -Model $route.Model) -ne 'oauth') {
+        if ($routeSource -ne 'oauth') {
             $targetPlatform = 'openai'
         }
 
         $routeKey = $publicModelId.ToLowerInvariant() + '|' + $targetPlatform.ToLowerInvariant()
-        if ($byRouteTarget.Contains($routeKey)) { continue }
+        $priority = if ($routeSource -eq 'oauth') { 1 } else { 100 }
+        if ($byRouteTarget.Contains($routeKey)) {
+            # Same public model + platform (e.g. ChatGPT OAuth + Chiral API) must
+            # keep the higher-priority OAuth entry when both are present.
+            $existing = $byRouteTarget[$routeKey]
+            if ([int]$existing.Priority -le $priority) { continue }
+        }
 
         $byRouteTarget[$routeKey] = [pscustomobject][ordered]@{
             PublicModelId = $publicModelId
             UpstreamModelId = $upstreamModelId
             TargetPlatform = $targetPlatform
-            Priority = if ((Get-RouterModelSource -Model $route.Model) -eq 'oauth') { 1 } else { 100 }
+            Priority = $priority
         }
     }
     return @($byRouteTarget.Values)
@@ -1454,7 +1554,8 @@ function Set-RouterAccountProxy {
 function Get-RouterOpenAIChannelPolicy {
     param(
         [Parameter(Mandatory)][string]$BaseUrl,
-        [AllowNull()]$Extra
+        [AllowNull()]$Extra,
+        [AllowEmptyString()][string]$ModelId = ''
     )
 
     $effectiveExtra = [ordered]@{}
@@ -1481,12 +1582,22 @@ function Get-RouterOpenAIChannelPolicy {
     # keep it on that path even if a transient probe fails. Other unknown hosts
     # remain automatic and explicit account settings always win.
     if ([string]::IsNullOrWhiteSpace($mode) -and -not $isOfficialOpenAI) {
+        $normalizedOpenRouterModelId = $ModelId.Trim().TrimStart('~')
+        $openRouterChatBridgeRequired = $hostName -eq 'openrouter.ai' -and
+            -not [string]::IsNullOrWhiteSpace($normalizedOpenRouterModelId) -and
+            $normalizedOpenRouterModelId -notmatch '^(?i)deepseek/'
         $mode = if ($hostName -eq 'api.430123.xyz') {
             'force_responses'
+        } elseif ($openRouterChatBridgeRequired) {
+            # OpenRouter's non-DeepSeek providers reject Codex custom tools on
+            # the native Responses path. The compatibility bridge preserves
+            # those tools by translating them to Chat Completions functions.
+            'force_chat_completions'
         } elseif ($hostName -in @(
             'api.kimi.com',
             'api.moonshot.ai',
-            'api.moonshot.cn'
+            'api.moonshot.cn',
+            'ark.cn-beijing.volces.com'
         )) {
             'force_chat_completions'
         } else {
@@ -1505,6 +1616,7 @@ function Get-RouterOpenAIChannelPolicy {
             'api.kimi.com' { $effectiveExtra.openai_compact_supported = $false }
             'api.moonshot.ai' { $effectiveExtra.openai_compact_supported = $false }
             'api.moonshot.cn' { $effectiveExtra.openai_compact_supported = $false }
+            'ark.cn-beijing.volces.com' { $effectiveExtra.openai_compact_supported = $false }
         }
     }
 
@@ -1754,6 +1866,7 @@ Export-ModuleMember -Function `
     Get-RouterOpenRouterUpstreamModelId, `
     Get-RouterUpstreamModelId, `
     Get-RouterServableCatalogRoutes, `
+    Get-RouterServableRoutingRoutes, `
     Get-RouterCompositeTargetPlatform, `
     Get-RouterCompositeRoutePlan, `
     Sync-RouterCompositeRoutes, `

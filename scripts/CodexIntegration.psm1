@@ -154,9 +154,21 @@ function Copy-CodexPermissionSettings {
             $text = Set-CodexTopLevelValue -Content $text -Key $key -Value $value
         }
     }
-    $windowsSandbox = Get-CodexTableRawValue -Content $SourceContent -Table 'windows' -Key 'sandbox'
-    if (-not [string]::IsNullOrWhiteSpace($windowsSandbox)) {
-        $text = Set-CodexTableValue -Content $text -Table 'windows' -Key 'sandbox' -Value $windowsSandbox
+    # Codex Desktop owns this one-time Windows installation state.
+    # Prefer a completed elevated marker from either the live config or the
+    # permission baseline. Never delete a completion marker during Apply.
+    $liveWindowsSandbox = Get-CodexTableRawValue -Content $text -Table 'windows' -Key 'sandbox'
+    $sourceWindowsSandbox = Get-CodexTableRawValue -Content $SourceContent -Table 'windows' -Key 'sandbox'
+    $liveValue = if ($null -eq $liveWindowsSandbox) { '' } else { $liveWindowsSandbox.Trim().Trim('"') }
+    $sourceValue = if ($null -eq $sourceWindowsSandbox) { '' } else { $sourceWindowsSandbox.Trim().Trim('"') }
+    if ($liveValue -eq 'elevated') {
+        # already complete
+    }
+    elseif ($sourceValue -eq 'elevated') {
+        $text = Set-CodexTableValue -Content $text -Table 'windows' -Key 'sandbox' -Value '"elevated"'
+    }
+    elseif ([string]::IsNullOrWhiteSpace($liveValue) -and -not [string]::IsNullOrWhiteSpace($sourceWindowsSandbox)) {
+        $text = Set-CodexTableValue -Content $text -Table 'windows' -Key 'sandbox' -Value $sourceWindowsSandbox
     }
     return $text
 }
@@ -185,7 +197,7 @@ function Get-CodexPermissionSourceContent {
         $windowsSandbox = Get-CodexTableRawValue -Content $candidate -Table 'windows' -Key 'sandbox'
         if (-not [string]::IsNullOrWhiteSpace($approval) -or
             -not [string]::IsNullOrWhiteSpace($sandboxMode) -or
-            (-not [string]::IsNullOrWhiteSpace($windowsSandbox) -and $windowsSandbox -ne '"unelevated"')) {
+            -not [string]::IsNullOrWhiteSpace($windowsSandbox)) {
             return $candidate
         }
     }
@@ -347,6 +359,9 @@ function New-CodexRouterConfig {
     }
 
     $text = Remove-CodexTopLevelValues -Content $Content -Keys @(
+        'base_url',
+        'wire_api',
+        'experimental_bearer_token',
         'openai_base_url',
         'service_tier',
         'disable_response_storage'
@@ -355,6 +370,9 @@ function New-CodexRouterConfig {
     $text = Set-CodexTopLevelValue -Content $text -Key 'model' -Value ('"' + (ConvertTo-CodexTomlString $Model) + '"')
     $text = Set-CodexTopLevelValue -Content $text -Key 'model_catalog_json' -Value ('"' + (ConvertTo-CodexTomlString $CatalogPath) + '"')
     $text = Set-CodexTopLevelValue -Content $text -Key 'model_reasoning_effort' -Value ('"' + $ReasoningEffort + '"')
+    # Antigravity Claude rejects the provider-side Apps tool schemas. Keep the
+    # local coding tools, MCP, shell, files, and multi-agent features available.
+    $text = Set-CodexTableValue -Content $text -Table 'features' -Key 'apps' -Value 'false'
     $text = Set-CodexTableValue -Content $text -Table 'models.new_thread' -Key 'model' -Value ('"' + (ConvertTo-CodexTomlString $Model) + '"')
     $text = Set-CodexTableValue -Content $text -Table 'models.new_thread' -Key 'model_reasoning_effort' -Value ('"' + $ReasoningEffort + '"')
     if ($FastMode) {

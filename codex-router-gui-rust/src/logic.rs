@@ -550,6 +550,14 @@ pub fn resolve_multimodal(model: &ModelConfig) -> bool {
     }
 }
 
+fn is_non_openai_oauth_model(model: &ModelConfig) -> bool {
+    if model.source != "oauth" {
+        return false;
+    }
+    let platform = model.oauth_platform.trim().to_ascii_lowercase();
+    !platform.is_empty() && platform != "openai" && platform != "chatgpt"
+}
+
 pub fn resolve_default_model(cfg: &RouterConfig) -> Option<&str> {
     cfg.models
         .iter()
@@ -1132,13 +1140,13 @@ pub fn build_model_catalog(cfg: &RouterConfig) -> Vec<serde_json::Value> {
                 "support_verbosity": true,
                 "default_verbosity": "low",
                 "apply_patch_tool_type": "freeform",
-                "web_search_tool_type": "text_and_image",
+            "web_search_tool_type": if is_non_openai_oauth_model(model) { serde_json::Value::Null } else { json!("text_and_image") },
                 "truncation_policy": { "mode": "tokens", "limit": 10_000 },
                 "supports_parallel_tool_calls": true,
                 "comp_hash": "codex-router-v1",
                 "effective_context_window_percent": model.auto_compact_percent,
                 "experimental_supported_tools": Vec::<String>::new(),
-                "supports_search_tool": true,
+            "supports_search_tool": !is_non_openai_oauth_model(model),
                 "use_responses_lite": true,
                 "tool_mode": "code_mode_only",
                 "multi_agent_version": "v2",
@@ -1402,6 +1410,24 @@ pub fn store_credentials(cfg: &mut RouterConfig, router_root: &Path) -> anyhow::
                 ps_literal(model.api_key.trim())
             ));
         }
+        if model
+            .base_url
+            .to_ascii_lowercase()
+            .contains("ark.cn-beijing.volces.com/api/coding")
+        {
+            if !model.volcengine_access_key_id.trim().is_empty() {
+                script.push_str(&format!(
+                    "Set-RouterCredential -Name 'VolcengineAccessKeyId' -Secret {}\n",
+                    ps_literal(model.volcengine_access_key_id.trim())
+                ));
+            }
+            if !model.volcengine_secret_access_key.trim().is_empty() {
+                script.push_str(&format!(
+                    "Set-RouterCredential -Name 'VolcengineSecretAccessKey' -Secret {}\n",
+                    ps_literal(model.volcengine_secret_access_key.trim())
+                ));
+            }
+        }
     }
     if cfg.proxy.password_credential.trim().is_empty() {
         cfg.proxy.password_credential = "ProxyPassword".to_string();
@@ -1621,6 +1647,15 @@ where
     const DEPLOYMENT_COMPLETE_MARKER: &str = "[codex-router:deployment-complete]";
 
     fn safe_output_line(line: &str) -> String {
+        // Machine-generated deployment flags. Apply-Router builds them from ids,
+        // counts, platforms, and already sanitized reasons, so they pass through
+        // verbatim and stay greppable for debugging.
+        if let Some(flag) = line.trim().strip_prefix("CR-FLAG ") {
+            let mut safe = String::from("CR-FLAG ");
+            safe.push_str(flag.trim());
+            safe.truncate(400);
+            return safe;
+        }
         for prefix in [
             "[1/7]", "[2/7]", "[3/7]", "[4/7]", "[5/7]", "[6/7]", "[7/7]",
         ] {
@@ -1628,10 +1663,47 @@ where
                 return prefix.to_owned();
             }
         }
-        format!(
-            "deployment_diagnostic {}",
-            crate::runtime_logs::summarize_error_for_display(line)
-        )
+        // Normal Apply progress must keep a stable English marker so the UI can
+        // localize it. Running it through the error classifier first turns every
+        // "Updated channel:" line into class=unclassified_error.
+        const PROGRESS_MARKERS: &[&str] = &[
+            "Sub2API compliance acknowledgement recorded",
+            "Sub2API administrator ready",
+            "Codex model catalog generated",
+            "Composite routes",
+            "Updated channel:",
+            "Created channel:",
+            "isolated until recovery",
+            "Outbound proxy reconciliation",
+            "Catalog availability filter",
+            "OAuth on-demand recovery delegated",
+            "Autostart registered",
+            "Autostart removed",
+            "will start directly in lightweight tray mode",
+            "model channel(s).",
+            "Codex configuration written to",
+            "Local access key is stored in Windows Credential Manager",
+            "Codex Router is running at",
+            "Codex Router secrets and PostgreSQL",
+            "Codex Router is stopped",
+            "Configured ",
+        ];
+        if let Some(marker) = PROGRESS_MARKERS
+            .iter()
+            .find(|marker| line.contains(**marker))
+        {
+            return (*marker).to_owned();
+        }
+        let summary = crate::runtime_logs::summarize_error_for_display(line);
+        // PowerShell Write-Warning traffic is often informational (discovery
+        // skips, proxy notes). Surface it as a note, not a hard diagnostic.
+        if line.contains("WARNING:")
+            || summary.contains("class=warning")
+            || summary.contains("class=rate_limit")
+        {
+            return format!("deployment_warning {summary}");
+        }
+        format!("deployment_diagnostic {summary}")
     }
 
     if cancel.load(Ordering::Acquire) {
@@ -2117,6 +2189,15 @@ pub fn load_usage_snapshot(
     profile_name: &str,
     cfg: &RouterConfig,
 ) -> anyhow::Result<crate::UsageSnapshot> {
+    load_usage_snapshot_with_timeout(router_root, profile_name, cfg, Duration::from_secs(120))
+}
+
+fn load_usage_snapshot_with_timeout(
+    router_root: &Path,
+    profile_name: &str,
+    cfg: &RouterConfig,
+    timeout: Duration,
+) -> anyhow::Result<crate::UsageSnapshot> {
     let script = router_root.join("scripts").join("Get-UsageMonitor.ps1");
     let state_dir = crate::user_data::data_root(router_root).join("ui");
     std::fs::create_dir_all(&state_dir)?;
@@ -2132,7 +2213,8 @@ pub fn load_usage_snapshot(
     let result = (|| -> anyhow::Result<crate::UsageSnapshot> {
         let mut last_failure = "class=unclassified_error".to_owned();
         for attempt in 0..2 {
-            let output_result = Command::new("powershell.exe")
+            let shell = prefer_powershell_executable();
+            let mut child = match Command::new(shell)
                 .args([
                     "-NoLogo",
                     "-NoProfile",
@@ -2147,22 +2229,74 @@ pub fn load_usage_snapshot(
                 .arg(&config_snapshot)
                 .current_dir(router_root)
                 .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
                 .creation_flags(0x08000000)
-                .output();
-
-            match output_result {
-                Ok(output) if output.status.success() => {
-                    match parse_usage_snapshot_output(&output.stdout) {
-                        Ok(snapshot) => return Ok(snapshot),
-                        Err(error) => last_failure = error.to_string(),
-                    }
-                }
-                Ok(output) => last_failure = usage_process_failure_summary(&output),
+                .spawn()
+            {
+                Ok(child) => child,
                 Err(error) => {
                     last_failure = crate::runtime_logs::summarize_error_for_display(&format!(
                         "usage monitor process start failed: {error}"
                     ));
+                    break;
                 }
+            };
+            let stdout = child
+                .stdout
+                .take()
+                .context("usage monitor stdout unavailable")?;
+            let stderr = child
+                .stderr
+                .take()
+                .context("usage monitor stderr unavailable")?;
+            let stdout_reader = std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = BufReader::new(stdout).read_to_end(&mut bytes);
+                bytes
+            });
+            let stderr_reader = std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = BufReader::new(stderr).read_to_end(&mut bytes);
+                bytes
+            });
+            let started = Instant::now();
+            let status = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break Some(status),
+                    Ok(None) if started.elapsed() < timeout => {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    Ok(None) => {
+                        terminate_deployment_process_tree(&mut child);
+                        last_failure = "class=timeout".to_owned();
+                        break None;
+                    }
+                    Err(error) => {
+                        terminate_deployment_process_tree(&mut child);
+                        last_failure = crate::runtime_logs::summarize_error_for_display(&format!(
+                            "usage monitor process wait failed: {error}"
+                        ));
+                        break None;
+                    }
+                }
+            };
+            let stdout = stdout_reader.join().unwrap_or_default();
+            let stderr = stderr_reader.join().unwrap_or_default();
+            let Some(status) = status else { break };
+            let output = std::process::Output {
+                status,
+                stdout,
+                stderr,
+            };
+
+            if output.status.success() {
+                match parse_usage_snapshot_output(&output.stdout) {
+                    Ok(snapshot) => return Ok(snapshot),
+                    Err(error) => last_failure = error.to_string(),
+                }
+            } else {
+                last_failure = usage_process_failure_summary(&output);
             }
 
             if attempt == 0 && usage_failure_is_locally_retryable(&last_failure) {
@@ -2390,39 +2524,101 @@ pub fn enroll_unseen_oauth_accounts(
     added
 }
 
-/// Restore must not invent a `[windows] sandbox` value. Codex's desktop client
-/// runs a one-time Windows setup step; forcing `unelevated` (or adding the
-/// table at all) makes that step fail with "Windows 安装未完成" and loops the UAC
-/// prompt. Router only removes a value it wrote itself in older releases and
-/// otherwise keeps the user's own setting untouched.
+/// Codex Desktop owns `[windows].sandbox`.
+///
+/// - `elevated` means the one-time elevated Windows setup finished.
+/// - Stripping that marker reopens “Windows 安装未完成” after every login.
+/// - Router must never invent, force, or delete this key during Apply/restore/exit.
 pub fn normalize_windows_sandbox_config(text: &str) -> String {
-    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
-    let had_trailing_newline = text.ends_with('\n') || text.ends_with('\r');
-    let mut lines = Vec::new();
-    let mut in_windows = false;
+    text.to_owned()
+}
 
+fn windows_sandbox_value(text: &str) -> Option<String> {
+    let mut in_windows = false;
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
             in_windows = trimmed == "[windows]";
+            continue;
         }
+        if !in_windows {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if key.trim() == "sandbox" {
+            let value = value.trim().trim_matches('"').trim();
+            if !value.is_empty() {
+                return Some(value.to_owned());
+            }
+        }
+    }
+    None
+}
 
+/// Keep a completed Windows setup marker from the live config when a restore
+/// snapshot or sanitized fallback does not carry one.
+pub fn preserve_windows_sandbox_config(current: &str, next: &str) -> String {
+    let current_value = windows_sandbox_value(current);
+    let next_value = windows_sandbox_value(next);
+    let preferred = match (current_value.as_deref(), next_value.as_deref()) {
+        (Some("elevated"), _) | (_, Some("elevated")) => Some("elevated"),
+        (Some(value), None) => Some(value),
+        _ => None,
+    };
+    let Some(value) = preferred else {
+        return next.to_owned();
+    };
+    if next_value.as_deref() == Some(value) {
+        return next.to_owned();
+    }
+
+    let newline = if next.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut lines = Vec::new();
+    let mut in_windows = false;
+    let mut wrote = false;
+    let mut saw_windows = false;
+    for line in next.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            if in_windows && !wrote {
+                lines.push(format!("sandbox = \"{value}\""));
+                wrote = true;
+            }
+            in_windows = trimmed == "[windows]";
+            if in_windows {
+                saw_windows = true;
+            }
+            lines.push(line.to_owned());
+            continue;
+        }
         if in_windows {
             let key = trimmed.split('=').next().unwrap_or_default().trim();
             if key == "sandbox" {
-                let value = trimmed.split_once('=').map(|(_, v)| v.trim()).unwrap_or("");
-                // Drop only the legacy Router-forced downgrade. Any other value
-                // is the user's own Codex permission and must survive restore.
-                if value.trim_matches('"') == "unelevated" {
-                    continue;
+                if !wrote {
+                    lines.push(format!("sandbox = \"{value}\""));
+                    wrote = true;
                 }
+                continue;
             }
         }
         lines.push(line.to_owned());
     }
-
+    if in_windows && !wrote {
+        lines.push(format!("sandbox = \"{value}\""));
+        wrote = true;
+    }
+    if !saw_windows {
+        if !lines.is_empty() && !lines.last().map(|line| line.is_empty()).unwrap_or(true) {
+            lines.push(String::new());
+        }
+        lines.push("[windows]".to_owned());
+        lines.push(format!("sandbox = \"{value}\""));
+        wrote = true;
+    }
     let mut result = lines.join(newline);
-    if had_trailing_newline && !result.ends_with(newline) {
+    if (next.ends_with('\n') || next.ends_with('\r') || wrote) && !result.ends_with(newline) {
         result.push_str(newline);
     }
     result
@@ -3384,6 +3580,32 @@ exit 1
     }
 
     #[test]
+    fn usage_monitor_times_out_and_terminates_the_helper() {
+        let root = temporary_test_dir("usage-timeout");
+        let scripts = root.join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::write(
+            scripts.join("Get-UsageMonitor.ps1"),
+            "Start-Sleep -Seconds 30\nWrite-Output '{}'\n",
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        let error = load_usage_snapshot_with_timeout(
+            &root,
+            "test",
+            &RouterConfig::default(),
+            Duration::from_millis(250),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert_eq!(error, "class=timeout");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn usage_monitor_parser_accepts_utf8_names_and_ignores_prefix_noise() {
         let output = "warning: cached data follows\n{\"profileName\":\"中文配置\",\"subscriptions\":[],\"apiChannels\":[]}\n";
         let snapshot = parse_usage_snapshot_output(output.as_bytes()).unwrap();
@@ -3471,18 +3693,26 @@ exit 1
 
     #[test]
     fn windows_sandbox_normalization_disables_elevated_setup_loop() {
-        // The user's own elevated setting must survive: Codex needs it for its
-        // one-time Windows setup step.
+        // Completed elevated setup is owned by Codex Desktop and must survive.
         let input = "model = \"test\"\r\n\r\n[windows]\r\nsandbox = \"elevated\"\r\n";
         let output = normalize_windows_sandbox_config(input);
-        assert!(output.contains("[windows]\r\nsandbox = \"elevated\"\r\n"));
+        assert!(output.contains("sandbox = \"elevated\""));
         assert!(!output.contains("sandbox = \"unelevated\""));
 
-        // Only a legacy Router-forced downgrade is removed.
+        // Restricted-mode completion markers are also left untouched.
         let legacy = "model = \"test\"\n\n[windows]\nsandbox = \"unelevated\"\n";
         let cleaned = normalize_windows_sandbox_config(legacy);
-        assert!(!cleaned.contains("sandbox ="));
+        assert!(cleaned.contains("sandbox = \"unelevated\""));
         assert!(cleaned.contains("[windows]"));
+
+        // Exit/restore must reattach a live elevated marker onto a snapshot that
+        // predated Windows setup completion.
+        let restored = preserve_windows_sandbox_config(
+            "model = \"live\"\n[windows]\nsandbox = \"elevated\"\n",
+            "model = \"first\"\n",
+        );
+        assert!(restored.contains("sandbox = \"elevated\""));
+        assert!(restored.contains("model = \"first\""));
     }
 
     #[test]

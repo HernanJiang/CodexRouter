@@ -7,6 +7,9 @@ $inputConfig = @'
 service_tier = "priority"
 disable_response_storage = true
 openai_base_url = "https://example.invalid/v1"
+base_url = "http://127.0.0.1:15721/v1"
+wire_api = "responses"
+experimental_bearer_token = "PROXY_MANAGED"
 model_provider = "custom"
 model = "old-model"
 model_catalog_json = "old-catalog.json"
@@ -77,7 +80,7 @@ Assert-True ($resultAgain -match '(?ms)^\[models\.new_thread\].*?^model\s*=\s*"k
 Assert-True ($resultAgain -match '(?m)^model_reasoning_effort\s*=\s*"high"\s*$') 'The reasoning default was not written.'
 Assert-True ($resultAgain -match '(?ms)^\[models\.new_thread\].*?^model_reasoning_effort\s*=\s*"high"\s*$') 'The new-thread reasoning default was not written.'
 Assert-True ($resultAgain -match '(?ms)^\[features\].*?^fast_mode\s*=\s*false\s*$') 'Fast was not disabled.'
-Assert-True ($resultAgain -match '(?ms)^\[windows\].*?^sandbox\s*=\s*"elevated"\s*$') 'The existing Windows sandbox permission was not preserved.'
+Assert-True ($resultAgain -match '(?ms)^\[windows\].*?^sandbox\s*=\s*"elevated"\s*$') 'The completed Windows setup marker was not preserved.'
 Assert-True ($resultAgain -match '(?m)^approval_policy\s*=\s*"never"\s*$') 'The existing approval policy was not preserved.'
 Assert-True ($resultAgain -match '(?m)^sandbox_mode\s*=\s*"danger-full-access"\s*$') 'The existing sandbox mode was not preserved.'
 Assert-True ($resultAgain -match '(?m)^personality\s*=\s*"pragmatic"\s*$') 'An unrelated user preference was not preserved.'
@@ -91,6 +94,8 @@ Assert-True ($resultAgain -match '(?ms)^\[model_providers\.lmstudio\].*?^base_ur
 Assert-True ($resultAgain -match '(?ms)^\[model_providers\.custom\].*?^name\s*=\s*"Unrelated provider"\s*$') 'An unrelated custom provider was overwritten instead of preserved.'
 Assert-True ($resultAgain -match '(?ms)^\[mcp_servers\.user-tool\].*?^command\s*=\s*"user-mcp\.exe"\s*$') 'An unrelated MCP server was not preserved.'
 Assert-True ($resultAgain -notmatch '18081|service_tier|disable_response_storage|openai_base_url') 'Legacy provider settings remain.'
+Assert-True (([regex]::Matches($resultAgain, '(?m)^base_url\s*=')).Count -eq 5) 'A stale top-level base_url remains outside provider tables.'
+Assert-True ($resultAgain -notmatch 'PROXY_MANAGED') 'A stale top-level proxy bearer remains.'
 Assert-True (([regex]::Matches($resultAgain, '\[model_providers\.codex_router\]')).Count -eq 1) 'Router provider is duplicated.'
 Assert-True ($resultAgain -notmatch '\[model_providers\.sub2api\]') 'The legacy sub2api provider remains.'
 
@@ -174,7 +179,7 @@ $migratedPermissions = New-CodexRouterConfig `
 Assert-True ($migratedPermissions -match '(?m)^model_provider\s*=\s*"codex_router"\s*$') 'Legacy custom Router provider was not migrated to codex_router.'
 Assert-True ($migratedPermissions -match '(?m)^requires_openai_auth\s*=\s*true\s*$') 'Local Router must keep account sign-in mode and still load the Router catalog.'
 Assert-True ($migratedPermissions -notmatch '(?ms)^\[model_providers\.custom\].*?^name\s*=\s*"Codex-Router"\s*$') 'Legacy custom Codex-Router block was not removed after migration.'
-Assert-True ($migratedPermissions -match '(?ms)^\[windows\].*?^sandbox\s*=\s*"elevated"\s*$') 'An older Router sandbox downgrade was not migrated back to the user setting.'
+Assert-True ($migratedPermissions -match '(?ms)^\[windows\].*?^sandbox\s*=\s*"elevated"\s*$') 'An older Router sandbox downgrade was not migrated back to the completed elevated marker.'
 Assert-True ($migratedPermissions -match '(?m)^approval_policy\s*=\s*"never"\s*$') 'Approval policy was not recovered from the permission baseline.'
 Assert-True ($migratedPermissions -match '(?m)^sandbox_mode\s*=\s*"danger-full-access"\s*$') 'Sandbox mode was not recovered from the permission baseline.'
 

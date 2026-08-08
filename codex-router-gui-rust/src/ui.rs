@@ -83,6 +83,15 @@ fn usage_monitor_uses_two_columns(available_width: f32) -> bool {
     available_width >= 920.0
 }
 
+fn usage_column_indices(account_count: usize, column_count: usize) -> Vec<Vec<usize>> {
+    let column_count = column_count.max(1);
+    let mut columns = vec![Vec::new(); column_count];
+    for index in 0..account_count {
+        columns[index % column_count].push(index);
+    }
+    columns
+}
+
 fn paint_chiral_mark(ui: &mut egui::Ui, size: f32, palette: &theme::Palette) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
     let painter = ui.painter_at(rect);
@@ -142,8 +151,8 @@ mod ordering_tests {
     use super::{
         dashboard_panel_heights, dashboard_uses_wide_layout, fit_dialog_size, friendly_error,
         move_list_item, oauth_terms_confirmation_ready, remaining_quota_percent, shell_metrics,
-        topbar_control_size, usage_monitor_uses_two_columns, APP_VERSION, DIALOG_VIEWPORT_GUTTER,
-        TERMS_EN, TERMS_ZH, TOPBAR_CONTROL_HEIGHT, TOPBAR_CONTROL_WIDTH,
+        topbar_control_size, usage_column_indices, usage_monitor_uses_two_columns, APP_VERSION,
+        DIALOG_VIEWPORT_GUTTER, TERMS_EN, TERMS_ZH, TOPBAR_CONTROL_HEIGHT, TOPBAR_CONTROL_WIDTH,
     };
 
     #[test]
@@ -252,6 +261,24 @@ mod ordering_tests {
         assert!(!dashboard_uses_wide_layout(900.0, 620.0));
         assert!(usage_monitor_uses_two_columns(960.0));
         assert!(!usage_monitor_uses_two_columns(800.0));
+    }
+
+    #[test]
+    fn usage_cards_stack_independently_in_two_columns() {
+        assert_eq!(usage_column_indices(5, 2), vec![vec![0, 2, 4], vec![1, 3]]);
+        assert_eq!(usage_column_indices(3, 1), vec![vec![0, 1, 2]]);
+    }
+
+    #[test]
+    fn balance_windows_keep_provider_amounts() {
+        let window: super::UsageWindow = serde_json::from_str(
+            r#"{"kind":"balance","displayName":"Balance","remainingAmount":9.5,"limitAmount":20.0,"usedAmount":10.5,"currency":"USD"}"#,
+        )
+        .expect("balance window should deserialize");
+        assert_eq!(window.remaining_amount, Some(9.5));
+        assert_eq!(window.limit_amount, Some(20.0));
+        assert_eq!(window.used_amount, Some(10.5));
+        assert_eq!(window.currency, "USD");
     }
 
     #[test]
@@ -1022,6 +1049,36 @@ impl CodexRouterApp {
             .show(ctx, |ui| {
                 ui.set_min_size(dialog_size);
                 ui.set_max_size(dialog_size);
+                egui::Frame::NONE
+                    .fill(palette.paper_alt)
+                    .inner_margin(egui::Margin::same(22))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("✓")
+                                    .size(30.0)
+                                    .strong()
+                                    .color(palette.action),
+                            );
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    egui::RichText::new(t(zh, "配置已应用", "Configuration applied"))
+                                        .size(22.0)
+                                        .strong()
+                                        .color(palette.ink),
+                                );
+                                ui.label(
+                                    egui::RichText::new(t(
+                                        zh,
+                                        "Router 已接管本机 Codex 路由",
+                                        "Router now owns the local Codex route",
+                                    ))
+                                    .color(palette.ink_soft),
+                                );
+                            });
+                        });
+                        ui.add_space(16.0);
+                        ui.separator();
                 let button_reserve = 64.0;
                 let body_height = (ui.available_height() - button_reserve).max(140.0);
                 egui::ScrollArea::vertical()
@@ -1103,6 +1160,7 @@ impl CodexRouterApp {
                         acknowledged = true;
                     }
                 });
+                    });
             });
         if acknowledged {
             self.apply_success_dialog_open = false;
@@ -2606,6 +2664,11 @@ impl CodexRouterApp {
                                     .map(|value| value.is_object())
                                     .unwrap_or(false);
                             let oauth_model = this.temp_model.source == "oauth";
+                            let volcengine_coding_plan = this
+                                .temp_model
+                                .base_url
+                                .to_ascii_lowercase()
+                                .contains("ark.cn-beijing.volces.com/api/coding");
                             let valid = !this.temp_model.model.trim().is_empty()
                                 && json_valid
                                 && (oauth_model
@@ -2826,6 +2889,56 @@ impl CodexRouterApp {
                                     true,
                                     palette,
                                 );
+                            }
+                            if volcengine_coding_plan {
+                                ui.add_space(8.0);
+                                ui.separator();
+                                ui.label(
+                                    egui::RichText::new(t(
+                                        zh,
+                                        "火山方舟 Coding Plan 管控面凭据（可选）",
+                                        "Volcengine Coding Plan control-plane credentials (optional)",
+                                    ))
+                                    .strong()
+                                    .color(palette.ink),
+                                );
+                                ui.label(
+                                    egui::RichText::new(t(
+                                        zh,
+                                        "用于读取官方 5 小时、周、月额度；仅写入 Windows 凭据管理器，不会保存到配置文件。留空则保留已保存凭据。",
+                                        "Used for official 5-hour, weekly, and monthly quota. Stored only in Windows Credential Manager, never in the config file. Leave blank to keep saved credentials.",
+                                    ))
+                                    .small()
+                                    .color(palette.muted),
+                                );
+                                ui.columns(2, |columns| {
+                                    theme::field_label(
+                                        &mut columns[0],
+                                        "ACCESS KEY ID",
+                                        t(zh, "火山控制面 AK", "Volcengine control-plane AK"),
+                                        palette,
+                                    );
+                                    theme::input_ascii(
+                                        &mut columns[0],
+                                        &mut this.temp_model.volcengine_access_key_id,
+                                        t(zh, "输入 Access Key ID", "Enter Access Key ID"),
+                                        true,
+                                        palette,
+                                    );
+                                    theme::field_label(
+                                        &mut columns[1],
+                                        "SECRET ACCESS KEY",
+                                        t(zh, "火山控制面 SK", "Volcengine control-plane SK"),
+                                        palette,
+                                    );
+                                    theme::input_ascii(
+                                        &mut columns[1],
+                                        &mut this.temp_model.volcengine_secret_access_key,
+                                        t(zh, "输入 Secret Access Key", "Enter Secret Access Key"),
+                                        true,
+                                        palette,
+                                    );
+                                });
                             }
                             ui.columns(2, |columns| {
                                 theme::field_label(
@@ -7184,10 +7297,29 @@ impl CodexRouterApp {
         }
         match window.kind.as_str() {
             "fiveHour" => t(zh, "5 小时额度", "5-hour limit").to_owned(),
+            "daily" => t(zh, "每日额度", "Daily limit").to_owned(),
             "weekly" => t(zh, "周额度", "Weekly limit").to_owned(),
             "monthly" => t(zh, "月额度", "Monthly limit").to_owned(),
             "model" => t(zh, "模型额度", "Model limit").to_owned(),
+            "balance" => t(zh, "账户余额", "Account balance").to_owned(),
             _ => t(zh, "其他额度窗口", "Other quota window").to_owned(),
+        }
+    }
+
+    fn usage_amount(value: f64, currency: &str) -> String {
+        let currency = currency.trim().to_uppercase();
+        if currency == "USD" || currency.is_empty() {
+            format!("${value:.2}")
+        } else {
+            format!("{currency} {value:.2}")
+        }
+    }
+
+    fn usage_window_is_readable(window: &UsageWindow) -> bool {
+        if window.kind == "balance" {
+            window.remaining_amount.is_some()
+        } else {
+            remaining_quota_percent(window.used_percent).is_some()
         }
     }
 
@@ -7267,6 +7399,62 @@ impl CodexRouterApp {
         zh: bool,
     ) {
         let label = Self::usage_window_label(window, zh);
+        if window.kind == "balance" {
+            let remaining = window.remaining_amount.unwrap_or_default();
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(label).strong().color(palette.ink));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(Self::usage_amount(remaining, &window.currency))
+                            .strong()
+                            .color(palette.ink_soft),
+                    );
+                });
+            });
+            if let Some(used_percent) = window.used_percent {
+                let progress = (100.0 - used_percent.clamp(0.0, 100.0)) / 100.0;
+                let (bar_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 10.0),
+                    egui::Sense::hover(),
+                );
+                ui.painter()
+                    .rect_filled(bar_rect, egui::CornerRadius::same(5), palette.paper_alt);
+                if progress > 0.0 {
+                    let fill_rect = egui::Rect::from_min_size(
+                        bar_rect.min,
+                        egui::vec2(bar_rect.width() * progress, bar_rect.height()),
+                    );
+                    ui.painter().rect_filled(
+                        fill_rect,
+                        egui::CornerRadius::same(5),
+                        if progress <= 0.05 {
+                            palette.danger
+                        } else {
+                            palette.action
+                        },
+                    );
+                }
+            }
+            let details = match (window.used_amount, window.limit_amount) {
+                (Some(used), Some(limit)) => Some(format!(
+                    "{} {} · {} {}",
+                    t(zh, "已用", "Used"),
+                    Self::usage_amount(used, &window.currency),
+                    t(zh, "总额", "Total"),
+                    Self::usage_amount(limit, &window.currency)
+                )),
+                (Some(used), None) => Some(format!(
+                    "{} {}",
+                    t(zh, "已用", "Used"),
+                    Self::usage_amount(used, &window.currency)
+                )),
+                _ => None,
+            };
+            if let Some(details) = details {
+                ui.label(egui::RichText::new(details).small().color(palette.muted));
+            }
+            return;
+        }
         let reset = Self::usage_reset_label(window, zh);
         let remaining = remaining_quota_percent(window.used_percent);
         ui.horizontal(|ui| {
@@ -7416,7 +7604,7 @@ impl CodexRouterApp {
                     let readable_windows = account
                         .windows
                         .iter()
-                        .filter(|window| remaining_quota_percent(window.used_percent).is_some())
+                        .filter(|window| Self::usage_window_is_readable(window))
                         .collect::<Vec<_>>();
                     if readable_windows.is_empty() {
                         ui.label(
@@ -7509,10 +7697,12 @@ impl CodexRouterApp {
     /// pay-as-you-go API channels have no such windows and are listed separately.
     fn usage_account_is_quota_plan(account: &UsageAccount) -> bool {
         account.kind == "oauth"
-            || account
-                .windows
-                .iter()
-                .any(|window| matches!(window.kind.as_str(), "fiveHour" | "weekly" | "monthly"))
+            || account.windows.iter().any(|window| {
+                matches!(
+                    window.kind.as_str(),
+                    "fiveHour" | "daily" | "weekly" | "monthly" | "other"
+                )
+            })
     }
 
     fn show_usage_account_grid(
@@ -7534,32 +7724,26 @@ impl CodexRouterApp {
         } else {
             1usize
         };
-        let card_width = if columns == 2 {
-            ((usable_width - gap) / 2.0).max(0.0)
-        } else {
-            usable_width.max(0.0)
-        };
-        let mut index = 0usize;
-        while index < accounts.len() {
-            ui.horizontal_top(|ui| {
-                for offset in 0..columns {
-                    let Some(account) = accounts.get(index + offset) else {
-                        break;
-                    };
-                    if offset > 0 {
-                        ui.add_space(gap);
-                    }
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(card_width, 0.0),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
+        let assignments = usage_column_indices(accounts.len(), columns);
+        ui.allocate_ui_with_layout(
+            egui::vec2(usable_width, 0.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                ui.columns(columns, |column_uis| {
+                    for (column, indices) in column_uis.iter_mut().zip(assignments) {
+                        for (position, index) in indices.into_iter().enumerate() {
+                            if position > 0 {
+                                column.add_space(gap);
+                            }
+                            let account = accounts[index];
                             let account_section = if account.kind == "oauth" {
                                 UsageOrderSection::Subscription
                             } else {
                                 UsageOrderSection::Api
                             };
                             let (card, handle) = Self::show_usage_account(
-                                ui,
+                                column,
                                 account,
                                 palette,
                                 zh,
@@ -7573,7 +7757,7 @@ impl CodexRouterApp {
                                 if payload.section == account_section
                                     && payload.account_id != account.id
                                 {
-                                    ui.painter().rect_stroke(
+                                    column.painter().rect_stroke(
                                         card.rect,
                                         egui::CornerRadius::same(7),
                                         egui::Stroke::new(2.0, palette.action),
@@ -7587,15 +7771,11 @@ impl CodexRouterApp {
                                         Some((account_section, payload.account_id, account.id));
                                 }
                             }
-                        },
-                    );
-                }
-            });
-            index += columns;
-            if index < accounts.len() {
-                ui.add_space(gap);
-            }
-        }
+                        }
+                    }
+                });
+            },
+        );
         usage_reorder
     }
 

@@ -197,6 +197,49 @@ $catalogModels = @(for ($index = 0; $index -lt $visibleRoutes.Count; $index++) {
     $catalogModel.service_tiers = $serviceTiers
     $catalogModel.availability_nux = $null
     $catalogModel.upgrade = $null
+    # Non-OpenAI OAuth platforms (Antigravity/Gemini/Grok) must not inherit the
+    # GPT-5 multi-agent protocol text. That template can leak as visible JSON
+    # envelopes (e.g. type=reasoning_text) inside Codex.
+    $oauthPlatform = ''
+    foreach ($name in @('oauthPlatform', 'oauth_platform')) {
+        $prop = $model.PSObject.Properties[$name]
+        if ($null -ne $prop -and -not [string]::IsNullOrWhiteSpace([string]$prop.Value)) {
+            $oauthPlatform = ([string]$prop.Value).Trim().ToLowerInvariant()
+            break
+        }
+    }
+    $source = Get-RouterModelSource -Model $model
+    if ([string]::IsNullOrWhiteSpace($oauthPlatform) -and $source -eq 'oauth') {
+        $mid = ([string]$model.model).Trim().ToLowerInvariant()
+        if ($mid -match 'gemini') { $oauthPlatform = 'antigravity' }
+        elseif ($mid -match 'grok') { $oauthPlatform = 'grok' }
+        elseif ($mid -match 'claude') { $oauthPlatform = 'anthropic' }
+        elseif ($mid -match '^(gpt-|o\d|codex-)') { $oauthPlatform = 'openai' }
+    }
+    if ($source -eq 'oauth' -and $oauthPlatform -in @('antigravity', 'gemini', 'google', 'google_one', 'grok', 'xai', 'x-ai')) {
+        $simpleInstructions = @'
+You are a coding assistant. Follow the user's instructions carefully and completely.
+Prefer plain language and standard markdown. Never emit protocol metadata, control JSON,
+reasoning envelopes, or internal tags such as {"type":"reasoning_text"} in user-visible output.
+Put only the final answer and necessary tool calls in the response stream.
+'@
+        $catalogModel.base_instructions = $simpleInstructions.Trim()
+        if ($null -ne $catalogModel.model_messages) {
+            $catalogModel.model_messages.instructions_template = $simpleInstructions.Trim()
+        }
+        $catalogModel.use_responses_lite = $false
+        $catalogModel.multi_agent_version = $null
+        $catalogModel.tool_mode = 'default'
+        $catalogModel.default_reasoning_summary = 'none'
+        # Antigravity rejects Codex built-in search/function invocation metadata
+        # unless a provider-specific server-side flag is present. Sub2API does
+        # not expose that flag, so keep the normal coding tools but do not ask
+        # Codex to send its built-in search tool to Google OAuth.
+        $catalogModel.supports_search_tool = $false
+        # Codex rejects an explicit JSON null for this optional typed field.
+        # Omitting it disables search without invalidating the whole catalog.
+        $catalogModel.PSObject.Properties.Remove('web_search_tool_type')
+    }
     $catalogModel
 })
 

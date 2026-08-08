@@ -379,11 +379,13 @@ fn restore_full_state(
     } else {
         String::new()
     };
-    let merged_config = if let Some(current) = original_config.as_deref() {
-        merge_codex_route_config(
-            std::str::from_utf8(current).context("当前 Codex config.toml 不是 UTF-8")?,
-            &snapshot_config,
-        )?
+    let current_text = original_config
+        .as_deref()
+        .map(|bytes| std::str::from_utf8(bytes).context("当前 Codex config.toml 不是 UTF-8"))
+        .transpose()?;
+    let merged_config = if let Some(current) = current_text {
+        let merged = merge_codex_route_config(current, &snapshot_config)?;
+        logic::preserve_windows_sandbox_config(current, &merged)
     } else {
         logic::normalize_windows_sandbox_config(&snapshot_config)
     };
@@ -988,8 +990,9 @@ pub(crate) fn merge_codex_route_config(current: &str, target: &str) -> anyhow::R
         }
     }
 
-    Ok(logic::normalize_windows_sandbox_config(
-        &current_doc.to_string(),
+    Ok(logic::preserve_windows_sandbox_config(
+        current,
+        &logic::normalize_windows_sandbox_config(&current_doc.to_string()),
     ))
 }
 
@@ -1006,11 +1009,17 @@ fn restore_shared_config(
     } else {
         String::new()
     };
-    let merged = if target_path.is_file() {
-        merge_codex_route_config(&std::fs::read_to_string(&target_path)?, &snapshot)?
+    let current = if target_path.is_file() {
+        std::fs::read_to_string(&target_path)?
+    } else {
+        String::new()
+    };
+    let merged = if !current.is_empty() {
+        merge_codex_route_config(&current, &snapshot)?
     } else {
         logic::normalize_windows_sandbox_config(&snapshot)
     };
+    let merged = logic::preserve_windows_sandbox_config(&current, &merged);
     if merged.trim().is_empty() {
         clear_optional_file(&target_path)?;
     } else {
@@ -1137,7 +1146,12 @@ fn sanitize_router_config(text: &str) -> String {
     if remove_empty_providers {
         document.remove("model_providers");
     }
-    let cleaned = document.to_string().trim().to_owned();
+    let cleaned = logic::preserve_windows_sandbox_config(
+        text,
+        &logic::normalize_windows_sandbox_config(&document.to_string()),
+    )
+    .trim()
+    .to_owned();
     if cleaned.is_empty() {
         String::new()
     } else {
@@ -1696,6 +1710,7 @@ sandbox = "unelevated"
         assert!(!output.contains("model_providers.sub2api"));
         assert!(output.contains("approval_policy"));
         assert!(output.contains("[windows]"));
+        assert!(output.contains("sandbox = \"unelevated\""));
     }
 
     #[test]
@@ -1809,7 +1824,7 @@ experimental_bearer_token = "sk-local-test"
     }
 
     #[test]
-    fn restore_keeps_the_users_windows_sandbox_permission() {
+    fn restore_keeps_completed_windows_setup_state() {
         let input = "model = \"custom\"\n[windows]\nsandbox = \"elevated\"\n";
         let output = logic::normalize_windows_sandbox_config(input);
         assert!(output.contains("sandbox = \"elevated\""));

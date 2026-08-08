@@ -49,12 +49,10 @@ const RECOVERY_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_s
 const CODEX_BINDING_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
 const HEALTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 const EXIT_CONFIG_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-const EXIT_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+const EXIT_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 const EXIT_HELPER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 const EXIT_PROCESS_KILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const EXIT_HELPER_OUTPUT_LIMIT: usize = 64 * 1024;
-const EXIT_TAKEOVER_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
-const STARTUP_TAKEOVER_MUTEX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 // Logical points, not physical pixels. Startup is fitted to the primary
 // monitor's work area, so ordinary displays retain the comfortable desktop
 // size while 200%-scaled displays receive a usable compact window.
@@ -293,6 +291,14 @@ struct UsageWindow {
     requests: i64,
     #[serde(default)]
     tokens: i64,
+    #[serde(default)]
+    remaining_amount: Option<f64>,
+    #[serde(default)]
+    limit_amount: Option<f64>,
+    #[serde(default)]
+    used_amount: Option<f64>,
+    #[serde(default)]
+    currency: String,
 }
 
 fn negative_one() -> i64 {
@@ -1199,6 +1205,26 @@ fn deployment_progress_line(zh: bool, line: &str) -> Option<String> {
             zh: "本机访问密钥已保存到 Windows 凭据管理器",
             en: "Stored the local access key in Windows Credential Manager",
         },
+        Progress {
+            marker: "Codex Router is running at",
+            zh: "本地 Router 服务已启动",
+            en: "Local Router services are running",
+        },
+        Progress {
+            marker: "Codex Router secrets and PostgreSQL",
+            zh: "本地凭据与数据库目录已就绪",
+            en: "Local secrets and database directory are ready",
+        },
+        Progress {
+            marker: "Codex Router is stopped",
+            zh: "本地 Router 服务已停止",
+            en: "Local Router services are stopped",
+        },
+        Progress {
+            marker: "Configured ",
+            zh: "模型渠道数量已确认",
+            en: "Model channel count confirmed",
+        },
     ];
     PROGRESS
         .iter()
@@ -1206,7 +1232,123 @@ fn deployment_progress_line(zh: bool, line: &str) -> Option<String> {
         .map(|progress| if zh { progress.zh } else { progress.en }.to_owned())
 }
 
+/// Stable per-step deployment flags. Every Apply stage and every routing
+/// decision emits one, so the activity log stays diagnosable and searchable:
+/// the code is always kept verbatim next to a human explanation.
+fn localized_router_flag(zh: bool, rest: &str) -> String {
+    let mut parts = rest.trim().splitn(2, ' ');
+    let code = parts.next().unwrap_or_default().trim();
+    let data = parts.next().unwrap_or_default().trim();
+    let meaning = match code {
+        "STAGE-01-INIT-OK" => (
+            "步骤 1/7 完成：本地凭据与数据库已就绪",
+            "Step 1/7 done: local credentials and database are ready",
+        ),
+        "STAGE-02-SERVICES-OK" => (
+            "步骤 2/7 完成：PostgreSQL / Redis / Sub2API 已启动",
+            "Step 2/7 done: PostgreSQL, Redis, and Sub2API are running",
+        ),
+        "STAGE-03-ADMIN-OK" => (
+            "步骤 3/7 完成：管理接口登录成功",
+            "Step 3/7 done: signed in to the admin API",
+        ),
+        "STAGE-04-COMPLIANCE-OK" => (
+            "步骤 4/7 完成：合规状态已确认",
+            "Step 4/7 done: compliance state confirmed",
+        ),
+        "STAGE-06-CODEX-OK" => (
+            "步骤 6/7 完成：Codex 配置与本地密钥已写入",
+            "Step 6/7 done: Codex configuration and local key written",
+        ),
+        "STAGE-07-DONE" => ("步骤 7/7 完成：部署成功", "Step 7/7 done: deployment succeeded"),
+        "OAUTH-PRIMARY" => (
+            "订阅额度可用：优先使用该 OAuth 账号",
+            "Subscription quota available: this OAuth account is preferred",
+        ),
+        "OAUTH-PARKED-WITH-FALLBACK" => (
+            "订阅额度已用完：暂停该账号，改用同名第三方 API 兜底",
+            "Subscription quota exhausted: account parked, same-model API channel serves instead",
+        ),
+        "OAUTH-PARKED-NO-FALLBACK" => (
+            "订阅额度已用完且没有同名第三方兜底：该模型暂时下线",
+            "Subscription quota exhausted with no same-model API fallback: the model is temporarily offline",
+        ),
+        "OAUTH-SKIP-UNSELECTED" => (
+            "该 OAuth 账号未加入当前配置，不参与路由",
+            "This OAuth account is not part of the active profile and does not route",
+        ),
+        "OAUTH-SKIP-NO-MODELS" => (
+            "该 OAuth 账号未导入任何模型，继续使用模型列表中的第三方渠道",
+            "No OAuth models imported for this account; third-party channels keep serving",
+        ),
+        "API-CHANNEL" => (
+            "已配置独立第三方 API 渠道",
+            "Configured a standalone third-party API channel",
+        ),
+        "API-FALLBACK-CHANNEL" => (
+            "已配置同名第三方兜底渠道（OAuth 用尽时接管）",
+            "Configured a same-model API fallback channel (takes over when OAuth is exhausted)",
+        ),
+        "CATALOG-MODEL" => (
+            "模型已写入 Codex 菜单",
+            "Model written into the Codex menu",
+        ),
+        "CATALOG-DROPPED" => (
+            "模型暂时移出 Codex 菜单（当前无可用账号）",
+            "Model temporarily removed from the Codex menu (no serviceable account)",
+        ),
+        "CATALOG-FILTER" => (
+            "Codex 菜单可用性过滤完成",
+            "Codex menu availability filter finished",
+        ),
+        "FALLBACK-ACTIVE" => (
+            "已触发兜底：该模型改由第三方 API 提供",
+            "Fallback active: this model is now served by a third-party API channel",
+        ),
+        "COMPOSITE-SYNC" => ("组合路由已同步", "Composite routes synchronized"),
+        "COMPOSITE-ROUTE" => ("组合路由项已就绪", "Composite route entry is ready"),
+        "ROUTING-SYNC-OK" => (
+            "额度状态变化后已重新同步路由与 Codex 菜单",
+            "Routing and the Codex menu were re-synchronized after a quota change",
+        ),
+        "ROUTING-SYNC-MODEL" => (
+            "路由同步：模型当前的服务来源",
+            "Routing sync: current serving source for this model",
+        ),
+        "ROUTING-SYNC-SKIPPED" => (
+            "路由同步已跳过",
+            "Routing sync was skipped",
+        ),
+        "ROUTING-SYNC-FAILED" => (
+            "路由同步未完成，下次应用会重新对齐",
+            "Routing sync did not finish; the next Apply realigns it",
+        ),
+        "ROUTING-SYNC-ACCOUNT-UNREADABLE" => (
+            "路由同步：无法读取该 OAuth 账号状态",
+            "Routing sync: could not read this OAuth account state",
+        ),
+        "OAUTH-REJOINED" => (
+            "订阅额度已恢复：该账号重新回到优先路由",
+            "Subscription quota recovered: this account is preferred again",
+        ),
+        "OAUTH-PARKED" => (
+            "订阅额度不可用：该账号已移出请求路径",
+            "Subscription quota unavailable: this account left the request path",
+        ),
+        _ => ("部署事件", "Deployment event"),
+    };
+    let text = if zh { meaning.0 } else { meaning.1 };
+    if data.is_empty() {
+        format!("[{code}] {text}")
+    } else {
+        format!("[{code}] {text} · {data}")
+    }
+}
+
 fn localized_deployment_line(zh: bool, line: String) -> String {
+    if let Some(rest) = line.trim().strip_prefix("CR-FLAG ") {
+        return localized_router_flag(zh, rest);
+    }
     let localized = [
         (
             "[1/7]",
@@ -1248,20 +1390,73 @@ fn localized_deployment_line(zh: bool, line: String) -> String {
         })
         .or_else(|| deployment_progress_line(zh, &line))
         .unwrap_or_else(|| {
-            format!(
-                "{}: {}",
-                if zh {
+            if let Some(rest) = line
+                .strip_prefix("deployment_warning ")
+                .or_else(|| line.strip_prefix("deployment_diagnostic "))
+            {
+                let label = if line.starts_with("deployment_warning ") {
+                    if zh {
+                        "部署提示"
+                    } else {
+                        "Deployment note"
+                    }
+                } else if zh {
                     "部署诊断"
                 } else {
                     "Deployment diagnostic"
-                },
-                localized_error_summary(zh, &line)
-            )
+                };
+                format!("{label}: {}", localized_error_summary(zh, rest))
+            } else {
+                format!(
+                    "{}: {}",
+                    if zh {
+                        "部署诊断"
+                    } else {
+                        "Deployment diagnostic"
+                    },
+                    localized_error_summary(zh, &line)
+                )
+            }
         })
 }
 
 fn localized_error_summary(zh: bool, text: &str) -> String {
     for (marker, chinese, english) in [
+        (
+            "ROUTER_CONFIG_SAVE_LOCK_FAILED",
+            "无法取得配置保存锁。可能有另一个 Router 操作仍在进行，请完全退出重复运行的 Router 后重试。",
+            "Could not acquire the configuration save lock. Another Router operation may still be running; fully exit duplicate Router processes and retry.",
+        ),
+        (
+            "ROUTER_CONFIG_SAVE_CODEX_SNAPSHOT_FAILED",
+            "无法保存 Codex 原始配置快照。请关闭正在运行的 Codex 后再点击保存并应用。",
+            "Could not save the original Codex configuration snapshot. Close Codex completely, then click Save and Apply again.",
+        ),
+        (
+            "ROUTER_CONFIG_SAVE_BACKUP_FAILED",
+            "无法创建应用前配置备份。请检查 UserData 目录是否可写，并关闭占用配置文件的程序。",
+            "Could not create the pre-apply configuration backup. Check that UserData is writable and close programs holding the configuration files.",
+        ),
+        (
+            "ROUTER_CONFIG_SAVE_CREDENTIALS_FAILED",
+            "无法写入 Windows 凭据管理器。请以当前用户重新启动 Router 后重试，不会覆盖现有配置。",
+            "Could not write Windows Credential Manager entries. Restart Router as the current user and retry; the existing configuration was not overwritten.",
+        ),
+        (
+            "ROUTER_CONFIG_SAVE_FILES_FAILED",
+            "无法提交 Router 配置文件。请关闭 Codex-Router 后重新打开 LAB 版本再试。",
+            "Could not commit Router configuration files. Close Codex-Router, reopen the LAB version, and retry.",
+        ),
+        (
+            "ROUTER_CONFIG_SAVE_APPLY_SCRIPT_FAILED",
+            "配置文件已写入，但 Router 应用脚本失败。请查看活动日志中的 STAGE 或 CR-FLAG 原因。",
+            "The configuration files were written, but the Router apply script failed. Check the activity log for the STAGE or CR-FLAG reason.",
+        ),
+        (
+            "ROUTER_CONFIG_SAVE_DEPLOY_FAILED",
+            "保存配置事务失败，已保留应用前配置。请查看活动日志中的具体保存阶段。",
+            "The configuration transaction failed and the previously applied configuration was preserved. Check the activity log for the exact save stage.",
+        ),
         (
             "ROUTER_DEPLOY_NO_MODELS",
             "当前配置没有可部署的模型。请在模型卡片中添加 API 渠道，或在 OAuth 账号卡片中点击「＋ 模型」把官方模型加入本配置后再试。",
@@ -1548,7 +1743,7 @@ where
             "ROUTER_DEPLOY_NO_MODELS: the configuration has no model channel, so nothing can be deployed"
         );
     }
-    logic::store_credentials(cfg, router_root)?;
+    logic::store_credentials(cfg, router_root).context("ROUTER_CONFIG_SAVE_CREDENTIALS_FAILED")?;
     on_log(
         if zh {
             "API Key 已安全保存到 Windows 凭据管理器"
@@ -1557,7 +1752,7 @@ where
         }
         .to_owned(),
     );
-    logic::write_all_files(cfg, router_root)?;
+    logic::write_all_files(cfg, router_root).context("ROUTER_CONFIG_SAVE_FILES_FAILED")?;
     on_log(
         if zh {
             "无密钥配置和模型目录已写入"
@@ -1569,6 +1764,7 @@ where
     logic::run_apply_script_with_cancel(router_root, cancel, |line| {
         on_log(localized_deployment_line(zh, line));
     })
+    .context("ROUTER_CONFIG_SAVE_APPLY_SCRIPT_FAILED")
 }
 
 /// Redeploys a configuration recovered from a restore point.
@@ -2278,9 +2474,7 @@ impl CodexRouterApp {
         if configured || legacy_autostart_shortcut_exists() {
             app.reconcile_autostart_registration();
         }
-        if ui_preferences.prefer_router_mode && !configured_router_mode {
-            app.repair_router_codex_binding_if_needed();
-        } else if router_mode_enabled && !ui_preferences.prefer_router_mode {
+        if router_mode_enabled && !ui_preferences.prefer_router_mode {
             // Migrate older installs that already bind Codex to Router.
             let _ = app.persist_ui_preferences();
         }
@@ -2438,6 +2632,7 @@ impl CodexRouterApp {
                             remaining_seconds: 14_400,
                             requests: 148,
                             tokens: 2_300_400,
+                            ..Default::default()
                         },
                         UsageWindow {
                             kind: "weekly".to_owned(),
@@ -2447,6 +2642,7 @@ impl CodexRouterApp {
                             remaining_seconds: 432_000,
                             requests: 512,
                             tokens: 9_842_331,
+                            ..Default::default()
                         },
                     ],
                     ..Default::default()
@@ -2476,6 +2672,7 @@ impl CodexRouterApp {
                         remaining_seconds: 431_340,
                         requests: 74,
                         tokens: 1_540_000,
+                        ..Default::default()
                     }],
                     ..Default::default()
                 },
@@ -3362,7 +3559,6 @@ if ($relaunched) { 'codex-router:codex-restarted' } else { 'codex-router:codex-r
             // One opportunistic recovery when the user returns from tray, not a
             // recurring hourly schedule.
             self.request_oauth_recovery_probe(std::time::Duration::from_secs(2));
-            self.repair_router_codex_binding_if_needed();
         }
         if let Some(tray) = &self.tray_icon {
             let _ = tray.set_tooltip(Some(APP_TITLE));
@@ -3651,6 +3847,7 @@ if ($relaunched) { 'codex-router:codex-restarted' } else { 'codex-router:codex-r
                 }
                 AppEvent::Error(error) => {
                     let was_applying = self.applying;
+                    let was_router_mode_switching = self.router_mode_switching;
                     self.applying = false;
                     if self.exit_shutdown_in_progress {
                         continue;
@@ -3674,6 +3871,12 @@ if ($relaunched) { 'codex-router:codex-restarted' } else { 'codex-router:codex-r
                     if !self.restore_pending_apply_ui_rollback() {
                         self.router_mode_enabled = logic::codex_router_mode_active(&self.config);
                         self.pending_profile_activation = None;
+                    } else if was_router_mode_switching {
+                        // A failed automatic rebind must not retry every watchdog
+                        // interval. A later manual Apply can enable Router mode again.
+                        self.router_mode_enabled =
+                            logic::codex_router_mode_configured(&self.config);
+                        self.persist_ui_preferences();
                     }
                     let detail = localized_error_summary(zh, &error);
                     let message = format!(
@@ -4070,17 +4273,7 @@ if ($relaunched) { 'codex-router:codex-restarted' } else { 'codex-router:codex-r
                     }
                     self.usage_loading = false;
                     let detail = usage_error_for_display(zh, &error);
-                    self.usage_error = if self.usage_snapshot.is_some()
-                        && self.usage_snapshot_profile_key == self.active_route_profile_key()
-                    {
-                        if zh {
-                            format!("刷新失败，下面保留上次成功数据；{detail}")
-                        } else {
-                            format!("Refresh failed; the last successful data is retained below. {detail}")
-                        }
-                    } else {
-                        detail.clone()
-                    };
+                    self.usage_error = detail.clone();
                     self.log(format!(
                         "{}: {detail}",
                         if zh {
@@ -4339,7 +4532,6 @@ if ($relaunched) { 'codex-router:codex-restarted' } else { 'codex-router:codex-r
                             self.health_probe_failures = 0;
                             self.health_probe_due =
                                 Some(std::time::Instant::now() + HEALTHY_PROBE_INTERVAL);
-                            self.repair_router_codex_binding_if_needed();
                         }
                         Err(error) => {
                             let detail = runtime_logs::summarize_error_for_display(&error);
@@ -5067,34 +5259,18 @@ if ($relaunched) { 'codex-router:codex-restarted' } else { 'codex-router:codex-r
         self.oauth_error.clear();
     }
 
-    fn repair_router_codex_binding_if_needed(&mut self) {
-        if self.ui_audit_mode
-            || self.applying
-            || self.router_mode_switching
-            || self.exit_shutdown_in_progress
-        {
-            return;
-        }
-        if !self.router_mode_enabled {
-            return;
-        }
-        if logic::codex_router_mode_configured(&self.config) {
-            return;
-        }
-        self.log(if self.ui_language == "zh" {
-            "检测到 Codex 配置被外部工具改写，正在重新绑定本地 Router…"
-        } else {
-            "Codex configuration was rewritten externally; rebinding the local Router…"
-        });
-        self.enable_router_mode();
-    }
-
     fn process_codex_binding_watch(&mut self, ctx: &egui::Context) {
         if self.exit_shutdown_in_progress || !self.router_mode_enabled {
             self.codex_binding_check_due = None;
             return;
         }
         if self.applying || self.router_mode_switching {
+            return;
+        }
+        if codex_desktop_or_setup_running() {
+            self.codex_binding_check_due =
+                Some(std::time::Instant::now() + CODEX_BINDING_WATCH_INTERVAL);
+            ctx.request_repaint_after(CODEX_BINDING_WATCH_INTERVAL);
             return;
         }
         let now = std::time::Instant::now();
@@ -5107,11 +5283,6 @@ if ($relaunched) { 'codex-router:codex-restarted' } else { 'codex-router:codex-r
         }
         self.codex_binding_check_due = Some(now + CODEX_BINDING_WATCH_INTERVAL);
         if !logic::codex_router_mode_configured(&self.config) {
-            self.log(if self.ui_language == "zh" {
-                "看门狗：Codex 绑定被覆盖，自动恢复 Router 路由。"
-            } else {
-                "Watchdog: Codex binding was overwritten; restoring Router route."
-            });
             self.enable_router_mode();
         }
         ctx.request_repaint_after(CODEX_BINDING_WATCH_INTERVAL);
@@ -6469,157 +6640,167 @@ fn run_hidden_powershell_output(
 }
 
 #[cfg(windows)]
-fn process_name_from_entry(executable: &[u16]) -> String {
-    let end = executable
-        .iter()
-        .position(|character| *character == 0)
-        .unwrap_or(executable.len());
-    String::from_utf16_lossy(&executable[..end])
-}
+struct SingleInstanceGuard(windows_sys::Win32::Foundation::HANDLE);
 
 #[cfg(windows)]
-fn should_take_over_process(current_pid: u32, candidate_pid: u32, executable: &str) -> bool {
-    candidate_pid != current_pid && executable.eq_ignore_ascii_case("Codex-Router.exe")
-}
-
-#[cfg(windows)]
-fn same_windows_executable(left: &Path, right: &Path) -> bool {
-    left.to_string_lossy()
-        .eq_ignore_ascii_case(&right.to_string_lossy())
-}
-
-#[cfg(windows)]
-unsafe fn queried_process_executable(
-    process: windows_sys::Win32::Foundation::HANDLE,
-) -> Option<PathBuf> {
-    use windows_sys::Win32::System::Threading::QueryFullProcessImageNameW;
-
-    let mut path = vec![0_u16; 32_768];
-    let mut path_len = path.len() as u32;
-    if QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &mut path_len) == 0 {
-        return None;
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
     }
-    path.truncate(path_len as usize);
-    Some(PathBuf::from(String::from_utf16_lossy(&path)))
 }
 
 #[cfg(windows)]
-fn exit_marker_matches_executable(executable: &Path, candidate_pid: u32) -> bool {
-    let Some(router_root) = executable.parent() else {
-        return false;
-    };
-    let marker = user_data::data_root(router_root)
-        .join("pids")
-        .join("gui-exit.pid");
-    std::fs::read_to_string(marker)
-        .ok()
-        .and_then(|value| value.trim().parse::<u32>().ok())
-        == Some(candidate_pid)
-}
-
-#[cfg(windows)]
-unsafe fn process_has_exit_transaction_marker(
-    process: windows_sys::Win32::Foundation::HANDLE,
-    candidate_pid: u32,
-) -> bool {
-    let Some(executable) = queried_process_executable(process) else {
-        return false;
-    };
-    exit_marker_matches_executable(&executable, candidate_pid)
-}
-
-#[cfg(windows)]
-fn take_over_older_gui_instances() {
-    use windows_sys::Win32::Foundation::{
-        CloseHandle, INVALID_HANDLE_VALUE, WAIT_ABANDONED, WAIT_OBJECT_0,
-    };
+fn another_router_gui_running() -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
     };
-    use windows_sys::Win32::System::Threading::{
-        CreateMutexW, GetCurrentProcessId, OpenProcess, ReleaseMutex, TerminateProcess,
-        WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
-    };
-    const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 
-    let mutex_name: Vec<u16> = "Local\\CodexRouterStartupTakeoverV1"
+    unsafe {
+        let current_pid = GetCurrentProcessId();
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut found = false;
+        let mut has_entry = Process32FirstW(snapshot, &mut entry) != 0;
+        while has_entry {
+            let end = entry
+                .szExeFile
+                .iter()
+                .position(|character| *character == 0)
+                .unwrap_or(entry.szExeFile.len());
+            let executable = String::from_utf16_lossy(&entry.szExeFile[..end]);
+            if entry.th32ProcessID != current_pid
+                && executable.eq_ignore_ascii_case("Codex-Router.exe")
+            {
+                found = true;
+                break;
+            }
+            has_entry = Process32NextW(snapshot, &mut entry) != 0;
+        }
+        CloseHandle(snapshot);
+        found
+    }
+}
+
+#[cfg(windows)]
+fn codex_desktop_or_setup_running() -> bool {
+    process_name_running(&["ChatGPT.exe", "codex-windows-sandbox-setup.exe"])
+}
+
+#[cfg(not(windows))]
+fn codex_desktop_or_setup_running() -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn process_name_running(names: &[&str]) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            // Failing closed prevents a process-enumeration error from racing
+            // the Windows setup helper.
+            return true;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut found = false;
+        let mut has_entry = Process32FirstW(snapshot, &mut entry) != 0;
+        while has_entry {
+            let end = entry
+                .szExeFile
+                .iter()
+                .position(|character| *character == 0)
+                .unwrap_or(entry.szExeFile.len());
+            let executable = String::from_utf16_lossy(&entry.szExeFile[..end]);
+            if names
+                .iter()
+                .any(|name| executable.eq_ignore_ascii_case(name))
+            {
+                found = true;
+                break;
+            }
+            has_entry = Process32NextW(snapshot, &mut entry) != 0;
+        }
+        CloseHandle(snapshot);
+        found
+    }
+}
+
+#[cfg(windows)]
+fn show_already_running_message() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
+
+    let title: Vec<u16> = "Codex-Router"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let message: Vec<u16> = "Codex-Router 已经开启，请勿重复开启。\n\nCodex-Router is already running. Do not start another instance."
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
     unsafe {
-        let mutex = CreateMutexW(std::ptr::null(), 0, mutex_name.as_ptr());
-        if mutex.is_null() {
-            return;
-        }
-        let wait = WaitForSingleObject(
-            mutex,
-            STARTUP_TAKEOVER_MUTEX_TIMEOUT
-                .as_millis()
-                .min(u32::MAX as u128) as u32,
+        MessageBoxW(
+            std::ptr::null_mut(),
+            message.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONINFORMATION,
         );
-        if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
-            CloseHandle(mutex);
-            return;
-        }
+    }
+}
 
-        let current_pid = GetCurrentProcessId();
-        let current_executable = std::env::current_exe().ok();
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snapshot != INVALID_HANDLE_VALUE {
-            let mut entry: PROCESSENTRY32W = std::mem::zeroed();
-            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-            let mut has_entry = Process32FirstW(snapshot, &mut entry) != 0;
-            while has_entry {
-                let executable = process_name_from_entry(&entry.szExeFile);
-                if should_take_over_process(current_pid, entry.th32ProcessID, &executable) {
-                    let process = OpenProcess(
-                        PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE_ACCESS,
-                        0,
-                        entry.th32ProcessID,
-                    );
-                    if !process.is_null() {
-                        let owned = current_executable.as_ref().is_some_and(|current| {
-                            queried_process_executable(process).is_some_and(|candidate| {
-                                same_windows_executable(current, &candidate)
-                            })
-                        });
-                        if !owned {
-                            CloseHandle(process);
-                            has_entry = Process32NextW(snapshot, &mut entry) != 0;
-                            continue;
-                        }
-                        if process_has_exit_transaction_marker(process, entry.th32ProcessID)
-                            && WaitForSingleObject(
-                                process,
-                                EXIT_TAKEOVER_GRACE.as_millis().min(u32::MAX as u128) as u32,
-                            ) == WAIT_OBJECT_0
-                        {
-                            CloseHandle(process);
-                            has_entry = Process32NextW(snapshot, &mut entry) != 0;
-                            continue;
-                        }
-                        if TerminateProcess(process, 0) != 0 {
-                            WaitForSingleObject(process, 5_000);
-                        }
-                        CloseHandle(process);
-                    }
-                }
-                has_entry = Process32NextW(snapshot, &mut entry) != 0;
-            }
-            CloseHandle(snapshot);
+#[cfg(windows)]
+fn acquire_single_instance() -> Option<SingleInstanceGuard> {
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+
+    let mutex_name: Vec<u16> = "Local\\CodexRouterSingleInstanceV1"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let mutex = CreateMutexW(std::ptr::null(), 1, mutex_name.as_ptr());
+        if mutex.is_null() {
+            return None;
         }
-        ReleaseMutex(mutex);
-        CloseHandle(mutex);
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            windows_sys::Win32::Foundation::CloseHandle(mutex);
+            show_already_running_message();
+            return None;
+        }
+        if another_router_gui_running() {
+            windows_sys::Win32::Foundation::CloseHandle(mutex);
+            show_already_running_message();
+            return None;
+        }
+        Some(SingleInstanceGuard(mutex))
     }
 }
 
 fn main() -> eframe::Result<()> {
     let ui_audit = UiAuditOptions::from_args();
     #[cfg(windows)]
-    if ui_audit.is_none() {
-        take_over_older_gui_instances();
-    }
+    let _single_instance = if ui_audit.is_none() {
+        let Some(guard) = acquire_single_instance() else {
+            return Ok(());
+        };
+        Some(guard)
+    } else {
+        None
+    };
     let start_in_background =
         std::env::args_os().any(|argument| argument == "--background" || argument == "--watchdog");
     let compact = ui_audit.as_ref().is_some_and(|options| options.compact);
@@ -6802,27 +6983,7 @@ mod main_tests {
     }
 
     #[cfg(windows)]
-    use super::{
-        exit_marker_matches_executable, same_windows_executable, should_take_over_process,
-        stop_router_for_exit, stop_router_for_exit_with_timeout, ExitTransactionMarker,
-    };
-
-    #[cfg(windows)]
-    #[test]
-    fn only_an_older_router_gui_is_selected_for_takeover() {
-        assert!(should_take_over_process(20, 10, "Codex-Router.exe"));
-        assert!(should_take_over_process(20, 10, "codex-router.EXE"));
-        assert!(!should_take_over_process(20, 20, "Codex-Router.exe"));
-        assert!(!should_take_over_process(20, 10, "sub2api.exe"));
-        assert!(same_windows_executable(
-            std::path::Path::new(r"D:\Portable\Codex-Router.exe"),
-            std::path::Path::new(r"d:\portable\CODEX-ROUTER.EXE")
-        ));
-        assert!(!same_windows_executable(
-            std::path::Path::new(r"D:\Portable-A\Codex-Router.exe"),
-            std::path::Path::new(r"D:\Portable-B\Codex-Router.exe")
-        ));
-    }
+    use super::{stop_router_for_exit, stop_router_for_exit_with_timeout, ExitTransactionMarker};
 
     #[cfg(windows)]
     #[test]
@@ -6835,17 +6996,12 @@ mod main_tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let executable = root.join("Codex-Router.exe");
         std::fs::create_dir_all(&root).unwrap();
         let marker = ExitTransactionMarker::create(&root).unwrap();
-        assert!(exit_marker_matches_executable(
-            &executable,
-            std::process::id()
-        ));
-        assert!(!exit_marker_matches_executable(
-            &executable,
-            std::process::id().saturating_add(1)
-        ));
+        assert_eq!(
+            std::fs::read_to_string(&marker.path).unwrap(),
+            std::process::id().to_string()
+        );
         let marker_path = marker.path.clone();
         drop(marker);
         assert!(!marker_path.exists());
@@ -7133,9 +7289,40 @@ mod main_tests {
             "Configured 8 model channel(s).",
             "Codex configuration written to: C:\\Users\\x\\.codex\\config.toml",
             "Local access key is stored in Windows Credential Manager and the current user environment.",
+            "Codex Router is running at http://127.0.0.1:18080",
+            "Codex Router secrets and PostgreSQL data directory are initialized.",
         ] {
             for zh in [true, false] {
-                let rendered = localized_deployment_line(zh, line.to_owned());
+                // Mimic the deploy pipeline: logic.rs first reduces the line to a
+                // safe marker, then the UI localizes it.
+                let reduced = if line.starts_with('[') {
+                    line.chars().take(5).collect::<String>()
+                } else {
+                    // Keep the same markers logic.rs emits for progress lines.
+                    [
+                        "Sub2API administrator ready",
+                        "Codex model catalog generated",
+                        "Composite routes",
+                        "Updated channel:",
+                        "Created channel:",
+                        "isolated until recovery",
+                        "Outbound proxy reconciliation",
+                        "Catalog availability filter",
+                        "OAuth on-demand recovery delegated",
+                        "Autostart registered",
+                        "model channel(s).",
+                        "Codex configuration written to",
+                        "Local access key is stored in Windows Credential Manager",
+                        "Codex Router is running at",
+                        "Codex Router secrets and PostgreSQL",
+                        "Configured ",
+                    ]
+                    .into_iter()
+                    .find(|marker| line.contains(marker))
+                    .unwrap_or(line)
+                    .to_owned()
+                };
+                let rendered = localized_deployment_line(zh, reduced);
                 assert!(
                     !rendered.contains("class="),
                     "normal progress was classified as an error: {line} -> {rendered}"
@@ -7145,6 +7332,60 @@ mod main_tests {
                     "normal progress was labeled a diagnostic: {line} -> {rendered}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn every_router_flag_keeps_a_searchable_code_and_a_human_meaning() {
+        for (line, zh_needle) in [
+            ("CR-FLAG STAGE-01-INIT-OK", "步骤 1/7"),
+            (
+                "CR-FLAG OAUTH-PRIMARY account=1 platform=openai priority=1 models=3 fallback=yes",
+                "优先使用该 OAuth 账号",
+            ),
+            (
+                "CR-FLAG OAUTH-PARKED-WITH-FALLBACK account=1 platform=openai reason=quota reset=2026-08-08T03:34:03Z models=3",
+                "改用同名第三方 API 兜底",
+            ),
+            (
+                "CR-FLAG FALLBACK-ACTIVE model=gpt-5.6-sol account=1 reason=subscription-quota-parked",
+                "已触发兜底",
+            ),
+            (
+                "CR-FLAG CATALOG-MODEL model=gemini-3.1-pro-high served=oauth suffix=oauth account=4",
+                "模型已写入 Codex 菜单",
+            ),
+            (
+                "CR-FLAG ROUTING-SYNC-OK models=8 listChanged=yes created=1 updated=0 removed=0 parked=1",
+                "重新同步路由",
+            ),
+        ] {
+            let zh_text = localized_deployment_line(true, line.to_owned());
+            let en_text = localized_deployment_line(false, line.to_owned());
+            let code = line
+                .trim_start_matches("CR-FLAG ")
+                .split(' ')
+                .next()
+                .unwrap();
+            for rendered in [&zh_text, &en_text] {
+                assert!(
+                    rendered.contains(code),
+                    "the searchable flag code disappeared: {line} -> {rendered}"
+                );
+                assert!(
+                    !rendered.contains("class="),
+                    "a deployment flag was classified as an error: {line} -> {rendered}"
+                );
+                assert!(
+                    !rendered.contains("部署诊断") && !rendered.contains("Deployment diagnostic"),
+                    "a deployment flag was labeled a diagnostic: {line} -> {rendered}"
+                );
+            }
+            assert!(
+                zh_text.contains(zh_needle),
+                "missing Chinese meaning for {line}: {zh_text}"
+            );
+            assert_ne!(zh_text, en_text, "flag was not localized: {line}");
         }
     }
 

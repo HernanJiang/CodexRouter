@@ -222,6 +222,19 @@ function Test-TcpListenerPort {
         Where-Object { $_.Port -eq $Port }).Count -gt 0
 }
 
+function Wait-TcpListenerPortReleased {
+    param(
+        [Parameter(Mandatory)][int]$Port,
+        [ValidateRange(1, 10)][int]$TimeoutSeconds = 2
+    )
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        if (-not (Test-TcpListenerPort -Port $Port)) { return $true }
+        Start-Sleep -Milliseconds 50
+    } while ([DateTime]::UtcNow -lt $deadline)
+    return -not (Test-TcpListenerPort -Port $Port)
+}
+
 function Assert-ManagedServiceStopped {
     param(
         [Parameter(Mandatory)][int]$Port,
@@ -234,7 +247,7 @@ function Assert-ManagedServiceStopped {
             throw "$ServiceName process $processId is still running after shutdown."
         }
     }
-    if (Test-TcpListenerPort -Port $Port) {
+    if (-not (Wait-TcpListenerPortReleased -Port $Port)) {
         throw "$ServiceName is still listening on port $Port after shutdown."
     }
     $remaining = @(Get-ProcessesByExecutablePath -ExpectedPath $ExpectedPath)

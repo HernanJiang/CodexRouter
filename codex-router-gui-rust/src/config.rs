@@ -290,11 +290,18 @@ pub struct ModelConfig {
     /// an automatic recommendation that may adapt to OAuth merge state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alias_customized: Option<bool>,
-    #[serde(default)]
+    #[serde(default, alias = "baseURL")]
     pub base_url: String,
     /// Runtime-only input. API keys are never serialized to project files.
     #[serde(skip_serializing, default)]
     pub api_key: String,
+    /// Runtime-only Volcengine control-plane Access Key ID. Stored in Windows
+    /// Credential Manager so Coding Plan usage can query weekly/monthly quota.
+    #[serde(skip_serializing, default)]
+    pub volcengine_access_key_id: String,
+    /// Runtime-only Volcengine control-plane Secret Access Key.
+    #[serde(skip_serializing, default)]
+    pub volcengine_secret_access_key: String,
     #[serde(default)]
     pub credential_name: String,
     #[serde(default = "default_10")]
@@ -361,6 +368,8 @@ impl Default for ModelConfig {
             alias_customized: None,
             base_url: String::new(),
             api_key: String::new(),
+            volcengine_access_key_id: String::new(),
+            volcengine_secret_access_key: String::new(),
             credential_name: String::new(),
             priority: 10,
             weight: 1,
@@ -465,7 +474,9 @@ impl Default for RouterConfig {
 impl RouterConfig {
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        let mut cfg: Self = serde_json::from_str(&content)?;
+        let mut value: serde_json::Value = serde_json::from_str(&content)?;
+        normalize_legacy_model_numbers(&mut value)?;
+        let mut cfg: Self = serde_json::from_value(value)?;
         for model in &mut cfg.models {
             if model.model.eq_ignore_ascii_case("gpt-5.6") {
                 model.model = "gpt-5.6-sol".to_owned();
@@ -503,6 +514,40 @@ impl RouterConfig {
     }
 }
 
+fn normalize_legacy_model_numbers(value: &mut serde_json::Value) -> anyhow::Result<()> {
+    let Some(models) = value
+        .get_mut("models")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+    for model in models {
+        let Some(fields) = model.as_object_mut() else {
+            continue;
+        };
+        for key in [
+            "priority",
+            "weight",
+            "autoCompactPercent",
+            "contextWindow",
+            "oauthAccountId",
+        ] {
+            let Some(number) = fields.get(key).and_then(serde_json::Value::as_f64) else {
+                continue;
+            };
+            if !number.is_finite() || number.fract() != 0.0 {
+                anyhow::bail!("model field {key} must be an integer");
+            }
+            let integer = number as i64;
+            if integer as f64 != number {
+                anyhow::bail!("model field {key} is outside the supported integer range");
+            }
+            fields.insert(key.to_owned(), serde_json::Value::Number(integer.into()));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -517,6 +562,8 @@ mod tests {
         let model = ModelConfig {
             model: "test-model".into(),
             api_key: "sk-provider-secret".into(),
+            volcengine_access_key_id: "volc-ak-secret".into(),
+            volcengine_secret_access_key: "volc-sk-secret".into(),
             credential_name: "ModelApiKey-test".into(),
             ..ModelConfig::default()
         };
@@ -525,6 +572,8 @@ mod tests {
         assert!(!json.contains("sk-local-secret"));
         assert!(!json.contains("proxy-secret"));
         assert!(!json.contains("sk-provider-secret"));
+        assert!(!json.contains("volc-ak-secret"));
+        assert!(!json.contains("volc-sk-secret"));
         assert!(json.contains("ModelApiKey-test"));
     }
 
@@ -614,6 +663,32 @@ mod tests {
         assert_eq!(config.models[0].alias, "ChatGPT-5.6-Sol");
         assert_eq!(config.default_model, "gpt-5.6-sol");
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn legacy_integral_floats_and_base_url_spelling_are_normalized_on_load() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-router-legacy-numbers-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"models":[{"model":"test","baseURL":"https://example.test/v1","priority":90.0,"weight":1.0,"autoCompactPercent":80.0,"contextWindow":128000.0,"oauthAccountId":0.0}]}"#,
+        )
+        .unwrap();
+        let config = RouterConfig::load(&path).unwrap();
+        assert_eq!(config.models[0].base_url, "https://example.test/v1");
+        assert_eq!(config.models[0].priority, 90);
+        assert_eq!(config.models[0].weight, 1);
+        assert_eq!(config.models[0].auto_compact_percent, 80);
+        assert_eq!(config.models[0].context_window, 128_000);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

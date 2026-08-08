@@ -33,6 +33,34 @@ Assert-True (
     $openRouter.Extra.openai_compact_supported -eq $false
 ) 'The verified OpenRouter compact limitation was not seeded.'
 
+foreach ($modelId in @(
+    'x-ai/grok-4.5',
+    '~x-ai/grok-latest',
+    'google/gemini-3.1-pro-high',
+    'qwen/qwen3.8-max',
+    'anthropic/claude-opus-5',
+    'openai/gpt-5.6-sol'
+)) {
+    $openRouterAgentFallback = Get-RouterOpenAIChannelPolicy `
+        -BaseUrl 'https://openrouter.ai/api/v1' `
+        -ModelId $modelId `
+        -Extra @{}
+    Assert-True (
+        [string]$openRouterAgentFallback.ResponsesMode -eq 'force_chat_completions'
+    ) "OpenRouter agent fallback did not use the compatible Chat Completions bridge: $modelId"
+    Assert-True (
+        @($openRouterAgentFallback.OpenAICapabilities) -contains 'chat_completions'
+    ) "OpenRouter agent fallback lost Chat Completions tool capability: $modelId"
+}
+
+$openRouterDeepSeek = Get-RouterOpenAIChannelPolicy `
+    -BaseUrl 'https://openrouter.ai/api/v1' `
+    -ModelId 'deepseek/deepseek-v4-flash' `
+    -Extra @{}
+Assert-True (
+    [string]$openRouterDeepSeek.ResponsesMode -eq 'auto'
+) 'The working OpenRouter DeepSeek native Responses path was unexpectedly replaced.'
+
 foreach ($kimiBaseUrl in @(
     'https://api.kimi.com/coding/v1',
     'https://api.moonshot.ai/v1',
@@ -48,6 +76,22 @@ foreach ($kimiBaseUrl in @(
     Assert-True (
         $kimi.Extra.openai_compact_supported -eq $false
     ) "Kimi endpoint incorrectly advertised Responses compact support: $kimiBaseUrl"
+}
+
+foreach ($arkBaseUrl in @(
+    'https://ark.cn-beijing.volces.com/api/coding/v3',
+    'https://ark.cn-beijing.volces.com/api/plan/v3'
+)) {
+    $ark = Get-RouterOpenAIChannelPolicy -BaseUrl $arkBaseUrl -Extra @{}
+    Assert-True (
+        [string]$ark.ResponsesMode -eq 'force_chat_completions'
+    ) "Ark endpoint was not routed through the reliable Chat Completions bridge: $arkBaseUrl"
+    Assert-True (
+        @($ark.OpenAICapabilities) -contains 'chat_completions'
+    ) "Ark endpoint did not advertise Chat Completions capability: $arkBaseUrl"
+    Assert-True (
+        $ark.Extra.openai_compact_supported -eq $false
+    ) "Ark endpoint incorrectly advertised Responses compact support: $arkBaseUrl"
 }
 
 $kimiExplicitResponses = Get-RouterOpenAIChannelPolicy `

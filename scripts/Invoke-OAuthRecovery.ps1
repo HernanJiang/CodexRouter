@@ -143,8 +143,22 @@ $observationDocument = [ordered]@{ entries = @($observations.Values) } | Convert
 Import-Module (Join-Path $PSScriptRoot 'CredentialStore.psm1')
 Write-RouterTextFileAtomic -Path $observationPath -Text $observationDocument
 
+# Membership changed, so the Codex menu, the group model list, and the composite
+# routes must be realigned immediately. Otherwise a recovered subscription stays
+# invisible until the next manual Apply, and a newly parked one keeps a route
+# that can only answer 503.
+if (($recovered + $isolated) -gt 0) {
+    try {
+        & (Join-Path $PSScriptRoot 'Sync-RouterRoutingState.ps1') -ConfigPath $configPath -Quiet |
+            ForEach-Object { [Console]::Error.WriteLine([string]$_) }
+    } catch {
+        [Console]::Error.WriteLine('CR-FLAG ROUTING-SYNC-FAILED reason=recovery-followup')
+    }
+}
+
 $result = [ordered]@{
     nextCheckSeconds = if ($nextCheckSeconds -eq [long]::MaxValue) { 0L } else { $nextCheckSeconds }
     summary = "healthy=$healthy deferred=$deferred probed=$probed recovered=$recovered isolated=$isolated"
+    routingSynced = ($recovered + $isolated) -gt 0
 }
 [Console]::Out.WriteLine(($result | ConvertTo-Json -Compress))

@@ -54,6 +54,8 @@ Assert-Equal $false (Test-RouterSameModel -LeftModelId 'kimi-k3' -RightModelId '
 Assert-Equal $false (Test-RouterSameModel -LeftModelId 'vendor-a/model-x' -RightModelId 'vendor-b/model-x') 'Unknown provider namespaces were merged by leaf ID.'
 Assert-Equal $true (Test-RouterSameModel -LeftModelId 'claude-opus-4-6' -RightModelId 'anthropic/claude-opus-4.6') 'Anthropic separator aliases did not match.'
 Assert-Equal $true (Test-RouterCodingPlanChannel -BaseUrl 'https://api.kimi.com/coding/v1' -ModelId 'kimi-for-coding') 'Kimi Coding Plan endpoint was not recognized.'
+Assert-Equal $true (Test-RouterCodingPlanChannel -BaseUrl 'https://ark.cn-beijing.volces.com/api/coding/v3' -ModelId 'glm-5.2') 'Ark Coding Plan endpoint was not recognized.'
+Assert-Equal $true (Test-RouterCodingPlanChannel -BaseUrl 'https://ark.cn-beijing.volces.com/api/plan/v3' -ModelId 'ark-code-latest') 'Ark Agent Plan endpoint was not recognized.'
 Assert-Equal $false (Test-RouterCodingPlanChannel -BaseUrl 'https://openrouter.ai/api/v1' -ModelId 'kimi-for-coding') 'OpenRouter was misclassified as a Coding Plan.'
 Assert-Equal $true (Test-RouterCodingPlanChannel -BaseUrl 'https://vendor.example/v1' -ModelId 'model-x' -Extra '{"codex_router_channel_kind":"coding_plan"}') 'Explicit Coding Plan marker was ignored.'
 Assert-Equal 0 (Get-RouterChannelTier -Model ([pscustomobject]@{ model='gpt-5.6-sol'; source='oauth'; baseURL='' })) 'OAuth tier is wrong.'
@@ -349,6 +351,7 @@ Assert-Equal 100 (@($fallbackCompositePlan | Where-Object TargetPlatform -eq 'op
 Assert-equal 'anthropic/claude-opus-5' (Get-RouterOpenRouterUpstreamModelId -ModelId 'claude/claude-opus-5') 'OpenRouter Claude id normalization failed.'
 Assert-equal 'anthropic/claude-opus-5' (Get-RouterUpstreamModelId -ModelId 'claude-opus-5' -BaseUrl 'https://openrouter.ai/api/v1') 'OpenRouter bare Claude id normalization failed.'
 Assert-equal 'claude-opus-5' (Get-RouterUpstreamModelId -ModelId 'claude-opus-5' -BaseUrl 'https://api.anthropic.com/v1') 'Non-OpenRouter Claude ids should stay unchanged.'
+Assert-equal 'google/gemini-3.1-pro-preview' (Get-RouterUpstreamModelId -ModelId 'google/gemini-3.1-pro-high' -BaseUrl 'https://openrouter.ai/api/v1') 'OpenRouter Gemini 3.1 Pro fallback normalization failed.'
 
 $servable = @(Get-RouterServableCatalogRoutes -RoutePlan @(
     [pscustomobject]@{
@@ -430,6 +433,10 @@ if ($applySource -notmatch 'proxy_direct_fallback' -or
     $applySource -notmatch 'Test-RouterDirectFallbackEligible') {
     throw 'Apply-Router.ps1 does not mark verified auto-proxy channels for transport-only direct fallback.'
 }
+if ($applySource -notmatch '\$shouldUseManagedProxy\s*=\s*\$isRouterMember\s+-and\s+\$isManagedChannel' -or
+    $applySource -match '\$shouldUseManagedProxy\s*=.*-not\s+\$isOAuthFallbackChannel') {
+    throw 'Apply-Router.ps1 does not route OAuth fallback API channels through the managed proxy.'
+}
 
 $accountSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Get-OAuthAccounts.ps1') -Raw
 if ($accountSource -match '/quota') {
@@ -439,4 +446,120 @@ if ($accountSource -notmatch 'Get-RouterOAuthModelSuggestions') {
     throw 'Get-OAuthAccounts.ps1 does not append the tested provider model suggestions.'
 }
 
+# ---------------------------------------------------------------------------
+# Quota state machine: subscription first, park on exhaustion, same-model API
+# fallback, and recovery. Verified for openai / antigravity / grok platforms.
+# ---------------------------------------------------------------------------
+function New-QuotaConfig {
+    param([string]$OAuthModel, [long]$AccountId, [string]$ApiModel, [string]$ApiBase)
+    $models = @(
+        @{ model = $OAuthModel; source = 'oauth'; oauthAccountId = $AccountId; priority = 1 }
+    )
+    if (-not [string]::IsNullOrWhiteSpace($ApiModel)) {
+        $models += @{ model = $ApiModel; baseURL = $ApiBase; credentialName = 'ModelApiKey-openrouter'; priority = 10 }
+    }
+    return (@{
+        defaultModel = $OAuthModel
+        oauthFallback = @{ enabled = $true; preferOAuth = $true; officialPriority = 1; fallbackPriority = 100 }
+        oauthAccountIds = @($AccountId)
+        fallbackChannelSelections = @{}
+        models = $models
+    } | ConvertTo-Json -Depth 8) | ConvertFrom-Json
+}
+
+$platformCases = @(
+    [pscustomobject]@{ Name = 'ChatGPT'; OAuthModel = 'gpt-5.6-sol'; Account = 1; Platform = 'openai'; ApiModel = 'openai/gpt-5.6-sol' }
+    [pscustomobject]@{ Name = 'Gemini'; OAuthModel = 'gemini-3.1-pro-high'; Account = 4; Platform = 'antigravity'; ApiModel = 'google/gemini-3.1-pro-high' }
+    [pscustomobject]@{ Name = 'Grok'; OAuthModel = 'grok-4.5'; Account = 3; Platform = 'grok'; ApiModel = 'x-ai/grok-4.5' }
+)
+
+foreach ($case in $platformCases) {
+    $label = $case.Name
+    $config = New-QuotaConfig -OAuthModel $case.OAuthModel -AccountId $case.Account -ApiModel $case.ApiModel -ApiBase 'https://openrouter.ai/api/v1'
+    $plan = @(Get-RouterModelRoutePlan -RouterConfig $config -DiscoveredOAuthModelsByAccount @{})
+    $platformMap = @{ ([string]$case.Account) = $case.Platform }
+
+    # 1. Quota available -> OAuth is primary and the API row is a joined fallback.
+    $healthyCatalog = @(Get-RouterServableCatalogRoutes -RoutePlan $plan -IsolatedOAuthAccountIds @{} -OAuthAccountIds @($case.Account) -OAuthSelectionInitialized $true)
+    Assert-Equal 1 $healthyCatalog.Count "$label healthy catalog should expose exactly one merged model."
+    Assert-Equal 'oauth' ([string]$healthyCatalog[0].ServedBy) "$label healthy model must be served by the subscription."
+    $healthyDisplay = Get-RouterModelDisplayName -Model $healthyCatalog[0].Model -Route $healthyCatalog[0]
+    if ($healthyDisplay -notlike '*(OAuth)') { throw "$label healthy display name must end with (OAuth): $healthyDisplay" }
+    $healthyRouting = @(Get-RouterServableRoutingRoutes -RoutePlan $plan -IsolatedOAuthAccountIds @{} -OAuthAccountIds @($case.Account) -OAuthSelectionInitialized $true)
+    $healthyComposite = @(Get-RouterCompositeRoutePlan -RoutePlan $healthyRouting -AccountPlatformById $platformMap -ExcludedOAuthAccountIds @())
+    $healthyPlatforms = @($healthyComposite | ForEach-Object { [string]$_.TargetPlatform } | Sort-Object -Unique)
+    if ($healthyPlatforms -notcontains $case.Platform) {
+        throw "$label healthy composite routes lost the subscription platform '$($case.Platform)'."
+    }
+    if ($healthyPlatforms -notcontains 'openai') {
+        throw "$label healthy composite routes lost the third-party API fallback platform."
+    }
+    $oauthComposite = @($healthyComposite | Where-Object { [string]$_.TargetPlatform -eq $case.Platform })[0]
+    Assert-Equal 1 ([int]$oauthComposite.Priority) "$label subscription composite route must keep priority 1."
+
+    # 2/3. Quota exhausted -> account parked, same-model API keeps serving.
+    $parkedCatalog = @(Get-RouterServableCatalogRoutes -RoutePlan $plan -IsolatedOAuthAccountIds @{ ([long]$case.Account) = 'quota' } -OAuthAccountIds @($case.Account) -OAuthSelectionInitialized $true)
+    Assert-Equal 1 $parkedCatalog.Count "$label parked catalog must still expose the model through the API fallback."
+    Assert-Equal 'api' ([string]$parkedCatalog[0].ServedBy) "$label parked model must be served by the API fallback."
+    $parkedDisplay = Get-RouterModelDisplayName -Model $parkedCatalog[0].Model -Route $parkedCatalog[0]
+    if ($parkedDisplay -like '*(OAuth)') {
+        throw "$label parked model must not advertise (OAuth) while the API fallback serves it."
+    }
+    $parkedRouting = @(Get-RouterServableRoutingRoutes -RoutePlan $plan -IsolatedOAuthAccountIds @{ ([long]$case.Account) = 'quota' } -OAuthAccountIds @($case.Account) -OAuthSelectionInitialized $true)
+    $parkedComposite = @(Get-RouterCompositeRoutePlan -RoutePlan $parkedRouting -AccountPlatformById $platformMap -ExcludedOAuthAccountIds @($case.Account))
+    $parkedPlatforms = @($parkedComposite | ForEach-Object { [string]$_.TargetPlatform } | Sort-Object -Unique)
+    if ($parkedPlatforms -contains $case.Platform -and $case.Platform -ne 'openai') {
+        throw "$label parked subscription platform route must be removed so it cannot answer 503."
+    }
+    if ($parkedPlatforms -notcontains 'openai') {
+        throw "$label parked model lost its third-party API route."
+    }
+
+    # 4. Recovery -> identical state to the healthy case (idempotent reconciliation).
+    $recoveredCatalog = @(Get-RouterServableCatalogRoutes -RoutePlan $plan -IsolatedOAuthAccountIds @{} -OAuthAccountIds @($case.Account) -OAuthSelectionInitialized $true)
+    Assert-Equal 'oauth' ([string]$recoveredCatalog[0].ServedBy) "$label recovery must restore subscription-first routing."
+
+    # 5. Exhausted without any same-model API channel -> model leaves the menu.
+    $soloConfig = New-QuotaConfig -OAuthModel $case.OAuthModel -AccountId $case.Account -ApiModel '' -ApiBase ''
+    $soloPlan = @(Get-RouterModelRoutePlan -RouterConfig $soloConfig -DiscoveredOAuthModelsByAccount @{})
+    $soloParked = @(Get-RouterServableCatalogRoutes -RoutePlan $soloPlan -IsolatedOAuthAccountIds @{ ([long]$case.Account) = 'quota' } -OAuthAccountIds @($case.Account) -OAuthSelectionInitialized $true)
+    Assert-Equal 0 $soloParked.Count "$label exhausted subscription without fallback must leave the Codex menu."
+}
+
+# Third-party-only profiles must be untouched by the quota state machine.
+$apiOnlyConfig = (@{
+    defaultModel = 'openai/gpt-5.6-sol'
+    oauthFallback = @{ enabled = $true; preferOAuth = $true; officialPriority = 1; fallbackPriority = 100 }
+    oauthAccountIds = @()
+    fallbackChannelSelections = @{}
+    models = @(@{ model = 'openai/gpt-5.6-sol'; baseURL = 'https://openrouter.ai/api/v1'; credentialName = 'ModelApiKey-openrouter'; priority = 10 })
+} | ConvertTo-Json -Depth 8) | ConvertFrom-Json
+$apiOnlyPlan = @(Get-RouterModelRoutePlan -RouterConfig $apiOnlyConfig -DiscoveredOAuthModelsByAccount @{})
+$apiOnlyCatalog = @(Get-RouterServableCatalogRoutes -RoutePlan $apiOnlyPlan -IsolatedOAuthAccountIds @{} -OAuthAccountIds @() -OAuthSelectionInitialized $true)
+Assert-Equal 1 $apiOnlyCatalog.Count 'An API-only profile lost its model.'
+Assert-Equal 'api' ([string]$apiOnlyCatalog[0].ServedBy) 'An API-only model must be served by the API channel.'
+
+$applyFlagSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Apply-Router.ps1') -Raw
+foreach ($requiredFlag in @(
+    'STAGE-01-INIT-OK', 'STAGE-02-SERVICES-OK', 'STAGE-03-ADMIN-OK', 'STAGE-04-COMPLIANCE-OK',
+    'STAGE-06-CODEX-OK', 'STAGE-07-DONE', 'OAUTH-PRIMARY', 'OAUTH-PARKED-WITH-FALLBACK',
+    'OAUTH-PARKED-NO-FALLBACK', 'FALLBACK-ACTIVE', 'CATALOG-MODEL', 'COMPOSITE-SYNC'
+)) {
+    if ($applyFlagSource -notmatch [Regex]::Escape($requiredFlag)) {
+        throw "Apply-Router.ps1 no longer emits the diagnosable flag '$requiredFlag'."
+    }
+}
+if ($applyFlagSource -notmatch 'Get-RouterServableRoutingRoutes') {
+    throw 'Apply-Router.ps1 does not keep API fallback platforms in the composite route sync.'
+}
+$syncSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Sync-RouterRoutingState.ps1') -Raw
+if ($syncSource -notmatch 'ROUTING-SYNC-OK' -or $syncSource -notmatch 'Get-RouterServableRoutingRoutes') {
+    throw 'Sync-RouterRoutingState.ps1 does not report a diagnosable routing sync.'
+}
+$recoverySource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Invoke-OAuthRecovery.ps1') -Raw
+if ($recoverySource -notmatch 'Sync-RouterRoutingState.ps1') {
+    throw 'OAuth recovery does not realign routing after a quota change.'
+}
+
+Write-Output 'Quota state machine tests passed.'
 Write-Output 'OAuth routing tests passed.'

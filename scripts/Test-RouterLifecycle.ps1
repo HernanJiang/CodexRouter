@@ -483,6 +483,8 @@ Export-ModuleMember -Function Get-RouterBaseUri
             $stopSource.Contains('ReadToEndAsync()') -and
             $stopSource.Contains('Stop-ProcessTree -ProcessId $process.Id') -and
             $stopSource.Contains('Stop-RemainingManagedProcesses') -and
+            $stopSource.Contains('Wait-TcpListenerPortReleased') -and
+            $stopSource.Contains('if (-not (Wait-TcpListenerPortReleased -Port $Port))') -and
             $stopSource.Contains('Assert-ManagedServiceStopped') -and
             $mainSource.Contains('ExitShutdownFinished') -and
             $mainSource.Contains('EXIT_CONFIG_LOCK_TIMEOUT') -and

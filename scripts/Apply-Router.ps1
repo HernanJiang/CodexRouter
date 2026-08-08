@@ -97,12 +97,42 @@ function Get-ModelSource($Model) {
     return ([string]$property.Value).Trim().ToLowerInvariant()
 }
 
+# Stable, greppable deployment flags. Every value is a machine-generated id,
+# count, platform, or an already sanitized reason - never a secret or a path.
+function Write-RouterFlag {
+    param(
+        [Parameter(Mandatory)][string]$Code,
+        [hashtable]$Data = @{}
+    )
+    $sanitize = {
+        param([string]$Value)
+        $text = ([string]$Value).Trim()
+        if ([string]::IsNullOrWhiteSpace($text)) { return 'none' }
+        $text = [Text.RegularExpressions.Regex]::Replace($text, '\s+', '-')
+        $text = [Text.RegularExpressions.Regex]::Replace($text, '[^A-Za-z0-9._:/~+-]', '')
+        if ($text.Length -gt 80) { $text = $text.Substring(0, 80) }
+        if ([string]::IsNullOrWhiteSpace($text)) { return 'none' }
+        return $text
+    }
+    $pairs = @($Data.GetEnumerator() | Sort-Object Name | ForEach-Object {
+        "$($_.Key)=$(& $sanitize ([string]$_.Value))"
+    })
+    if ($pairs.Count -gt 0) {
+        Write-Output ("CR-FLAG $Code " + ($pairs -join ' '))
+    } else {
+        Write-Output "CR-FLAG $Code"
+    }
+}
+
 Write-Output '[1/7] Initializing local credentials and database...'
 & (Join-Path $PSScriptRoot 'Initialize-Router.ps1')
+Write-RouterFlag 'STAGE-01-INIT-OK'
 Write-Output '[2/7] Starting PostgreSQL, Redis, and Sub2API...'
-& (Join-Path $PSScriptRoot 'Start-Router.ps1')
+& (Join-Path $PSScriptRoot 'Start-Router.ps1') -RepairUnhealthy
+Write-RouterFlag 'STAGE-02-SERVICES-OK'
 Write-Output '[3/7] Local services are ready; signing in to the admin API...'
 $session = New-RouterAdminSession
+Write-RouterFlag 'STAGE-03-ADMIN-OK'
 Write-Output '[4/7] Checking Sub2API compliance status...'
 $compliance = Get-RouterResponseData (Invoke-RouterApi -Session $session -Method GET -Path '/api/v1/admin/compliance')
 if ($compliance.required) {
@@ -197,6 +227,7 @@ Copy-Item -LiteralPath $catalogPath -Destination $packageCatalogPath -Force
 $modelNames = @($routePlan | Where-Object { $_.IncludeInCatalog } | ForEach-Object {
     [string]$_.PublicModelId
 } | Where-Object { $_ } | Select-Object -Unique)
+Write-RouterFlag 'STAGE-04-COMPLIANCE-OK'
 Write-Output '[5/7] Creating or updating model channels...'
 $groupName = 'Codex-Router'
 $groups = @(Get-RouterGroups -Session $session)
@@ -318,7 +349,8 @@ for ($modelIndex = 0; $modelIndex -lt $models.Count; $modelIndex++) {
         }
         $channelPolicy = Get-RouterOpenAIChannelPolicy `
             -BaseUrl ([string]$model.baseURL) `
-            -Extra $extra
+            -Extra $extra `
+            -ModelId ([string]$model.model)
         $extra = $channelPolicy.Extra
         if (@($channelPolicy.OpenAICapabilities).Count -gt 0) {
             $credentials.openai_capabilities = @($channelPolicy.OpenAICapabilities)
@@ -358,9 +390,11 @@ for ($modelIndex = 0; $modelIndex -lt $models.Count; $modelIndex++) {
         if ($existing) {
             [void](Invoke-RouterApi -Session $session -Method PUT -Path "/api/v1/admin/accounts/$($existing.id)" -Body $body)
             Write-Output "Updated channel: $accountName"
+        Write-RouterFlag $(if ($isOAuthFallback) { 'API-FALLBACK-CHANNEL' } else { 'API-CHANNEL' }) @{ model = [string]$route.PublicModelId; priority = $effectivePriority; joined = $(if ($shouldJoinRouter) { 'yes' } else { 'no' }) }
         } else {
             [void](Invoke-RouterApi -Session $session -Method POST -Path '/api/v1/admin/accounts' -Body $body)
             Write-Output "Created channel: $accountName"
+        Write-RouterFlag $(if ($isOAuthFallback) { 'API-FALLBACK-CHANNEL' } else { 'API-CHANNEL' }) @{ model = [string]$route.PublicModelId; priority = $effectivePriority; joined = $(if ($shouldJoinRouter) { 'yes' } else { 'no' }) }
         }
 
         # A proxy is a transport property of this logical channel, not a second
@@ -418,16 +452,40 @@ foreach ($accountSummary in $existingAccounts) {
     if ([string]$account.type -eq 'oauth') {
         if (-not $oauthSelectionInitialized) { continue }
         $selectedByConfig = $oauthAccountIds -contains $accountID
-        $hasExplicitOAuthModels = @($explicitSelectedOAuthModels | Where-Object {
+        $accountOAuthModels = @($explicitSelectedOAuthModels | Where-Object {
             [long]$_.oauthAccountId -eq $accountID
-        }).Count -gt 0
+        })
+        $hasExplicitOAuthModels = $accountOAuthModels.Count -gt 0
+        $hasApiFallbackForAccount = $false
+        if ($hasExplicitOAuthModels -and [bool]$routePriorities.Enabled) {
+            foreach ($oauthModel in $accountOAuthModels) {
+                # Never name this $matches: the regex engine inside the identity
+                # helpers owns that automatic variable and would clobber the count.
+                $fallbackMatches = @($models | Where-Object {
+                    (Get-ModelSource $_) -ne 'oauth' -and
+                    (Test-RouterSameModel -LeftModelId ([string]$_.model) -RightModelId ([string]$oauthModel.model)) -and
+                    (Test-RouterFallbackChannelSelected `
+                        -Selections $fallbackChannelSelections `
+                        -ModelId ([string]$_.model) `
+                        -BaseUrl ([string]$_.baseURL))
+                })
+                if ($fallbackMatches.Count -gt 0) {
+                    $hasApiFallbackForAccount = $true
+                    break
+                }
+            }
+        }
         $recoveryState = Get-RouterOAuthRecoveryState -Account $account
         if ($selectedByConfig -and $hasExplicitOAuthModels -and [bool]$recoveryState.ShouldIsolate) {
             $isolatedOAuthAccountIds[$accountID] = [string]$recoveryState.Reason
         }
-        # Join the live Router group only when the profile actually imported
-        # OAuth models for this account. Otherwise third-party channels remain
-        # the sole request path.
+        # Quota state machine:
+        #   quota available            -> account joins the group and wins on priority
+        #   quota exhausted            -> account leaves the group (no wasted attempt,
+        #                                 so no extra latency) and the same-model API
+        #                                 channel serves instead
+        #   quota restored (recovery)  -> Invoke-OAuthRecovery re-joins the account
+        # Account enrollment without imported OAuth models never joins the group.
         $selected = $selectedByConfig -and $hasExplicitOAuthModels -and -not [bool]$recoveryState.ShouldIsolate
         $nextGroups = @($groupIds | Where-Object { $_ -ne $groupId })
         if ($selected) { $nextGroups += $groupId }
@@ -443,6 +501,28 @@ foreach ($accountSummary in $existingAccounts) {
                     $accountPriority = $parsedPriority
                 }
             } catch { }
+        }
+        $accountPlatform = [string]$account.platform
+        if (-not $selectedByConfig) {
+            Write-RouterFlag 'OAUTH-SKIP-UNSELECTED' @{ account = $accountID; platform = $accountPlatform }
+        } elseif (-not $hasExplicitOAuthModels) {
+            Write-RouterFlag 'OAUTH-SKIP-NO-MODELS' @{ account = $accountID; platform = $accountPlatform }
+        } elseif ([bool]$recoveryState.ShouldIsolate) {
+            Write-RouterFlag $(if ($hasApiFallbackForAccount) { 'OAUTH-PARKED-WITH-FALLBACK' } else { 'OAUTH-PARKED-NO-FALLBACK' }) @{
+                account = $accountID
+                platform = $accountPlatform
+                reason = [string]$recoveryState.Reason
+                reset = [string]$recoveryState.ResetAt
+                models = $accountOAuthModels.Count
+            }
+        } else {
+            Write-RouterFlag 'OAUTH-PRIMARY' @{
+                account = $accountID
+                platform = $accountPlatform
+                priority = $accountPriority
+                models = $accountOAuthModels.Count
+                fallback = $(if ($hasApiFallbackForAccount) { 'yes' } else { 'no' })
+            }
         }
         $oauthUpdate = @{
             priority = $accountPriority
@@ -472,8 +552,15 @@ foreach ($accountSummary in $existingAccounts) {
         continue
     }
     $isManagedChannel = [string]$account.name -in $managedAccountNames
-    $shouldUseManagedProxy = $isRouterMember -and
-        $isManagedChannel
+    $isOAuthFallbackChannel = $false
+    if ($isManagedChannel) {
+        $extraProperty = $account.PSObject.Properties['extra']
+        if ($null -ne $extraProperty -and $null -ne $extraProperty.Value) {
+            $flag = $extraProperty.Value.PSObject.Properties['codex_router_oauth_fallback']
+            if ($null -ne $flag) { $isOAuthFallbackChannel = [bool]$flag.Value }
+        }
+    }
+    $shouldUseManagedProxy = $isRouterMember -and $isManagedChannel
     if ($shouldUseManagedProxy -and [long]$managedProxyState.DesiredProxyId -gt 0) {
         $target = [string]$managedAccountTargets[[string]$account.name]
         if (-not [string]::IsNullOrWhiteSpace($target) -and
@@ -516,47 +603,92 @@ Write-Output (
     $proxyCustomPreserved,
     $proxyBypassed)
 
-# Drop catalog/composite entries that no live account can serve (for example
-# ChatGPT OAuth models while that account is quota-isolated). Keep public ids
-# that still have a joined API fallback channel.
+# Deterministic routing reconciliation. This block always runs so every Apply
+# ends in the same verified state: healthy subscription quota first, quota-out
+# subscriptions parked, and same-model third-party API channels serving instead.
 $servableRoutes = @(Get-RouterServableCatalogRoutes `
     -RoutePlan $routePlan `
     -IsolatedOAuthAccountIds $isolatedOAuthAccountIds `
     -OAuthAccountIds $oauthAccountIds `
     -OAuthSelectionInitialized:$oauthSelectionInitialized)
+# Composite routes must also keep API fallback rows that stay hidden from the
+# Codex menu, otherwise the cross-platform fallback route is deleted right after
+# it is created (this used to break Gemini/Grok fallback on every Apply).
+$servableRoutingRoutes = @(Get-RouterServableRoutingRoutes `
+    -RoutePlan $routePlan `
+    -IsolatedOAuthAccountIds $isolatedOAuthAccountIds `
+    -OAuthAccountIds $oauthAccountIds `
+    -OAuthSelectionInitialized:$oauthSelectionInitialized)
 $servableModelNames = @($servableRoutes | ForEach-Object { [string]$_.PublicModelId } | Where-Object { $_ } | Select-Object -Unique)
-$removedUnavailable = @($modelNames | Where-Object { $servableModelNames -notcontains $_ })
-if ($removedUnavailable.Count -gt 0 -or (@($servableModelNames).Count -ne @($modelNames).Count)) {
-    Write-Output (
-        'Catalog availability filter: kept={0}; removed-unavailable={1}' -f
-        $servableModelNames.Count,
-        ($(if ($removedUnavailable.Count -gt 0) { $removedUnavailable -join ', ' } else { 'none' }))
-    )
-    $groupBody.models_list_config = @{ enabled = $true; models = @($servableModelNames) }
-    $group = Get-RouterResponseData (Invoke-RouterApi -Session $session -Method PUT -Path "/api/v1/admin/groups/$groupId" -Body $groupBody)
-    $compositeRoutes = @(Get-RouterCompositeRoutePlan `
-        -RoutePlan $servableRoutes `
-        -AccountPlatformById $accountPlatformById)
-    $compositeSync = Sync-RouterCompositeRoutes `
-        -Session $session `
-        -GroupId $groupId `
-        -CompositeRoutes $compositeRoutes
-    Write-Output (
-        'Composite routes (servable): desired={0}; created={1}; updated={2}; removed={3}' -f
-        [int]$compositeSync.Desired,
-        [int]$compositeSync.Created,
-        [int]$compositeSync.Updated,
-        [int]$compositeSync.Removed)
-    $defaultModel = Get-RouterDefaultPublicModelId -RouterConfig $config -RoutePlan $servableRoutes
-    & (Join-Path $PSScriptRoot 'Build-ModelCatalog.ps1') `
-        -ConfigPath $configPath `
-        -OutputPath $catalogPath `
-        -DiscoveredOAuthModelsByAccount $discoveredOAuthModelsByAccount `
-        -RoutePlan $servableRoutes | Write-Output
-    [IO.Directory]::CreateDirectory((Split-Path -Parent $packageCatalogPath)) | Out-Null
-    Copy-Item -LiteralPath $catalogPath -Destination $packageCatalogPath -Force
-    $modelNames = @($servableModelNames)
+if ($servableModelNames.Count -eq 0) {
+    throw 'ROUTER_DEPLOY_NO_SERVABLE_MODEL: no model can be served right now. Add an API channel, or wait for a subscription quota reset.'
 }
+$removedUnavailable = @($modelNames | Where-Object { $servableModelNames -notcontains $_ })
+Write-Output (
+    'Catalog availability filter: kept={0}; removed-unavailable={1}' -f
+    $servableModelNames.Count,
+    ($(if ($removedUnavailable.Count -gt 0) { $removedUnavailable -join ', ' } else { 'none' }))
+)
+Write-RouterFlag 'CATALOG-FILTER' @{ kept = $servableModelNames.Count; dropped = $removedUnavailable.Count }
+foreach ($dropped in $removedUnavailable) {
+    Write-RouterFlag 'CATALOG-DROPPED' @{ model = $dropped; reason = 'no-servable-account' }
+}
+foreach ($route in $servableRoutes) {
+    $servedBy = if ($null -eq $route.PSObject.Properties['ServedBy']) { 'api' } else { [string]$route.ServedBy }
+    $oauthId = 0
+    try { $oauthId = [long]$route.Model.oauthAccountId } catch { $oauthId = 0 }
+    Write-RouterFlag 'CATALOG-MODEL' @{
+        model = [string]$route.PublicModelId
+        served = $servedBy
+        suffix = $(if ($servedBy -eq 'oauth') { 'oauth' } else { 'none' })
+        account = $(if ($servedBy -eq 'oauth' -and $oauthId -gt 0) { $oauthId } else { 0 })
+    }
+    if ($servedBy -eq 'api' -and (Get-RouterModelSource -Model $route.Model) -eq 'oauth') {
+        Write-RouterFlag 'FALLBACK-ACTIVE' @{
+            model = [string]$route.PublicModelId
+            account = $oauthId
+            reason = 'subscription-quota-parked'
+        }
+    }
+}
+$groupBody.models_list_config = @{ enabled = $true; models = @($servableModelNames) }
+$group = Get-RouterResponseData (Invoke-RouterApi -Session $session -Method PUT -Path "/api/v1/admin/groups/$groupId" -Body $groupBody)
+$compositeRoutes = @(Get-RouterCompositeRoutePlan `
+    -RoutePlan $servableRoutingRoutes `
+    -AccountPlatformById $accountPlatformById `
+    -ExcludedOAuthAccountIds @($isolatedOAuthAccountIds.Keys))
+$compositeSync = Sync-RouterCompositeRoutes `
+    -Session $session `
+    -GroupId $groupId `
+    -CompositeRoutes $compositeRoutes
+Write-Output (
+    'Composite routes (servable): desired={0}; created={1}; updated={2}; removed={3}' -f
+    [int]$compositeSync.Desired,
+    [int]$compositeSync.Created,
+    [int]$compositeSync.Updated,
+    [int]$compositeSync.Removed)
+Write-RouterFlag 'COMPOSITE-SYNC' @{
+    desired = [int]$compositeSync.Desired
+    created = [int]$compositeSync.Created
+    updated = [int]$compositeSync.Updated
+    removed = [int]$compositeSync.Removed
+}
+foreach ($composite in $compositeRoutes) {
+    Write-RouterFlag 'COMPOSITE-ROUTE' @{
+        model = [string]$composite.PublicModelId
+        platform = [string]$composite.TargetPlatform
+        priority = [int]$composite.Priority
+    }
+}
+$defaultModel = Get-RouterDefaultPublicModelId -RouterConfig $config -RoutePlan $servableRoutes
+& (Join-Path $PSScriptRoot 'Build-ModelCatalog.ps1') `
+    -ConfigPath $configPath `
+    -OutputPath $catalogPath `
+    -DiscoveredOAuthModelsByAccount $discoveredOAuthModelsByAccount `
+    -RoutePlan $servableRoutes | Write-Output
+[IO.Directory]::CreateDirectory((Split-Path -Parent $packageCatalogPath)) | Out-Null
+Copy-Item -LiteralPath $catalogPath -Destination $packageCatalogPath -Force
+$modelNames = @($servableModelNames)
 
 # Sub2API honors provider reset timestamps when a rate-limit response includes
 # one. Codex-Router owns OAuth recovery probes and only runs them on app start
@@ -675,9 +807,11 @@ if ($startWithWindows) {
 }
 
 Write-Output "Configured $($models.Count) model channel(s)."
+Write-RouterFlag 'STAGE-06-CODEX-OK' @{ channels = $models.Count }
 Write-Output "Codex configuration written to: $codexConfig"
 Write-Output 'Local access key is stored in Windows Credential Manager and the current user environment.'
 Write-Output '[7/7] Deployment complete.'
+Write-RouterFlag 'STAGE-07-DONE'
 [Console]::Error.WriteLine('[codex-router:deployment-complete]')
 $localKey = $null
 $session.Headers.Clear()

@@ -541,7 +541,7 @@ dependencies = [
 
 [[package]]
 name = "codex-router"
-version = "1.3.12"
+version = "1.4.9"
 dependencies = [
  "anyhow",
  "chrono",

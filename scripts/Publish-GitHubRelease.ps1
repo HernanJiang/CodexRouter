@@ -2,6 +2,8 @@
 param(
     [Parameter(Mandatory)][string]$StagePath,
     [Parameter(Mandatory)][string]$ArchivePath,
+    [string]$InstallerPath,
+    [string]$NotesPath,
     [switch]$SkipAcceptance
 )
 
@@ -12,9 +14,24 @@ $ProgressPreference = 'SilentlyContinue'
 $routerRoot = Split-Path -Parent $PSScriptRoot
 $stage = [IO.Path]::GetFullPath($StagePath)
 $archive = [IO.Path]::GetFullPath($ArchivePath)
+$installer = if ([string]::IsNullOrWhiteSpace($InstallerPath)) { $null } else { [IO.Path]::GetFullPath($InstallerPath) }
+$notes = if ([string]::IsNullOrWhiteSpace($NotesPath)) { $null } else { [IO.Path]::GetFullPath($NotesPath) }
 $repository = 'HernanJiang/Codex-Router'
 if (-not (Test-Path -LiteralPath $stage -PathType Container)) { throw 'Release stage does not exist.' }
 if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) { throw 'Release archive does not exist.' }
+if ($null -ne $installer -and -not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+    throw 'Release installer does not exist.'
+}
+if ($null -ne $notes -and -not (Test-Path -LiteralPath $notes -PathType Leaf)) {
+    throw 'Release notes do not exist.'
+}
+
+$assetPaths = @($archive)
+if ($null -ne $installer) { $assetPaths += $installer }
+$assetNames = @($assetPaths | ForEach-Object { [IO.Path]::GetFileName($_) })
+if (@($assetNames | Select-Object -Unique).Count -ne $assetNames.Count) {
+    throw 'Release assets must have unique file names.'
+}
 
 $manifestPath = Join-Path $stage 'release-manifest.json'
 if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { throw 'Release manifest is missing.' }
@@ -64,21 +81,40 @@ $existingRelease = gh release view $tag --repo $repository --json tagName,target
 if ($LASTEXITCODE -eq 0) {
     $release = $existingRelease | ConvertFrom-Json
     if ([string]$release.tagName -ne $tag) { throw 'GitHub returned an unexpected release tag.' }
-    gh release upload $tag $archive --repo $repository --clobber
+    gh release upload $tag @assetPaths --repo $repository --clobber
+    if ($LASTEXITCODE -eq 0 -and $null -ne $notes) {
+        gh release edit $tag --repo $repository --title "Codex-Router $tag" --notes-file $notes
+    }
 } else {
-    gh release create $tag $archive `
-        --repo $repository `
-        --target $head `
-        --title "Codex-Router $tag" `
-        --generate-notes
+    $createArguments = @(
+        'release', 'create', $tag
+    ) + $assetPaths + @(
+        '--repo', $repository,
+        '--target', $head,
+        '--title', "Codex-Router $tag"
+    )
+    if ($null -ne $notes) {
+        $createArguments += @('--notes-file', $notes)
+    } else {
+        $createArguments += '--generate-notes'
+    }
+    gh @createArguments
 }
-if ($LASTEXITCODE -ne 0) { throw 'Could not publish the GitHub Release asset.' }
+if ($LASTEXITCODE -ne 0) { throw 'Could not publish the GitHub Release assets or notes.' }
 
 $releaseInfo = gh release view $tag --repo $repository --json assets,url | ConvertFrom-Json
-$assetName = [IO.Path]::GetFileName($archive)
-$assets = @($releaseInfo.assets | Where-Object { $_.name -eq $assetName })
-if ($assets.Count -ne 1 -or [long]$assets[0].size -ne (Get-Item -LiteralPath $archive).Length) {
-    throw 'The published GitHub asset size does not match the verified local archive.'
+$publishedAssets = @()
+foreach ($assetPath in $assetPaths) {
+    $assetName = [IO.Path]::GetFileName($assetPath)
+    $assets = @($releaseInfo.assets | Where-Object { $_.name -eq $assetName })
+    if ($assets.Count -ne 1 -or [long]$assets[0].size -ne (Get-Item -LiteralPath $assetPath).Length) {
+        throw "The published GitHub asset size does not match the verified local file: $assetName"
+    }
+    $publishedAssets += [ordered]@{
+        name = $assetName
+        bytes = [long](Get-Item -LiteralPath $assetPath).Length
+        sha256 = (Get-FileHash -LiteralPath $assetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
 }
 
 $updateTestRoot = Join-Path ([IO.Path]::GetTempPath()) ('codex-router-private-update-' + [Guid]::NewGuid().ToString('N'))
@@ -91,6 +127,9 @@ try {
         ConvertFrom-Json
     if ([string]$check.status -ne 'update_available' -or [string]$check.latestVersion -ne $tag) {
         throw 'The private GitHub update check did not discover the new release.'
+    }
+    if ([string]$check.assetName -ne [IO.Path]::GetFileName($archive)) {
+        throw 'The private GitHub update check selected an unexpected release asset.'
     }
     $download = & (Join-Path $testScripts 'GitHub-Update.ps1') `
         -Action Download `
@@ -106,6 +145,23 @@ try {
     $localHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
     $downloadHash = (Get-FileHash -LiteralPath ([string]$download.downloadPath) -Algorithm SHA256).Hash
     if ($localHash -ne $downloadHash) { throw 'The downloaded private release hash does not match.' }
+
+    if ($null -ne $installer) {
+        $installerDownloadRoot = Join-Path $updateTestRoot 'installer'
+        [IO.Directory]::CreateDirectory($installerDownloadRoot) | Out-Null
+        $installerName = [IO.Path]::GetFileName($installer)
+        gh release download $tag --repo $repository --pattern $installerName --dir $installerDownloadRoot --clobber
+        if ($LASTEXITCODE -ne 0) { throw 'Could not download the published installer for verification.' }
+        $downloadedInstaller = Join-Path $installerDownloadRoot $installerName
+        if (-not (Test-Path -LiteralPath $downloadedInstaller -PathType Leaf)) {
+            throw 'The published installer download is missing.'
+        }
+        $localInstallerHash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
+        $downloadedInstallerHash = (Get-FileHash -LiteralPath $downloadedInstaller -Algorithm SHA256).Hash
+        if ($localInstallerHash -ne $downloadedInstallerHash) {
+            throw 'The downloaded installer hash does not match.'
+        }
+    }
 } finally {
     if (Test-Path -LiteralPath $updateTestRoot) {
         Remove-Item -LiteralPath $updateTestRoot -Recurse -Force
@@ -117,9 +173,9 @@ try {
     visibility = 'private'
     tag = $tag
     commit = $head
-    asset = $assetName
-    bytes = [long](Get-Item -LiteralPath $archive).Length
+    assets = $publishedAssets
     updateCheck = 'passed'
     updateDownloadHash = 'passed'
+    installerDownloadHash = if ($null -eq $installer) { 'not-requested' } else { 'passed' }
     url = [string]$releaseInfo.url
 } | ConvertTo-Json -Compress

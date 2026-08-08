@@ -11,6 +11,19 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
+if ($PSVersionTable.PSEdition -eq 'Desktop') {
+    $desktopModuleRoot = Join-Path $PSHOME 'Modules'
+    $modulePaths = @($env:PSModulePath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($modulePaths -notcontains $desktopModuleRoot) {
+        $env:PSModulePath = $desktopModuleRoot + ';' + ($modulePaths -join ';')
+    }
+    Import-Module (Join-Path $desktopModuleRoot 'Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1') -ErrorAction Stop
+    Import-Module (Join-Path $desktopModuleRoot 'Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1') -ErrorAction Stop
+} else {
+    Import-Module Microsoft.PowerShell.Utility -ErrorAction Stop
+    Import-Module Microsoft.PowerShell.Security -ErrorAction Stop
+}
+
 $routerRoot = Split-Path -Parent $PSScriptRoot
 $routerRootPath = [IO.Path]::GetFullPath($routerRoot).TrimEnd([char[]]@('\', '/'))
 $utf8NoBom = [Text.UTF8Encoding]::new($false)
@@ -47,9 +60,11 @@ $runtimeScripts = @(
     'Start-ProviderOAuth.ps1',
     'Start-Router.ps1',
     'Stop-Router.ps1',
+    'Sync-RouterRoutingState.ps1',
     'Test-RouterCapabilities.ps1',
     'Test-RealOAuthFallback.ps1',
-    'Unregister-Autostart.ps1'
+    'Repair-CodexWindowsSetup.ps1',
+    'Unregister-Autostart.ps1',
     'UserData.psm1'
 )
 
@@ -66,7 +81,9 @@ $staticLicenseFiles = @(
     'MSYS2-Runtime-LICENSES.txt',
     'Redis-8.10.0-LICENSES.txt',
     'Rust-SPDX-LICENSE-TEXTS.txt',
-    'sub2api-0.1.168-codex-router.3.patch'
+    'sub2api-0.1.168-codex-router.3.patch',
+    'sub2api-0.1.170-codex-router.2.patch',
+    'sub2api-0.1.170-codex-router.3.patch'
 )
 
 $generatedLicenseFiles = @(
@@ -364,6 +381,7 @@ function Assert-ReleaseLayout {
         'Codex-Router.exe',
         'LICENSE',
         'README.md',
+        'README.zh-CN.md',
         'TERMS.en.md',
         'TERMS.zh-CN.md',
         'THIRD_PARTY_NOTICES.md',
@@ -407,6 +425,8 @@ function Assert-ReleaseLayout {
 
     $required = @(
         'Codex-Router.exe',
+        'README.md',
+        'README.zh-CN.md',
         'app\sub2api.exe',
         'app\data\model_pricing.json',
         'app\resources\model-pricing\model_prices_and_context_window.json',
@@ -1344,7 +1364,7 @@ try {
 
     $redisRoot = 'redis\Redis-8.10.0-Windows-x64-msys2'
     foreach ($name in $redisRuntimeFiles) { Copy-ReleaseItem -RelativePath "$redisRoot\$name" }
-    foreach ($relative in @('LICENSE', 'README.md', 'TERMS.en.md', 'TERMS.zh-CN.md', 'THIRD_PARTY_NOTICES.md')) {
+    foreach ($relative in @('LICENSE', 'README.md', 'README.zh-CN.md', 'TERMS.en.md', 'TERMS.zh-CN.md', 'THIRD_PARTY_NOTICES.md')) {
         Copy-ReleaseItem -RelativePath $relative
     }
     [void](Assert-TermsReleaseMetadata -Root $staging -ExpectedVersion $version -ExpectedDate $releaseDate)
