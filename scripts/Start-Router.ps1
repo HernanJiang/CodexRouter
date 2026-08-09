@@ -285,6 +285,19 @@ function Get-RedisPing([string]$Password) {
     }
 }
 
+function Wait-RedisAuthenticatedPing {
+    param(
+        [Parameter(Mandatory)][string]$Password,
+        [ValidateRange(1, 60)][int]$TimeoutSeconds = 30
+    )
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        if ((Get-RedisPing -Password $Password) -eq 'PONG') { return $true }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $deadline)
+    return $false
+}
+
 function Get-NetworkSettingsFingerprint {
     param(
         [Parameter(Mandatory)][string]$Value,
@@ -656,56 +669,61 @@ if ($authenticatedPing -ne 'PONG') {
     $anonymousPing = Get-RedisPing -Password ''
     if ($anonymousPing -ne 'PONG') {
         if (Wait-TcpPort -Port 16379 -TimeoutSeconds 1) {
-            throw 'Redis is running with an unknown password. Stop the verified local Redis process before restarting the router.'
-        }
-        # Bake requirepass into the runtime config so Redis never accepts
-        # unauthenticated clients during the startup race that used to spam
-        # authentication errors into the activity log and briefly break Sub2API.
-        $redisConfigText = [IO.File]::ReadAllText($redisConfig)
-        if ($redisConfigText -notmatch '(?m)^\s*requirepass\s+') {
-            $redisConfigText = $redisConfigText.TrimEnd() + "`nrequirepass $redisPassword`n"
+            # Redis opens its listener before persisted AOF/RDB data is fully
+            # loaded. Wait for the password already staged in redis.conf before
+            # treating the process as a foreign instance with an unknown key.
+            if (-not (Wait-RedisAuthenticatedPing -Password $redisPassword -TimeoutSeconds 30)) {
+                throw 'Redis is running with an unknown password. Stop the verified local Redis process before restarting the router.'
+            }
         } else {
-            $redisConfigText = [regex]::Replace(
-                $redisConfigText,
-                '(?m)^\s*requirepass\s+\S+\s*$',
-                "requirepass $redisPassword")
+            # Bake requirepass into the runtime config so Redis never accepts
+            # unauthenticated clients during startup.
+            $redisConfigText = [IO.File]::ReadAllText($redisConfig)
+            if ($redisConfigText -notmatch '(?m)^\s*requirepass\s+') {
+                $redisConfigText = $redisConfigText.TrimEnd() + "`nrequirepass $redisPassword`n"
+            } else {
+                $redisConfigText = [regex]::Replace(
+                    $redisConfigText,
+                    '(?m)^\s*requirepass\s+\S+\s*$',
+                    "requirepass $redisPassword")
+            }
+            Write-RouterFileAtomic `
+                -Path $redisRuntimeConfig `
+                -Bytes ([Text.Encoding]::UTF8.GetBytes($redisConfigText))
+            $redisProcess = Start-Process `
+                -FilePath $redisServer `
+                -ArgumentList @('redis.conf') `
+                -WorkingDirectory (Join-Path $dataRoot 'redis') `
+                -WindowStyle Hidden `
+                -RedirectStandardOutput "$routerRoot\logs\redis-stdout.log" `
+                -RedirectStandardError "$routerRoot\logs\redis-stderr.log" `
+                -PassThru
+            $redisStarted = $false
+            $redisDeadline = [DateTime]::UtcNow.AddSeconds(30)
+            do {
+                $redisProcess.Refresh()
+                if ($redisProcess.HasExited) {
+                    throw "Redis exited before listening on port 16379 (exit code $($redisProcess.ExitCode))."
+                }
+                if (Wait-TcpPort -Port 16379 -TimeoutSeconds 1) {
+                    $redisStarted = $true
+                    break
+                }
+            } while ([DateTime]::UtcNow -lt $redisDeadline)
+            if (-not $redisStarted) { throw 'Redis failed to listen on port 16379.' }
+            Write-RouterFileAtomic `
+                -Path (Join-Path $dataRoot 'pids\redis.pid') `
+                -Bytes ([Text.Encoding]::ASCII.GetBytes([string]$redisProcess.Id))
+            if (-not (Wait-RedisAuthenticatedPing -Password $redisPassword -TimeoutSeconds 30)) {
+                throw 'Redis did not become ready with the configured authentication after startup.'
+            }
         }
-        Write-RouterFileAtomic `
-            -Path $redisRuntimeConfig `
-            -Bytes ([Text.Encoding]::UTF8.GetBytes($redisConfigText))
-        $redisProcess = Start-Process `
-            -FilePath $redisServer `
-            -ArgumentList @('redis.conf') `
-            -WorkingDirectory (Join-Path $dataRoot 'redis') `
-            -WindowStyle Hidden `
-            -RedirectStandardOutput "$routerRoot\logs\redis-stdout.log" `
-            -RedirectStandardError "$routerRoot\logs\redis-stderr.log" `
-            -PassThru
-        $redisStarted = $false
-        $redisDeadline = [DateTime]::UtcNow.AddSeconds(30)
-        do {
-            $redisProcess.Refresh()
-            if ($redisProcess.HasExited) {
-                throw "Redis exited before listening on port 16379 (exit code $($redisProcess.ExitCode))."
-            }
-            if (Wait-TcpPort -Port 16379 -TimeoutSeconds 1) {
-                $redisStarted = $true
-                break
-            }
-        } while ([DateTime]::UtcNow -lt $redisDeadline)
-        if (-not $redisStarted) { throw 'Redis failed to listen on port 16379.' }
-        Write-RouterFileAtomic `
-            -Path (Join-Path $dataRoot 'pids\redis.pid') `
-            -Bytes ([Text.Encoding]::ASCII.GetBytes([string]$redisProcess.Id))
     } else {
         # An already-running unauthenticated Redis still needs the password.
         Set-RedisRequirePass -Password $redisPassword
-    }
-    $authenticatedPing = Get-RedisPing -Password $redisPassword
-    if ($authenticatedPing -ne 'PONG') {
-        Set-RedisRequirePass -Password $redisPassword
-        $authenticatedPing = Get-RedisPing -Password $redisPassword
-        if ($authenticatedPing -ne 'PONG') { throw 'Redis authentication check failed.' }
+        if (-not (Wait-RedisAuthenticatedPing -Password $redisPassword -TimeoutSeconds 5)) {
+            throw 'Redis authentication check failed.'
+        }
     }
 }
 

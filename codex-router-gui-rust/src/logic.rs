@@ -1389,12 +1389,13 @@ pub(crate) fn remove_isolated_profile_credentials(names: &[String]) -> anyhow::R
     }
 }
 
-pub fn store_credentials(cfg: &mut RouterConfig, router_root: &Path) -> anyhow::Result<()> {
+pub fn store_credentials(cfg: &mut RouterConfig, router_root: &Path) -> anyhow::Result<usize> {
     let module = router_root.join("scripts").join("CredentialStore.psm1");
     let mut script = format!(
         "$ErrorActionPreference='Stop'\nImport-Module {} -Force\n",
         ps_literal(&module.to_string_lossy())
     );
+    let mut updated_model_keys = 0usize;
     for (index, model) in cfg.models.iter_mut().enumerate() {
         if model.source == "oauth" {
             model.credential_name.clear();
@@ -1409,6 +1410,7 @@ pub fn store_credentials(cfg: &mut RouterConfig, router_root: &Path) -> anyhow::
                 ps_literal(&model.credential_name),
                 ps_literal(model.api_key.trim())
             ));
+            updated_model_keys += 1;
         }
         if model
             .base_url
@@ -1446,7 +1448,7 @@ pub fn store_credentials(cfg: &mut RouterConfig, router_root: &Path) -> anyhow::
     }
     cfg.proxy.password.clear();
     cfg.local_api_key.clear();
-    Ok(())
+    Ok(updated_model_keys)
 }
 
 pub fn isolate_profile_credentials(
@@ -1996,7 +1998,7 @@ pub fn load_oauth_accounts(router_root: &Path) -> anyhow::Result<Vec<crate::OAut
     // are substantially more reliable than Windows PowerShell 5.1.
     let shell = prefer_powershell_executable();
     let mut attempted_repair = false;
-    for attempt in 0..4 {
+    for attempt in 0..5 {
         if attempt == 0 {
             // Soft wait for the local admin API without failing the whole load.
             for _ in 0..6 {
@@ -2069,8 +2071,8 @@ pub fn load_oauth_accounts(router_root: &Path) -> anyhow::Result<Vec<crate::OAut
             }
         }
 
-        if attempt + 1 < 4 && oauth_accounts_failure_is_retryable(&last_failure) {
-            std::thread::sleep(Duration::from_millis(500 + attempt as u64 * 400));
+        if attempt + 1 < 5 && oauth_accounts_failure_is_retryable(&last_failure) {
+            std::thread::sleep(Duration::from_millis(1200 + attempt as u64 * 800));
         } else {
             break;
         }
@@ -2212,7 +2214,7 @@ fn load_usage_snapshot_with_timeout(
     cfg.save(&config_snapshot)?;
     let result = (|| -> anyhow::Result<crate::UsageSnapshot> {
         let mut last_failure = "class=unclassified_error".to_owned();
-        for attempt in 0..2 {
+        for attempt in 0..USAGE_MONITOR_MAX_ATTEMPTS {
             let shell = prefer_powershell_executable();
             let mut child = match Command::new(shell)
                 .args([
@@ -2299,8 +2301,10 @@ fn load_usage_snapshot_with_timeout(
                 last_failure = usage_process_failure_summary(&output);
             }
 
-            if attempt == 0 && usage_failure_is_locally_retryable(&last_failure) {
-                std::thread::sleep(Duration::from_millis(500));
+            if attempt + 1 < USAGE_MONITOR_MAX_ATTEMPTS
+                && usage_failure_is_locally_retryable(&last_failure)
+            {
+                std::thread::sleep(usage_monitor_retry_delay(attempt));
             } else {
                 break;
             }
@@ -2311,15 +2315,45 @@ fn load_usage_snapshot_with_timeout(
     result
 }
 
+const USAGE_MONITOR_MAX_ATTEMPTS: usize = 5;
+
+fn usage_monitor_retry_delay(attempt: usize) -> Duration {
+    match attempt {
+        0 => Duration::from_millis(500),
+        1 => Duration::from_millis(1_000),
+        2 => Duration::from_millis(2_000),
+        _ => Duration::from_millis(3_500),
+    }
+}
+
 fn usage_failure_is_locally_retryable(summary: &str) -> bool {
+    let lower = summary.to_ascii_lowercase();
+    if ["class=configuration", "class=permission", "class=storage"]
+        .iter()
+        .any(|class| lower.contains(class))
+    {
+        return false;
+    }
     [
         "class=connection_refused",
         "class=connection_closed",
+        "class=request_failure",
         "class=process_failure",
         "class=empty_response",
+        "class=authentication",
+        "class=rate_limit",
+        "class=lifecycle_busy",
+        "class=lifecycle_deferred",
+        "class=network",
+        "class=dns",
+        "class=proxy",
+        "class=tls",
+        "class=upstream",
+        "class=invalid_response",
+        "class=unclassified_error",
     ]
     .iter()
-    .any(|class| summary.contains(class))
+    .any(|class| lower.contains(class))
 }
 
 fn parse_usage_snapshot_output(stdout: &[u8]) -> anyhow::Result<crate::UsageSnapshot> {
@@ -2702,6 +2736,43 @@ base_url = "https://api.430123.xyz/v1"
         ));
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn credential_storage_reports_only_actual_model_key_updates() {
+        let root = temporary_test_dir("credential-update-count");
+        let scripts = root.join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::write(
+            scripts.join("CredentialStore.psm1"),
+            "function Set-RouterCredential { param([string]$Name, [string]$Secret)\n\
+             if ([string]::IsNullOrWhiteSpace($Secret)) { throw 'empty test secret' }\n\
+             }\n\
+             Export-ModuleMember -Function Set-RouterCredential\n",
+        )
+        .unwrap();
+        let mut config = RouterConfig {
+            models: vec![
+                ModelConfig {
+                    model: "existing-model".to_owned(),
+                    credential_name: "ExistingCredential".to_owned(),
+                    ..ModelConfig::default()
+                },
+                ModelConfig {
+                    model: "updated-model".to_owned(),
+                    api_key: "not-a-real-key".to_owned(),
+                    credential_name: "UpdatedCredential".to_owned(),
+                    ..ModelConfig::default()
+                },
+            ],
+            ..RouterConfig::default()
+        };
+
+        let updated = store_credentials(&mut config, &root).unwrap();
+
+        assert_eq!(updated, 1);
+        assert!(config.models.iter().all(|model| model.api_key.is_empty()));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3487,6 +3558,74 @@ Write-Output '{}'
         assert!(snapshot.subscriptions.is_empty());
         assert!(scripts.join("attempted.marker").is_file());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn usage_monitor_retries_after_a_sanitized_request_failure() {
+        let root = temporary_test_dir("usage-request-failure-retry");
+        let scripts = root.join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::write(
+            scripts.join("Get-UsageMonitor.ps1"),
+            r#"param([string]$ProfileName, [string]$ConfigPath)
+$marker = Join-Path $PSScriptRoot 'attempted.marker'
+if (-not (Test-Path -LiteralPath $marker)) {
+    [IO.File]::WriteAllText($marker, 'first')
+    Write-Output 'class=request_failure'
+    exit 1
+}
+Write-Output '{}'
+"#,
+        )
+        .unwrap();
+
+        let snapshot = load_usage_snapshot(&root, "test", &RouterConfig::default()).unwrap();
+
+        assert!(snapshot.subscriptions.is_empty());
+        assert!(scripts.join("attempted.marker").is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn usage_monitor_retries_after_a_rate_limited_admin_login() {
+        let root = temporary_test_dir("usage-admin-login-rate-limit-retry");
+        let scripts = root.join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::write(
+            scripts.join("Get-UsageMonitor.ps1"),
+            r#"param([string]$ProfileName, [string]$ConfigPath)
+$marker = Join-Path $PSScriptRoot 'attempted.marker'
+if (-not (Test-Path -LiteralPath $marker)) {
+    [IO.File]::WriteAllText($marker, 'first')
+    Write-Output 'Sub2API admin login is rate-limited. Wait a few seconds and retry.'
+    exit 1
+}
+Write-Output '{}'
+"#,
+        )
+        .unwrap();
+
+        let snapshot = load_usage_snapshot(&root, "test", &RouterConfig::default()).unwrap();
+
+        assert!(snapshot.subscriptions.is_empty());
+        assert!(scripts.join("attempted.marker").is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn usage_monitor_retry_budget_is_five_attempts_with_increasing_backoff() {
+        assert_eq!(USAGE_MONITOR_MAX_ATTEMPTS, 5);
+        assert!(usage_monitor_retry_delay(0) < usage_monitor_retry_delay(1));
+        assert!(usage_monitor_retry_delay(1) < usage_monitor_retry_delay(2));
+        assert!(usage_monitor_retry_delay(2) < usage_monitor_retry_delay(3));
+        assert_eq!(usage_monitor_retry_delay(4), usage_monitor_retry_delay(3));
+        assert!(usage_failure_is_locally_retryable("class=authentication"));
+        assert!(usage_failure_is_locally_retryable("class=rate_limit"));
+        assert!(usage_failure_is_locally_retryable(
+            "class=unclassified_error | exit_code=1"
+        ));
+        assert!(!usage_failure_is_locally_retryable("class=configuration"));
+        assert!(!usage_failure_is_locally_retryable("class=permission"));
     }
 
     #[test]

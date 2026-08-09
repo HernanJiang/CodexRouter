@@ -46,6 +46,10 @@ build/
 *.py[cod]
 .pnpm-debug.log*
 
+# Local portable release stages and generated root catalog
+/Codex-Router-Portable-*-windows-x64-*/
+/model-catalog.json
+
 # Go build artifacts
 source/backend/sub2api
 source/backend/*.exe

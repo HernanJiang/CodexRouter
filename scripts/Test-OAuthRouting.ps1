@@ -437,6 +437,10 @@ if ($applySource -notmatch '\$shouldUseManagedProxy\s*=\s*\$isRouterMember\s+-an
     $applySource -match '\$shouldUseManagedProxy\s*=.*-not\s+\$isOAuthFallbackChannel') {
     throw 'Apply-Router.ps1 does not route OAuth fallback API channels through the managed proxy.'
 }
+if ($applySource -notmatch '\$shouldUseOAuthManagedProxy\s*=\s*\$selectedByConfig\s+-and\s+\$hasExplicitOAuthModels' -or
+    $applySource -notmatch '-ShouldUseManagedProxy\s+\$shouldUseOAuthManagedProxy') {
+    throw 'Recovery-isolated OAuth accounts can lose the managed proxy required to refresh credentials and quota.'
+}
 
 $accountSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Get-OAuthAccounts.ps1') -Raw
 if ($accountSource -match '/quota') {
@@ -445,6 +449,48 @@ if ($accountSource -match '/quota') {
 if ($accountSource -notmatch 'Get-RouterOAuthModelSuggestions') {
     throw 'Get-OAuthAccounts.ps1 does not append the tested provider model suggestions.'
 }
+
+$accountTokens = $null
+$accountParseErrors = $null
+$accountAst = [Management.Automation.Language.Parser]::ParseFile(
+    (Join-Path $PSScriptRoot 'Get-OAuthAccounts.ps1'),
+    [ref]$accountTokens,
+    [ref]$accountParseErrors)
+if ($accountParseErrors.Count -gt 0) {
+    throw "Get-OAuthAccounts.ps1 could not be parsed: $($accountParseErrors[0].Message)"
+}
+foreach ($functionName in @('Get-SafePropertyValue', 'Get-SafeString', 'Get-SafeLong', 'Get-OAuthStableIdentityKey', 'Select-UniqueOAuthAccounts')) {
+    $definition = $accountAst.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq $functionName
+        }, $true) | Select-Object -First 1
+    if ($null -eq $definition) { throw "Missing OAuth account helper function: $functionName" }
+    Invoke-Expression $definition.Extent.Text
+}
+
+$stableIdentity = Get-OAuthStableIdentityKey -Platform 'openai' -Credentials ([pscustomobject]@{
+    chatgpt_account_id = 'acct-stable-1'
+    chatgpt_user_id = 'user-stable-1'
+    email = 'same@example.invalid'
+})
+Assert-Equal 'openai|account|acct-stable-1' $stableIdentity 'ChatGPT account id was not used as the stable OAuth identity.'
+Assert-Equal '' (Get-OAuthStableIdentityKey -Platform 'openai' -Credentials ([pscustomobject]@{
+    email = 'same@example.invalid'
+})) 'Email alone must not merge potentially distinct ChatGPT workspaces.'
+
+$duplicateOAuthAccounts = @(
+    [ordered]@{ id = 1; platform = 'openai'; boundToRouter = $true; _identityKey = 'openai|account|acct-stable-1' }
+    [ordered]@{ id = 15; platform = 'openai'; boundToRouter = $false; _identityKey = 'openai|account|acct-stable-1' }
+    [ordered]@{ id = 21; platform = 'openai'; boundToRouter = $true; _identityKey = 'openai|account|acct-stable-2' }
+)
+$dedupedOAuthAccounts = @(Select-UniqueOAuthAccounts -Accounts $duplicateOAuthAccounts -SelectedAccountIds @(1))
+Assert-Equal 2 $dedupedOAuthAccounts.Count 'Historical ChatGPT OAuth duplicates were not collapsed by stable identity.'
+Assert-Equal 1 ([long]@($dedupedOAuthAccounts | Where-Object { $_._identityKey -eq 'openai|account|acct-stable-1' })[0].id) `
+    'OAuth deduplication did not preserve the selected Router account.'
+$selectedDuplicate = @(Select-UniqueOAuthAccounts -Accounts $duplicateOAuthAccounts -SelectedAccountIds @(15))
+Assert-Equal 15 ([long]@($selectedDuplicate | Where-Object { $_._identityKey -eq 'openai|account|acct-stable-1' })[0].id) `
+    'OAuth deduplication replaced an explicitly selected duplicate with another database row.'
 
 # ---------------------------------------------------------------------------
 # Quota state machine: subscription first, park on exhaustion, same-model API
@@ -525,6 +571,42 @@ foreach ($case in $platformCases) {
     $soloParked = @(Get-RouterServableCatalogRoutes -RoutePlan $soloPlan -IsolatedOAuthAccountIds @{ ([long]$case.Account) = 'quota' } -OAuthAccountIds @($case.Account) -OAuthSelectionInitialized $true)
     Assert-Equal 0 $soloParked.Count "$label exhausted subscription without fallback must leave the Codex menu."
 }
+
+# Disabling automatic continuation exposes independent public IDs so the user
+# can choose the subscription or the same-name third-party API explicitly.
+$splitConfig = New-QuotaConfig -OAuthModel 'gpt-5.6-sol' -AccountId 1 `
+    -ApiModel 'openai/gpt-5.6-sol' -ApiBase 'https://openrouter.ai/api/v1'
+$splitConfig.oauthFallback.enabled = $false
+$splitPlan = @(Get-RouterModelRoutePlan -RouterConfig $splitConfig -DiscoveredOAuthModelsByAccount @{})
+$splitHealthyCatalog = @(Get-RouterServableCatalogRoutes -RoutePlan $splitPlan -IsolatedOAuthAccountIds @{} `
+    -OAuthAccountIds @(1) -OAuthSelectionInitialized $true)
+Assert-Equal 2 $splitHealthyCatalog.Count 'Manual quota selection must expose separate OAuth and API catalog rows.'
+$splitOAuth = @($splitHealthyCatalog | Where-Object Source -eq 'oauth')[0]
+$splitApi = @($splitHealthyCatalog | Where-Object Source -ne 'oauth')[0]
+Assert-Equal 'gpt-5.6-sol' ([string]$splitOAuth.PublicModelId) 'Manual OAuth row lost its canonical model ID.'
+if ((Get-RouterModelDisplayName -Model $splitOAuth.Model -Route $splitOAuth) -notlike '*(OAuth)') {
+    throw 'Manual OAuth row does not identify its subscription quota with (OAuth).'
+}
+if ([string]$splitApi.PublicModelId -notmatch '^gpt-5\.6-sol--api-[0-9a-f]{12}$') {
+    throw "Manual API row does not have a stable independent public ID: $($splitApi.PublicModelId)"
+}
+if ((Get-RouterModelDisplayName -Model $splitApi.Model -Route $splitApi) -like '*(OAuth)') {
+    throw 'Manual third-party API row incorrectly advertises OAuth quota.'
+}
+
+$splitParkedCatalog = @(Get-RouterServableCatalogRoutes -RoutePlan $splitPlan `
+    -IsolatedOAuthAccountIds @{ ([long]1) = 'quota' } -OAuthAccountIds @(1) -OAuthSelectionInitialized $true)
+Assert-Equal 1 $splitParkedCatalog.Count 'An exhausted manual OAuth row must leave only the independent API model.'
+Assert-Equal ([string]$splitApi.PublicModelId) ([string]$splitParkedCatalog[0].PublicModelId) `
+    'The manual API public ID changed when the OAuth account was isolated.'
+Assert-Equal 'api' ([string]$splitParkedCatalog[0].ServedBy) 'The remaining manual model is not served by the API channel.'
+$splitParkedRouting = @(Get-RouterServableRoutingRoutes -RoutePlan $splitPlan `
+    -IsolatedOAuthAccountIds @{ ([long]1) = 'quota' } -OAuthAccountIds @(1) -OAuthSelectionInitialized $true)
+$splitParkedComposite = @(Get-RouterCompositeRoutePlan -RoutePlan $splitParkedRouting `
+    -AccountPlatformById @{ '1' = 'openai' } -ExcludedOAuthAccountIds @(1))
+Assert-Equal 1 $splitParkedComposite.Count 'Manual API routing retained a dead OAuth canonical route.'
+Assert-Equal ([string]$splitApi.PublicModelId) ([string]$splitParkedComposite[0].PublicModelId) `
+    'Manual API composite routing does not use the independent public ID.'
 
 # Third-party-only profiles must be untouched by the quota state machine.
 $apiOnlyConfig = (@{

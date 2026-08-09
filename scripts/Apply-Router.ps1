@@ -5,7 +5,6 @@ $ProgressPreference = 'SilentlyContinue'
 $routerRoot = Split-Path -Parent $PSScriptRoot
 Import-Module (Join-Path $PSScriptRoot 'UserData.psm1') -Force
 $configPath = Get-RouterConfigPath -RouterRoot $routerRoot
-$dataRoot = Get-RouterDataRoot -RouterRoot $routerRoot
 # Stable catalog path: package folders change between releases, but Codex must
 # keep reading the same model menu after Apply/restart. Resolve it here, while
 # UserData.psm1 is still imported in this scope.
@@ -33,27 +32,6 @@ $lifecycleLock = Enter-RouterLifecycleLock `
     -Operation 'Apply Router configuration'
 [Environment]::SetEnvironmentVariable('CODEX_ROUTER_LIFECYCLE_LOCK_HELD', [string]$PID, 'Process')
 $config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
-$sub2apiPidPath = Join-Path $dataRoot 'pids\sub2api.pid'
-$sub2apiPid = 0
-if (Test-Path -LiteralPath $sub2apiPidPath) {
-    [void][int]::TryParse(
-        ([IO.File]::ReadAllText($sub2apiPidPath)).Trim(),
-        [ref]$sub2apiPid)
-}
-if ($sub2apiPid -gt 0) {
-    $sub2apiProcess = Get-Process -Id $sub2apiPid -ErrorAction SilentlyContinue
-    if ($null -ne $sub2apiProcess) {
-        $expectedSub2Api = [IO.Path]::GetFullPath((Join-Path $routerRoot 'app\sub2api.exe'))
-        $actualSub2Api = try { [IO.Path]::GetFullPath($sub2apiProcess.Path) } catch { '' }
-        if ($actualSub2Api.Equals($expectedSub2Api, [StringComparison]::OrdinalIgnoreCase)) {
-            $sub2apiUri = [Uri](Get-RouterBaseUri)
-            Assert-RouterServiceInterruptionAllowed `
-                -ProcessId $sub2apiPid `
-                -Port $sub2apiUri.Port `
-                -Operation 'Apply Router configuration'
-        }
-    }
-}
 $proxyProperty = $config.PSObject.Properties['proxy']
 $proxyConfig = if ($null -eq $proxyProperty) { $null } else { $proxyProperty.Value }
 $proxySettings = Resolve-RouterProxySettings -ProxyConfig $proxyConfig -ProxyPassword $null
@@ -529,11 +507,14 @@ foreach ($accountSummary in $existingAccounts) {
             group_ids = @($nextGroups | Select-Object -Unique)
             confirm_mixed_channel_risk = $true
         }
+        # Recovery isolation removes the account from scheduling, but must not
+        # remove the transport proxy needed to refresh its OAuth token and quota.
+        $shouldUseOAuthManagedProxy = $selectedByConfig -and $hasExplicitOAuthModels
         $proxyDecision = Get-RouterAccountProxyReconciliation `
             -CurrentProxyId $currentProxyId `
             -RouterManagedProxyIds $routerManagedProxyIds `
             -DesiredProxyId ([long]$managedProxyState.DesiredProxyId) `
-            -ShouldUseManagedProxy $selected
+            -ShouldUseManagedProxy $shouldUseOAuthManagedProxy
         if ($proxyDecision.Action -in @('assign', 'replace', 'clear')) {
             # Sub2API uses proxy_id=0, not JSON null, to express an explicit clear.
             $oauthUpdate.proxy_id = [long]$proxyDecision.ProxyId

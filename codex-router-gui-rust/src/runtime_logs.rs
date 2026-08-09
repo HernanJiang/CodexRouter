@@ -909,6 +909,7 @@ const STABLE_ERROR_MARKERS: &[&str] = &[
     "ROUTER_PROFILE_CREDENTIAL_MISSING",
     "ROUTER_PROFILE_CREDENTIAL_READ_FAILED",
     "ROUTER_PROFILE_CREDENTIAL_WRITE_FAILED",
+    "ROUTER_KIMI_CREDENTIAL_REJECTED",
     "ROUTER_PROFILE_SAVE_FAILED",
     "ROUTER_PROFILE_ROLLBACK_INCOMPLETE",
     "ROUTER_PROXY_UNSUPPORTED",
@@ -938,21 +939,24 @@ fn error_classes(text: &str) -> Vec<&'static str> {
     let lower = text.to_lowercase();
     let mut classes = Vec::new();
 
+    // Lifecycle markers describe why a destructive action was deliberately not
+    // taken. The explanation often names the protected services, which must not
+    // turn a safe deferral into database/Redis/configuration failure classes.
+    if lower.contains("router_lifecycle_deferred") {
+        return vec!["lifecycle_deferred"];
+    }
+    if lower.contains("router_lifecycle_busy") {
+        return vec!["lifecycle_busy"];
+    }
+    if lower.contains("router_lifecycle_safety_check_failed") {
+        return vec!["lifecycle_safety_check_failed"];
+    }
+
     if lower.contains("router_install_root_conflict") || lower.contains("install_root_conflict") {
         push_unique_class(&mut classes, "install_root_conflict");
     }
     if lower.contains("router_port_conflict") || lower.contains("port_conflict") {
         push_unique_class(&mut classes, "port_conflict");
-    }
-
-    if lower.contains("router_lifecycle_deferred") {
-        push_unique_class(&mut classes, "lifecycle_deferred");
-    }
-    if lower.contains("router_lifecycle_busy") {
-        push_unique_class(&mut classes, "lifecycle_busy");
-    }
-    if lower.contains("router_lifecycle_safety_check_failed") {
-        push_unique_class(&mut classes, "lifecycle_safety_check_failed");
     }
 
     if contains_any(
@@ -963,7 +967,13 @@ fn error_classes(text: &str) -> Vec<&'static str> {
     }
     if contains_any(
         &lower,
-        &["rate limit", "too many requests", "quota", "限流", "额度"],
+        &[
+            "rate limit",
+            "rate-limit",
+            "rate limited",
+            "too many requests",
+            "限流",
+        ],
     ) || lower.contains("429")
     {
         push_unique_class(&mut classes, "rate_limit");
@@ -1501,12 +1511,38 @@ mod tests {
     }
 
     #[test]
+    fn hyphenated_admin_rate_limits_are_classified() {
+        let safe = summarize_error_for_display(
+            "Sub2API admin login is rate-limited. Wait a few seconds and retry.",
+        );
+        assert_eq!(safe, "class=rate_limit");
+    }
+
+    #[test]
+    fn kimi_quota_authentication_failures_are_not_misclassified_as_rate_limits() {
+        let unauthorized = summarize_error_for_display(
+            "ROUTER_KIMI_CREDENTIAL_REJECTED: Kimi Coding Plan quota query failed (HTTP 401).",
+        );
+        assert_eq!(
+            unauthorized,
+            "class=authentication | status=401 | marker=ROUTER_KIMI_CREDENTIAL_REJECTED"
+        );
+
+        let forbidden = summarize_error_for_display(
+            "ROUTER_KIMI_CREDENTIAL_REJECTED: Kimi Coding Plan quota query failed (HTTP 403).",
+        );
+        assert_eq!(
+            forbidden,
+            "class=permission | status=403 | marker=ROUTER_KIMI_CREDENTIAL_REJECTED"
+        );
+    }
+
+    #[test]
     fn lifecycle_deferrals_remain_explicit_after_error_sanitization() {
         let safe = summarize_error_for_display(
-            "ROUTER_LIFECYCLE_DEFERRED: Stop Router was deferred for an active request",
+            "ROUTER_LIFECYCLE_DEFERRED: Apply Router configuration was deferred; Sub2API, Redis, and PostgreSQL were left unchanged",
         );
-        assert!(safe.contains("class=lifecycle_deferred"));
-        assert!(!safe.contains("active request"));
+        assert_eq!(safe, "class=lifecycle_deferred");
     }
 
     #[test]

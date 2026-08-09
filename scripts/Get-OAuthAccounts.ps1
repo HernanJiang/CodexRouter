@@ -39,6 +39,53 @@ function Get-SafeLong {
     try { return [long]$Value } catch { return $Default }
 }
 
+function Get-OAuthStableIdentityKey {
+    param(
+        [Parameter(Mandatory)][string]$Platform,
+        [AllowNull()]$Credentials
+    )
+    $normalizedPlatform = $Platform.Trim().ToLowerInvariant()
+    if ($normalizedPlatform -ne 'openai') { return '' }
+    $accountId = (Get-SafeString -InputObject $Credentials -Name 'chatgpt_account_id').Trim()
+    if ($accountId) { return "$normalizedPlatform|account|$($accountId.ToLowerInvariant())" }
+    $userId = (Get-SafeString -InputObject $Credentials -Name 'chatgpt_user_id').Trim()
+    if ($userId) { return "$normalizedPlatform|user|$($userId.ToLowerInvariant())" }
+    return ''
+}
+
+function Select-UniqueOAuthAccounts {
+    param(
+        [Parameter()][AllowEmptyCollection()][object[]]$Accounts = @(),
+        [Parameter()][AllowEmptyCollection()][long[]]$SelectedAccountIds = @()
+    )
+    $selected = @{}
+    foreach ($id in @($SelectedAccountIds)) {
+        if ($id -gt 0) { $selected[[long]$id] = $true }
+    }
+    $bestByIdentity = [ordered]@{}
+    foreach ($account in @($Accounts)) {
+        $accountId = Get-SafeLong -Value (Get-SafePropertyValue -InputObject $account -Name 'id')
+        $identityKey = (Get-SafeString -InputObject $account -Name '_identityKey').Trim()
+        if (-not $identityKey) { $identityKey = "row|$accountId" }
+        if (-not $bestByIdentity.Contains($identityKey)) {
+            $bestByIdentity[$identityKey] = $account
+            continue
+        }
+        $current = $bestByIdentity[$identityKey]
+        $currentId = Get-SafeLong -Value (Get-SafePropertyValue -InputObject $current -Name 'id')
+        $candidateSelected = $selected.ContainsKey($accountId)
+        $currentSelected = $selected.ContainsKey($currentId)
+        $candidateBound = [bool](Get-SafePropertyValue -InputObject $account -Name 'boundToRouter')
+        $currentBound = [bool](Get-SafePropertyValue -InputObject $current -Name 'boundToRouter')
+        $replace = ($candidateSelected -and -not $currentSelected) -or
+            ($candidateSelected -eq $currentSelected -and $candidateBound -and -not $currentBound) -or
+            ($candidateSelected -eq $currentSelected -and $candidateBound -eq $currentBound -and
+                $accountId -gt 0 -and ($currentId -le 0 -or $accountId -lt $currentId))
+        if ($replace) { $bestByIdentity[$identityKey] = $account }
+    }
+    return @($bestByIdentity.Values)
+}
+
 function Test-OAuthRouterHealth {
     param([int]$TimeoutMilliseconds = 1500)
     $request = $null
@@ -244,6 +291,7 @@ try {
                 error = $errorMessage
                 expiresAt = $expiresAt
                 models = @($models)
+                _identityKey = Get-OAuthStableIdentityKey -Platform $platform -Credentials $credentials
             })
         } catch {
             $detailFailures++
@@ -255,7 +303,24 @@ try {
         throw "ROUTER_OAUTH_ACCOUNTS_UNAVAILABLE: failed to load details for $detailFailures OAuth account(s)."
     }
 
-    $json = ConvertTo-Json -InputObject @($result.ToArray()) -Depth 12 -Compress
+    $selectedAccountIds = @()
+    try {
+        $configPath = Get-RouterConfigPath -RouterRoot $routerRoot
+        if (Test-Path -LiteralPath $configPath) {
+            $routerConfig = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+            $selectionProperty = $routerConfig.PSObject.Properties['oauthAccountIds']
+            if ($null -ne $selectionProperty) {
+                $selectedAccountIds = @($selectionProperty.Value | ForEach-Object { Get-SafeLong -Value $_ } | Where-Object { $_ -gt 0 })
+            }
+        }
+    } catch { }
+    $uniqueAccounts = @(Select-UniqueOAuthAccounts -Accounts @($result.ToArray()) -SelectedAccountIds $selectedAccountIds)
+    foreach ($account in $uniqueAccounts) {
+        if ($account -is [Collections.IDictionary] -and $account.Contains('_identityKey')) {
+            $account.Remove('_identityKey')
+        }
+    }
+    $json = ConvertTo-Json -InputObject $uniqueAccounts -Depth 12 -Compress
     if ([string]::IsNullOrWhiteSpace($json)) { $json = '[]' }
     $utf8 = [Text.UTF8Encoding]::new($false)
     [Console]::OutputEncoding = $utf8

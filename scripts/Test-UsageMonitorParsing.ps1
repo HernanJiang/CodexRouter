@@ -54,7 +54,8 @@ $requiredFunctions = @(
     'Merge-UsageTotals',
     'Merge-CodingPlanApiChannels',
     'Get-UsageWindowCacheKey',
-    'Merge-UsageWindows'
+    'Merge-UsageWindows',
+    'Resolve-UsageAccountState'
 )
 foreach ($name in $requiredFunctions) {
     $definition = $ast.FindAll({
@@ -90,6 +91,12 @@ Add-UsageWindow -Target $remaining -Kind 'monthly' -Window ([pscustomobject]@{
 })
 Assert-True ($remaining.Count -eq 1) 'A remaining-percent quota window was dropped.'
 Assert-True ([double]$remaining[0].usedPercent -eq 75.0) 'Remaining-percent quota was not normalized to used percent.'
+$usagePercentageRatio = Get-NormalizedWindowPercent -Window ([pscustomobject]@{ usagePercentage = 0.4 })
+$usagePercentagePercent = Get-NormalizedWindowPercent -Window ([pscustomobject]@{ usagePercentage = 40 })
+$usedRatio = Get-NormalizedWindowPercent -Window ([pscustomobject]@{ usedRatio = 0.4 })
+Assert-True ([double]$usagePercentageRatio -eq 40.0) 'Fractional usagePercentage was not converted to percent.'
+Assert-True ([double]$usagePercentagePercent -eq 40.0) 'Percent-form usagePercentage was multiplied twice.'
+Assert-True ([double]$usedRatio -eq 40.0) 'Ratio-form usage was not converted to percent.'
 Assert-True ((ConvertTo-CodingPlanResetAt -Value ([DateTime]::SpecifyKind(
     [DateTime]::Parse('2026-08-03T12:00:00'), [DateTimeKind]::Utc))) -eq '2026-08-03T12:00:00.0000000Z') `
     'PowerShell DateTime quota resets were not normalized to UTC ISO format.'
@@ -129,6 +136,29 @@ Assert-True ($kimiDurationWindows[0].kind -eq 'fiveHour' -and [double]$kimiDurat
 Assert-True ($kimiDurationWindows[1].kind -eq 'weekly' -and [double]$kimiDurationWindows[1].usedPercent -eq 25.0) `
     'Kimi duration=7 days was not classified as the weekly window.'
 
+$kimiRatioWindows = @(ConvertFrom-KimiCodingPlanUsage -Body ([pscustomobject]@{
+    data = [pscustomobject]@{
+        usage = [pscustomobject]@{
+            name = 'weekly'
+            detail = [pscustomobject]@{ amountUsedRatio = 0.25; expireTime = 1786000000000 }
+        }
+        limits = @([pscustomobject]@{
+            window = [pscustomobject]@{ duration = 5; timeUnit = 'HOUR' }
+            quota = [pscustomobject]@{ used_ratio = 0.4; reset_at = 1785751200000 }
+        })
+    }
+}))
+Assert-True ($kimiRatioWindows.Count -eq 2) 'Kimi nested detail/quota usage was not parsed.'
+Assert-True ($kimiRatioWindows[0].kind -eq 'fiveHour' -and [double]$kimiRatioWindows[0].usedPercent -eq 40.0) `
+    'Kimi ratio-based five-hour usage was not normalized.'
+Assert-True ($kimiRatioWindows[1].kind -eq 'weekly' -and [double]$kimiRatioWindows[1].usedPercent -eq 25.0) `
+    'Kimi nested weekly usage was not normalized.'
+$kimiBusinessError = @(ConvertFrom-KimiCodingPlanUsage -Body ([pscustomobject]@{
+    code = 1004
+    limits = @([pscustomobject]@{ detail = [pscustomobject]@{ limit = 100; remaining = 0 } })
+}))
+Assert-True ($kimiBusinessError.Count -eq 0) 'Kimi business errors were parsed as quota windows.'
+
 $volcengine = @(ConvertFrom-VolcengineCodingPlanUsage -Body ([pscustomobject]@{
     Result = [pscustomobject]@{ QuotaUsage = @(
         [pscustomobject]@{ Level = 'session'; Percent = 12.5; ResetTimestamp = 1785751200 },
@@ -160,7 +190,8 @@ Assert-True ($arkMerged.Count -eq 1) 'Ark channels with the same base URL were n
 Assert-True ($arkMerged[0].totals.requests -eq 3 -and @($arkMerged[0].totals.models).Count -eq 2) 'Ark aggregate model usage was not merged.'
 
 $usageSource = [IO.File]::ReadAllText($sourcePath)
-Assert-True ($usageSource.Contains('/api/v1/admin/grok/accounts/$accountId/quota?billing_only=true')) 'Grok usage does not query the dedicated billing-only quota endpoint.'
+Assert-True ($usageSource.Contains('/api/v1/admin/grok/accounts/$accountId/quota"')) 'Grok usage does not query the complete quota endpoint.'
+Assert-True (-not $usageSource.Contains('quota?billing_only=true')) 'Grok usage still suppresses the active quota-header fallback.'
 Assert-True (-not $usageSource.Contains('usage?source=passive')) 'Grok usage still calls the unsupported passive usage endpoint.'
 Assert-True ($usageSource.Contains('GetCodingPlanUsage&Version=2024-01-01')) 'Volcengine Coding Plan no longer queries the official control-plane action.'
 Assert-True ($usageSource.Contains('Recovery reconciliation is best-effort')) 'OAuth recovery reconciliation can still abort a complete usage snapshot.'
@@ -309,6 +340,29 @@ $staleCache = @{
 Assert-True ($null -eq (Get-UsageCacheFallback -Cache $staleCache -Key 'provider|base|stale' -Provider 'Provider')) `
     'Stale last-good quota data was displayed after the cache TTL.'
 
+$kimiRefreshedState = Resolve-UsageAccountState -Status 'active' -Schedulable $true `
+    -StatusDetail 'class=rate_limit status=403' -HasFreshQuotaData $true `
+    -Windows @([pscustomobject]@{ kind = 'fiveHour'; usedPercent = 0.0 }, [pscustomobject]@{ kind = 'weekly'; usedPercent = 0.0 })
+Assert-True ($kimiRefreshedState.health -eq 'healthy') 'Fresh Kimi zero-percent quota did not restore a healthy state.'
+Assert-True ([string]::IsNullOrWhiteSpace($kimiRefreshedState.statusDetail)) 'Fresh Kimi quota retained a historical 403 status detail.'
+
+$kimiActiveFailedRefreshState = Resolve-UsageAccountState -Status 'active' -Schedulable $true `
+    -StatusDetail 'class=permission status=403' -HasFreshQuotaData $false -Windows @()
+Assert-True ($kimiActiveFailedRefreshState.health -eq 'healthy') 'An active schedulable Kimi channel was not kept healthy.'
+Assert-True ([string]::IsNullOrWhiteSpace($kimiActiveFailedRefreshState.statusDetail)) `
+    'An active schedulable Kimi channel retained a stale request error beside the current quota error.'
+
+$grokExhaustedState = Resolve-UsageAccountState -Status 'active' -Schedulable $true `
+    -StatusDetail 'class=request_failure' -HasFreshQuotaData $true `
+    -Windows @([pscustomobject]@{ kind = 'weekly'; usedPercent = 100.0 })
+Assert-True ($grokExhaustedState.health -eq 'quotaExhausted') 'Fresh Grok exhausted quota was not classified from the current window.'
+Assert-True ([string]::IsNullOrWhiteSpace($grokExhaustedState.statusDetail)) 'Fresh Grok quota retained a historical request failure.'
+
+$failedRefreshState = Resolve-UsageAccountState -Status 'error' -Schedulable $false `
+    -StatusDetail 'class=authentication status=401' -HasFreshQuotaData $false -Windows @()
+Assert-True ($failedRefreshState.health -eq 'upstreamError') 'A current failed refresh was hidden as healthy.'
+Assert-True ($failedRefreshState.statusDetail -eq 'class=authentication status=401') 'A current failed refresh lost its actionable status detail.'
+
 $zenmux = @(ConvertFrom-ZenMuxCodingPlanUsage -Body ([pscustomobject]@{
     success = $true
     data = [pscustomobject]@{
@@ -392,6 +446,15 @@ Assert-True (@($grokQuotaWindows | Where-Object { $_.displayName -eq 'Grok token
     'Grok token quota headers were not normalized to used percent.'
 Assert-True (@($grokQuotaWindows | Where-Object { $_.displayName -eq 'Grok request quota' -and [double]$_.usedPercent -eq 20.0 }).Count -eq 1) `
     'Grok request quota headers were not normalized to used percent.'
+
+$grokUnifiedWindows = @(ConvertFrom-GrokQuotaUsage -Body ([pscustomobject]@{
+    config = [pscustomobject]@{
+        creditUsagePercent = 42.5
+        currentPeriod = [pscustomobject]@{ type = 'WEEKLY'; end = '2026-08-12T00:00:00Z' }
+    }
+}))
+Assert-True ($grokUnifiedWindows.Count -eq 1 -and $grokUnifiedWindows[0].kind -eq 'weekly' -and [double]$grokUnifiedWindows[0].usedPercent -eq 42.5) `
+    'Grok unified credits response was not parsed.'
 
 $grokSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Get-UsageMonitor.ps1') -Raw
 Assert-True ($grokSource -match "Name 'billing'") 'Grok quota parsing no longer reads the billing payload.'

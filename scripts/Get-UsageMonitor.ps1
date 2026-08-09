@@ -1,6 +1,7 @@
 param(
     [string]$ProfileName = 'Codex-Router',
-    [string]$ConfigPath = ''
+    [string]$ConfigPath = '',
+    [switch]$DefineOnly
 )
 
 Set-StrictMode -Version Latest
@@ -168,13 +169,21 @@ function ConvertTo-NormalizedPercent {
 function Get-NormalizedWindowPercent {
     param([AllowNull()]$Window, [string]$Provider = '')
     if ($null -eq $Window) { return $null }
-    foreach ($name in @('utilization','used_percent','usedPercent','percentage','percent','usage_percentage','usagePercentage','remaining_percent','remainingPercent')) {
+    foreach ($name in @('utilization','used_percent','usedPercent','percentage','percent','usage_percentage','usagePercentage','usedRatio','used_ratio','ratio','amountUsedRatio','amount_used_ratio','remaining_percent','remainingPercent')) {
         $value = Get-SafeValue -InputObject $Window -Name $name
         if ($null -eq $value) { continue }
         $numeric = ConvertTo-NormalizedPercent -Value $value
         if ($null -eq $numeric) { continue }
-        if ($name -match '(?i)usage_percentage|usagePercentage') {
-            try { if ([double]$value -le 1.0) { $numeric = ConvertTo-NormalizedPercent -Value $value -Semantics 'ratio' } } catch { }
+        if ($name -match '(?i)^usage_percentage$|^usagePercentage$') {
+            try {
+                $percentage = [double]$value
+                if ($percentage -ge 0 -and $percentage -le 1.0) {
+                    $numeric = ConvertTo-NormalizedPercent -Value ($percentage * 100.0)
+                }
+            } catch { }
+        }
+        elseif ($name -match '(?i)^usedRatio$|^used_ratio$|^ratio$|^amountUsedRatio$|^amount_used_ratio$') {
+            try { $numeric = ConvertTo-NormalizedPercent -Value (([double]$value) * 100.0) } catch { }
         }
         elseif ($name -match '(?i)remaining_percent|remainingPercent') {
             $numeric = ConvertTo-NormalizedPercent -Value $value -Semantics 'remaining'
@@ -198,7 +207,7 @@ function Get-NormalizedWindowPercent {
 
 function Get-NormalizedResetValue {
     param([AllowNull()]$Window)
-    return Get-FirstSafeValue -InputObject $Window -Names @('resets_at','reset_time','reset_at','resetAt','resetTime','next_reset_at','nextResetAt','ResetTimestamp','reset_timestamp')
+    return Get-FirstSafeValue -InputObject $Window -Names @('resets_at','reset_time','reset_at','resetAt','resetTime','next_reset_at','nextResetAt','ResetTimestamp','reset_timestamp','period_end','billing_period_end','expireTime','expire_time')
 }
 
 function ConvertTo-KimiWindowMinutes {
@@ -308,6 +317,40 @@ function ConvertFrom-GrokQuotaUsage {
     $windows = [System.Collections.ArrayList]::new()
     if ($null -eq $Body) { return @($windows) }
 
+    $config = Get-SafeValue -InputObject $Body -Name 'config'
+    if ($null -eq $config) { $config = $Body }
+    $creditPercent = Get-FirstSafeValue -InputObject $config -Names @('creditUsagePercent','credit_usage_percent')
+    $currentPeriod = Get-FirstSafeValue -InputObject $config -Names @('currentPeriod','current_period')
+    $periodType = Get-SafeString -InputObject $currentPeriod -Name 'type'
+    if (-not $periodType) { $periodType = Get-SafeString -InputObject $currentPeriod -Name 'period_type' }
+    $periodEnd = Get-FirstSafeValue -InputObject $currentPeriod -Names @('end','billingPeriodEnd','billing_period_end','resetAt','reset_at')
+    $configKind = switch -Regex ($periodType) {
+        '(?i)week' { 'weekly'; break }
+        '(?i)month' { 'monthly'; break }
+        '(?i)day' { 'other'; break }
+        default { 'monthly' }
+    }
+    if ($null -ne $creditPercent) {
+        try {
+            [void]$windows.Add((New-CodingPlanWindow -Kind $configKind -UsedPercent ([double]$creditPercent) `
+                -ResetAt $periodEnd -DisplayName 'Grok credits'))
+        } catch { }
+    } else {
+        $monthlyLimit = Get-FirstSafeValue -InputObject $config -Names @('monthlyLimit','monthly_limit')
+        $usage = Get-SafeValue -InputObject $config -Name 'usage'
+        $used = Get-FirstSafeValue -InputObject $config -Names @('used','totalUsed','total_used')
+        if ($null -eq $used) { $used = Get-FirstSafeValue -InputObject $usage -Names @('totalUsed','total_used','includedUsed','included_used','used') }
+        if ($null -ne $monthlyLimit -and $null -ne $used) {
+            try {
+                $limitNumber = [double]$monthlyLimit
+                if ($limitNumber -gt 0) {
+                    [void]$windows.Add((New-CodingPlanWindow -Kind $configKind `
+                        -UsedPercent (([double]$used / $limitNumber) * 100.0) -ResetAt $periodEnd -DisplayName 'Grok credits'))
+                }
+            } catch { }
+        }
+    }
+
     $billing = Get-SafeValue -InputObject $Body -Name 'billing'
     if ($null -eq $billing) { $billing = $Body }
     $periodType = Get-SafeString -InputObject $billing -Name 'period_type'
@@ -376,17 +419,27 @@ function ConvertFrom-KimiCodingPlanUsage {
     param([Parameter(Mandatory)]$Body)
     $data = Get-SafeValue -InputObject $Body -Name 'data'
     if ($null -ne $data) { $Body = $data }
+    $nestedData = Get-SafeValue -InputObject $Body -Name 'data'
+    if ($null -ne $nestedData) { $Body = $nestedData }
+    $businessError = Get-SafeValue -InputObject $Body -Name 'error'
+    if ($null -ne $businessError) { return @() }
+    $businessCode = Get-SafeValue -InputObject $Body -Name 'code'
+    if ($null -ne $businessCode) {
+        try { if ([long]$businessCode -ne 0) { return @() } } catch { }
+    }
     $classified = @{}
     $unclassified = @()
     $usage = Get-SafeValue -InputObject $Body -Name 'usage'
     if ($null -ne $usage) {
-        $usedPercent = Get-NormalizedWindowPercent -Window $usage
+        $usageDetail = Get-FirstSafeValue -InputObject $usage -Names @('detail','quota')
+        if ($null -eq $usageDetail) { $usageDetail = $usage }
+        $usedPercent = Get-NormalizedWindowPercent -Window $usageDetail
         if ($null -ne $usedPercent) {
             $kind = Get-KimiWindowKind -Window $usage
             if (-not $kind) { $kind = 'weekly' }
             $classified[$kind] = New-CodingPlanWindow -Kind $kind `
                 -UsedPercent ([double]$usedPercent) `
-                -ResetAt (Get-NormalizedResetValue -Window $usage)
+                -ResetAt (Get-NormalizedResetValue -Window $usageDetail)
         }
     }
     $limits = Get-SafeValue -InputObject $Body -Name 'limits'
@@ -891,6 +944,116 @@ function Invoke-UsageRestMethod {
     }
 }
 
+function Invoke-UsageTasksBounded {
+    param(
+        [AllowEmptyCollection()][object[]]$Tasks = @(),
+        [Parameter(Mandatory)][scriptblock]$WorkerScript,
+        [ValidateRange(1, 32)][int]$MaxConcurrency = 4,
+        [ValidateRange(1, 300)][int]$TaskTimeoutSec = 20,
+        [AllowNull()][scriptblock]$OnResult
+    )
+    if ($Tasks.Count -eq 0) { return @() }
+
+    $pool = [RunspaceFactory]::CreateRunspacePool(1, $MaxConcurrency)
+    $pool.Open()
+    $pending = [System.Collections.ArrayList]::new()
+    $completed = [System.Collections.ArrayList]::new()
+    $nextTaskIndex = 0
+    $startTask = {
+        param($Task)
+        $powershell = [PowerShell]::Create()
+        $powershell.RunspacePool = $pool
+        [void]$powershell.AddScript($WorkerScript.ToString()).AddArgument($Task)
+        return [pscustomobject]@{
+            task = $Task
+            powershell = $powershell
+            handle = $powershell.BeginInvoke()
+            deadline = [DateTime]::UtcNow.AddSeconds($TaskTimeoutSec)
+        }
+    }
+    try {
+        while ($pending.Count -lt $MaxConcurrency -and $nextTaskIndex -lt $Tasks.Count) {
+            [void]$pending.Add((& $startTask $Tasks[$nextTaskIndex]))
+            $nextTaskIndex++
+        }
+
+        while ($pending.Count -gt 0 -or $nextTaskIndex -lt $Tasks.Count) {
+            foreach ($entry in @($pending.ToArray())) {
+                $envelope = $null
+                if ($entry.handle.IsCompleted) {
+                    try {
+                        $output = @($entry.powershell.EndInvoke($entry.handle))
+                        $result = if ($output.Count -eq 1) { $output[0] } elseif ($output.Count -gt 1) { $output } else { $null }
+                        $envelope = [pscustomobject]@{
+                            task = $entry.task
+                            result = $result
+                            timedOut = $false
+                            error = ''
+                        }
+                    } catch {
+                        $envelope = [pscustomobject]@{
+                            task = $entry.task
+                            result = $null
+                            timedOut = $false
+                            error = 'usage task failed'
+                        }
+                    }
+                } elseif ([DateTime]::UtcNow -ge $entry.deadline) {
+                    try { $entry.powershell.Stop() } catch { }
+                    $envelope = [pscustomobject]@{
+                        task = $entry.task
+                        result = $null
+                        timedOut = $true
+                        error = 'usage task timed out'
+                    }
+                }
+
+                if ($null -ne $envelope) {
+                    [void]$completed.Add($envelope)
+                    [void]$pending.Remove($entry)
+                    if ($null -ne $OnResult) { & $OnResult $envelope }
+                    try { $entry.powershell.Dispose() } catch { }
+                }
+            }
+            while ($pending.Count -lt $MaxConcurrency -and $nextTaskIndex -lt $Tasks.Count) {
+                [void]$pending.Add((& $startTask $Tasks[$nextTaskIndex]))
+                $nextTaskIndex++
+            }
+            if ($pending.Count -gt 0) { Start-Sleep -Milliseconds 25 }
+        }
+    } finally {
+        foreach ($entry in @($pending.ToArray())) {
+            try { $entry.powershell.Stop() } catch { }
+            try { $entry.powershell.Dispose() } catch { }
+        }
+        try { $pool.Close() } catch { }
+        try { $pool.Dispose() } catch { }
+    }
+    return @($completed)
+}
+
+function Merge-UsageMonitorCacheEntries {
+    param(
+        [Parameter(Mandatory)][hashtable]$Target,
+        [AllowNull()]$Incoming
+    )
+    if ($null -eq $Incoming) { return }
+    foreach ($key in @($Incoming.Keys)) {
+        $candidate = $Incoming[$key]
+        if ($null -eq $candidate) { continue }
+        $current = if ($Target.ContainsKey($key)) { $Target[$key] } else { $null }
+        $candidateAt = Get-SafeString -InputObject $candidate -Name 'updatedAt'
+        $currentAt = Get-SafeString -InputObject $current -Name 'updatedAt'
+        $replace = $null -eq $current
+        if (-not $replace -and $candidateAt -and $currentAt) {
+            try { $replace = [DateTimeOffset]::Parse($candidateAt) -ge [DateTimeOffset]::Parse($currentAt) } catch { $replace = $false }
+        } elseif (-not $replace -and $candidateAt) {
+            $replace = $true
+        }
+        if ($replace) { $Target[$key] = $candidate }
+    }
+}
+
 function Get-UsageCacheFallback {
     param(
         [Parameter(Mandatory)][hashtable]$Cache,
@@ -1162,7 +1325,7 @@ function Get-CodingPlanUsage {
                     'ZenMux Coding Plan' { ConvertFrom-ZenMuxCodingPlanUsage -Body $body }
                 }
                 if (@($windows).Count -gt 0) {
-                    $result = [pscustomobject]@{ provider = $provider; windows = @($windows); note = "$provider quota queried directly from the provider." }
+                    $result = [pscustomobject]@{ provider = $provider; windows = @($windows); note = '' }
                     if ($null -ne $UsageCache) { Save-UsageCacheEntry -Cache $UsageCache -Key $cacheKey -Result $result }
                     return $result
                 }
@@ -1173,14 +1336,23 @@ function Get-CodingPlanUsage {
         throw "$provider returned no readable quota windows"
     } catch {
         $status = 'transport error'
+        $statusCodeValue = 0
         $response = $_.Exception.PSObject.Properties['Response']
         if ($null -ne $response -and $null -ne $response.Value) {
             $statusCode = $response.Value.PSObject.Properties['StatusCode']
-            if ($null -ne $statusCode) { $status = "HTTP $([int]$statusCode.Value)" }
+            if ($null -ne $statusCode) {
+                $statusCodeValue = [int]$statusCode.Value
+                $status = "HTTP $statusCodeValue"
+            }
         }
-        $fallback = if ($null -ne $UsageCache) { Get-UsageCacheFallback -Cache $UsageCache -Key $cacheKey -Provider $provider -Note "$provider live quota query failed ($status); showing cached quota." } else { $null }
+        $failureNote = if ($provider -eq 'Kimi Coding Plan' -and $statusCodeValue -in @(401, 403)) {
+            "ROUTER_KIMI_CREDENTIAL_REJECTED: Kimi Coding Plan API Key is invalid or lacks Coding Plan access ($status)."
+        } else {
+            "$provider live quota query failed ($status)."
+        }
+        $fallback = if ($null -ne $UsageCache) { Get-UsageCacheFallback -Cache $UsageCache -Key $cacheKey -Provider $provider -Note "$failureNote Showing cached quota." } else { $null }
         if ($null -ne $fallback) { return $fallback }
-        return [pscustomobject]@{ provider = $provider; windows = @(); note = "$provider quota query failed ($status)." }
+        return [pscustomobject]@{ provider = $provider; windows = @(); note = $failureNote }
     } finally {
         $apiKey = $null
         if ($headers) { $headers.Clear() }
@@ -1252,6 +1424,33 @@ function Add-UsageWindow {
     })
 }
 
+function Resolve-UsageAccountState {
+    param(
+        [Parameter(Mandatory)][string]$Status,
+        [AllowNull()]$Schedulable,
+        [AllowEmptyString()][string]$StatusDetail = '',
+        [Parameter()][AllowEmptyCollection()][object[]]$Windows = @(),
+        [bool]$HasFreshQuotaData = $false
+    )
+    $currentDetail = $StatusDetail
+    if ($HasFreshQuotaData -or ($Status -eq 'active' -and $Schedulable -ne $false)) { $currentDetail = '' }
+    $quotaExhausted = @($Windows | Where-Object {
+            $null -ne $_.usedPercent -and [double]$_.usedPercent -ge 99.999
+        }).Count -gt 0
+    $health = if ($quotaExhausted) {
+        'quotaExhausted'
+    } elseif ($Status -eq 'active' -and $Schedulable -ne $false) {
+        'healthy'
+    } elseif ($currentDetail -match 'usage limit|quota|billing cycle') {
+        'quotaExhausted'
+    } elseif ($currentDetail -or $Status -eq 'error') {
+        'upstreamError'
+    } else {
+        'cooldown'
+    }
+    return [pscustomobject]@{ health = $health; statusDetail = $currentDetail }
+}
+
 function Get-AccountRecord {
     param(
         [Parameter(Mandatory)]$Session,
@@ -1268,6 +1467,7 @@ function Get-AccountRecord {
     $usageData = $null
     $grokQuotaData = $null
     $queryNote = ''
+    $hasFreshQuotaData = $false
     try {
         $statsData = Get-RouterResponseData (Invoke-RouterApi -Session $Session -Method GET -Path "/api/v1/admin/accounts/$accountId/stats" -TimeoutSec 10)
     } catch {
@@ -1277,7 +1477,7 @@ function Get-AccountRecord {
         if ($platform -eq 'grok') {
             try {
                 $grokQuotaData = Get-RouterResponseData (Invoke-RouterApi -Session $Session -Method GET `
-                    -Path "/api/v1/admin/grok/accounts/$accountId/quota?billing_only=true" -TimeoutSec 10)
+                    -Path "/api/v1/admin/grok/accounts/$accountId/quota" -TimeoutSec 30)
                 $usageData = $grokQuotaData
             } catch {
                 $grokQuotaData = $null
@@ -1316,6 +1516,9 @@ function Get-AccountRecord {
     Add-UsageWindow -Target $windows -Kind 'fiveHour' -Window (Get-SafeValue -InputObject $usageData -Name 'five_hour')
     Add-UsageWindow -Target $windows -Kind 'weekly' -Window (Get-SafeValue -InputObject $usageData -Name 'seven_day')
     Add-UsageWindow -Target $windows -Kind 'monthly' -Window (Get-SafeValue -InputObject $usageData -Name 'monthly')
+    if ($kind -eq 'oauth' -and $null -ne $usageData -and $windows.Count -gt 0) {
+        $hasFreshQuotaData = $true
+    }
 
     if ($kind -eq 'oauth' -and $platform -eq 'openai') {
         try {
@@ -1333,6 +1536,7 @@ function Get-AccountRecord {
                         if ($windows[$index].kind -eq $windowKind) { $windows.RemoveAt($index) }
                     }
                     [void]$windows.Add($quotaCandidate[0])
+                    $hasFreshQuotaData = $true
                 }
             }
         } catch {
@@ -1342,9 +1546,11 @@ function Get-AccountRecord {
 
     if ($kind -eq 'oauth' -and $platform -eq 'grok') {
         $grokQuota = if ($null -ne $grokQuotaData) { $grokQuotaData } else { $usageData }
-        foreach ($window in @(ConvertFrom-GrokQuotaUsage -Body $grokQuota)) {
+        $grokWindows = @(ConvertFrom-GrokQuotaUsage -Body $grokQuota)
+        foreach ($window in $grokWindows) {
             [void]$windows.Add($window)
         }
+        if ($null -ne $grokQuotaData -and $grokWindows.Count -gt 0) { $hasFreshQuotaData = $true }
         if ($null -eq $grokQuota -and -not $queryNote) {
             $queryNote = 'Grok billing quota is unavailable; showing local usage statistics.'
         }
@@ -1359,11 +1565,18 @@ function Get-AccountRecord {
             $detail = Get-SafeValue -InputObject $detailMap -Name $modelId
             $displayName = Get-SafeString -InputObject $detail -Name 'display_name'
             if (-not $displayName) { $displayName = $modelId }
+            $previousWindowCount = $windows.Count
             Add-UsageWindow -Target $windows -Kind 'model' -Window $modelWindow -DisplayName $displayName
+            if ($windows.Count -gt $previousWindowCount) { $hasFreshQuotaData = $true }
         }
     }
     if ($null -ne $providerUsage) {
         foreach ($window in @($providerUsage.windows)) { [void]$windows.Add($window) }
+        $cachedProperty = $providerUsage.PSObject.Properties['cached']
+        $providerUsageCached = $null -ne $cachedProperty -and [bool]$cachedProperty.Value
+        if (-not $providerUsageCached -and @($providerUsage.windows).Count -gt 0) {
+            $hasFreshQuotaData = $true
+        }
         if (-not [string]::IsNullOrWhiteSpace([string]$providerUsage.note)) {
             $queryNote = if ($queryNote) { "$queryNote $($providerUsage.note)" } else { [string]$providerUsage.note }
         }
@@ -1396,26 +1609,16 @@ function Get-AccountRecord {
     $schedulable = Get-SafeValue -InputObject $Account -Name 'schedulable'
     $statusDetail = Get-SafeString -InputObject $Account -Name 'temp_unschedulable_reason'
     if (-not $statusDetail) { $statusDetail = Get-SafeString -InputObject $Account -Name 'error_message' }
-    $quotaExhausted = @($windows | Where-Object { $null -ne $_.usedPercent -and [double]$_.usedPercent -ge 99.999 }).Count -gt 0
-    $health = if ($quotaExhausted) {
-        'quotaExhausted'
-    } elseif ($status -eq 'active' -and $schedulable -ne $false) {
-        'healthy'
-    } elseif ($statusDetail -match 'usage limit|quota|billing cycle') {
-        'quotaExhausted'
-    } elseif ($statusDetail -or $status -eq 'error') {
-        'upstreamError'
-    } else {
-        'cooldown'
-    }
+    $resolvedState = Resolve-UsageAccountState -Status $status -Schedulable $schedulable `
+        -StatusDetail $statusDetail -Windows @($windows) -HasFreshQuotaData:$hasFreshQuotaData
     return [ordered]@{
         id = $accountId
         name = Get-SafeString -InputObject $Account -Name 'name'
         kind = $kind
         platform = $platform
         status = $status
-        health = $health
-        statusDetail = $statusDetail
+        health = [string]$resolvedState.health
+        statusDetail = [string]$resolvedState.statusDetail
         queryNote = $queryNote
         lastUsedAt = Get-SafeString -InputObject $Account -Name 'last_used_at'
         updatedAt = Get-SafeString -InputObject $usageData -Name 'updated_at'
@@ -1485,6 +1688,8 @@ function Merge-CodingPlanApiChannels {
     return @($merged)
 }
 
+if ($DefineOnly) { return }
+
 $effectiveConfigPath = if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     Get-RouterConfigPath -RouterRoot $routerRoot
 } else {
@@ -1542,15 +1747,87 @@ try {
 
     $subscriptions = @()
     $apiChannels = @()
-    $codingPlanCache = @{}
     $usageCache = Read-UsageMonitorCache
+    $usageTasks = @()
     foreach ($account in $selected) {
         $id = [long](Get-SafeNumber -InputObject $account -Name 'id')
-        $configuredModels = if ($modelsByOAuth.ContainsKey($id)) { @($modelsByOAuth[$id]) } else { @() }
         $configuredChannel = if ($apiChannelsByName.ContainsKey([string]$account.name)) { $apiChannelsByName[[string]$account.name] } else { $null }
-        $record = Get-AccountRecord -Session $session -Account $account -ConfiguredModels $configuredModels `
-            -ConfiguredChannel $configuredChannel -CodingPlanCache $codingPlanCache -UsageCache $usageCache
-        if ($record.kind -eq 'oauth') { $subscriptions += $record } else { $apiChannels += $record }
+        $safeChannel = if ($null -eq $configuredChannel) { $null } else {
+            [pscustomobject][ordered]@{
+                baseUrl = Get-ChannelBaseUrl -Channel $configuredChannel
+                credentialName = Get-SafeString -InputObject $configuredChannel -Name 'credentialName'
+                model = Get-SafeString -InputObject $configuredChannel -Name 'model'
+            }
+        }
+        $safeAccount = [pscustomobject][ordered]@{
+            id = $id
+            type = Get-SafeString -InputObject $account -Name 'type'
+            platform = Get-SafeString -InputObject $account -Name 'platform'
+            name = Get-SafeString -InputObject $account -Name 'name'
+            status = Get-SafeString -InputObject $account -Name 'status'
+            schedulable = Get-SafeValue -InputObject $account -Name 'schedulable'
+            temp_unschedulable_reason = Get-SafeString -InputObject $account -Name 'temp_unschedulable_reason'
+            error_message = Get-SafeString -InputObject $account -Name 'error_message'
+            last_used_at = Get-SafeString -InputObject $account -Name 'last_used_at'
+        }
+        $usageTasks += [pscustomobject][ordered]@{
+            id = $id
+            scriptPath = Join-Path $PSScriptRoot 'Get-UsageMonitor.ps1'
+            account = $safeAccount
+            configuredModels = if ($modelsByOAuth.ContainsKey($id)) { @($modelsByOAuth[$id]) } else { @() }
+            configuredChannel = $safeChannel
+        }
+    }
+
+    $usageWorkerScript = {
+        param($Task)
+        Set-StrictMode -Version Latest
+        $ErrorActionPreference = 'Stop'
+        . $Task.scriptPath -DefineOnly
+        $workerSession = New-RouterAdminSession
+        try {
+            $workerCache = Read-UsageMonitorCache
+            $workerCodingPlanCache = @{}
+            $workerRecord = Get-AccountRecord -Session $workerSession -Account $Task.account `
+                -ConfiguredModels @($Task.configuredModels) -ConfiguredChannel $Task.configuredChannel `
+                -CodingPlanCache $workerCodingPlanCache -UsageCache $workerCache
+            [pscustomobject][ordered]@{
+                record = $workerRecord
+                usageCache = $workerCache
+            }
+        } finally {
+            if ($workerSession -and $workerSession.Headers) { $workerSession.Headers.Clear() }
+        }
+    }
+    $taskResults = @(Invoke-UsageTasksBounded -Tasks $usageTasks -WorkerScript $usageWorkerScript `
+        -MaxConcurrency 4 -TaskTimeoutSec 32)
+    foreach ($envelope in $taskResults) {
+        $task = Get-SafeValue -InputObject $envelope -Name 'task'
+        $payload = Get-SafeValue -InputObject $envelope -Name 'result'
+        Merge-UsageMonitorCacheEntries -Target $usageCache -Incoming (Get-SafeValue -InputObject $payload -Name 'usageCache')
+        $record = Get-SafeValue -InputObject $payload -Name 'record'
+        if ($null -eq $record) {
+            $account = Get-SafeValue -InputObject $task -Name 'account'
+            $configuredChannel = Get-SafeValue -InputObject $task -Name 'configuredChannel'
+            $timedOut = [bool](Get-SafeValue -InputObject $envelope -Name 'timedOut')
+            $record = [ordered]@{
+                id = [long](Get-SafeNumber -InputObject $account -Name 'id')
+                name = Get-SafeString -InputObject $account -Name 'name'
+                kind = Get-SafeString -InputObject $account -Name 'type'
+                platform = Get-SafeString -InputObject $account -Name 'platform'
+                status = Get-SafeString -InputObject $account -Name 'status'
+                health = 'upstreamError'
+                statusDetail = ''
+                queryNote = if ($timedOut) { 'Usage query timed out; local token statistics are shown.' } else { 'Usage query failed; local token statistics are shown.' }
+                lastUsedAt = Get-SafeString -InputObject $account -Name 'last_used_at'
+                updatedAt = ''
+                baseUrl = if ($null -ne $configuredChannel) { (Get-ChannelBaseUrl -Channel $configuredChannel).ToLowerInvariant() } else { '' }
+                configuredModel = if ($null -ne $configuredChannel) { Get-SafeString -InputObject $configuredChannel -Name 'model' } else { '' }
+                totals = Convert-Stats -Stats $null
+                windows = @()
+            }
+        }
+        if ((Get-SafeString -InputObject $record -Name 'kind') -eq 'oauth') { $subscriptions += $record } else { $apiChannels += $record }
     }
     $apiChannels = @(Merge-CodingPlanApiChannels -Records $apiChannels)
     Write-UsageMonitorCache -Cache $usageCache

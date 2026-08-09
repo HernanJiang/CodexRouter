@@ -1,0 +1,210 @@
+diff --git a/backend/cmd/server/wire_gen.go b/backend/cmd/server/wire_gen.go
+index dedf06d..9a12961 100644
+--- a/backend/cmd/server/wire_gen.go
++++ b/backend/cmd/server/wire_gen.go
+@@ -213,7 +213,7 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
+ 	imageStorageSettingService := service.ProvideImageStorageSettingService(settingRepository, secretEncryptor, backupService, imageStorageFactory, configConfig)
+ 	backupHandler := admin.NewBackupHandler(backupService, userService, imageStorageSettingService)
+ 	oAuthHandler := admin.NewOAuthHandler(oAuthService)
+-	openAIOAuthHandler := admin.NewOpenAIOAuthHandler(openAIOAuthService, adminService, openAIQuotaService)
++	openAIOAuthHandler := admin.NewOpenAIOAuthHandler(openAIOAuthService, adminService, openAIQuotaService, compositeTokenCacheInvalidator)
+ 	geminiOAuthHandler := admin.NewGeminiOAuthHandler(geminiOAuthService)
+ 	antigravityOAuthHandler := admin.NewAntigravityOAuthHandler(antigravityOAuthService)
+ 	tokenRefreshService := service.ProvideTokenRefreshService(accountRepository, oAuthService, openAIOAuthService, geminiOAuthService, antigravityOAuthService, grokOAuthService, compositeTokenCacheInvalidator, schedulerCache, configConfig, tempUnschedCache, privacyClientFactory, proxyRepository, oAuthRefreshAPI, openAIGatewayService)
+diff --git a/backend/internal/handler/admin/openai_oauth_handler.go b/backend/internal/handler/admin/openai_oauth_handler.go
+index 78d5729..bca3bb7 100644
+--- a/backend/internal/handler/admin/openai_oauth_handler.go
++++ b/backend/internal/handler/admin/openai_oauth_handler.go
+@@ -18,6 +18,44 @@ type OpenAIOAuthHandler struct {
+ 	openaiOAuthService *service.OpenAIOAuthService
+ 	adminService       service.AdminService
+ 	quotaService       *service.OpenAIQuotaService
++	tokenInvalidator   service.TokenCacheInvalidator
++}
++
++func openAIOAuthStableCredential(credentials map[string]any) (string, string) {
++	for _, key := range []string{"chatgpt_account_id", "chatgpt_user_id"} {
++		value, _ := credentials[key].(string)
++		value = strings.TrimSpace(value)
++		if value != "" {
++			return key, value
++		}
++	}
++	return "", ""
++}
++
++func selectExistingOpenAIOAuthAccount(accounts []service.Account, credentials map[string]any) *service.Account {
++	identityKey, identityValue := openAIOAuthStableCredential(credentials)
++	if identityValue == "" {
++		return nil
++	}
++	var selected *service.Account
++	for i := range accounts {
++		candidate := &accounts[i]
++		if candidate.Platform != service.PlatformOpenAI || candidate.Type != service.AccountTypeOAuth {
++			continue
++		}
++		candidateKey, candidateValue := openAIOAuthStableCredential(candidate.Credentials)
++		if candidateKey != identityKey || !strings.EqualFold(candidateValue, identityValue) {
++			continue
++		}
++		candidateBound := len(candidate.GroupIDs) > 0
++		selectedBound := selected != nil && len(selected.GroupIDs) > 0
++		if selected == nil ||
++			(candidateBound && !selectedBound) ||
++			(candidateBound == selectedBound && candidate.ID < selected.ID) {
++			selected = candidate
++		}
++	}
++	return selected
+ }
+ 
+ func oauthPlatformFromPath(c *gin.Context) string {
+@@ -29,11 +67,17 @@ func NewOpenAIOAuthHandler(
+ 	openaiOAuthService *service.OpenAIOAuthService,
+ 	adminService service.AdminService,
+ 	quotaService *service.OpenAIQuotaService,
++	tokenInvalidators ...service.TokenCacheInvalidator,
+ ) *OpenAIOAuthHandler {
++	var tokenInvalidator service.TokenCacheInvalidator
++	if len(tokenInvalidators) > 0 {
++		tokenInvalidator = tokenInvalidators[0]
++	}
+ 	return &OpenAIOAuthHandler{
+ 		openaiOAuthService: openaiOAuthService,
+ 		adminService:       adminService,
+ 		quotaService:       quotaService,
++		tokenInvalidator:   tokenInvalidator,
+ 	}
+ }
+ 
+@@ -266,6 +310,36 @@ func (h *OpenAIOAuthHandler) CreateAccountFromOAuth(c *gin.Context) {
+ 	credentials := h.openaiOAuthService.BuildAccountCredentials(tokenInfo)
+ 
+ 	platform := oauthPlatformFromPath(c)
++	ctx := c.Request.Context()
++	if _, identityValue := openAIOAuthStableCredential(credentials); identityValue != "" {
++		existingAccounts, _, listErr := h.adminService.ListAccounts(
++			ctx, 1, 10000, platform, service.AccountTypeOAuth, "", "", 0, "", "", "",
++		)
++		if listErr != nil {
++			response.ErrorFrom(c, listErr)
++			return
++		}
++		if existing := selectExistingOpenAIOAuthAccount(existingAccounts, credentials); existing != nil {
++			account, updateErr := h.adminService.UpdateAccount(ctx, existing.ID, &service.UpdateAccountInput{
++				Credentials: credentials,
++			})
++			if updateErr != nil {
++				response.ErrorFrom(c, updateErr)
++				return
++			}
++			if cleared, clearErr := h.adminService.ClearAccountError(ctx, existing.ID); clearErr != nil {
++				response.ErrorFrom(c, clearErr)
++				return
++			} else if cleared != nil {
++				account = cleared
++			}
++			if h.tokenInvalidator != nil {
++				_ = h.tokenInvalidator.InvalidateToken(ctx, account)
++			}
++			response.Success(c, dto.AccountFromService(account))
++			return
++		}
++	}
+ 
+ 	// Use email as default name if not provided
+ 	name := req.Name
+diff --git a/backend/internal/handler/admin/openai_oauth_identity_test.go b/backend/internal/handler/admin/openai_oauth_identity_test.go
+new file mode 100644
+index 0000000..2f3bc17
+--- /dev/null
++++ b/backend/internal/handler/admin/openai_oauth_identity_test.go
+@@ -0,0 +1,87 @@
++package admin
++
++import (
++	"testing"
++
++	"github.com/Wei-Shaw/sub2api/internal/service"
++	"github.com/stretchr/testify/require"
++)
++
++func TestSelectExistingOpenAIOAuthAccount(t *testing.T) {
++	accounts := []service.Account{
++		{
++			ID:       1,
++			Platform: service.PlatformOpenAI,
++			Type:     service.AccountTypeOAuth,
++			Credentials: map[string]any{
++				"chatgpt_account_id": "acct-stable-1",
++				"chatgpt_user_id":    "user-stable-1",
++				"email":              "same@example.invalid",
++			},
++			GroupIDs: []int64{9},
++		},
++		{
++			ID:       15,
++			Platform: service.PlatformOpenAI,
++			Type:     service.AccountTypeOAuth,
++			Credentials: map[string]any{
++				"chatgpt_account_id": "acct-stable-1",
++				"chatgpt_user_id":    "user-stable-1",
++				"email":              "same@example.invalid",
++			},
++		},
++		{
++			ID:       21,
++			Platform: service.PlatformOpenAI,
++			Type:     service.AccountTypeOAuth,
++			Credentials: map[string]any{
++				"chatgpt_account_id": "acct-stable-2",
++				"chatgpt_user_id":    "user-stable-1",
++				"email":              "same@example.invalid",
++			},
++			GroupIDs: []int64{9},
++		},
++	}
++
++	t.Run("same account id reuses the bound stable row", func(t *testing.T) {
++		match := selectExistingOpenAIOAuthAccount(accounts, map[string]any{
++			"chatgpt_account_id": "acct-stable-1",
++			"chatgpt_user_id":    "user-stable-1",
++			"email":              "same@example.invalid",
++		})
++		require.NotNil(t, match)
++		require.Equal(t, int64(1), match.ID)
++	})
++
++	t.Run("different account ids never merge by email or user id", func(t *testing.T) {
++		match := selectExistingOpenAIOAuthAccount(accounts[:1], map[string]any{
++			"chatgpt_account_id": "acct-stable-2",
++			"chatgpt_user_id":    "user-stable-1",
++			"email":              "same@example.invalid",
++		})
++		require.Nil(t, match)
++	})
++
++	t.Run("user id is used only when account id is unavailable", func(t *testing.T) {
++		withoutAccountID := []service.Account{{
++			ID:       30,
++			Platform: service.PlatformOpenAI,
++			Type:     service.AccountTypeOAuth,
++			Credentials: map[string]any{
++				"chatgpt_user_id": "user-stable-3",
++			},
++		}}
++		match := selectExistingOpenAIOAuthAccount(withoutAccountID, map[string]any{
++			"chatgpt_user_id": "user-stable-3",
++		})
++		require.NotNil(t, match)
++		require.Equal(t, int64(30), match.ID)
++	})
++
++	t.Run("email alone is not an OAuth identity", func(t *testing.T) {
++		match := selectExistingOpenAIOAuthAccount(accounts, map[string]any{
++			"email": "same@example.invalid",
++		})
++		require.Nil(t, match)
++	})
++}

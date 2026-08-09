@@ -1,0 +1,1014 @@
+diff --git a/backend/internal/handler/admin/grok_oauth_handler_test.go b/backend/internal/handler/admin/grok_oauth_handler_test.go
+index 6aabda5cebfd79a0cfeb21f0b2f5294251f003e2..05b1d7a6f4118200159f2f893b54b0d3b14c91c6 100644
+--- a/backend/internal/handler/admin/grok_oauth_handler_test.go
++++ b/backend/internal/handler/admin/grok_oauth_handler_test.go
+@@ -132,9 +132,13 @@ func TestGrokOAuthHandlerQueryQuotaProbesUpstream(t *testing.T) {
+ 	requests := append([]*http.Request(nil), upstream.requests...)
+ 	bodies := append([][]byte(nil), upstream.bodies...)
+ 	upstream.mu.Unlock()
+-	require.Len(t, requests, 3)
++	require.Len(t, requests, 4)
++	webBillingCalls := 0
+ 	for i, upstreamReq := range requests {
+ 		require.Equal(t, "Bearer access-token", upstreamReq.Header.Get("Authorization"))
++		if upstreamReq.URL.String() == xai.WebBillingURL {
++			webBillingCalls++
++		}
+ 		if upstreamReq.URL.String() == xai.DefaultCLIBaseURL+"/responses" {
+ 			require.Equal(t, "application/json, text/event-stream", upstreamReq.Header.Get("Accept"))
+ 			require.Contains(t, string(bodies[i]), `"model":"grok-4.5"`)
+@@ -144,6 +148,7 @@ func TestGrokOAuthHandlerQueryQuotaProbesUpstream(t *testing.T) {
+ 			require.NotContains(t, string(bodies[i]), `"store"`)
+ 		}
+ 	}
++	require.Equal(t, 1, webBillingCalls)
+ 	require.NotNil(t, repo.updates[42])
+ }
+ 
+@@ -179,8 +184,9 @@ func TestGrokOAuthHandlerQueryQuotaBillingOnlySkipsActiveProbe(t *testing.T) {
+ 	upstream.mu.Lock()
+ 	requests := append([]*http.Request(nil), upstream.requests...)
+ 	upstream.mu.Unlock()
+-	require.Len(t, requests, 2)
+-	for _, upstreamReq := range requests {
++	require.Len(t, requests, 3)
++	require.Equal(t, xai.WebBillingURL, requests[0].URL.String())
++	for _, upstreamReq := range requests[1:] {
+ 		require.Equal(t, "/v1/billing", upstreamReq.URL.Path)
+ 	}
+ }
+diff --git a/backend/internal/pkg/xai/web_billing.go b/backend/internal/pkg/xai/web_billing.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..c24d7f1fae8bbbe128a630be8c10ee3ad9d32849
+--- /dev/null
++++ b/backend/internal/pkg/xai/web_billing.go
+@@ -0,0 +1,358 @@
++package xai
++
++import (
++	"encoding/binary"
++	"fmt"
++	"math"
++	"net/http"
++	"net/url"
++	"strconv"
++	"strings"
++	"time"
++)
++
++const WebBillingURL = "https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig"
++
++func WebBillingRequestBody() []byte {
++	return []byte{0, 0, 0, 0, 0}
++}
++
++func ApplyWebBillingHeaders(req *http.Request, accessToken string) {
++	if req == nil {
++		return
++	}
++	if token := strings.TrimSpace(accessToken); token != "" {
++		req.Header.Set("Authorization", "Bearer "+token)
++	}
++	req.Header.Set(CLITokenAuthHeader, CLITokenAuthValue)
++	req.Header.Set("Accept", "application/grpc-web+proto")
++	req.Header.Set("Content-Type", "application/grpc-web+proto")
++	req.Header.Set("Origin", "https://grok.com")
++	req.Header.Set("Referer", "https://grok.com/?_s=usage")
++	req.Header.Set("User-Agent", "Grok Build")
++	req.Header.Set("x-grpc-web", "1")
++	req.Header.Set("x-user-agent", "connect-es/2.1.1")
++}
++
++type grokProtoVarintField struct {
++	path  []int
++	value uint64
++	order int
++}
++
++type grokProtoFloatField struct {
++	path  []int
++	value float32
++	order int
++}
++
++type grokProtoScan struct {
++	varints []grokProtoVarintField
++	floats  []grokProtoFloatField
++	order   int
++}
++
++// WebBillingRPCError preserves the gRPC-Web status separately from an HTTP
++// transport or protobuf parsing error so callers can trigger re-authentication.
++type WebBillingRPCError struct {
++	GRPCStatus   string
++	Message      string
++	Unauthorized bool
++}
++
++func (e *WebBillingRPCError) Error() string {
++	if e == nil {
++		return "Grok web billing RPC failed"
++	}
++	if e.Message == "" {
++		return fmt.Sprintf("Grok web billing RPC failed with gRPC status %s", e.GRPCStatus)
++	}
++	return fmt.Sprintf("Grok web billing RPC failed with gRPC status %s: %s", e.GRPCStatus, e.Message)
++}
++
++// ClassifyWebBillingGRPCStatus validates a response/header gRPC status. A
++// status of 16 is the common expired-token response; status 7 is only treated
++// as authentication failure when its message identifies bad credentials.
++func ClassifyWebBillingGRPCStatus(status, message string) error {
++	status = strings.TrimSpace(status)
++	if status == "" || status == "0" {
++		return nil
++	}
++	if decoded, err := url.QueryUnescape(strings.TrimSpace(message)); err == nil {
++		message = decoded
++	}
++	lower := strings.ToLower(strings.TrimSpace(message))
++	unauthorized := status == "16"
++	if status == "7" {
++		unauthorized = strings.Contains(lower, "bad-credentials") ||
++			strings.Contains(lower, "unauthenticated") ||
++			(strings.Contains(lower, "oauth2") && strings.Contains(lower, "could not be validated")) ||
++			(strings.Contains(lower, "access token") && (strings.Contains(lower, "invalid") ||
++				strings.Contains(lower, "expired") || strings.Contains(lower, "could not be validated")))
++	}
++	return &WebBillingRPCError{GRPCStatus: status, Message: strings.TrimSpace(message), Unauthorized: unauthorized}
++}
++
++// ClassifyWebBillingGRPCHeaders handles non-canonical header maps produced by
++// proxies and test transports while preserving HTTP's case-insensitive keys.
++func ClassifyWebBillingGRPCHeaders(header http.Header) error {
++	return ClassifyWebBillingGRPCStatus(
++		webBillingHeaderValue(header, "grpc-status"),
++		webBillingHeaderValue(header, "grpc-message"),
++	)
++}
++
++func webBillingHeaderValue(header http.Header, name string) string {
++	for key, values := range header {
++		if strings.EqualFold(key, name) && len(values) > 0 {
++			return values[0]
++		}
++	}
++	return ""
++}
++
++// ParseWebBillingResponse reads Grok's gRPC-Web response without depending on
++// its unstable protobuf schema. The useful percentage and period fields have
++// retained their wire paths across the observed response variants.
++func ParseWebBillingResponse(body []byte, now time.Time) (*BillingSummary, error) {
++	payloads, trailers, framed := parseGrokGRPCWebFrames(body)
++	if framed {
++		if err := ClassifyWebBillingGRPCStatus(trailers["grpc-status"], trailers["grpc-message"]); err != nil {
++			return nil, err
++		}
++	} else if looksLikeGrokProtobuf(body) {
++		payloads = [][]byte{body}
++	} else {
++		return nil, fmt.Errorf("Grok web billing returned no protobuf payload")
++	}
++
++	var scan grokProtoScan
++	for _, payload := range payloads {
++		scanGrokProto(payload, nil, 0, &scan)
++	}
++	percent := grokBillingPercent(scan)
++	reset, start := grokBillingTimes(scan, now)
++	if percent == nil {
++		if len(scan.floats) != 0 || reset == nil || !grokBillingHasUsagePeriod(scan) {
++			return nil, fmt.Errorf("could not parse Grok web billing usage")
++		}
++		zero := float64(0)
++		percent = &zero
++	}
++
++	summary := &BillingSummary{
++		PeriodType:   grokBillingPeriodType(start, reset),
++		UsagePercent: percent,
++		Source:       "web_billing_probe",
++	}
++	if start != nil {
++		summary.PeriodStart = start.UTC().Format(time.RFC3339)
++	}
++	if reset != nil {
++		summary.PeriodEnd = reset.UTC().Format(time.RFC3339)
++	}
++	return summary, nil
++}
++
++func grokBillingPeriodType(start, reset *time.Time) string {
++	if start == nil || reset == nil || !reset.After(*start) {
++		return "weekly"
++	}
++	days := reset.Sub(*start).Hours() / 24
++	if days >= 20 && days <= 45 {
++		return "monthly"
++	}
++	return "weekly"
++}
++
++func parseGrokGRPCWebFrames(body []byte) ([][]byte, map[string]string, bool) {
++	trailers := make(map[string]string)
++	if len(body) < 5 {
++		return nil, trailers, false
++	}
++	payloads := make([][]byte, 0, 1)
++	for offset := 0; offset < len(body); {
++		if offset+5 > len(body) {
++			return nil, trailers, false
++		}
++		flags := body[offset]
++		length := int(binary.BigEndian.Uint32(body[offset+1 : offset+5]))
++		start := offset + 5
++		end := start + length
++		if end < start || end > len(body) {
++			return nil, trailers, false
++		}
++		frame := body[start:end]
++		if flags&0x80 != 0 {
++			text := strings.ReplaceAll(string(frame), "\r\n", "\n")
++			for _, line := range strings.Split(text, "\n") {
++				key, value, ok := strings.Cut(line, ":")
++				if ok && strings.TrimSpace(key) != "" {
++					trailers[strings.ToLower(strings.TrimSpace(key))] = strings.TrimSpace(value)
++				}
++			}
++		} else {
++			payloads = append(payloads, append([]byte(nil), frame...))
++		}
++		offset = end
++	}
++	return payloads, trailers, true
++}
++
++func looksLikeGrokProtobuf(body []byte) bool {
++	if len(body) == 0 {
++		return false
++	}
++	field := body[0] >> 3
++	wireType := body[0] & 7
++	return field > 0 && (wireType == 0 || wireType == 1 || wireType == 2 || wireType == 5)
++}
++
++func scanGrokProto(data []byte, path []int, depth int, scan *grokProtoScan) {
++	if len(data) == 0 || depth > 8 || scan == nil {
++		return
++	}
++	for offset := 0; offset < len(data); {
++		key, next, ok := readGrokProtoVarint(data, offset)
++		if !ok {
++			return
++		}
++		offset = next
++		field := int(key >> 3)
++		wireType := int(key & 7)
++		if field <= 0 {
++			return
++		}
++		nextPath := append(append([]int(nil), path...), field)
++		switch wireType {
++		case 0:
++			value, nextOffset, valid := readGrokProtoVarint(data, offset)
++			if !valid {
++				return
++			}
++			scan.varints = append(scan.varints, grokProtoVarintField{
++				path: nextPath, value: value, order: scan.order,
++			})
++			scan.order++
++			offset = nextOffset
++		case 1:
++			if offset+8 > len(data) {
++				return
++			}
++			offset += 8
++		case 2:
++			length, nextOffset, valid := readGrokProtoVarint(data, offset)
++			if !valid || length > uint64(len(data)-nextOffset) {
++				return
++			}
++			offset = nextOffset
++			end := offset + int(length)
++			if length > 0 {
++				scanGrokProto(data[offset:end], nextPath, depth+1, scan)
++			}
++			offset = end
++		case 5:
++			if offset+4 > len(data) {
++				return
++			}
++			scan.floats = append(scan.floats, grokProtoFloatField{
++				path:  nextPath,
++				value: math.Float32frombits(binary.LittleEndian.Uint32(data[offset : offset+4])),
++				order: scan.order,
++			})
++			scan.order++
++			offset += 4
++		default:
++			return
++		}
++	}
++}
++
++func readGrokProtoVarint(data []byte, offset int) (uint64, int, bool) {
++	var value uint64
++	for shift := uint(0); offset < len(data) && shift <= 63; shift += 7 {
++		byteValue := data[offset]
++		offset++
++		value |= uint64(byteValue&0x7f) << shift
++		if byteValue&0x80 == 0 {
++			return value, offset, true
++		}
++	}
++	return 0, offset, false
++}
++
++func grokBillingPercent(scan grokProtoScan) *float64 {
++	var selected *grokProtoFloatField
++	for index := range scan.floats {
++		field := &scan.floats[index]
++		value := float64(field.value)
++		if len(field.path) == 0 || field.path[len(field.path)-1] != 1 ||
++			math.IsNaN(value) || math.IsInf(value, 0) || field.value < 0 || field.value > 100 {
++			continue
++		}
++		if selected == nil || len(field.path) < len(selected.path) ||
++			(len(field.path) == len(selected.path) && field.order < selected.order) {
++			selected = field
++		}
++	}
++	if selected == nil {
++		return nil
++	}
++	value := float64(selected.value)
++	return &value
++}
++
++func grokBillingTimes(scan grokProtoScan, now time.Time) (*time.Time, *time.Time) {
++	now = now.UTC()
++	var reset *time.Time
++	var start *time.Time
++	future := make([]grokProtoVarintField, 0)
++	for _, field := range scan.varints {
++		if field.value < 1_700_000_000 || field.value > 2_100_000_000 {
++			continue
++		}
++		value := time.Unix(int64(field.value), 0).UTC()
++		if value.After(now) {
++			future = append(future, field)
++		}
++		if grokProtoPath(field.path) == "1.4.1" && (start == nil || value.After(*start)) {
++			copy := value
++			start = &copy
++		}
++	}
++	for _, field := range future {
++		value := time.Unix(int64(field.value), 0).UTC()
++		if grokProtoPath(field.path) == "1.5.1" && (reset == nil || value.Before(*reset)) {
++			copy := value
++			reset = &copy
++		}
++	}
++	if reset == nil {
++		for _, field := range future {
++			value := time.Unix(int64(field.value), 0).UTC()
++			if reset == nil || value.Before(*reset) {
++				copy := value
++				reset = &copy
++			}
++		}
++	}
++	return reset, start
++}
++
++func grokBillingHasUsagePeriod(scan grokProtoScan) bool {
++	for _, field := range scan.varints {
++		path := grokProtoPath(field.path)
++		if strings.HasPrefix(path, "1.6") || (path == "1.8.1" && (field.value == 1 || field.value == 2)) {
++			return true
++		}
++	}
++	return false
++}
++
++func grokProtoPath(path []int) string {
++	values := make([]string, len(path))
++	for index, value := range path {
++		values[index] = strconv.Itoa(value)
++	}
++	return strings.Join(values, ".")
++}
+diff --git a/backend/internal/pkg/xai/web_billing_test.go b/backend/internal/pkg/xai/web_billing_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..1a404f8566795c978eb94db0f3eed7cfeb8c7269
+--- /dev/null
++++ b/backend/internal/pkg/xai/web_billing_test.go
+@@ -0,0 +1,171 @@
++//go:build unit
++
++package xai
++
++import (
++	"encoding/binary"
++	"math"
++	"net/http"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++func appendTestVarint(target []byte, value uint64) []byte {
++	for value >= 0x80 {
++		target = append(target, byte(value&0x7f)|0x80)
++		value >>= 7
++	}
++	return append(target, byte(value))
++}
++
++func testProtoVarint(field int, value uint64) []byte {
++	result := appendTestVarint(nil, uint64(field<<3))
++	return appendTestVarint(result, value)
++}
++
++func testProtoFloat(field int, value float32) []byte {
++	result := appendTestVarint(nil, uint64(field<<3|5))
++	data := make([]byte, 4)
++	binary.LittleEndian.PutUint32(data, math.Float32bits(value))
++	return append(result, data...)
++}
++
++func testProtoBytes(field int, payload []byte) []byte {
++	result := appendTestVarint(nil, uint64(field<<3|2))
++	result = appendTestVarint(result, uint64(len(payload)))
++	return append(result, payload...)
++}
++
++func testGRPCWebFrame(flags byte, payload []byte) []byte {
++	result := make([]byte, 5, 5+len(payload))
++	result[0] = flags
++	binary.BigEndian.PutUint32(result[1:5], uint32(len(payload)))
++	return append(result, payload...)
++}
++
++func testWebBillingPayload(percent *float32, start, end int64, includeUsagePeriod bool) []byte {
++	billing := make([]byte, 0)
++	if percent != nil {
++		billing = append(billing, testProtoFloat(1, *percent)...)
++	}
++	billing = append(billing, testProtoBytes(4, testProtoVarint(1, uint64(start)))...)
++	billing = append(billing, testProtoBytes(5, testProtoVarint(1, uint64(end)))...)
++	if includeUsagePeriod {
++		billing = append(billing, testProtoVarint(6, 1)...)
++	}
++	return testProtoBytes(1, billing)
++}
++
++func TestWebBillingRequestShape(t *testing.T) {
++	t.Parallel()
++
++	require.Equal(t, []byte{0, 0, 0, 0, 0}, WebBillingRequestBody())
++	req, err := http.NewRequest(http.MethodPost, WebBillingURL, nil)
++	require.NoError(t, err)
++	ApplyWebBillingHeaders(req, " token ")
++
++	require.Equal(t, "Bearer token", req.Header.Get("Authorization"))
++	require.Equal(t, CLITokenAuthValue, req.Header.Get(CLITokenAuthHeader))
++	require.Equal(t, "application/grpc-web+proto", req.Header.Get("Content-Type"))
++	require.Equal(t, "https://grok.com", req.Header.Get("Origin"))
++	require.Equal(t, "https://grok.com/?_s=usage", req.Header.Get("Referer"))
++	require.Equal(t, "1", req.Header.Get("x-grpc-web"))
++	require.Equal(t, "connect-es/2.1.1", req.Header.Get("x-user-agent"))
++}
++
++func TestParseWebBillingResponseReadsPercentAndPeriod(t *testing.T) {
++	t.Parallel()
++
++	now := time.Date(2026, 8, 7, 0, 0, 0, 0, time.UTC)
++	start := now.Add(-24 * time.Hour).Unix()
++	end := now.Add(6 * 24 * time.Hour).Unix()
++	percent := float32(42.5)
++	body := testGRPCWebFrame(0, testWebBillingPayload(&percent, start, end, true))
++	body = append(body, testGRPCWebFrame(0x80, []byte("grpc-status: 0\r\n"))...)
++
++	summary, err := ParseWebBillingResponse(body, now)
++	require.NoError(t, err)
++	require.NotNil(t, summary)
++	require.Equal(t, "weekly", summary.PeriodType)
++	require.InDelta(t, 42.5, *summary.UsagePercent, 1e-6)
++	require.Equal(t, time.Unix(start, 0).UTC().Format(time.RFC3339), summary.PeriodStart)
++	require.Equal(t, time.Unix(end, 0).UTC().Format(time.RFC3339), summary.PeriodEnd)
++}
++
++func TestParseWebBillingResponseClassifiesMonthlyPeriod(t *testing.T) {
++	t.Parallel()
++
++	now := time.Date(2026, 8, 7, 0, 0, 0, 0, time.UTC)
++	percent := float32(12.5)
++	body := testGRPCWebFrame(0, testWebBillingPayload(&percent, now.Add(-30*24*time.Hour).Unix(), now.Add(24*time.Hour).Unix(), true))
++
++	summary, err := ParseWebBillingResponse(body, now)
++	require.NoError(t, err)
++	require.Equal(t, "monthly", summary.PeriodType)
++}
++
++func TestParseWebBillingResponseTreatsUnusedPeriodAsZero(t *testing.T) {
++	t.Parallel()
++
++	now := time.Date(2026, 8, 7, 0, 0, 0, 0, time.UTC)
++	body := testGRPCWebFrame(0, testWebBillingPayload(nil, now.Unix(), now.Add(7*24*time.Hour).Unix(), true))
++
++	summary, err := ParseWebBillingResponse(body, now)
++	require.NoError(t, err)
++	require.NotNil(t, summary)
++	require.NotNil(t, summary.UsagePercent)
++	require.Zero(t, *summary.UsagePercent)
++}
++
++func TestParseWebBillingResponseRejectsGRPCErrorTrailer(t *testing.T) {
++	t.Parallel()
++
++	now := time.Date(2026, 8, 7, 0, 0, 0, 0, time.UTC)
++	percent := float32(10)
++	body := testGRPCWebFrame(0, testWebBillingPayload(&percent, now.Unix(), now.Add(7*24*time.Hour).Unix(), true))
++	body = append(body, testGRPCWebFrame(0x80, []byte("grpc-status: 16\r\ngrpc-message: unauthenticated\r\n"))...)
++
++	summary, err := ParseWebBillingResponse(body, now)
++	require.Error(t, err)
++	require.Nil(t, summary)
++	require.Contains(t, err.Error(), "gRPC status 16")
++	var rpcErr *WebBillingRPCError
++	require.ErrorAs(t, err, &rpcErr)
++	require.True(t, rpcErr.Unauthorized)
++}
++
++func TestParseWebBillingResponseRejectsUnrecognizedFixed32Usage(t *testing.T) {
++	t.Parallel()
++
++	now := time.Date(2026, 8, 7, 0, 0, 0, 0, time.UTC)
++	percent := float32(101)
++	body := testGRPCWebFrame(0, testWebBillingPayload(&percent, now.Unix(), now.Add(7*24*time.Hour).Unix(), true))
++
++	_, err := ParseWebBillingResponse(body, now)
++	require.Error(t, err)
++	require.Contains(t, err.Error(), "could not parse")
++}
++
++func TestClassifyWebBillingGRPCStatus(t *testing.T) {
++	t.Parallel()
++
++	require.NoError(t, ClassifyWebBillingGRPCStatus("0", ""))
++	err := ClassifyWebBillingGRPCStatus("7", "access token expired")
++	var rpcErr *WebBillingRPCError
++	require.ErrorAs(t, err, &rpcErr)
++	require.True(t, rpcErr.Unauthorized)
++	require.False(t, (&WebBillingRPCError{GRPCStatus: "13", Message: "upstream"}).Unauthorized)
++}
++
++func TestClassifyWebBillingGRPCHeadersIgnoresHeaderCase(t *testing.T) {
++	err := ClassifyWebBillingGRPCHeaders(http.Header{
++		"grpc-status":  []string{"16"},
++		"grpc-message": []string{"access%20token%20expired"},
++	})
++	require.Error(t, err)
++	var rpcErr *WebBillingRPCError
++	require.ErrorAs(t, err, &rpcErr)
++	require.True(t, rpcErr.Unauthorized)
++}
+diff --git a/backend/internal/service/grok_quota_service.go b/backend/internal/service/grok_quota_service.go
+index 2c703f9f10405ef7136f4442c223f348517ba3fb..03f3492faa884260db466d01dd67444ceb7f7d88 100644
+--- a/backend/internal/service/grok_quota_service.go
++++ b/backend/internal/service/grok_quota_service.go
+@@ -4,6 +4,7 @@ import (
+ 	"bytes"
+ 	"context"
+ 	"encoding/json"
++	"errors"
+ 	"io"
+ 	"log/slog"
+ 	"net/http"
+@@ -25,6 +26,7 @@ const (
+ 	grokBillingExtraKey      = "grok_billing_snapshot"
+ 	grokBillingMaxAttempts   = 2
+ 	grokBillingRetryDelay    = 100 * time.Millisecond
++	grokWebBillingTimeout    = 5 * time.Second
+ )
+ 
+ type GrokQuotaProbeResult struct {
+@@ -254,6 +256,44 @@ func (s *GrokQuotaService) probeBilling(ctx context.Context, accountID int64) (*
+ 		err     error
+ 	}
+ 	var weekly, monthly billingResult
++	// The browser-compatible billing RPC is the fastest authoritative source for
++	// OAuth accounts. Try it first with a short, independent budget so a stalled
++	// CLI billing endpoint cannot consume the whole usage-refresh request.
++	webCtx, webCancel := context.WithTimeout(probeCtx, grokWebBillingTimeout)
++	webSummary, webStatus, webErr := s.fetchWebBilling(webCtx, account, token, proxyURL)
++	webCancel()
++	if grokBillingSummaryHasWeeklyQuota(webSummary) {
++		weekly.summary = webSummary
++		weekly.status = webStatus
++		weekly.err = nil
++	} else if webErr != nil {
++		slog.Debug("grok_web_billing_primary_unavailable", "account_id", account.ID, "status", webStatus)
++	}
++	if weekly.summary != nil {
++		weeklyOK := true
++		previous, _ := grokBillingSnapshotFromExtra(account.Extra)
++		billing := xai.MergeBillingProbeResult(previous, weekly.summary, nil, weeklyOK, false)
++		billing.WeeklyStatusCode = weekly.status
++		billing = xai.StampBillingSummary(billing, weekly.status, "billing_probe")
++		persistErr := s.accountRepo.UpdateExtra(ctx, account.ID, map[string]any{
++			grokBillingExtraKey: billing,
++		})
++		if persistErr != nil {
++			slog.Warn("grok_billing_persist_failed", "account_id", account.ID, "error", persistErr)
++		}
++		now := time.Now().UTC()
++		localUsage24h, localUsage7d, localUsageMonthly := grokLocalUsageForQuota(ctx, s.usageLogRepo, account.ID, billing, now)
++		return &GrokQuotaProbeResult{
++			Source:            "billing_probe",
++			Billing:           billing,
++			LocalUsage24h:     localUsage24h,
++			LocalUsage7d:      localUsage7d,
++			LocalUsageMonthly: localUsageMonthly,
++			StatusCode:        weekly.status,
++			FetchedAt:         now.Unix(),
++			Persisted:         persistErr == nil,
++		}, nil
++	}
+ 	var wg sync.WaitGroup
+ 	wg.Add(2)
+ 	go func() {
+@@ -265,7 +305,6 @@ func (s *GrokQuotaService) probeBilling(ctx context.Context, accountID int64) (*
+ 		monthly.summary, monthly.status, monthly.err = s.fetchBilling(probeCtx, account, token, proxyURL, false)
+ 	}()
+ 	wg.Wait()
+-
+ 	weeklyOK := weekly.summary != nil
+ 	monthlyOK := monthly.summary != nil
+ 	previous, _ := grokBillingSnapshotFromExtra(account.Extra)
+@@ -395,19 +434,107 @@ func (s *GrokQuotaService) fetchBilling(
+ 			return nil, statusCode, nil
+ 		}
+ 		if statusCode >= 400 {
+-			bodyText := truncate(strings.TrimSpace(string(bodyBytes)), 240)
+-			slog.Warn("grok_quota_billing_failed", "account_id", account.ID, "weekly", weekly, "status", statusCode, "body", bodyText)
+-			return nil, statusCode, infraerrors.Newf(mapUpstreamStatus(statusCode), "GROK_QUOTA_PROBE_UPSTREAM_ERROR", "billing returned %d: %s", statusCode, bodyText)
++			// Upstream error bodies can include account and entitlement details.
++			// Preserve the status for routing without persisting or logging the body.
++			slog.Warn("grok_quota_billing_failed", "account_id", account.ID, "weekly", weekly, "status", statusCode)
++			return nil, statusCode, infraerrors.Newf(mapUpstreamStatus(statusCode), "GROK_QUOTA_PROBE_UPSTREAM_ERROR", "billing returned %d", statusCode)
+ 		}
+ 		payload, err := xai.ParseBillingPayload(bodyBytes)
+ 		if err != nil {
+ 			return nil, statusCode, infraerrors.Newf(http.StatusBadGateway, "GROK_QUOTA_BILLING_PARSE_ERROR", "failed to parse billing body: %v", err)
+ 		}
+-		return xai.BuildBillingSummary(payload.Config), statusCode, nil
++		summary := xai.BuildBillingSummary(payload.Config)
++		if summary == nil {
++			return nil, statusCode, infraerrors.New(http.StatusBadGateway, "GROK_QUOTA_BILLING_PARSE_ERROR", "billing response has no readable quota")
++		}
++		return summary, statusCode, nil
+ 	}
+ 	return nil, 0, infraerrors.New(http.StatusBadGateway, "GROK_QUOTA_PROBE_REQUEST_FAILED", "billing request failed")
+ }
+ 
++func (s *GrokQuotaService) fetchWebBilling(
++	ctx context.Context,
++	account *Account,
++	token string,
++	proxyURL string,
++) (*xai.BillingSummary, int, error) {
++	var lastStatus int
++	var lastErr error
++	for attempt := 0; attempt < grokBillingMaxAttempts; attempt++ {
++		req, err := http.NewRequestWithContext(
++			ctx,
++			http.MethodPost,
++			xai.WebBillingURL,
++			bytes.NewReader(xai.WebBillingRequestBody()),
++		)
++		if err != nil {
++			return nil, 0, infraerrors.Newf(http.StatusInternalServerError, "GROK_QUOTA_PROBE_REQUEST_BUILD_FAILED", "failed to build web billing request: %v", err)
++		}
++		xai.ApplyWebBillingHeaders(req, token)
++		account.ApplyHeaderOverrides(req.Header)
++		resp, requestErr := s.httpUpstream.Do(req, proxyURL, account.ID, maxInt(account.Concurrency, 1))
++		if requestErr != nil {
++			lastStatus = 0
++			lastErr = infraerrors.Newf(http.StatusBadGateway, "GROK_QUOTA_PROBE_REQUEST_FAILED", "web billing request failed: %v", requestErr)
++		} else {
++			statusCode := resp.StatusCode
++			bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
++			_ = resp.Body.Close()
++			lastStatus = statusCode
++			if statusCode >= 400 {
++				lastErr = infraerrors.Newf(mapUpstreamStatus(statusCode), "GROK_QUOTA_PROBE_UPSTREAM_ERROR", "web billing returned %d", statusCode)
++			} else if grpcErr := xai.ClassifyWebBillingGRPCHeaders(resp.Header); grpcErr != nil {
++				lastErr = grokWebBillingError(grpcErr)
++			} else {
++				summary, parseErr := xai.ParseWebBillingResponse(bodyBytes, time.Now().UTC())
++				if parseErr == nil {
++					return summary, statusCode, nil
++				}
++				lastErr = grokWebBillingError(parseErr)
++			}
++		}
++
++		if attempt+1 >= grokBillingMaxAttempts || !isRetryableGrokWebBillingFailure(lastStatus, lastErr) {
++			return nil, lastStatus, lastErr
++		}
++		if err := waitForGrokBillingRetry(ctx); err != nil {
++			return nil, lastStatus, err
++		}
++	}
++	return nil, lastStatus, lastErr
++}
++
++func grokBillingSummaryHasWeeklyQuota(summary *xai.BillingSummary) bool {
++	return summary != nil && summary.UsagePercent != nil
++}
++
++func grokWebBillingError(err error) error {
++	var rpcErr *xai.WebBillingRPCError
++	if errors.As(err, &rpcErr) && rpcErr.Unauthorized {
++		return infraerrors.New(http.StatusUnauthorized, "GROK_QUOTA_REAUTH_REQUIRED", "Grok web billing rejected credentials")
++	}
++	return infraerrors.Newf(http.StatusBadGateway, "GROK_QUOTA_BILLING_PARSE_ERROR", "failed to parse web billing body: %v", err)
++}
++
++func isRetryableGrokWebBillingFailure(statusCode int, err error) bool {
++	if statusCode == 0 || isRetryableGrokBillingStatus(statusCode) {
++		var rpcErr *xai.WebBillingRPCError
++		return !errors.As(err, &rpcErr) || !rpcErr.Unauthorized
++	}
++	return false
++}
++
++func waitForGrokBillingRetry(ctx context.Context) error {
++	timer := time.NewTimer(grokBillingRetryDelay)
++	defer timer.Stop()
++	select {
++	case <-timer.C:
++		return nil
++	case <-ctx.Done():
++		return infraerrors.Newf(http.StatusBadGateway, "GROK_QUOTA_PROBE_REQUEST_FAILED", "billing request failed: %v", ctx.Err())
++	}
++}
++
+ func isRetryableGrokBillingStatus(statusCode int) bool {
+ 	switch statusCode {
+ 	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+diff --git a/backend/internal/service/grok_quota_service_test.go b/backend/internal/service/grok_quota_service_test.go
+index 9ffb70f000022ca9795052a177f95458ceba63b7..fb21a4d1638b559f7914b9feed568a3a4fb2844a 100644
+--- a/backend/internal/service/grok_quota_service_test.go
++++ b/backend/internal/service/grok_quota_service_test.go
+@@ -5,9 +5,11 @@ package service
+ import (
+ 	"bytes"
+ 	"context"
++	"encoding/binary"
+ 	"errors"
+ 	"io"
+ 	"log/slog"
++	"math"
+ 	"net/http"
+ 	"strconv"
+ 	"strings"
+@@ -116,6 +118,8 @@ type grokHybridUpstream struct {
+ 	requests             []*http.Request
+ 	bodies               [][]byte
+ 	weeklyUsagePercent   *float64
++	weeklyProductUsage   bool
++	webBillingPercent    *float32
+ 	monthlyLimitCents    *float64
+ 	activeStatus         int
+ 	activeHeaders        http.Header
+@@ -129,9 +133,10 @@ type grokHybridUpstream struct {
+ }
+ 
+ type grokQuotaUpstreamStep struct {
+-	status int
+-	body   string
+-	err    error
++	status  int
++	body    string
++	headers http.Header
++	err     error
+ }
+ 
+ type grokQuotaSequenceUpstream struct {
+@@ -155,11 +160,48 @@ func (u *grokQuotaSequenceUpstream) Do(req *http.Request, _ string, _ int64, _ i
+ 	}
+ 	return &http.Response{
+ 		StatusCode: step.status,
+-		Header:     make(http.Header),
++		Header:     step.headers,
+ 		Body:       io.NopCloser(strings.NewReader(step.body)),
+ 	}, nil
+ }
+ 
++func appendGrokTestVarint(target []byte, value uint64) []byte {
++	for value >= 0x80 {
++		target = append(target, byte(value&0x7f)|0x80)
++		value >>= 7
++	}
++	return append(target, byte(value))
++}
++
++func grokTestProtoVarint(field int, value uint64) []byte {
++	result := appendGrokTestVarint(nil, uint64(field<<3))
++	return appendGrokTestVarint(result, value)
++}
++
++func grokTestProtoFloat(field int, value float32) []byte {
++	result := appendGrokTestVarint(nil, uint64(field<<3|5))
++	data := make([]byte, 4)
++	binary.LittleEndian.PutUint32(data, math.Float32bits(value))
++	return append(result, data...)
++}
++
++func grokTestProtoBytes(field int, payload []byte) []byte {
++	result := appendGrokTestVarint(nil, uint64(field<<3|2))
++	result = appendGrokTestVarint(result, uint64(len(payload)))
++	return append(result, payload...)
++}
++
++func grokTestWebBillingBody(percent float32, start, end int64) []byte {
++	billing := grokTestProtoFloat(1, percent)
++	billing = append(billing, grokTestProtoBytes(4, grokTestProtoVarint(1, uint64(start)))...)
++	billing = append(billing, grokTestProtoBytes(5, grokTestProtoVarint(1, uint64(end)))...)
++	billing = append(billing, grokTestProtoVarint(6, 1)...)
++	payload := grokTestProtoBytes(1, billing)
++	frame := make([]byte, 5, 5+len(payload))
++	binary.BigEndian.PutUint32(frame[1:5], uint32(len(payload)))
++	return append(frame, payload...)
++}
++
+ func (u *grokQuotaSequenceUpstream) snapshotRequests() []*http.Request {
+ 	u.mu.Lock()
+ 	defer u.mu.Unlock()
+@@ -190,6 +232,18 @@ func (u *grokHybridUpstream) Do(req *http.Request, _ string, _ int64, _ int) (*h
+ 		}
+ 		return &http.Response{StatusCode: status, Header: headers, Body: io.NopCloser(strings.NewReader(`{"id":"resp_probe"}`))}, nil
+ 	}
++	if req.URL.String() == xai.WebBillingURL && u.webBillingPercent != nil {
++		now := time.Now().UTC()
++		return &http.Response{
++			StatusCode: http.StatusOK,
++			Header:     make(http.Header),
++			Body: io.NopCloser(bytes.NewReader(grokTestWebBillingBody(
++				*u.webBillingPercent,
++				now.Add(-24*time.Hour).Unix(),
++				now.Add(6*24*time.Hour).Unix(),
++			))),
++		}, nil
++	}
+ 	if u.billingStarted != nil {
+ 		u.billingStartOnce.Do(func() { close(u.billingStarted) })
+ 	}
+@@ -220,7 +274,11 @@ func (u *grokHybridUpstream) Do(req *http.Request, _ string, _ int64, _ int) (*h
+ 		if u.weeklyUsagePercent != nil {
+ 			usage = `,"creditUsagePercent":` + strconv.FormatFloat(*u.weeklyUsagePercent, 'f', -1, 64)
+ 		}
+-		payload := `{"config":{"currentPeriod":{"type":"WEEKLY","start":"2026-07-09T03:25:00Z","end":"2026-07-16T03:25:00Z"}` + usage + `}}`
++		products := ""
++		if u.weeklyProductUsage {
++			products = `,"productUsage":[{"product":"GrokBuild","usagePercent":25}]`
++		}
++		payload := `{"config":{"currentPeriod":{"type":"WEEKLY","start":"2026-07-09T03:25:00Z","end":"2026-07-16T03:25:00Z"}` + usage + products + `}}`
+ 		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(payload))}, nil
+ 	}
+ 	monthlyLimit := ""
+@@ -320,10 +378,55 @@ func TestGrokQuotaServiceFetchBillingStopsAfterSingleTransientRetry(t *testing.T
+ 	require.Nil(t, summary)
+ 	require.Equal(t, http.StatusBadGateway, status)
+ 	require.Equal(t, "GROK_QUOTA_PROBE_UPSTREAM_ERROR", infraerrors.Reason(err))
+-	require.Contains(t, infraerrors.Message(err), "billing returned 502: cloudflare failure")
++	require.Equal(t, "billing returned 502", infraerrors.Message(err))
++	require.NotContains(t, infraerrors.Message(err), "cloudflare failure")
+ 	require.Len(t, upstream.snapshotRequests(), 2)
+ }
+ 
++func TestGrokQuotaServiceFetchWebBillingRetriesTransportAndUsesGRPCWebShape(t *testing.T) {
++	account := healthyGrokQuotaOAuthAccount(405)
++	now := time.Now().UTC()
++	upstream := &grokQuotaSequenceUpstream{steps: []grokQuotaUpstreamStep{
++		{err: errors.New("temporary transport failure")},
++		{status: http.StatusOK, headers: make(http.Header), body: string(grokTestWebBillingBody(35, now.Add(-24*time.Hour).Unix(), now.Add(6*24*time.Hour).Unix()))},
++	}}
++	svc := &GrokQuotaService{httpUpstream: upstream}
++
++	summary, status, err := svc.fetchWebBilling(context.Background(), account, "access-token", "")
++
++	require.NoError(t, err)
++	require.Equal(t, http.StatusOK, status)
++	require.InDelta(t, 35.0, *summary.UsagePercent, 1e-6)
++	requests := upstream.snapshotRequests()
++	require.Len(t, requests, 2)
++	for _, req := range requests {
++		require.Equal(t, http.MethodPost, req.Method)
++		require.Equal(t, xai.WebBillingURL, req.URL.String())
++		require.Equal(t, "Bearer access-token", req.Header.Get("Authorization"))
++		require.Equal(t, "application/grpc-web+proto", req.Header.Get("Content-Type"))
++		body, readErr := io.ReadAll(req.Body)
++		require.NoError(t, readErr)
++		require.Equal(t, xai.WebBillingRequestBody(), body)
++	}
++}
++
++func TestGrokQuotaServiceFetchWebBillingMapsHeaderAuthFailureWithoutRetry(t *testing.T) {
++	account := healthyGrokQuotaOAuthAccount(406)
++	upstream := &grokQuotaSequenceUpstream{steps: []grokQuotaUpstreamStep{
++		{status: http.StatusOK, headers: http.Header{"grpc-status": []string{"16"}, "grpc-message": []string{"access%20token%20expired"}}},
++		{status: http.StatusOK, headers: make(http.Header), body: string(grokTestWebBillingBody(1, time.Now().Add(-time.Hour).Unix(), time.Now().Add(time.Hour).Unix()))},
++	}}
++	svc := &GrokQuotaService{httpUpstream: upstream}
++
++	summary, status, err := svc.fetchWebBilling(context.Background(), account, "access-token", "")
++
++	require.Error(t, err)
++	require.Nil(t, summary)
++	require.Equal(t, http.StatusOK, status)
++	require.Equal(t, "GROK_QUOTA_REAUTH_REQUIRED", infraerrors.Reason(err))
++	require.Len(t, upstream.snapshotRequests(), 1)
++}
++
+ func TestGrokQuotaServiceFetchBillingDoesNotRetryNonTransientStatuses(t *testing.T) {
+ 	tests := []struct {
+ 		name    string
+@@ -665,7 +768,7 @@ func TestGrokQuotaServiceQueryQuotaFreeFallsBackToGrok45(t *testing.T) {
+ 	require.True(t, result.HeadersObserved)
+ 
+ 	requests, bodies := upstream.snapshot()
+-	require.Len(t, requests, 3)
++	require.Len(t, requests, 4)
+ 	responseCalls := 0
+ 	for i, req := range requests {
+ 		if req.URL.Path != "/v1/responses" {
+@@ -705,12 +808,35 @@ func TestGrokQuotaServiceQueryQuotaPaidBillingSkipsActiveProbe(t *testing.T) {
+ 	require.Nil(t, result.LocalUsage24h)
+ 
+ 	requests, _ := upstream.snapshot()
+-	require.Len(t, requests, 2)
+-	for _, req := range requests {
++	require.Len(t, requests, 3)
++	for _, req := range requests[1:] {
+ 		require.Equal(t, "/v1/billing", req.URL.Path)
+ 	}
+ }
+ 
++func TestGrokQuotaServiceQueryQuotaProductOnlyUsesWebWeeklyFallback(t *testing.T) {
++	t.Parallel()
++
++	account := healthyGrokQuotaOAuthAccount(58)
++	repo := &grokQuotaAccountRepo{mockAccountRepoForPlatform: &mockAccountRepoForPlatform{
++		accountsByID: map[int64]*Account{account.ID: account},
++	}}
++	webPercent := float32(37.5)
++	upstream := &grokHybridUpstream{weeklyProductUsage: true, webBillingPercent: &webPercent}
++	svc := NewGrokQuotaService(repo, nil, NewGrokTokenProvider(repo, nil), upstream, nil)
++
++	result, err := svc.QueryQuota(context.Background(), account.ID)
++	require.NoError(t, err)
++	require.Equal(t, "billing_probe", result.Source)
++	require.NotNil(t, result.Billing)
++	require.InDelta(t, float64(webPercent), *result.Billing.UsagePercent, 1e-6)
++	require.Nil(t, result.Snapshot)
++
++	requests, _ := upstream.snapshot()
++	require.Len(t, requests, 1)
++	require.Equal(t, xai.WebBillingURL, requests[0].URL.String())
++}
++
+ func TestGrokQuotaServiceQueryQuotaCustomPaidMonthlyLimitSkipsActiveProbe(t *testing.T) {
+ 	t.Parallel()
+ 
+@@ -730,8 +856,8 @@ func TestGrokQuotaServiceQueryQuotaCustomPaidMonthlyLimitSkipsActiveProbe(t *tes
+ 	require.Nil(t, result.Snapshot)
+ 
+ 	requests, _ := upstream.snapshot()
+-	require.Len(t, requests, 2)
+-	for _, req := range requests {
++	require.Len(t, requests, 3)
++	for _, req := range requests[1:] {
+ 		require.Equal(t, "/v1/billing", req.URL.Path)
+ 	}
+ }
+@@ -872,8 +998,10 @@ func TestAccountUsageServiceGrokRefreshUsesBillingOnly(t *testing.T) {
+ 	require.WithinDuration(t, time.Now().UTC().Add(-24*time.Hour), usageRepo.startTimes[0], time.Second)
+ 
+ 	requests, _ := upstream.snapshot()
+-	require.Len(t, requests, 2)
+-	for _, req := range requests {
++	require.Len(t, requests, 3)
++	require.Equal(t, http.MethodPost, requests[0].Method)
++	require.Equal(t, xai.WebBillingURL, requests[0].URL.String())
++	for _, req := range requests[1:] {
+ 		require.Equal(t, http.MethodGet, req.Method)
+ 		require.Equal(t, "/v1/billing", req.URL.Path)
+ 	}

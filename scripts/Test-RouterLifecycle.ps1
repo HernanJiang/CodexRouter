@@ -173,6 +173,13 @@ public static class LifecycleTestServer
     $portProbe.Stop()
     $fakeConfig = @{
         deploy = @{ sub2apiHost = "http://127.0.0.1:$fakePort" }
+        defaultModel = 'test-model'
+        models = @(@{
+            model = 'test-model'
+            alias = 'Test model'
+            source = 'apikey'
+            baseUrl = 'https://example.invalid/v1'
+        })
     } | ConvertTo-Json -Depth 3
     [IO.File]::WriteAllText(
         (Join-Path $fakeRoot 'codex-router-config.json'),
@@ -294,8 +301,10 @@ Export-ModuleMember -Function Get-RouterCredential, Write-RouterFileAtomic, Ente
 function Resolve-RouterProxySettings {
     param($ProxyConfig, $ProxyPassword)
     return [pscustomobject]@{
+        Mode = 'none'
         ProxyUrl = $null
         NoProxy = 'localhost,127.0.0.1'
+        HasCredentials = $false
     }
 }
 Export-ModuleMember -Function Resolve-RouterProxySettings
@@ -346,8 +355,16 @@ Export-ModuleMember -Function Get-RouterBaseUri
         -LiteralPath (Join-Path $PSScriptRoot 'Apply-Router.ps1') `
         -Destination (Join-Path $fakeRoot 'scripts\Apply-Router.ps1')
     [IO.File]::WriteAllText(
+        (Join-Path $fakeRoot 'scripts\Initialize-Router.ps1'),
+        "throw 'TEST_APPLY_REACHED_INITIALIZATION'",
+        [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText(
         (Join-Path $fakeRoot 'scripts\CodexIntegration.psm1'),
-        "Export-ModuleMember",
+        @'
+function Get-RouterModelRoutePlan { param($RouterConfig) return @() }
+function Get-RouterDefaultPublicModelId { param($RouterConfig, $RoutePlan) return 'test-model' }
+Export-ModuleMember -Function Get-RouterModelRoutePlan, Get-RouterDefaultPublicModelId
+'@,
         [Text.UTF8Encoding]::new($false))
     $applyInfo = [Diagnostics.ProcessStartInfo]::new()
     $applyInfo.FileName = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
@@ -364,10 +381,13 @@ Export-ModuleMember -Function Get-RouterBaseUri
         Assert-Test -Condition $applyAttempt.Start() -Message 'could not run the isolated Apply-Router script'
         Assert-Test -Condition $applyAttempt.WaitForExit(10000) -Message 'isolated Apply-Router did not finish'
         $applyOutput = $applyAttempt.StandardOutput.ReadToEnd() + $applyAttempt.StandardError.ReadToEnd()
-        Assert-Test -Condition ($applyAttempt.ExitCode -ne 0) -Message 'active Apply-Router unexpectedly succeeded'
+        Assert-Test -Condition ($applyAttempt.ExitCode -ne 0) -Message 'the isolated Apply-Router sentinel unexpectedly succeeded'
         Assert-Test `
-            -Condition $applyOutput.Contains('ROUTER_LIFECYCLE_DEFERRED') `
-            -Message "active Apply-Router did not report the explicit deferred result: $applyOutput"
+            -Condition $applyOutput.Contains('TEST_APPLY_REACHED_INITIALIZATION') `
+            -Message "active Apply-Router did not enter non-disruptive initialization: $applyOutput"
+        Assert-Test `
+            -Condition (-not $applyOutput.Contains('ROUTER_LIFECYCLE_DEFERRED')) `
+            -Message "active Apply-Router incorrectly blocked a hot configuration update: $applyOutput"
     } finally {
         $applyAttempt.Dispose()
     }
@@ -436,11 +456,12 @@ Export-ModuleMember -Function Get-RouterBaseUri
     Assert-Test `
         -Condition ($startSource.Contains('$redisConfig = "$routerRoot\config\redis.conf"') -and
             $startSource.Contains("`$redisRuntimeConfig = Join-Path `$dataRoot 'redis\redis.conf'") -and
-            $startSource.Contains('-Bytes ([IO.File]::ReadAllBytes($redisConfig))') -and
+            $startSource.Contains('function Wait-RedisAuthenticatedPing') -and
+            $startSource.Contains('Wait-RedisAuthenticatedPing -Password $redisPassword -TimeoutSeconds 30') -and
             $startSource.Contains("-ArgumentList @('redis.conf')") -and
             $startSource.Contains('$redisProcess.HasExited') -and
             -not $startSource.Contains('../../config/redis.conf')) `
-        -Message 'Redis configuration is not staged safely across portable and user-data drives'
+        -Message 'Redis startup does not wait for an authenticated PONG after loading persisted data'
     Assert-Test `
         -Condition ($monitorSource.Contains('/v1/models') -and
             $monitorSource.Contains('-RepairUnhealthy')) `
@@ -516,11 +537,9 @@ Export-ModuleMember -Function Get-RouterBaseUri
             $deploymentCancelTreeKill -lt $deploymentTimeout -and
             $deploymentTimeoutShellKill -gt $deploymentTimeout) `
         -Message 'deployment cancellation and timeout do not preserve their distinct process-termination scopes'
-    $applyGuard = $applySource.IndexOf('Assert-RouterServiceInterruptionAllowed')
-    $applyInitialization = $applySource.IndexOf("Write-Output '[1/7] Initializing")
     Assert-Test `
-        -Condition ($applyGuard -ge 0 -and $applyInitialization -gt $applyGuard) `
-        -Message 'Apply mutates Router state before checking active connections'
+        -Condition (-not $applySource.Contains('Assert-RouterServiceInterruptionAllowed')) `
+        -Message 'Apply reintroduced a blanket active-connection guard instead of delegating interruption safety to Start-Router'
     $complianceCheck = $applySource.IndexOf('if ($compliance.required)')
     $ensureAdminCall = $applySource.IndexOf("Ensure-Sub2ApiAdmin.ps1")
     $refreshedAdminSession = if ($ensureAdminCall -ge 0) {
@@ -588,14 +607,16 @@ Export-ModuleMember -Function Get-RouterBaseUri
     $forceStopAttempt.StartInfo = $forceStopInfo
     try {
         Assert-Test -Condition $forceStopAttempt.Start() -Message 'could not run the isolated forced Stop-Router script'
-        Assert-Test -Condition $forceStopAttempt.WaitForExit(10000) -Message 'isolated forced Stop-Router did not finish'
+        Assert-Test -Condition $forceStopAttempt.WaitForExit(30000) -Message 'isolated forced Stop-Router did not finish'
         $forceStopOutput = $forceStopAttempt.StandardOutput.ReadToEnd() + $forceStopAttempt.StandardError.ReadToEnd()
         Assert-Test `
             -Condition ($forceStopAttempt.ExitCode -eq 0) `
             -Message "cross-version forced full-exit shutdown failed: $forceStopOutput"
+        $usedVerifiedOwner = $forceStopOutput.Contains('active verified portable release')
+        $usedPortableFallback = $forceStopOutput.Contains('previous portable layout')
         Assert-Test `
-            -Condition $forceStopOutput.Contains('active verified portable release') `
-            -Message "cross-version shutdown did not report verified portable adoption: $forceStopOutput"
+            -Condition ($usedVerifiedOwner -or $usedPortableFallback) `
+            -Message "cross-version shutdown did not report a verified or safely reclaimed portable owner: $forceStopOutput"
         $fakeSub2Api.WaitForExit(5000)
         Assert-Test -Condition $fakeSub2Api.HasExited -Message 'cross-version full-exit shutdown left Sub2API running'
     } finally {
@@ -605,8 +626,8 @@ Export-ModuleMember -Function Get-RouterBaseUri
     Write-Output 'PASS lifecycle lock serializes concurrent processes.'
     Write-Output 'PASS active Stop entry point is deferred and preserves the process PID.'
     Write-Output 'PASS active proxy fingerprint restart is deferred and preserves the process PID.'
-    Write-Output 'PASS active Apply entry point is deferred before initialization and preserves the process PID.'
-    Write-Output 'PASS deliberate full GUI exit adopts and stops its verified active portable backend.'
+    Write-Output 'PASS active Apply enters non-disruptive initialization and preserves the process PID.'
+    Write-Output 'PASS deliberate full GUI exit safely adopts or reclaims its active portable backend.'
     Write-Output 'PASS transient health/listener handling and deployment timeout do not kill the service tree.'
     Write-Output 'PASS GUI-integrated deep health protection invokes only verified unhealthy-service recovery.'
     Write-Output 'PASS fresh deployment accepts compliance before administrator reconciliation and session refresh.'

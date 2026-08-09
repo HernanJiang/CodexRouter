@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.4.9-0969da" alt="Version 1.4.9">
+  <img src="https://img.shields.io/badge/version-1.5.2-0969da" alt="Version 1.5.2">
   <img src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078d4" alt="Windows 10/11">
   <img src="https://img.shields.io/badge/architecture-x64-555555" alt="x64">
   <img src="https://img.shields.io/badge/runtime-portable-2ea44f" alt="Portable runtime">
@@ -29,7 +29,7 @@
   <a href="#security-and-terms">Security</a>
 </p>
 
-Codex-Router keeps the original Codex workflow while adding a unified model menu for multiple providers, OAuth subscription accounts, and third-party API channels. Public model IDs are deduplicated for the Codex client, while the backend can keep several channels for the same model and use them for priority routing and failover.
+Codex-Router keeps the original Codex workflow while adding a unified model menu for multiple providers, OAuth subscription accounts, and third-party API channels. With automatic continuity enabled, matching OAuth and API channels share one public model and subscription quota is preferred. With it disabled, the API model and an `(OAuth)` subscription model remain separate so the user can choose the quota source directly.
 
 ## Overview
 
@@ -38,6 +38,13 @@ Codex-Router keeps the original Codex workflow while adding a unified model menu
 </p>
 
 Codex-Router is a Windows desktop router built around Sub2API and a Rust desktop console. PostgreSQL, Redis, Sub2API, the router runtime, and the required app-local VC++ runtime are included in the portable package. Services listen on the local loopback interface.
+
+### What is new in 1.5.2
+
+- Applying a configuration no longer fails merely because an active Codex connection is using the local Router. Restart protection remains active only when a real backend switch or restart is required.
+- Kimi Coding Plan usage distinguishes rejected credentials from permission and rate-limit failures, keeps bounded last-good quota data, and refreshes providers independently so one slow channel does not block the dashboard.
+- API Key replacement now reports the actual number of credentials updated. The model editor clearly separates staging a new Key from the final **Save and apply** action.
+- OAuth and API channels can remain merged for automatic subscription-first continuity or appear as separate model choices when automatic continuity is disabled.
 
 ### Why it is useful
 
@@ -51,7 +58,7 @@ Codex-Router is a Windows desktop router built around Sub2API and a Rust desktop
 
 ### One menu, many channels
 
-Codex-Router merges configured OAuth and API channels into the model list that Codex sees. The same public model ID appears once, even when several backend channels are available. Routing priority remains independent, so a model can have multiple providers for resilience without cluttering the Codex model selector.
+Codex-Router can merge configured OAuth and API channels into the model list that Codex sees. With automatic continuity enabled, the same public model ID appears once while backend routing priorities remain independent. With it disabled, the third-party API model and the subscription model marked `(OAuth)` both appear, allowing explicit quota selection from the model menu.
 
 <p align="center">
   <img src="assets/release/screenshot-codex.png" alt="Switching models from the Codex model menu" width="900">
@@ -66,7 +73,7 @@ Switch models directly from the Codex model menu and continue in the same contex
 - Supports the Sub2API login entries for OpenAI/ChatGPT, Anthropic/Claude, Google Gemini, Google Antigravity, and xAI/Grok.
 - Shows the account plan, status, available capacity, reset information, and models discovered by the upstream platform.
 - Stores OAuth account selection independently for each routing profile. Only imported and enabled models participate in that profile.
-- Prefers subscription capacity for a matching model and falls back to a lower-priority API channel when the subscription is exhausted or unhealthy.
+- With automatic continuity enabled, prefers subscription capacity for a matching model and falls back to a lower-priority API channel when the subscription is exhausted or unhealthy. With it disabled, no automatic handoff occurs and the selected model entry determines the quota source.
 - Uses the upstream reset time when available. When no reset time is exposed, Router performs a low-frequency recovery probe and automatically returns to the subscription after recovery.
 - Keeps OAuth tokens under Sub2API management. Tokens are not written to the Codex-Router configuration file and are not offered as plaintext exports.
 
@@ -93,13 +100,15 @@ Usage monitoring is a first-class part of Codex-Router, not a small detail of OA
 - token totals, requests, model-level usage, cost, balances, and provider error state;
 - last-good data with bounded cache fallback when a provider temporarily rejects or delays a usage query.
 
+Usage refresh now runs independent provider tasks with bounded concurrency and per-task deadlines. A slow Grok, Kimi, or API channel can time out independently while other cards continue to return; compatible quota payloads are normalized across nested, ratio-based, and provider-specific response shapes.
+
 The view keeps OAuth quota cards and API usage cards visible together, packs cards dynamically into independent columns, and avoids large blank areas when accounts have different numbers of quota windows.
 
 ## Tray Performance
 
 Codex-Router can start with Windows in a lightweight tray mode without launching an additional daemon. Tray mode pauses log following, UI refresh, and high-frequency usage updates. It retains one native health check every 60 seconds and can recover the local service without opening a window after consecutive failures.
 
-The 1.4.9 runtime also includes memory and background-work optimizations. Idle tray CPU, disk, and network activity are designed to be effectively negligible; the screenshot below shows the router process at 0% CPU and 0 Mbps network activity in the tested idle state.
+The 1.5.2 runtime retains the memory and background-work optimizations. Idle tray CPU, disk, and network activity are designed to be effectively negligible; the screenshot below shows the router process at 0% CPU and 0 Mbps network activity in the tested idle state.
 
 <p align="center">
   <img src="assets/release/usage-performance.png" alt="Codex-Router idle resource usage" width="900">
@@ -107,11 +116,13 @@ The 1.4.9 runtime also includes memory and background-work optimizations. Idle t
 
 ## Download And First Run
 
-Download the Windows x64 package from [GitHub Releases](https://github.com/HernanJiang/Codex-Router/releases/tag/v1.4.9):
+Download the Windows x64 package from [GitHub Releases](https://github.com/HernanJiang/Codex-Router/releases/tag/v1.5.2):
 
-`Codex-Router-Portable-1.4.9-windows-x64.zip`
+`Codex-Router-Portable-1.5.2-windows-x64.zip`
 
-An optional per-user installer is also provided as `Codex-Router-Installer-1.4.9-windows-x64.exe`. It installs the same verified runtime under `%LOCALAPPDATA%\Programs\Codex-Router\1.4.9` and does not require administrator access.
+An optional per-user installer is also provided as `Codex-Router-Installer-1.5.2-windows-x64.exe`. It installs the same verified runtime under `%LOCALAPPDATA%\Programs\Codex-Router\1.5.2` and does not require administrator access.
+
+For transient pre-output stream failures such as `Upstream request failed`, the router now allows up to five same-account retries by default with a longer 1.5-second interval. The request is never replayed after visible model output has started.
 
 The package is portable and does not require Python, Node.js, Rust, PostgreSQL, Redis, or a separately installed VC++ runtime. Extract the complete directory before launching it. Do not move only the GUI executable out of the package.
 

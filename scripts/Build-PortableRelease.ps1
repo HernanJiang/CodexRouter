@@ -81,9 +81,11 @@ $staticLicenseFiles = @(
     'MSYS2-Runtime-LICENSES.txt',
     'Redis-8.10.0-LICENSES.txt',
     'Rust-SPDX-LICENSE-TEXTS.txt',
-    'sub2api-0.1.168-codex-router.3.patch',
     'sub2api-0.1.170-codex-router.2.patch',
-    'sub2api-0.1.170-codex-router.3.patch'
+    'sub2api-0.1.170-codex-router.3.patch',
+    'sub2api-0.1.170-codex-router.4.patch',
+    'sub2api-0.1.170-codex-router.5.patch',
+    'sub2api-0.1.170-codex-router.6.patch'
 )
 
 $generatedLicenseFiles = @(
@@ -380,6 +382,7 @@ function Assert-ReleaseLayout {
     foreach ($path in @(
         'Codex-Router.exe',
         'LICENSE',
+        'CHANGELOG.md',
         'README.md',
         'README.zh-CN.md',
         'TERMS.en.md',
@@ -425,6 +428,7 @@ function Assert-ReleaseLayout {
 
     $required = @(
         'Codex-Router.exe',
+        'CHANGELOG.md',
         'README.md',
         'README.zh-CN.md',
         'app\sub2api.exe',
@@ -1364,7 +1368,7 @@ try {
 
     $redisRoot = 'redis\Redis-8.10.0-Windows-x64-msys2'
     foreach ($name in $redisRuntimeFiles) { Copy-ReleaseItem -RelativePath "$redisRoot\$name" }
-    foreach ($relative in @('LICENSE', 'README.md', 'README.zh-CN.md', 'TERMS.en.md', 'TERMS.zh-CN.md', 'THIRD_PARTY_NOTICES.md')) {
+    foreach ($relative in @('LICENSE', 'CHANGELOG.md', 'README.md', 'README.zh-CN.md', 'TERMS.en.md', 'TERMS.zh-CN.md', 'THIRD_PARTY_NOTICES.md')) {
         Copy-ReleaseItem -RelativePath $relative
     }
     [void](Assert-TermsReleaseMetadata -Root $staging -ExpectedVersion $version -ExpectedDate $releaseDate)

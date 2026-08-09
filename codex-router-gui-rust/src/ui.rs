@@ -2693,8 +2693,12 @@ impl CodexRouterApp {
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
+                                        let key_update_pending =
+                                            !this.temp_model.api_key.trim().is_empty();
                                         let next_label = if this.model_from_wizard {
                                             t(zh, "网络代理 →", "Network proxy →")
+                                        } else if key_update_pending {
+                                            t(zh, "保存新 Key 与模型", "Save new key & model")
                                         } else {
                                             t(zh, "保存模型", "Save model")
                                         };
@@ -3208,6 +3212,8 @@ impl CodexRouterApp {
                                 };
                             }
                             if next {
+                                let key_update_pending =
+                                    !this.temp_model.api_key.trim().is_empty();
                                 if this.model_from_wizard {
                                     this.config.models = vec![this.temp_model.clone()];
                                     super::logic::normalize_default_model(&mut this.config);
@@ -3227,6 +3233,14 @@ impl CodexRouterApp {
                                         None => this.config.models.push(this.temp_model.clone()),
                                     }
                                     super::logic::normalize_default_model(&mut this.config);
+                                    if key_update_pending {
+                                        this.status_text = t(
+                                            zh,
+                                            "新 API Key 已暂存；点击“保存并应用”后将安全覆写 Windows 凭据",
+                                            "The new API key is staged. Save & apply to overwrite the Windows credential securely.",
+                                        )
+                                        .to_owned();
+                                    }
                                     this.page = Page::Dashboard;
                                 }
                             }

@@ -1639,6 +1639,15 @@ fn usage_error_for_display(zh: bool, text: &str) -> String {
     } else {
         runtime_logs::summarize_error_for_display(trimmed)
     };
+    if summary.contains("marker=ROUTER_KIMI_CREDENTIAL_REJECTED") {
+        return if zh {
+            "Kimi API Key 无效或没有 Coding Plan 权限，请在 Kimi Code 控制台新建 Key 后重新填写。"
+                .to_owned()
+        } else {
+            "The Kimi API Key is invalid or lacks Coding Plan access. Create a new key in the Kimi Code Console and enter it again."
+                .to_owned()
+        };
+    }
     let class = summary
         .split('|')
         .map(str::trim)
@@ -1678,6 +1687,28 @@ fn usage_error_for_display(zh: bool, text: &str) -> String {
                 .to_owned()
         }
     }
+}
+
+fn usage_account_message_for_display(zh: bool, text: &str) -> String {
+    if text.trim().is_empty() {
+        return String::new();
+    }
+    let summary = runtime_logs::summarize_error_for_display(text);
+    if summary == "class=unclassified_error" {
+        return String::new();
+    }
+    usage_error_for_display(zh, &summary)
+}
+
+fn normalize_usage_account_messages(zh: bool, account: &mut UsageAccount) {
+    let status_detail = usage_account_message_for_display(zh, &account.status_detail);
+    let query_note = usage_account_message_for_display(zh, &account.query_note);
+    account.status_detail = if query_note.is_empty() {
+        status_detail
+    } else {
+        query_note
+    };
+    account.query_note.clear();
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1743,15 +1774,18 @@ where
             "ROUTER_DEPLOY_NO_MODELS: the configuration has no model channel, so nothing can be deployed"
         );
     }
-    logic::store_credentials(cfg, router_root).context("ROUTER_CONFIG_SAVE_CREDENTIALS_FAILED")?;
-    on_log(
-        if zh {
-            "API Key 已安全保存到 Windows 凭据管理器"
-        } else {
-            "API keys were stored securely in Windows Credential Manager"
+    let updated_model_keys = logic::store_credentials(cfg, router_root)
+        .context("ROUTER_CONFIG_SAVE_CREDENTIALS_FAILED")?;
+    on_log(match (zh, updated_model_keys) {
+        (true, 0) => "未输入新的 API Key；已保留 Windows 凭据管理器中的现有 Key".to_owned(),
+        (false, 0) => {
+            "No new API key was entered; existing Windows credentials were preserved".to_owned()
         }
-        .to_owned(),
-    );
+        (true, count) => format!("已安全更新 {count} 个 API Key 到 Windows 凭据管理器"),
+        (false, count) => {
+            format!("Updated {count} API key(s) securely in Windows Credential Manager")
+        }
+    });
     logic::write_all_files(cfg, router_root).context("ROUTER_CONFIG_SAVE_FILES_FAILED")?;
     on_log(
         if zh {
@@ -4052,11 +4086,11 @@ if ($relaunched) { 'codex-router:codex-restarted' } else { 'codex-router:codex-r
                     // Automatically retry a few times while the OAuth page is open so
                     // users do not have to mash Refresh during that window.
                     if self.page == Page::OAuth
-                        && self.oauth_retry_attempts < 4
+                        && self.oauth_retry_attempts < 5
                         && oauth_accounts_error_is_retryable(&error)
                     {
                         self.oauth_retry_attempts = self.oauth_retry_attempts.saturating_add(1);
-                        let delay_ms = 900u64 + u64::from(self.oauth_retry_attempts) * 700;
+                        let delay_ms = 1200u64 + u64::from(self.oauth_retry_attempts) * 800;
                         self.oauth_retry_due = Some(
                             std::time::Instant::now() + std::time::Duration::from_millis(delay_ms),
                         );
@@ -4205,19 +4239,13 @@ if ($relaunched) { 'codex-router:codex-restarted' } else { 'codex-router:codex-r
                     self.usage_loading = false;
                     self.usage_error.clear();
                     let mut snapshot = *snapshot;
+                    let zh = self.ui_language == "zh";
                     for account in snapshot
                         .subscriptions
                         .iter_mut()
                         .chain(snapshot.api_channels.iter_mut())
                     {
-                        if !account.status_detail.trim().is_empty() {
-                            account.status_detail =
-                                runtime_logs::summarize_error_for_display(&account.status_detail);
-                        }
-                        if !account.query_note.trim().is_empty() {
-                            account.query_note =
-                                runtime_logs::summarize_error_for_display(&account.query_note);
-                        }
+                        normalize_usage_account_messages(zh, account);
                     }
                     Self::sort_usage_accounts(
                         &mut snapshot.subscriptions,
@@ -6839,8 +6867,9 @@ mod main_tests {
         append_bounded_log, decode_icon, deploy_router_config, drain_bounded_output,
         failover_account_id, fallback_transition_notification, fit_window_to_monitor,
         fit_window_to_work_area, initial_window_logical_size, localized_deployment_line,
-        localized_error_summary, next_request_generation, oauth_prepare_error_from_output,
-        oauth_prepare_error_is_retryable, request_result_disposition, restore_apply_ui_fields,
+        localized_error_summary, next_request_generation, normalize_usage_account_messages,
+        oauth_prepare_error_from_output, oauth_prepare_error_is_retryable,
+        request_result_disposition, restore_apply_ui_fields,
         restore_codex_and_stop_router_for_exit, restore_codex_for_exit,
         run_hidden_powershell_output, usage_error_for_display, ApplyUiRollback, ModelConfig,
         RequestResultDisposition, RouterConfig, UsageAccount, UsageSnapshot, APP_TITLE,
@@ -7434,6 +7463,27 @@ mod main_tests {
             "The usage query temporarily failed. The last successful data is retained; retry shortly."
         );
         assert!(!usage_error_for_display(true, "class=configuration").contains("class="));
+    }
+
+    #[test]
+    fn kimi_usage_errors_are_actionable_and_deduplicated() {
+        let mut account = UsageAccount {
+            status_detail: "Kimi Coding Plan quota query failed (HTTP 403).".to_owned(),
+            query_note:
+                "class=authentication | status=401 | marker=ROUTER_KIMI_CREDENTIAL_REJECTED"
+                    .to_owned(),
+            ..UsageAccount::default()
+        };
+
+        normalize_usage_account_messages(true, &mut account);
+
+        assert_eq!(
+            account.status_detail,
+            "Kimi API Key 无效或没有 Coding Plan 权限，请在 Kimi Code 控制台新建 Key 后重新填写。"
+        );
+        assert!(account.query_note.is_empty());
+        assert!(!account.status_detail.contains("class="));
+        assert!(!account.status_detail.contains("rate_limit"));
     }
 
     #[test]

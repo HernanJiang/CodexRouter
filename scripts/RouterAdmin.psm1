@@ -1203,15 +1203,14 @@ function Get-RouterServableCatalogRoutes {
         }
     }
 
-    $joinedApiIdentities = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $joinedApiPublicIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($route in @($RoutePlan)) {
         if ((Get-RouterModelSource -Model $route.Model) -eq 'oauth') { continue }
         if (-not [bool]$route.JoinRouter) { continue }
-        $identityProperty = $route.PSObject.Properties['IdentityKey']
-        $identityKey = if ($null -eq $identityProperty) {
-            [string](Get-RouterModelIdentity -ModelId ([string]$route.Model.model)).IdentityKey
-        } else { [string]$identityProperty.Value }
-        [void]$joinedApiIdentities.Add($identityKey)
+        $joinedPublicId = ([string]$route.PublicModelId).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($joinedPublicId)) {
+            [void]$joinedApiPublicIds.Add($joinedPublicId)
+        }
     }
 
     $catalogIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -1228,11 +1227,10 @@ function Get-RouterServableCatalogRoutes {
                 $accountSelected = -not $OAuthSelectionInitialized -or (
                     $oauthId -gt 0 -and $selectedOAuthIds -contains $oauthId)
                 $accountIsolated = $oauthId -gt 0 -and $isolated.ContainsKey($oauthId)
-                $identityProperty = $route.PSObject.Properties['IdentityKey']
-                $identityKey = if ($null -eq $identityProperty) {
-                    [string](Get-RouterModelIdentity -ModelId ([string]$route.Model.model)).IdentityKey
-                } else { [string]$identityProperty.Value }
-                $hasApiFallback = $joinedApiIdentities.Contains($identityKey)
+                # A fallback must serve the exact public ID. In manual split
+                # mode the API row has its own hashed ID and cannot serve the
+                # OAuth canonical ID after that account is isolated.
+                $hasApiFallback = $joinedApiPublicIds.Contains($publicModelId)
                 if (-not $accountSelected) { continue }
                 if ($accountIsolated -and -not $hasApiFallback) { continue }
             }

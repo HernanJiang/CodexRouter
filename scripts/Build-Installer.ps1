@@ -21,7 +21,7 @@ if ([IO.Path]::GetExtension($output) -ne '.exe') { throw 'Installer output must 
 
 $work = Join-Path ([IO.Path]::GetTempPath()) ('codex-router-iexpress-' + [Guid]::NewGuid().ToString('N'))
 $payload = Join-Path $work 'payload'
-$sedPath = Join-Path $work 'Codex-Router-1.4.9.sed'
+$sedPath = Join-Path $work 'Codex-Router-1.5.2.sed'
 try {
     [IO.Directory]::CreateDirectory($payload) | Out-Null
     Copy-Item -LiteralPath $archive -Destination (Join-Path $payload (Split-Path -Leaf $archive)) -Force
@@ -57,10 +57,10 @@ SourceFiles0=$payload\
 %FILE0%=
 %FILE1%=
 [Strings]
-InstallPrompt="Install Codex-Router 1.4.9 for the current Windows user."
+InstallPrompt="Install Codex-Router 1.5.2 for the current Windows user."
 DisplayLicense=""
-FinishMessage="Codex-Router 1.4.9 was installed. Your existing user data was preserved."
-FriendlyName="Codex-Router 1.4.9"
+FinishMessage="Codex-Router 1.5.2 was installed. Your existing user data was preserved."
+FriendlyName="Codex-Router 1.5.2"
 AppLaunched="PowerShell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File Install-CodexRouter.ps1 -PackageZip $archiveName"
 PostInstallCmd="<None>"
 FILE0="$archiveName"
@@ -74,7 +74,7 @@ FILE1="Install-CodexRouter.ps1"
 
     [ordered]@{
         installer = $output
-        version = '1.4.9'
+        version = '1.5.2'
         payloadArchive = $archiveName
         sha256 = (Get-FileHash -LiteralPath $output -Algorithm SHA256).Hash.ToLowerInvariant()
         signed = $false

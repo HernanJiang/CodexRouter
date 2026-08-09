@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.4.9-0969da" alt="版本 1.4.9">
+  <img src="https://img.shields.io/badge/version-1.5.2-0969da" alt="版本 1.5.2">
   <img src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078d4" alt="Windows 10/11">
   <img src="https://img.shields.io/badge/architecture-x64-555555" alt="x64">
   <img src="https://img.shields.io/badge/runtime-portable-2ea44f" alt="便携运行">
@@ -29,7 +29,7 @@
   <a href="#安全与条款">安全</a>
 </p>
 
-Codex-Router 保留 Codex 原有工作方式，同时通过一个模型菜单接入不同服务商、OAuth 订阅账号与第三方 API 渠道。公开模型 ID 会自动去重，Codex 端只显示一个模型；后端仍可为同一模型保留多个渠道，用于优先级路由、容错和自动回退。
+Codex-Router 保留 Codex 原有工作方式，同时通过一个模型菜单接入不同服务商、OAuth 订阅账号与第三方 API 渠道。启用自动接续时，同名 OAuth 与 API 渠道合并为一个公开模型并优先使用订阅额度；关闭后则分别显示普通 API 模型和带 `(OAuth)` 标记的订阅模型，由用户手动选择额度来源。
 
 ## 总体概览
 
@@ -38,6 +38,13 @@ Codex-Router 保留 Codex 原有工作方式，同时通过一个模型菜单接
 </p>
 
 Codex-Router 是基于 Sub2API 和 Rust 桌面控制台的 Windows 本地路由器。便携包内置 PostgreSQL、Redis、Sub2API、Router 运行时以及 app-local VC++ Runtime，服务默认只监听本机回环地址。
+
+### 1.5.2 更新重点
+
+- 保存配置时不会再仅因 Codex 正在使用本机 Router 而失败；只有实际需要切换或重启后端时才会启用连接中断保护。
+- Kimi Coding Plan 用量查询会区分凭据拒绝、权限不足与限流，保留有时效边界的最近成功额度；各服务商独立刷新，单个慢渠道不会阻塞整个面板。
+- API Key 覆写会报告实际更新的凭据数量；模型编辑器明确区分“暂存新 Key”和最终“保存并应用”。
+- 自动接续开启时继续优先使用订阅额度；关闭时 OAuth 与同名第三方 API 会作为独立模型显示，由用户手动选择额度来源。
 
 ### 适合解决的问题
 
@@ -51,7 +58,7 @@ Codex-Router 是基于 Sub2API 和 Rust 桌面控制台的 Windows 本地路由�
 
 ### 一个菜单，多个后端渠道
 
-Codex-Router 将 OAuth 和 API 渠道合并为 Codex 可见的模型目录。同名模型只公开一次，即使后端存在多个服务商渠道，也不会污染 Codex 的模型选择菜单；后端优先级和容错链仍然独立保存。
+Codex-Router 可以将 OAuth 和 API 渠道合并为 Codex 可见的模型目录。启用自动接续时，同名模型只公开一次，后端优先级和容错链仍然独立保存；关闭自动接续时，同名的第三方 API 模型与带 `(OAuth)` 标记的订阅模型会同时出现，可直接通过模型选择控制额度来源。
 
 <p align="center">
   <img src="assets/release/screenshot-codex.png" alt="Codex 模型菜单中的多模型切换" width="900">
@@ -66,7 +73,7 @@ Codex-Router 将 OAuth 和 API 渠道合并为 Codex 可见的模型目录。同
 - 支持 Sub2API 当前提供的 OpenAI/ChatGPT、Anthropic/Claude、Google Gemini、Google Antigravity 与 xAI/Grok 登录入口。
 - 登录后可查看账号套餐、状态、可用额度、重置时间以及平台实际发现的模型。
 - 每套路由配置独立保存 OAuth 账号选择，只有已导入并启用的模型才参与当前路由。
-- 同名模型优先使用订阅额度，限额或故障时转入较低优先级的 API Key 渠道。
+- 开启自动接续时，同名模型优先使用订阅额度，限额或故障时转入较低优先级的 API Key 渠道；关闭时不自动转接，由模型列表中的独立条目决定额度来源。
 - 上游提供重置时间时按实际时间恢复；无法取得重置时间时执行低频保底探测，成功后自动回切。
 - OAuth 令牌由 Sub2API 管理，不写入 Codex-Router 配置文件，也不提供明文导出。
 
@@ -93,13 +100,15 @@ Codex-Router 将 OAuth 和 API 渠道合并为 Codex 可见的模型目录。同
 - Token 总量、请求数、模型级用量、估算费用、余额和服务商错误状态；
 - 服务商暂时拒绝或延迟查询时，使用有时效边界的最近一次成功数据，避免整块监控面板失效。
 
+用量刷新现在采用有界并发和单任务截止时间，每个服务商独立完成或失败。Grok、Kimi 或某个 API 渠道变慢时只会独立超时，其他卡片仍可先返回；嵌套结构、比例字段和服务商专用字段也会统一归一化。
+
 用量页面将 OAuth 订阅卡片与 API 用量卡片同时保留，按卡片内容动态填充为独立列，减少不同账号额度窗口数量不一致造成的大面积空白。
 
 ## 托盘与性能优化
 
 Codex-Router 可以在 Windows 登录后直接进入轻量托盘模式，不启动额外守护进程。托盘模式暂停日志跟随、界面刷新和高频用量更新，只保留每 60 秒一次的原生健康检查，以及连续失败后的无窗口恢复。
 
-1.4.9 同时进行了内存和后台任务优化。空闲托盘状态下的 CPU、磁盘和网络活动设计为几乎可以忽略；下图展示了测试环境中 Codex-Router 进程处于 0% CPU、0 Mbps 网络占用的空闲状态。
+1.5.2 同时保留了内存和后台任务优化。空闲托盘状态下的 CPU、磁盘和网络活动设计为几乎可以忽略；下图展示了测试环境中 Codex-Router 进程处于 0% CPU、0 Mbps 网络占用的空闲状态。
 
 <p align="center">
   <img src="assets/release/usage-performance.png" alt="Codex-Router 空闲资源占用" width="900">
@@ -107,11 +116,13 @@ Codex-Router 可以在 Windows 登录后直接进入轻量托盘模式，不启�
 
 ## 下载与首次启动
 
-前往 [GitHub Releases](https://github.com/HernanJiang/Codex-Router/releases/tag/v1.4.9) 下载 Windows x64 版本：
+前往 [GitHub Releases](https://github.com/HernanJiang/Codex-Router/releases/tag/v1.5.2) 下载 Windows x64 版本：
 
-`Codex-Router-Portable-1.4.9-windows-x64.zip`
+`Codex-Router-Portable-1.5.2-windows-x64.zip`
 
-同时提供可选的用户级安装器：`Codex-Router-Installer-1.4.9-windows-x64.exe`。它会把同一份已验收运行时安装到 `%LOCALAPPDATA%\Programs\Codex-Router\1.4.9`，不需要管理员权限。
+同时提供可选的用户级安装器：`Codex-Router-Installer-1.5.2-windows-x64.exe`。它会把同一份已验收运行时安装到 `%LOCALAPPDATA%\Programs\Codex-Router\1.5.2`，不需要管理员权限。
+
+对于 `Upstream request failed` 这类尚未向客户端输出内容的瞬时流错误，Router 默认允许同一账号最多重试 5 次，每次间隔 1.5 秒。已经开始输出模型内容后不会重复回放请求。
 
 这是一个解压即用的便携包，不要求预装 Python、Node.js、Rust、PostgreSQL、Redis 或独立 VC++ Runtime。请完整解压后启动，不要只把 `Codex-Router.exe` 单独移出目录。
 
