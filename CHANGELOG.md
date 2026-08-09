@@ -2,6 +2,43 @@
 
 本文件记录面向用户的重要变化。完整技术细节以对应版本的源码和 GitHub Release 为准。
 
+## 1.5.4 - 2026-08-10
+
+### 改进
+
+- 将模型目录生成、路由规划和 OAuth/API 合并拆分逻辑迁移到 Rust，`Build-ModelCatalog.ps1` 不再参与发布包。
+- 开启自动连续时，匹配的 OAuth 和 API 渠道共用同一个公开模型 ID 并优先使用订阅额度；关闭时，API 模型与带 `(OAuth)` 后缀的订阅模型分开显示，允许手动选择额度来源。
+- 修复旧目录生成器导致的重复 OAuth 账号条目和不稳定公开模型 ID。
+
+### 验证
+
+- Rust 完整测试、格式检查、静态检查和 Clippy 严格检查通过。
+- 使用真实本机配置验证模型目录：OAuth/API 合并与拆分模式均生成正确列表，未出现重复账号。
+
+### 发布物
+
+- `Codex-Router-Portable-1.5.4-windows-x64.zip`
+- `Codex-Router-Installer-1.5.4-windows-x64.exe`
+
+## 1.5.3 - 2026-08-09
+
+### 改进
+
+- 将用量查询、本机 Sub2API 管理读取、服务商响应归一化、有界并发和最近成功额度缓存迁移到 Rust，不再为每次刷新启动 PowerShell 进程。
+- Kimi、Grok、Z.ai/GLM、MiniMax、ZenMux、火山方舟、MiMo、OpenRouter 和 DeepSeek 继续使用各自的官方配额或余额接口，并保持单渠道失败不影响整个面板。
+- 用量查询直接按配置中的凭据引用读取 Windows Credential Manager；错误信息只保留安全分类，不输出 Key、Token、Cookie 或账号身份。
+- 便携包和安装包不再包含 `Get-UsageMonitor.ps1`，减少运行时 PowerShell 文件和后台进程开销。
+
+### 验证
+
+- Rust 完整测试、格式检查、静态检查和 Clippy 严格检查通过。
+- 使用现有本机数据进行只读真实查询，成功返回 3 个订阅账号和 5 个 API 渠道；Kimi 返回可读额度窗口，订阅记录未出现 `class=request_failure`。
+
+### 发布物
+
+- `Codex-Router-Portable-1.5.3-windows-x64.zip`
+- `Codex-Router-Installer-1.5.3-windows-x64.exe`
+
 ## 1.5.2 - 2026-08-09
 
 ### 修复

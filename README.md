@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.5.2-0969da" alt="Version 1.5.2">
+  <img src="https://img.shields.io/badge/version-1.5.4-0969da" alt="Version 1.5.4">
   <img src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078d4" alt="Windows 10/11">
   <img src="https://img.shields.io/badge/architecture-x64-555555" alt="x64">
   <img src="https://img.shields.io/badge/runtime-portable-2ea44f" alt="Portable runtime">
@@ -38,13 +38,6 @@ Codex-Router keeps the original Codex workflow while adding a unified model menu
 </p>
 
 Codex-Router is a Windows desktop router built around Sub2API and a Rust desktop console. PostgreSQL, Redis, Sub2API, the router runtime, and the required app-local VC++ runtime are included in the portable package. Services listen on the local loopback interface.
-
-### What is new in 1.5.2
-
-- Applying a configuration no longer fails merely because an active Codex connection is using the local Router. Restart protection remains active only when a real backend switch or restart is required.
-- Kimi Coding Plan usage distinguishes rejected credentials from permission and rate-limit failures, keeps bounded last-good quota data, and refreshes providers independently so one slow channel does not block the dashboard.
-- API Key replacement now reports the actual number of credentials updated. The model editor clearly separates staging a new Key from the final **Save and apply** action.
-- OAuth and API channels can remain merged for automatic subscription-first continuity or appear as separate model choices when automatic continuity is disabled.
 
 ### Why it is useful
 
@@ -108,19 +101,29 @@ The view keeps OAuth quota cards and API usage cards visible together, packs car
 
 Codex-Router can start with Windows in a lightweight tray mode without launching an additional daemon. Tray mode pauses log following, UI refresh, and high-frequency usage updates. It retains one native health check every 60 seconds and can recover the local service without opening a window after consecutive failures.
 
-The 1.5.2 runtime retains the memory and background-work optimizations. Idle tray CPU, disk, and network activity are designed to be effectively negligible; the screenshot below shows the router process at 0% CPU and 0 Mbps network activity in the tested idle state.
+The 1.5.4 runtime retains the memory and background-work optimizations. Idle tray CPU, disk, and network activity are designed to be effectively negligible; the screenshot below shows the router process at 0% CPU and 0 Mbps network activity in the tested idle state.
 
 <p align="center">
   <img src="assets/release/usage-performance.png" alt="Codex-Router idle resource usage" width="900">
 </p>
 
+### What is new in 1.5.4
+
+- Usage querying, local Sub2API reads, provider-response normalization, bounded concurrency, and last-good quota caching now run in Rust. Refreshing usage no longer starts a PowerShell process.
+- Kimi, Grok, Z.ai/GLM, MiniMax, ZenMux, Volcengine Ark, MiMo, OpenRouter, and DeepSeek continue to refresh independently, so one provider failure does not fail the dashboard.
+- Usage queries read Windows Credential Manager through references saved by the application. Keys, tokens, cookies, and account identities are not written to logs or test fixtures.
+- Model catalog generation, route planning, and OAuth/API merge-split logic now run in Rust. Codex sees the model list the GUI produces directly instead of waiting for a PowerShell helper.
+- With automatic continuity enabled, matching OAuth and API channels keep one public model ID and subscription quota is preferred. With it disabled, the API model and the subscription model marked `(OAuth)` appear separately so the user can choose the quota source.
+- Duplicate OAuth account entries and unstable public model IDs caused by the old catalog builder are resolved.
+- The 1.5.4 portable package and installer no longer contain `Get-UsageMonitor.ps1`, reducing the PowerShell runtime surface shipped to users.
+
 ## Download And First Run
 
-Download the Windows x64 package from [GitHub Releases](https://github.com/HernanJiang/Codex-Router/releases/tag/v1.5.2):
+Download the Windows x64 package from [GitHub Releases](https://github.com/HernanJiang/Codex-Router/releases/tag/v1.5.4):
 
-`Codex-Router-Portable-1.5.2-windows-x64.zip`
+`Codex-Router-Portable-1.5.4-windows-x64.zip`
 
-An optional per-user installer is also provided as `Codex-Router-Installer-1.5.2-windows-x64.exe`. It installs the same verified runtime under `%LOCALAPPDATA%\Programs\Codex-Router\1.5.2` and does not require administrator access.
+An optional per-user installer is also provided as `Codex-Router-Installer-1.5.4-windows-x64.exe`. It installs the same verified runtime under `%LOCALAPPDATA%\Programs\Codex-Router\1.5.4` and does not require administrator access.
 
 For transient pre-output stream failures such as `Upstream request failed`, the router now allows up to five same-account retries by default with a longer 1.5-second interval. The request is never replayed after visible model output has started.
 
@@ -156,6 +159,6 @@ For the full directory layout and upgrade behavior, see [THIRD_PARTY_NOTICES.md]
 
 ## Development
 
-The desktop UI is in `codex-router-gui-rust`. Runtime, routing, usage monitoring, and packaging helpers are in `scripts` and `source/backend`. The repository guide documents the supported validation commands. Do not package a live runtime directory containing user data or credentials.
+The desktop UI and usage-monitoring runtime are in `codex-router-gui-rust`. Routing and packaging helpers are in `scripts` and `source/backend`. The repository guide documents the supported validation commands. Do not package a live runtime directory containing user data or credentials.
 
 Official repository: <https://github.com/HernanJiang/Codex-Router>

@@ -425,10 +425,6 @@ if ($applySource -notmatch 'DiscoveredOAuthModelsByAccount' -or
     $applySource -notmatch '/api/v1/admin/accounts/\$oauthAccountId/models') {
     throw 'Apply-Router.ps1 does not discover implicit OAuth models with a failure-safe fallback.'
 }
-$catalogSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Build-ModelCatalog.ps1') -Raw
-if ($catalogSource -notmatch 'DiscoveredOAuthModelsByAccount') {
-    throw 'Build-ModelCatalog.ps1 does not reuse implicit OAuth discovery for stable public model IDs.'
-}
 if ($applySource -notmatch 'proxy_direct_fallback' -or
     $applySource -notmatch 'Test-RouterDirectFallbackEligible') {
     throw 'Apply-Router.ps1 does not mark verified auto-proxy channels for transport-only direct fallback.'

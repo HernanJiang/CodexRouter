@@ -20,6 +20,10 @@ use windows_sys::Win32::Security::Cryptography::{
     CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
 };
 
+pub mod catalog;
+mod usage;
+pub use catalog::*;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReasoningSpec {
     pub levels: Vec<String>,
@@ -550,14 +554,6 @@ pub fn resolve_multimodal(model: &ModelConfig) -> bool {
     }
 }
 
-fn is_non_openai_oauth_model(model: &ModelConfig) -> bool {
-    if model.source != "oauth" {
-        return false;
-    }
-    let platform = model.oauth_platform.trim().to_ascii_lowercase();
-    !platform.is_empty() && platform != "openai" && platform != "chatgpt"
-}
-
 pub fn resolve_default_model(cfg: &RouterConfig) -> Option<&str> {
     cfg.models
         .iter()
@@ -934,6 +930,7 @@ pub fn is_model_alias_customized(model: &ModelConfig) -> bool {
         .any(|candidate| normalized_display_name(candidate) == alias)
 }
 
+#[allow(dead_code)]
 pub fn resolved_model_display_name(cfg: &RouterConfig, model: &ModelConfig) -> String {
     if is_model_alias_customized(model) && !model.alias.trim().is_empty() {
         return model.alias.trim().to_owned();
@@ -1075,86 +1072,6 @@ pub fn slugify(value: &str) -> String {
     }
 }
 
-pub fn build_model_catalog(cfg: &RouterConfig) -> Vec<serde_json::Value> {
-    let mut seen_model_ids = std::collections::HashSet::new();
-    cfg.models
-        .iter()
-        .filter(|model| {
-            let mut public_id = model.model.trim().to_ascii_lowercase();
-            if public_id == "gpt-5.6" {
-                public_id = "gpt-5.6-sol".to_owned();
-            }
-            seen_model_ids.insert(public_id)
-        })
-        .enumerate()
-        .map(|(index, model)| {
-            let reasoning = resolve_reasoning(model, None);
-            let reasoning_levels: Vec<_> = reasoning
-                .levels
-                .iter()
-                .map(|effort| json!({"effort": effort, "description": format!("{} reasoning level", effort)}))
-                .collect();
-            let supports_images = resolve_multimodal(model);
-            let context_window = resolve_context_window(model);
-            let auto_compact_token_limit = resolve_auto_compact_token_limit(model);
-            let base_instructions = "You are Codex, a coding agent. Work in the user's workspace, follow the user's instructions, preserve unrelated changes, and verify completed work.";
-            let service_tiers = if reasoning.supports_fast {
-                vec![json!({
-                    "id": "priority",
-                    "name": "Fast",
-                    "description": "1.5x speed, increased usage",
-                })]
-            } else {
-                Vec::new()
-            };
-            json!({
-                "slug": model.model,
-                "display_name": resolved_model_display_name(cfg, model),
-                "description": format!("Codex-Router model #{}", index + 1),
-                "default_reasoning_level": reasoning.default_level,
-                "supported_reasoning_levels": reasoning_levels,
-                "input_modalities": if supports_images { vec!["text", "image"] } else { vec!["text"] },
-                "supports_image_detail_original": supports_images,
-                "supports_vision": supports_images,
-                "context_window": context_window,
-                "max_context_window": context_window,
-                "auto_compact_token_limit": auto_compact_token_limit,
-                "shell_type": "shell_command",
-                "visibility": "list",
-                "supported_in_api": true,
-                "priority": model.priority,
-                "additional_speed_tiers": if reasoning.supports_fast { vec!["fast"] } else { vec![] },
-                "service_tiers": service_tiers,
-                "availability_nux": null,
-                "upgrade": null,
-                "base_instructions": base_instructions,
-                "model_messages": {
-                    "instructions_template": base_instructions,
-                    "instructions_variables": null,
-                    "approvals": null,
-                    "auto_review": null,
-                    "permissions": null,
-                },
-                "include_skills_usage_instructions": false,
-                "default_reasoning_summary": "none",
-                "support_verbosity": true,
-                "default_verbosity": "low",
-                "apply_patch_tool_type": "freeform",
-            "web_search_tool_type": if is_non_openai_oauth_model(model) { serde_json::Value::Null } else { json!("text_and_image") },
-                "truncation_policy": { "mode": "tokens", "limit": 10_000 },
-                "supports_parallel_tool_calls": true,
-                "comp_hash": "codex-router-v1",
-                "effective_context_window_percent": model.auto_compact_percent,
-                "experimental_supported_tools": Vec::<String>::new(),
-            "supports_search_tool": !is_non_openai_oauth_model(model),
-                "use_responses_lite": true,
-                "tool_mode": "code_mode_only",
-                "multi_agent_version": "v2",
-            })
-        })
-        .collect()
-}
-
 /// This manifest intentionally contains credential references, never API keys.
 pub fn build_channel_manifest(cfg: &RouterConfig) -> Vec<serde_json::Value> {
     cfg.models
@@ -1200,7 +1117,7 @@ pub fn write_all_files(cfg: &RouterConfig, router_root: &Path) -> anyhow::Result
             "fetched_at": chrono::Utc::now().to_rfc3339(),
             "etag": "codex-router-local-v2",
             "client_version": env!("CARGO_PKG_VERSION"),
-            "models": build_model_catalog(cfg),
+            "models": build_model_catalog_with_root(cfg, router_root),
             }))?,
         ),
         (
@@ -2200,119 +2117,21 @@ fn load_usage_snapshot_with_timeout(
     cfg: &RouterConfig,
     timeout: Duration,
 ) -> anyhow::Result<crate::UsageSnapshot> {
-    let script = router_root.join("scripts").join("Get-UsageMonitor.ps1");
-    let state_dir = crate::user_data::data_root(router_root).join("ui");
-    std::fs::create_dir_all(&state_dir)?;
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let config_snapshot = state_dir.join(format!(
-        "usage-monitor-config-{}-{nonce}.tmp.json",
-        std::process::id(),
-    ));
-    cfg.save(&config_snapshot)?;
-    let result = (|| -> anyhow::Result<crate::UsageSnapshot> {
-        let mut last_failure = "class=unclassified_error".to_owned();
-        for attempt in 0..USAGE_MONITOR_MAX_ATTEMPTS {
-            let shell = prefer_powershell_executable();
-            let mut child = match Command::new(shell)
-                .args([
-                    "-NoLogo",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-File",
-                ])
-                .arg(&script)
-                .args(["-ProfileName", profile_name])
-                .arg("-ConfigPath")
-                .arg(&config_snapshot)
-                .current_dir(router_root)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .creation_flags(0x08000000)
-                .spawn()
-            {
-                Ok(child) => child,
-                Err(error) => {
-                    last_failure = crate::runtime_logs::summarize_error_for_display(&format!(
-                        "usage monitor process start failed: {error}"
-                    ));
-                    break;
-                }
-            };
-            let stdout = child
-                .stdout
-                .take()
-                .context("usage monitor stdout unavailable")?;
-            let stderr = child
-                .stderr
-                .take()
-                .context("usage monitor stderr unavailable")?;
-            let stdout_reader = std::thread::spawn(move || {
-                let mut bytes = Vec::new();
-                let _ = BufReader::new(stdout).read_to_end(&mut bytes);
-                bytes
-            });
-            let stderr_reader = std::thread::spawn(move || {
-                let mut bytes = Vec::new();
-                let _ = BufReader::new(stderr).read_to_end(&mut bytes);
-                bytes
-            });
-            let started = Instant::now();
-            let status = loop {
-                match child.try_wait() {
-                    Ok(Some(status)) => break Some(status),
-                    Ok(None) if started.elapsed() < timeout => {
-                        std::thread::sleep(Duration::from_millis(50));
-                    }
-                    Ok(None) => {
-                        terminate_deployment_process_tree(&mut child);
-                        last_failure = "class=timeout".to_owned();
-                        break None;
-                    }
-                    Err(error) => {
-                        terminate_deployment_process_tree(&mut child);
-                        last_failure = crate::runtime_logs::summarize_error_for_display(&format!(
-                            "usage monitor process wait failed: {error}"
-                        ));
-                        break None;
-                    }
-                }
-            };
-            let stdout = stdout_reader.join().unwrap_or_default();
-            let stderr = stderr_reader.join().unwrap_or_default();
-            let Some(status) = status else { break };
-            let output = std::process::Output {
-                status,
-                stdout,
-                stderr,
-            };
-
-            if output.status.success() {
-                match parse_usage_snapshot_output(&output.stdout) {
-                    Ok(snapshot) => return Ok(snapshot),
-                    Err(error) => last_failure = error.to_string(),
-                }
-            } else {
-                last_failure = usage_process_failure_summary(&output);
-            }
-
-            if attempt + 1 < USAGE_MONITOR_MAX_ATTEMPTS
-                && usage_failure_is_locally_retryable(&last_failure)
-            {
-                std::thread::sleep(usage_monitor_retry_delay(attempt));
-            } else {
-                break;
-            }
+    let mut last_failure = "class=unclassified_error".to_owned();
+    for attempt in 0..USAGE_MONITOR_MAX_ATTEMPTS {
+        match usage::query_usage(router_root, profile_name, cfg, Instant::now() + timeout) {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(error) => last_failure = error.to_string(),
         }
-        bail!(last_failure)
-    })();
-    let _ = std::fs::remove_file(&config_snapshot);
-    result
+        if attempt + 1 < USAGE_MONITOR_MAX_ATTEMPTS
+            && usage_failure_is_locally_retryable(&last_failure)
+        {
+            std::thread::sleep(usage_monitor_retry_delay(attempt));
+        } else {
+            break;
+        }
+    }
+    bail!(last_failure)
 }
 
 const USAGE_MONITOR_MAX_ATTEMPTS: usize = 5;
@@ -2354,42 +2173,6 @@ fn usage_failure_is_locally_retryable(summary: &str) -> bool {
     ]
     .iter()
     .any(|class| lower.contains(class))
-}
-
-fn parse_usage_snapshot_output(stdout: &[u8]) -> anyhow::Result<crate::UsageSnapshot> {
-    let text = std::str::from_utf8(stdout)
-        .map_err(|_| anyhow::anyhow!("class=invalid_response_encoding"))?;
-    let trimmed = text.trim().trim_start_matches('\u{feff}');
-    if trimmed.is_empty() || trimmed == "null" {
-        bail!("class=empty_response");
-    }
-    let json = trimmed
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|line| line.starts_with('{') && line.ends_with('}'))
-        .unwrap_or(trimmed);
-    serde_json::from_str(json).map_err(|_| anyhow::anyhow!("class=invalid_response"))
-}
-
-fn usage_process_failure_summary(output: &std::process::Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let raw = if !stderr.trim().is_empty() {
-        stderr.trim()
-    } else {
-        stdout.trim()
-    };
-    let exit_code = output.status.code().unwrap_or(-1);
-    if raw.is_empty() {
-        return format!("class=process_failure | exit_code={exit_code}");
-    }
-    let summary = crate::runtime_logs::summarize_error_for_display(raw);
-    if summary == "class=unclassified_error" {
-        format!("{summary} | exit_code={exit_code}")
-    } else {
-        summary
-    }
 }
 
 pub fn import_grok_sso(router_root: &Path, authorization: &str) -> anyhow::Result<String> {
@@ -3532,233 +3315,6 @@ Write-Output '[7/7] Deployment complete.'
             .iter()
             .all(|line| !line.contains("deployment-complete")));
         std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn usage_monitor_retries_once_after_a_transient_process_failure() {
-        let root = temporary_test_dir("usage-retry");
-        let scripts = root.join("scripts");
-        std::fs::create_dir_all(&scripts).unwrap();
-        std::fs::write(
-            scripts.join("Get-UsageMonitor.ps1"),
-            r#"param([string]$ProfileName, [string]$ConfigPath)
-$marker = Join-Path $PSScriptRoot 'attempted.marker'
-if (-not (Test-Path -LiteralPath $marker)) {
-    [IO.File]::WriteAllText($marker, 'first')
-    Write-Output 'connection refused during startup'
-    exit 1
-}
-Write-Output '{}'
-"#,
-        )
-        .unwrap();
-
-        let snapshot = load_usage_snapshot(&root, "test", &RouterConfig::default()).unwrap();
-
-        assert!(snapshot.subscriptions.is_empty());
-        assert!(scripts.join("attempted.marker").is_file());
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn usage_monitor_retries_after_a_sanitized_request_failure() {
-        let root = temporary_test_dir("usage-request-failure-retry");
-        let scripts = root.join("scripts");
-        std::fs::create_dir_all(&scripts).unwrap();
-        std::fs::write(
-            scripts.join("Get-UsageMonitor.ps1"),
-            r#"param([string]$ProfileName, [string]$ConfigPath)
-$marker = Join-Path $PSScriptRoot 'attempted.marker'
-if (-not (Test-Path -LiteralPath $marker)) {
-    [IO.File]::WriteAllText($marker, 'first')
-    Write-Output 'class=request_failure'
-    exit 1
-}
-Write-Output '{}'
-"#,
-        )
-        .unwrap();
-
-        let snapshot = load_usage_snapshot(&root, "test", &RouterConfig::default()).unwrap();
-
-        assert!(snapshot.subscriptions.is_empty());
-        assert!(scripts.join("attempted.marker").is_file());
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn usage_monitor_retries_after_a_rate_limited_admin_login() {
-        let root = temporary_test_dir("usage-admin-login-rate-limit-retry");
-        let scripts = root.join("scripts");
-        std::fs::create_dir_all(&scripts).unwrap();
-        std::fs::write(
-            scripts.join("Get-UsageMonitor.ps1"),
-            r#"param([string]$ProfileName, [string]$ConfigPath)
-$marker = Join-Path $PSScriptRoot 'attempted.marker'
-if (-not (Test-Path -LiteralPath $marker)) {
-    [IO.File]::WriteAllText($marker, 'first')
-    Write-Output 'Sub2API admin login is rate-limited. Wait a few seconds and retry.'
-    exit 1
-}
-Write-Output '{}'
-"#,
-        )
-        .unwrap();
-
-        let snapshot = load_usage_snapshot(&root, "test", &RouterConfig::default()).unwrap();
-
-        assert!(snapshot.subscriptions.is_empty());
-        assert!(scripts.join("attempted.marker").is_file());
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn usage_monitor_retry_budget_is_five_attempts_with_increasing_backoff() {
-        assert_eq!(USAGE_MONITOR_MAX_ATTEMPTS, 5);
-        assert!(usage_monitor_retry_delay(0) < usage_monitor_retry_delay(1));
-        assert!(usage_monitor_retry_delay(1) < usage_monitor_retry_delay(2));
-        assert!(usage_monitor_retry_delay(2) < usage_monitor_retry_delay(3));
-        assert_eq!(usage_monitor_retry_delay(4), usage_monitor_retry_delay(3));
-        assert!(usage_failure_is_locally_retryable("class=authentication"));
-        assert!(usage_failure_is_locally_retryable("class=rate_limit"));
-        assert!(usage_failure_is_locally_retryable(
-            "class=unclassified_error | exit_code=1"
-        ));
-        assert!(!usage_failure_is_locally_retryable("class=configuration"));
-        assert!(!usage_failure_is_locally_retryable("class=permission"));
-    }
-
-    #[test]
-    fn usage_monitor_does_not_repeat_a_configuration_failure() {
-        let root = temporary_test_dir("usage-config-no-retry");
-        let scripts = root.join("scripts");
-        std::fs::create_dir_all(&scripts).unwrap();
-        std::fs::write(
-            scripts.join("Get-UsageMonitor.ps1"),
-            r#"$attemptPath = Join-Path $PSScriptRoot 'attempt-count.txt'
-$attempt = if (Test-Path -LiteralPath $attemptPath) { [int](Get-Content -LiteralPath $attemptPath -Raw) } else { 0 }
-[IO.File]::WriteAllText($attemptPath, [string]($attempt + 1))
-Write-Output 'configuration snapshot unavailable'
-exit 1
-"#,
-        )
-        .unwrap();
-
-        let error = load_usage_snapshot(&root, "test", &RouterConfig::default())
-            .unwrap_err()
-            .to_string();
-
-        assert_eq!(error, "class=configuration");
-        assert_eq!(
-            std::fs::read_to_string(scripts.join("attempt-count.txt")).unwrap(),
-            "1"
-        );
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    #[allow(clippy::permissions_set_readonly_false)]
-    fn usage_monitor_uses_a_unique_snapshot_when_a_stale_process_file_exists() {
-        let root = temporary_test_dir("usage-unique-snapshot");
-        let scripts = root.join("scripts");
-        let state = root.join("data").join("ui");
-        std::fs::create_dir_all(&scripts).unwrap();
-        std::fs::create_dir_all(&state).unwrap();
-        std::fs::write(scripts.join("Get-UsageMonitor.ps1"), "Write-Output '{}'\n").unwrap();
-        let stale = state.join(format!(
-            "usage-monitor-config-{}.tmp.json",
-            std::process::id()
-        ));
-        std::fs::write(&stale, "stale").unwrap();
-        let mut permissions = std::fs::metadata(&stale).unwrap().permissions();
-        permissions.set_readonly(true);
-        std::fs::set_permissions(&stale, permissions).unwrap();
-
-        let snapshot = load_usage_snapshot(&root, "test", &RouterConfig::default()).unwrap();
-
-        assert!(snapshot.subscriptions.is_empty());
-        assert_eq!(std::fs::read_to_string(&stale).unwrap(), "stale");
-        let mut permissions = std::fs::metadata(&stale).unwrap().permissions();
-        permissions.set_readonly(false);
-        std::fs::set_permissions(&stale, permissions).unwrap();
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn usage_monitor_uses_stdout_when_stderr_is_empty() {
-        let root = temporary_test_dir("usage-stdout-error");
-        let scripts = root.join("scripts");
-        std::fs::create_dir_all(&scripts).unwrap();
-        std::fs::write(
-            scripts.join("Get-UsageMonitor.ps1"),
-            "Write-Output 'connection refused during startup'\nexit 1\n",
-        )
-        .unwrap();
-
-        let error = load_usage_snapshot(&root, "test", &RouterConfig::default())
-            .unwrap_err()
-            .to_string();
-
-        assert_eq!(error, "class=connection_refused");
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn usage_monitor_reports_an_exit_code_when_process_output_is_empty() {
-        let root = temporary_test_dir("usage-empty-error");
-        let scripts = root.join("scripts");
-        std::fs::create_dir_all(&scripts).unwrap();
-        std::fs::write(scripts.join("Get-UsageMonitor.ps1"), "exit 7\n").unwrap();
-
-        let error = load_usage_snapshot(&root, "test", &RouterConfig::default())
-            .unwrap_err()
-            .to_string();
-
-        assert_eq!(error, "class=process_failure | exit_code=7");
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn usage_monitor_times_out_and_terminates_the_helper() {
-        let root = temporary_test_dir("usage-timeout");
-        let scripts = root.join("scripts");
-        std::fs::create_dir_all(&scripts).unwrap();
-        std::fs::write(
-            scripts.join("Get-UsageMonitor.ps1"),
-            "Start-Sleep -Seconds 30\nWrite-Output '{}'\n",
-        )
-        .unwrap();
-
-        let started = Instant::now();
-        let error = load_usage_snapshot_with_timeout(
-            &root,
-            "test",
-            &RouterConfig::default(),
-            Duration::from_millis(250),
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert_eq!(error, "class=timeout");
-        assert!(started.elapsed() < Duration::from_secs(5));
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn usage_monitor_parser_accepts_utf8_names_and_ignores_prefix_noise() {
-        let output = "warning: cached data follows\n{\"profileName\":\"中文配置\",\"subscriptions\":[],\"apiChannels\":[]}\n";
-        let snapshot = parse_usage_snapshot_output(output.as_bytes()).unwrap();
-        assert_eq!(snapshot.profile_name, "中文配置");
-        assert!(snapshot.subscriptions.is_empty());
-        assert!(snapshot.api_channels.is_empty());
-    }
-
-    #[test]
-    fn usage_monitor_parser_classifies_non_utf8_output() {
-        let error = parse_usage_snapshot_output(&[0x81, 0x40])
-            .unwrap_err()
-            .to_string();
-        assert_eq!(error, "class=invalid_response_encoding");
     }
 
     #[test]

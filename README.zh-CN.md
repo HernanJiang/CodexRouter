@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.5.2-0969da" alt="版本 1.5.2">
+  <img src="https://img.shields.io/badge/version-1.5.4-0969da" alt="版本 1.5.4">
   <img src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078d4" alt="Windows 10/11">
   <img src="https://img.shields.io/badge/architecture-x64-555555" alt="x64">
   <img src="https://img.shields.io/badge/runtime-portable-2ea44f" alt="便携运行">
@@ -38,13 +38,6 @@ Codex-Router 保留 Codex 原有工作方式，同时通过一个模型菜单接
 </p>
 
 Codex-Router 是基于 Sub2API 和 Rust 桌面控制台的 Windows 本地路由器。便携包内置 PostgreSQL、Redis、Sub2API、Router 运行时以及 app-local VC++ Runtime，服务默认只监听本机回环地址。
-
-### 1.5.2 更新重点
-
-- 保存配置时不会再仅因 Codex 正在使用本机 Router 而失败；只有实际需要切换或重启后端时才会启用连接中断保护。
-- Kimi Coding Plan 用量查询会区分凭据拒绝、权限不足与限流，保留有时效边界的最近成功额度；各服务商独立刷新，单个慢渠道不会阻塞整个面板。
-- API Key 覆写会报告实际更新的凭据数量；模型编辑器明确区分“暂存新 Key”和最终“保存并应用”。
-- 自动接续开启时继续优先使用订阅额度；关闭时 OAuth 与同名第三方 API 会作为独立模型显示，由用户手动选择额度来源。
 
 ### 适合解决的问题
 
@@ -108,19 +101,29 @@ Codex-Router 可以将 OAuth 和 API 渠道合并为 Codex 可见的模型目录
 
 Codex-Router 可以在 Windows 登录后直接进入轻量托盘模式，不启动额外守护进程。托盘模式暂停日志跟随、界面刷新和高频用量更新，只保留每 60 秒一次的原生健康检查，以及连续失败后的无窗口恢复。
 
-1.5.2 同时保留了内存和后台任务优化。空闲托盘状态下的 CPU、磁盘和网络活动设计为几乎可以忽略；下图展示了测试环境中 Codex-Router 进程处于 0% CPU、0 Mbps 网络占用的空闲状态。
+1.5.4 同时保留了内存和后台任务优化。空闲托盘状态下的 CPU、磁盘和网络活动设计为几乎可以忽略；下图展示了测试环境中 Codex-Router 进程处于 0% CPU、0 Mbps 网络占用的空闲状态。
 
 <p align="center">
   <img src="assets/release/usage-performance.png" alt="Codex-Router 空闲资源占用" width="900">
 </p>
 
+### 1.5.4 更新重点
+
+- 用量查询、本机 Sub2API 读取、服务商响应归一化、有界并发和最近成功额度缓存已迁移到 Rust，刷新用量时不再启动 PowerShell 进程。
+- Kimi、Grok、Z.ai/GLM、MiniMax、ZenMux、火山方舟、MiMo、OpenRouter 和 DeepSeek 继续独立刷新；单个服务商失败不会使整个面板失败。
+- 用量查询直接按软件配置中的引用读取 Windows Credential Manager，Key、Token、Cookie 和账号身份不会进入日志或测试夹具。
+- 模型目录生成、路由规划和 OAuth/API 合并拆分逻辑已迁移到 Rust；Codex 看到的模型列表由 GUI 直接生成，不再依赖 PowerShell 脚本。
+- 开启自动连续时，匹配的 OAuth 和 API 渠道共用同一个公开模型 ID 并优先使用订阅额度；关闭时，API 模型和带 `(OAuth)` 后缀的订阅模型会分开显示，方便手动选择额度来源。
+- 修复了旧目录生成器导致的重复 OAuth 账号条目和不稳定的公开模型 ID。
+- 1.5.4 便携包和安装包不再包含 `Get-UsageMonitor.ps1`，减少最终用户运行时中的 PowerShell 文件。
+
 ## 下载与首次启动
 
-前往 [GitHub Releases](https://github.com/HernanJiang/Codex-Router/releases/tag/v1.5.2) 下载 Windows x64 版本：
+前往 [GitHub Releases](https://github.com/HernanJiang/Codex-Router/releases/tag/v1.5.4) 下载 Windows x64 版本：
 
-`Codex-Router-Portable-1.5.2-windows-x64.zip`
+`Codex-Router-Portable-1.5.4-windows-x64.zip`
 
-同时提供可选的用户级安装器：`Codex-Router-Installer-1.5.2-windows-x64.exe`。它会把同一份已验收运行时安装到 `%LOCALAPPDATA%\Programs\Codex-Router\1.5.2`，不需要管理员权限。
+同时提供可选的用户级安装器：`Codex-Router-Installer-1.5.4-windows-x64.exe`。它会把同一份已验收运行时安装到 `%LOCALAPPDATA%\Programs\Codex-Router\1.5.4`，不需要管理员权限。
 
 对于 `Upstream request failed` 这类尚未向客户端输出内容的瞬时流错误，Router 默认允许同一账号最多重试 5 次，每次间隔 1.5 秒。已经开始输出模型内容后不会重复回放请求。
 

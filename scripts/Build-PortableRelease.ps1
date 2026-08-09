@@ -31,7 +31,6 @@ $utf8NoBom = [Text.UTF8Encoding]::new($false)
 $runtimeScripts = @(
     'apply-codex-router.ps1',
     'Apply-Router.ps1',
-    'Build-ModelCatalog.ps1',
     'CodexIntegration.psm1',
     'Copy-AdminPassword.ps1',
     'Copy-LocalApiKey.ps1',
@@ -42,7 +41,6 @@ $runtimeScripts = @(
     'Get-LocalApiKey.ps1',
     'Get-OAuthAccounts.ps1',
     'Get-RouterStatus.ps1',
-    'Get-UsageMonitor.ps1',
     'GitHub-Update.ps1',
     'Import-GrokSSO.ps1',
     'Initialize-Router.ps1',

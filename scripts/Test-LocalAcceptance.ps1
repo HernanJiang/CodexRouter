@@ -416,15 +416,13 @@ try {
             }
         }
         foreach ($testName in @(
-            'Test-BuildModelCatalog.ps1',
             'Test-CodexIntegration.ps1',
             'Test-CredentialStore.ps1',
             'Test-OAuthRouting.ps1',
             'Test-OpenAIChannelPolicy.ps1',
             'Test-ManagedProxy.ps1',
             'Test-ProxyDiscovery.ps1',
-            'Test-RouterBaseUri.ps1',
-            'Test-UsageMonitorParsing.ps1'
+            'Test-RouterBaseUri.ps1'
         )) {
             $testPath = Join-Path $PSScriptRoot $testName
             Invoke-AcceptanceCheck -Name ('powershell-' + [IO.Path]::GetFileNameWithoutExtension($testName).ToLowerInvariant()) -Action {
