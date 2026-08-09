@@ -77,8 +77,15 @@ if (-not $SkipAcceptance) {
     if ($LASTEXITCODE -ne 0) { throw 'Final release acceptance failed.' }
 }
 
-$existingRelease = gh release view $tag --repo $repository --json tagName,targetCommitish 2>$null
-if ($LASTEXITCODE -eq 0) {
+$previousErrorActionPreference = $ErrorActionPreference
+try {
+    $ErrorActionPreference = 'Continue'
+    $existingRelease = gh release view $tag --repo $repository --json tagName,targetCommitish 2>$null
+    $releaseViewExitCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+}
+if ($releaseViewExitCode -eq 0) {
     $release = $existingRelease | ConvertFrom-Json
     if ([string]$release.tagName -ne $tag) { throw 'GitHub returned an unexpected release tag.' }
     gh release upload $tag @assetPaths --repo $repository --clobber
