@@ -6,15 +6,15 @@ Codex-Router combines original project material with independent third-party sof
 
 - Project: Sub2API
 - Upstream: https://github.com/Wei-Shaw/sub2api
-- Bundled release: v0.1.170-codex-router.2
-- Upstream release source and binaries: https://github.com/Wei-Shaw/sub2api/releases/tag/v0.1.170
-- Codex-Router compatibility patch: `licenses/sub2api-0.1.170-codex-router.2.patch`
+- Bundled release: v0.1.170-codex-router.6
+- Upstream source commit: https://github.com/Wei-Shaw/sub2api/commit/c043c24774228ba891ddf90d783aa6dc7d0855b5
+- Codex-Router compatibility patch series (apply in order): `licenses/sub2api-0.1.170-codex-router.2.patch`, `licenses/sub2api-0.1.170-codex-router.3.patch`, `licenses/sub2api-0.1.170-codex-router.4.patch`, `licenses/sub2api-0.1.170-codex-router.5.patch`, and `licenses/sub2api-0.1.170-codex-router.6.patch`
 - License: GNU Lesser General Public License v3.0 or later
-- License text: https://github.com/Wei-Shaw/sub2api/blob/v0.1.170/LICENSE
+- License text: https://github.com/Wei-Shaw/sub2api/blob/c043c24774228ba891ddf90d783aa6dc7d0855b5/LICENSE
 - Deployment and operations commitment: https://github.com/Wei-Shaw/sub2api/blob/main/docs/legal/admin-compliance.zh.md
 - Upstream copyright and contributor notices remain with the upstream project.
 
-The bundled executable is built from the upstream v0.1.170 source with the documented Codex-Router compatibility patch. Recipients may exercise the rights granted by Sub2API's upstream license with respect to Sub2API itself. Restrictions in Codex-Router's license apply to original Codex-Router material and the Codex-Router combination/distribution, not to independently obtained upstream Sub2API code.
+The bundled executable is built from upstream commit `c043c24774228ba891ddf90d783aa6dc7d0855b5` with the documented Codex-Router compatibility patch series applied in order. The series is verified with `git apply --check` against that exact commit. Recipients may exercise the rights granted by Sub2API's upstream license with respect to Sub2API itself. Restrictions in Codex-Router's license apply to original Codex-Router material and the Codex-Router combination/distribution, not to independently obtained upstream Sub2API code.
 
 ## PostgreSQL
 

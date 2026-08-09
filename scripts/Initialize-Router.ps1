@@ -78,16 +78,34 @@ if (-not (Test-Path -LiteralPath (Join-Path $dataRoot 'redis'))) {
 $aclMarker = Join-Path $dataRoot '.acl-protected-v2'
 if (-not (Test-Path -LiteralPath $aclMarker)) {
     if (Test-RouterPathAclSupport -Path $userDataRoot) {
-        # The autostart shortcut executes scripts from this directory. Protect
-        # the package root against replacement by another local account.
-        if (Test-RouterPathAclSupport -Path $routerRoot) {
-            Protect-RouterPathAcl -Path $routerRoot
-        }
-        foreach ($resolved in @($dataRoot, (Join-Path $userDataRoot 'backups'), (Join-Path $routerRoot 'logs'))) {
-            if (Test-Path -LiteralPath $resolved) {
+        # Stable user data contains the local database and OAuth material, so
+        # ACL hardening here is part of successful initialization.
+        foreach ($resolved in @($dataRoot, (Join-Path $userDataRoot 'backups'))) {
+            if (-not (Test-Path -LiteralPath $resolved)) { continue }
+            try {
                 Protect-RouterPathAcl -Path $resolved -Recurse
+            } catch {
+                # ACL hardening must never block first-run Router startup. Secrets
+                # remain in Windows Credential Manager even if NTFS ACLs cannot be
+                # applied on this machine/PowerShell host.
+                Write-Warning ("ROUTER_USERDATA_ACL_SKIPPED: Could not harden '{0}': {1}" -f $resolved, $_.Exception.Message)
             }
         }
+
+        # Package directories may be read-only or inherit ACLs the current
+        # user cannot replace. Their hardening is useful, but must not prevent
+        # a portable build from starting on an otherwise supported machine.
+        foreach ($resolved in @($routerRoot, (Join-Path $routerRoot 'logs'))) {
+            if (-not (Test-Path -LiteralPath $resolved)) { continue }
+            try {
+                if (Test-RouterPathAclSupport -Path $resolved) {
+                    Protect-RouterPathAcl -Path $resolved -Recurse
+                }
+            } catch {
+                Write-Warning ("ROUTER_PACKAGE_ACL_SKIPPED: Could not harden '{0}': {1}" -f $resolved, $_.Exception.Message)
+            }
+        }
+
         $markerBytes = [Text.Encoding]::ASCII.GetBytes('current-user-only')
         try { Write-RouterFileAtomic -Path $aclMarker -Bytes $markerBytes }
         finally { [Array]::Clear($markerBytes, 0, $markerBytes.Length) }

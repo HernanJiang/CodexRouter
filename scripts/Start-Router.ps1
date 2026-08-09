@@ -73,6 +73,7 @@ function Invoke-PostgresScalar {
     param(
         [Parameter(Mandatory)][string]$Query,
         [Parameter(Mandatory)][string]$Password,
+        [string]$Database = 'postgres',
         [ValidateRange(1, 30)][int]$TimeoutSeconds = 10
     )
 
@@ -80,7 +81,7 @@ function Invoke-PostgresScalar {
     $startInfo.FileName = "$routerRoot\postgres\pgsql\bin\psql.exe"
     $quotedArguments = @(
         '-X', '-w', '-h', '127.0.0.1', '-p', '15432',
-        '-U', 'sub2api', '-d', 'postgres', '-tAc', $Query
+        '-U', 'sub2api', '-d', $Database, '-tAc', $Query
     ) | ForEach-Object {
         ConvertTo-WindowsCommandLineArgument -Argument ([string]$_)
     }
@@ -145,6 +146,20 @@ function Get-VerifiedLoopbackListener {
         if ([IO.Path]::GetFileName($actual).Equals(
             [IO.Path]::GetFileName($expected),
             [StringComparison]::OrdinalIgnoreCase)) {
+            if ($RepairUnhealthy) {
+                # A previous portable folder left services running. Take ownership
+                # so upgrades do not leave the GUI talking to a foreign Sub2API.
+                Write-Warning "ROUTER_INSTALL_ROOT_REPAIR: stopping foreign $ServiceName from $actual"
+                try {
+                    Stop-Process -Id ([int]$process.ProcessId) -Force -ErrorAction Stop
+                    Wait-Process -Id ([int]$process.ProcessId) -Timeout 8 -ErrorAction SilentlyContinue
+                } catch {
+                    throw "ROUTER_INSTALL_ROOT_CONFLICT: Could not stop foreign $ServiceName PID $($process.ProcessId): $($_.Exception.Message)"
+                }
+                Start-Sleep -Milliseconds 400
+                # Treat the port as free so the caller can start this package's binary.
+                return $null
+            }
             throw "ROUTER_INSTALL_ROOT_CONFLICT: $ServiceName port $Port is owned by another Codex-Router installation."
         }
         throw "ROUTER_PORT_CONFLICT: $ServiceName port $Port is owned by another program."
@@ -268,6 +283,19 @@ function Get-RedisPing([string]$Password) {
     } finally {
         $process.Dispose()
     }
+}
+
+function Wait-RedisAuthenticatedPing {
+    param(
+        [Parameter(Mandatory)][string]$Password,
+        [ValidateRange(1, 60)][int]$TimeoutSeconds = 30
+    )
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        if ((Get-RedisPing -Password $Password) -eq 'PONG') { return $true }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $deadline)
+    return $false
 }
 
 function Get-NetworkSettingsFingerprint {
@@ -554,11 +582,56 @@ if (-not $postgresRunning) {
         -ServiceName 'PostgreSQL' `
         -AllowMissing
     if ($null -ne $unexpectedPostgres) {
-        throw 'PostgreSQL is listening from this package but is not using the expected data directory.'
+        if (-not $RepairUnhealthy) {
+            throw 'PostgreSQL is listening from this package but is not using the expected data directory.'
+        }
+        Write-Warning 'ROUTER_POSTGRES_DATADIR_REPAIR: stopping package PostgreSQL that is not using the expected data directory.'
+        $pgStopExitCode = Invoke-NativeQuiet `
+            -FilePath $pgCtl `
+            -ArgumentList @('stop', '-D', $pgData, '-s', '-m', 'fast', '-w', '-t', '15')
+        if ($pgStopExitCode -ne 0) {
+            Stop-VerifiedPostgresTree `
+                -MainProcessId ([int]$unexpectedPostgres.ProcessId) `
+                -ExpectedPath $postgresExe
+        }
+        Start-Sleep -Milliseconds 500
+        $stillListening = Get-VerifiedLoopbackListener `
+            -Port 15432 `
+            -ExpectedPath $postgresExe `
+            -ServiceName 'PostgreSQL' `
+            -AllowMissing
+        if ($null -ne $stillListening) {
+            throw 'PostgreSQL remained listening after data-directory repair.'
+        }
     }
-    $pgStartExitCode = Invoke-NativeQuiet `
-        -FilePath $pgCtl `
-        -ArgumentList @('start', '-D', $pgData, '-s', '-w', '-t', '60', '-l', "$routerRoot\logs\postgres.log", '-o', "-c config_file=$pgConfig")
+    # Stale postmaster.pid after a hard kill makes pg_ctl status report "no server"
+    # while also blocking a clean start.
+    $postmasterPidFile = Join-Path $pgData 'postmaster.pid'
+    if (Test-Path -LiteralPath $postmasterPidFile) {
+        $stalePid = 0
+        try {
+            $firstLine = @(Get-Content -LiteralPath $postmasterPidFile -TotalCount 1)[0]
+            [void][int]::TryParse(([string]$firstLine).Trim(), [ref]$stalePid)
+        } catch {
+            $stalePid = 0
+        }
+        if ($stalePid -le 0 -or -not (Get-Process -Id $stalePid -ErrorAction SilentlyContinue)) {
+            Remove-Item -LiteralPath $postmasterPidFile -Force -ErrorAction SilentlyContinue
+        }
+    }
+    [IO.Directory]::CreateDirectory((Join-Path $routerRoot 'logs')) | Out-Null
+    $pgBin = Join-Path $routerRoot 'postgres\pgsql\bin'
+    $previousPath = [Environment]::GetEnvironmentVariable('PATH', 'Process')
+    try {
+        if ($previousPath -notlike "*${pgBin}*") {
+            [Environment]::SetEnvironmentVariable('PATH', ($pgBin + ';' + $previousPath), 'Process')
+        }
+        $pgStartExitCode = Invoke-NativeQuiet `
+            -FilePath $pgCtl `
+            -ArgumentList @('start', '-D', $pgData, '-s', '-w', '-t', '60', '-l', "$routerRoot\logs\postgres.log", '-o', "-c config_file=$pgConfig")
+    } finally {
+        [Environment]::SetEnvironmentVariable('PATH', $previousPath, 'Process')
+    }
     if ($pgStartExitCode -ne 0) { throw "PostgreSQL failed to start with exit code $pgStartExitCode" }
 }
 if (-not (Test-PostgresReadyStable -Password $pgPassword)) {
@@ -596,39 +669,74 @@ if ($authenticatedPing -ne 'PONG') {
     $anonymousPing = Get-RedisPing -Password ''
     if ($anonymousPing -ne 'PONG') {
         if (Wait-TcpPort -Port 16379 -TimeoutSeconds 1) {
-            throw 'Redis is running with an unknown password. Stop the verified local Redis process before restarting the router.'
+            # Redis opens its listener before persisted AOF/RDB data is fully
+            # loaded. Wait for the password already staged in redis.conf before
+            # treating the process as a foreign instance with an unknown key.
+            if (-not (Wait-RedisAuthenticatedPing -Password $redisPassword -TimeoutSeconds 30)) {
+                throw 'Redis is running with an unknown password. Stop the verified local Redis process before restarting the router.'
+            }
+        } else {
+            # Bake requirepass into the runtime config so Redis never accepts
+            # unauthenticated clients during startup.
+            $redisConfigText = [IO.File]::ReadAllText($redisConfig)
+            if ($redisConfigText -notmatch '(?m)^\s*requirepass\s+') {
+                $redisConfigText = $redisConfigText.TrimEnd() + "`nrequirepass $redisPassword`n"
+            } else {
+                $redisConfigText = [regex]::Replace(
+                    $redisConfigText,
+                    '(?m)^\s*requirepass\s+\S+\s*$',
+                    "requirepass $redisPassword")
+            }
+            Write-RouterFileAtomic `
+                -Path $redisRuntimeConfig `
+                -Bytes ([Text.Encoding]::UTF8.GetBytes($redisConfigText))
+            $redisProcess = Start-Process `
+                -FilePath $redisServer `
+                -ArgumentList @('redis.conf') `
+                -WorkingDirectory (Join-Path $dataRoot 'redis') `
+                -WindowStyle Hidden `
+                -RedirectStandardOutput "$routerRoot\logs\redis-stdout.log" `
+                -RedirectStandardError "$routerRoot\logs\redis-stderr.log" `
+                -PassThru
+            $redisStarted = $false
+            $redisDeadline = [DateTime]::UtcNow.AddSeconds(30)
+            do {
+                $redisProcess.Refresh()
+                if ($redisProcess.HasExited) {
+                    throw "Redis exited before listening on port 16379 (exit code $($redisProcess.ExitCode))."
+                }
+                if (Wait-TcpPort -Port 16379 -TimeoutSeconds 1) {
+                    $redisStarted = $true
+                    break
+                }
+            } while ([DateTime]::UtcNow -lt $redisDeadline)
+            if (-not $redisStarted) { throw 'Redis failed to listen on port 16379.' }
+            Write-RouterFileAtomic `
+                -Path (Join-Path $dataRoot 'pids\redis.pid') `
+                -Bytes ([Text.Encoding]::ASCII.GetBytes([string]$redisProcess.Id))
+            if (-not (Wait-RedisAuthenticatedPing -Password $redisPassword -TimeoutSeconds 30)) {
+                throw 'Redis did not become ready with the configured authentication after startup.'
+            }
         }
-        Write-RouterFileAtomic `
-            -Path $redisRuntimeConfig `
-            -Bytes ([IO.File]::ReadAllBytes($redisConfig))
-        $redisProcess = Start-Process `
-            -FilePath $redisServer `
-            -ArgumentList @('redis.conf') `
-            -WorkingDirectory (Join-Path $dataRoot 'redis') `
-            -WindowStyle Hidden `
-            -RedirectStandardOutput "$routerRoot\logs\redis-stdout.log" `
-            -RedirectStandardError "$routerRoot\logs\redis-stderr.log" `
-            -PassThru
-        $redisStarted = $false
-        $redisDeadline = [DateTime]::UtcNow.AddSeconds(30)
-        do {
-            $redisProcess.Refresh()
-            if ($redisProcess.HasExited) {
-                throw "Redis exited before listening on port 16379 (exit code $($redisProcess.ExitCode))."
-            }
-            if (Wait-TcpPort -Port 16379 -TimeoutSeconds 1) {
-                $redisStarted = $true
-                break
-            }
-        } while ([DateTime]::UtcNow -lt $redisDeadline)
-        if (-not $redisStarted) { throw 'Redis failed to listen on port 16379.' }
-        Write-RouterFileAtomic `
-            -Path (Join-Path $dataRoot 'pids\redis.pid') `
-            -Bytes ([Text.Encoding]::ASCII.GetBytes([string]$redisProcess.Id))
+    } else {
+        # An already-running unauthenticated Redis still needs the password.
+        Set-RedisRequirePass -Password $redisPassword
+        if (-not (Wait-RedisAuthenticatedPing -Password $redisPassword -TimeoutSeconds 5)) {
+            throw 'Redis authentication check failed.'
+        }
     }
-    Set-RedisRequirePass -Password $redisPassword
-    $authenticatedPing = Get-RedisPing -Password $redisPassword
-    if ($authenticatedPing -ne 'PONG') { throw 'Redis authentication check failed.' }
+}
+
+function Test-Sub2ApiDatabaseReady {
+    param([Parameter(Mandatory)][string]$Password)
+    $probe = Invoke-PostgresScalar `
+        -Database 'sub2api' `
+        -Query "SELECT COUNT(*) FROM users WHERE role = 'admin' AND status = 'active'" `
+        -Password $Password `
+        -TimeoutSeconds 8
+    if (-not $probe.Succeeded) { return $false }
+    $count = 0L
+    return [long]::TryParse($probe.Output, [ref]$count) -and $count -gt 0
 }
 [void](Get-VerifiedLoopbackListener `
     -Port 16379 `
@@ -754,6 +862,7 @@ do {
     }
     if ((Test-Sub2ApiHealth -Uri "$sub2apiBaseUri/health") -and
         (Test-PostgresReadyStable -Password $pgPassword) -and
+        (Test-Sub2ApiDatabaseReady -Password $pgPassword) -and
         (Get-RedisPing -Password $redisPassword) -eq 'PONG') {
         $sub2apiReady = $true
         break
@@ -762,7 +871,7 @@ do {
 } while ([DateTime]::UtcNow -lt $deadline)
 
 if (-not $sub2apiReady) {
-    throw 'Sub2API or one of its authenticated dependencies did not become ready within 120 seconds.'
+    throw 'Sub2API or one of its authenticated dependencies did not become ready within 120 seconds. The application database must contain a readable active administrator; use the explicit repair flow if the data directory is incomplete.'
 }
 
 [void](Get-VerifiedLoopbackListener `

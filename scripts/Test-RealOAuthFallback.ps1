@@ -1,6 +1,12 @@
 param(
     [string]$Model = 'gpt-5.6-sol',
     [long]$OAuthAccountId = 0,
+    [ValidateSet('/v1/responses', '/v1/chat/completions')]
+    [string]$ExpectedUpstreamEndpoint = '/v1/responses',
+    [ValidateSet('function', 'custom')]
+    [string]$ToolType = 'function',
+    [ValidateRange(64, 4096)]
+    [int]$MaxOutputTokens = 128,
     [switch]$ExerciseOAuth429
 )
 
@@ -11,8 +17,9 @@ $ProgressPreference = 'SilentlyContinue'
 $routerRoot = Split-Path -Parent $PSScriptRoot
 Import-Module (Join-Path $PSScriptRoot 'CredentialStore.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'RouterAdmin.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'UserData.psm1') -Force
 
-if ($Model -notmatch '^[A-Za-z0-9._:/-]{1,160}$') {
+if ($Model -notmatch '^[A-Za-z0-9._:/~-]{1,160}$') {
     throw 'Model contains unsupported characters.'
 }
 
@@ -83,7 +90,8 @@ function Invoke-RouterSseRequest {
             }
             if ($eventType -eq 'response.completed') { $sawCompleted = $true }
             $itemProperty = $event.PSObject.Properties['item']
-            if ($null -ne $itemProperty -and [string]$itemProperty.Value.type -eq 'function_call') {
+            if ($null -ne $itemProperty -and
+                [string]$itemProperty.Value.type -in @('function_call', 'custom_tool_call')) {
                 $toolCall = $itemProperty.Value
             }
         }
@@ -132,7 +140,7 @@ $testStartedAt = [DateTimeOffset]::UtcNow
 try {
     $accounts = @(Get-RouterAccounts -Session $session)
     if ($OAuthAccountId -le 0) {
-        $configured = Get-Content -LiteralPath (Join-Path $routerRoot 'codex-router-config.json') -Raw | ConvertFrom-Json
+        $configured = Get-Content -LiteralPath (Get-RouterConfigPath -RouterRoot $routerRoot) -Raw | ConvertFrom-Json
         $OAuthAccountId = @($configured.oauthAccountIds | ForEach-Object { [long]$_ }) | Select-Object -First 1
     }
     if ($OAuthAccountId -le 0) { throw 'No selected OAuth account is available for the fallback test.' }
@@ -156,19 +164,33 @@ try {
             -Body @{})
     }
 
-    $tool = [ordered]@{
-        type = 'function'
-        name = 'lookup_test_value'
-        description = 'Return the deterministic test value for a key.'
-        parameters = [ordered]@{
-            type = 'object'
-            properties = [ordered]@{ key = [ordered]@{ type = 'string' } }
-            required = @('key')
-            additionalProperties = $false
+    $toolName = if ($ToolType -eq 'custom') { 'run_test_command' } else { 'lookup_test_value' }
+    $tool = if ($ToolType -eq 'custom') {
+        [ordered]@{
+            type = 'custom'
+            name = $toolName
+            description = 'Run the deterministic test command.'
+            format = [ordered]@{ type = 'text' }
+        }
+    } else {
+        [ordered]@{
+            type = 'function'
+            name = $toolName
+            description = 'Return the deterministic test value for a key.'
+            parameters = [ordered]@{
+                type = 'object'
+                properties = [ordered]@{ key = [ordered]@{ type = 'string' } }
+                required = @('key')
+                additionalProperties = $false
+            }
         }
     }
     $testRunId = [Guid]::NewGuid().ToString('N')
-    $prompt = "Call lookup_test_value with key alpha. After its result arrives, reply exactly TOOL_OK. Test run: $testRunId"
+    $prompt = if ($ToolType -eq 'custom') {
+        "Call run_test_command with raw input alpha. After its result arrives, reply exactly TOOL_OK. Test run: $testRunId"
+    } else {
+        "Call lookup_test_value with key alpha. After its result arrives, reply exactly TOOL_OK. Test run: $testRunId"
+    }
     $first = Invoke-RouterSseRequest `
         -BaseUri (Get-RouterBaseUri) `
         -ApiKey $localApiKey `
@@ -176,27 +198,47 @@ try {
             model = $Model
             input = $prompt
             tools = @($tool)
-            tool_choice = [ordered]@{ type = 'function'; name = 'lookup_test_value' }
+            tool_choice = [ordered]@{ type = $ToolType; name = $toolName }
             parallel_tool_calls = $true
             reasoning = [ordered]@{ effort = 'high'; summary = 'auto' }
             include = @('reasoning.encrypted_content')
             prompt_cache_key = $testRunId
             store = $false
             stream = $true
-            max_output_tokens = 128
+            max_output_tokens = $MaxOutputTokens
         })
     # Native Responses streams terminate after response.completed and may omit
     # the Chat Completions-style data: [DONE] sentinel.
     if (-not $first.SawCompleted) {
         throw 'The fallback tool-call stream did not complete cleanly.'
     }
-    if ($null -eq $first.ToolCall -or [string]$first.ToolCall.name -ne 'lookup_test_value') {
-        throw 'The fallback stream did not return the expected function call.'
+    if ($null -eq $first.ToolCall -or [string]$first.ToolCall.name -ne $toolName) {
+        throw "The fallback stream did not return the expected $ToolType tool call."
     }
     $callId = [string]$first.ToolCall.call_id
     if ([string]::IsNullOrWhiteSpace($callId)) { $callId = [string]$first.ToolCall.id }
     if ([string]::IsNullOrWhiteSpace($callId)) { throw 'The fallback tool call did not include a call ID.' }
 
+    $callItem = if ($ToolType -eq 'custom') {
+        [ordered]@{
+            type = 'custom_tool_call'
+            call_id = $callId
+            name = $toolName
+            input = [string]$first.ToolCall.input
+        }
+    } else {
+        [ordered]@{
+            type = 'function_call'
+            call_id = $callId
+            name = $toolName
+            arguments = [string]$first.ToolCall.arguments
+        }
+    }
+    $outputItem = [ordered]@{
+        type = if ($ToolType -eq 'custom') { 'custom_tool_call_output' } else { 'function_call_output' }
+        call_id = $callId
+        output = '{"value":"TOOL_OK"}'
+    }
     $second = Invoke-RouterSseRequest `
         -BaseUri (Get-RouterBaseUri) `
         -ApiKey $localApiKey `
@@ -204,17 +246,8 @@ try {
             model = $Model
             input = @(
                 [ordered]@{ role = 'user'; content = $prompt },
-                [ordered]@{
-                    type = 'function_call'
-                    call_id = $callId
-                    name = 'lookup_test_value'
-                    arguments = [string]$first.ToolCall.arguments
-                },
-                [ordered]@{
-                    type = 'function_call_output'
-                    call_id = $callId
-                    output = '{"value":"TOOL_OK"}'
-                }
+                $callItem,
+                $outputItem
             )
             tools = @($tool)
             tool_choice = 'none'
@@ -222,7 +255,7 @@ try {
             prompt_cache_key = $testRunId
             store = $false
             stream = $true
-            max_output_tokens = 128
+            max_output_tokens = $MaxOutputTokens
         })
     if (-not $second.SawCompleted -or $second.Text -notmatch '(?i)TOOL_OK') {
         throw 'The fallback tool-result round trip did not return TOOL_OK in a completed stream.'
@@ -236,13 +269,13 @@ try {
     }
 
     $startedSql = $testStartedAt.UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss.ffffff+00')
-    $usageRows = Invoke-PostgresRows -Query @"
+    $usageRows = @(Invoke-PostgresRows -Query @"
 SELECT account_id || '|' || COALESCE(upstream_endpoint, '') || '|' || COALESCE(first_token_ms, 0) || '|' || duration_ms
 FROM usage_logs
 WHERE created_at >= TIMESTAMPTZ '$startedSql'
-  AND model = '$Model'
+  AND requested_model = '$Model'
 ORDER BY id;
-"@
+"@)
     if ($usageRows.Count -lt 2) { throw 'The two fallback requests were not recorded in usage logs.' }
     $fallbackIds = @($fallbackAccounts | ForEach-Object { [long]$_.id })
     foreach ($row in $usageRows[-2..-1]) {
@@ -250,8 +283,8 @@ ORDER BY id;
         if ([long]$fields[0] -notin $fallbackIds) {
             throw "A fallback request used unexpected account $($fields[0])."
         }
-        if ($fields[1] -ne '/v1/responses') {
-            throw "A Chiral fallback request did not use native Responses: $($fields[1])"
+        if ($fields[1] -ne $ExpectedUpstreamEndpoint) {
+            throw "A fallback request used unexpected upstream endpoint '$($fields[1])'; expected '$ExpectedUpstreamEndpoint'."
         }
     }
 
@@ -275,7 +308,8 @@ ORDER BY id;
         OAuth429Observed = [bool]$ExerciseOAuth429
         RecoveryAtUtc = if ($null -eq $resetAt) { '' } else { $resetAt.UtcDateTime.ToString('o') }
         FallbackAccountIds = @($usageRows[-2..-1] | ForEach-Object { [long]$_.Split('|')[0] })
-        UpstreamEndpoint = '/v1/responses'
+        UpstreamEndpoint = $ExpectedUpstreamEndpoint
+        ToolType = $ToolType
         FirstToolEventMilliseconds = $first.FirstEventMilliseconds
         FinalTextEventMilliseconds = $second.FirstEventMilliseconds
         ToolRoundTrip = $true

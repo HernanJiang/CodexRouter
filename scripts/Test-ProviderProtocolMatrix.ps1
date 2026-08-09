@@ -17,9 +17,25 @@ $credentialMap = [ordered]@{
     PROBE_KEY_KIMI = 'ModelApiKey-3-k3-256k'
     PROBE_KEY_CHIRAL_LUNA = 'ModelApiKey-4-gpt-5-6-luna'
 }
+$providerCredentials = @{
+    'chiral-sol' = @('PROBE_KEY_CHIRAL_SOL')
+    'chiral-luna' = @('PROBE_KEY_CHIRAL_LUNA')
+    'openrouter-deepseek' = @('PROBE_KEY_OPENROUTER')
+    'openrouter-grok' = @('PROBE_KEY_OPENROUTER')
+    'openrouter-gemini' = @('PROBE_KEY_OPENROUTER')
+    'kimi-coding' = @('PROBE_KEY_KIMI')
+}
+$requiredEnvironmentNames = if ([string]::IsNullOrWhiteSpace($Providers)) {
+    @($credentialMap.Keys)
+} else {
+    @($Providers.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ } | ForEach-Object {
+        if (-not $providerCredentials.ContainsKey($_)) { throw "Unknown provider: $_" }
+        $providerCredentials[$_]
+    } | Select-Object -Unique)
+}
 $previous = @{}
 try {
-    foreach ($entry in $credentialMap.GetEnumerator()) {
+    foreach ($entry in $credentialMap.GetEnumerator() | Where-Object { $requiredEnvironmentNames -contains $_.Key }) {
         $previous[$entry.Key] = [Environment]::GetEnvironmentVariable($entry.Key, 'Process')
         $secret = Get-RouterCredential -Name $entry.Value -AllowMissing
         if ([string]::IsNullOrWhiteSpace($secret)) {
@@ -50,7 +66,7 @@ try {
         throw "Provider protocol probe failed with exit code $LASTEXITCODE."
     }
 } finally {
-    foreach ($entry in $credentialMap.GetEnumerator()) {
+    foreach ($entry in $credentialMap.GetEnumerator() | Where-Object { $previous.ContainsKey($_.Key) }) {
         [Environment]::SetEnvironmentVariable($entry.Key, $previous[$entry.Key], 'Process')
     }
     $previous.Clear()

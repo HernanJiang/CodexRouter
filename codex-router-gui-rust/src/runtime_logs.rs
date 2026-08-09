@@ -301,6 +301,24 @@ pub(crate) fn spawn(
 
         while !stop.load(Ordering::Relaxed) {
             if paused.load(Ordering::Relaxed) {
+                // Lightweight tray mode still watches only Sub2API quota failover
+                // events so the first automatic channel switch is not missed.
+                if let Some(source) = sources.first_mut() {
+                    if let Ok((lines, _)) = source.read_new_lines() {
+                        for line in lines {
+                            if let Some(record) =
+                                format_diagnostic_line(source.label, source.kind, &line)
+                            {
+                                if record.contains("openai.upstream_failover_switching")
+                                    && record.contains("upstream_status=429")
+                                {
+                                    emitter.push(record);
+                                }
+                            }
+                        }
+                        emitter.flush();
+                    }
+                }
                 std::thread::sleep(Duration::from_millis(750));
                 continue;
             }
@@ -314,6 +332,9 @@ pub(crate) fn spawn(
                                 if let Some(record) =
                                     format_diagnostic_line(source.label, source.kind, &line)
                                 {
+                                    if record.contains("openai.upstream_failover_switching") {
+                                        continue;
+                                    }
                                     if recent.len() == INITIAL_LINES_PER_SOURCE {
                                         recent.pop_front();
                                     }
@@ -457,6 +478,9 @@ fn format_sub2api_line(label: &str, line: &str) -> Option<String> {
         }
         if let Some(value) = object.get("latency_ms").and_then(safe_latency_value) {
             append_field(&mut output, "latency_ms", &value);
+        }
+        if let Some(value) = object.get("account_id").and_then(value_as_u64) {
+            append_field(&mut output, "account_id", &value.to_string());
         }
         for key in ["request_id", "client_request_id"] {
             if let Some(value) = object
@@ -829,6 +853,18 @@ fn safe_timestamp(text: &str) -> Option<String> {
 }
 
 pub(crate) fn summarize_error_for_display(text: &str) -> String {
+    // Already-sanitized summaries must stay stable. Wrapping them in another
+    // Chinese/English shell (for example "无法读取…") would otherwise reclassify
+    // class=connection_refused as the generic request_failure via "无法".
+    if let Some(existing) = existing_sanitized_summary(text) {
+        let mut output = existing;
+        if let Some(marker) = stable_error_marker(text) {
+            if !output.contains("marker=") {
+                append_field(&mut output, "marker", marker);
+            }
+        }
+        return output;
+    }
     let mut classes = error_classes(text);
     if classes.is_empty() {
         classes.push("unclassified_error");
@@ -837,28 +873,90 @@ pub(crate) fn summarize_error_for_display(text: &str) -> String {
     for status in safe_http_statuses(text) {
         append_field(&mut output, "status", &status);
     }
+    if let Some(marker) = stable_error_marker(text) {
+        append_field(&mut output, "marker", marker);
+    }
     output
+}
+
+fn existing_sanitized_summary(text: &str) -> Option<String> {
+    static SANITIZED: OnceLock<Regex> = OnceLock::new();
+    let regex = SANITIZED.get_or_init(|| {
+        Regex::new(r"(?i)\bclass=[a-z0-9_+]+(?:\s+[a-z0-9_+]+=[^\s]+)*")
+            .expect("sanitized summary regex is valid")
+    });
+    regex
+        .find(text)
+        .map(|matched| matched.as_str().trim().to_owned())
+}
+
+/// Fixed, secret-free identifiers raised by the Router scripts and by the
+/// desktop app. Summarization keeps only an error class, which is too coarse to
+/// act on, so these markers have to survive it for the UI to explain what the
+/// user must do next.
+const STABLE_ERROR_MARKERS: &[&str] = &[
+    "ROUTER_CONFIG_SAVE_LOCK_FAILED",
+    "ROUTER_CONFIG_SAVE_CODEX_SNAPSHOT_FAILED",
+    "ROUTER_CONFIG_SAVE_BACKUP_FAILED",
+    "ROUTER_CONFIG_SAVE_CREDENTIALS_FAILED",
+    "ROUTER_CONFIG_SAVE_FILES_FAILED",
+    "ROUTER_CONFIG_SAVE_APPLY_SCRIPT_FAILED",
+    "ROUTER_CONFIG_SAVE_DEPLOY_FAILED",
+    "ROUTER_INSTALL_ROOT_CONFLICT",
+    "ROUTER_PORT_CONFLICT",
+    "ROUTER_DEPLOY_NO_MODELS",
+    "ROUTER_DEPLOY_NO_SERVABLE_MODEL",
+    "ROUTER_PROFILE_CREDENTIAL_MISSING",
+    "ROUTER_PROFILE_CREDENTIAL_READ_FAILED",
+    "ROUTER_PROFILE_CREDENTIAL_WRITE_FAILED",
+    "ROUTER_KIMI_CREDENTIAL_REJECTED",
+    "ROUTER_PROFILE_SAVE_FAILED",
+    "ROUTER_PROFILE_ROLLBACK_INCOMPLETE",
+    "ROUTER_PROXY_UNSUPPORTED",
+    "ROUTER_PROXY_CREDENTIAL_STORAGE_UNSUPPORTED",
+    "ROUTER_PROXY_MANAGED_RESOURCE_CONFLICT",
+    "ROUTER_OAUTH_PREPARE_LIFECYCLE_BUSY",
+    "ROUTER_OAUTH_PREPARE_ROUTER_START",
+    "ROUTER_OAUTH_PREPARE_ADMIN_LOGIN",
+    "ROUTER_OAUTH_PREPARE_COMPLIANCE",
+    "ROUTER_OAUTH_PREPARE_COMPONENTS",
+    "ROUTER_OAUTH_PREPARE_PROCESS",
+    "ROUTER_OAUTH_PREPARE_TIMEOUT",
+    "ROUTER_OAUTH_ACCOUNTS_UNAVAILABLE",
+    "ROUTER_OAUTH_ACCOUNTS_PARSE",
+    "ROUTER_ACL_UNSUPPORTED",
+];
+
+fn stable_error_marker(text: &str) -> Option<&'static str> {
+    let upper = text.to_ascii_uppercase();
+    STABLE_ERROR_MARKERS
+        .iter()
+        .copied()
+        .find(|marker| upper.contains(marker))
 }
 
 fn error_classes(text: &str) -> Vec<&'static str> {
     let lower = text.to_lowercase();
     let mut classes = Vec::new();
 
+    // Lifecycle markers describe why a destructive action was deliberately not
+    // taken. The explanation often names the protected services, which must not
+    // turn a safe deferral into database/Redis/configuration failure classes.
+    if lower.contains("router_lifecycle_deferred") {
+        return vec!["lifecycle_deferred"];
+    }
+    if lower.contains("router_lifecycle_busy") {
+        return vec!["lifecycle_busy"];
+    }
+    if lower.contains("router_lifecycle_safety_check_failed") {
+        return vec!["lifecycle_safety_check_failed"];
+    }
+
     if lower.contains("router_install_root_conflict") || lower.contains("install_root_conflict") {
         push_unique_class(&mut classes, "install_root_conflict");
     }
     if lower.contains("router_port_conflict") || lower.contains("port_conflict") {
         push_unique_class(&mut classes, "port_conflict");
-    }
-
-    if lower.contains("router_lifecycle_deferred") {
-        push_unique_class(&mut classes, "lifecycle_deferred");
-    }
-    if lower.contains("router_lifecycle_busy") {
-        push_unique_class(&mut classes, "lifecycle_busy");
-    }
-    if lower.contains("router_lifecycle_safety_check_failed") {
-        push_unique_class(&mut classes, "lifecycle_safety_check_failed");
     }
 
     if contains_any(
@@ -869,7 +967,13 @@ fn error_classes(text: &str) -> Vec<&'static str> {
     }
     if contains_any(
         &lower,
-        &["rate limit", "too many requests", "quota", "限流", "额度"],
+        &[
+            "rate limit",
+            "rate-limit",
+            "rate limited",
+            "too many requests",
+            "限流",
+        ],
     ) || lower.contains("429")
     {
         push_unique_class(&mut classes, "rate_limit");
@@ -1407,12 +1511,70 @@ mod tests {
     }
 
     #[test]
+    fn hyphenated_admin_rate_limits_are_classified() {
+        let safe = summarize_error_for_display(
+            "Sub2API admin login is rate-limited. Wait a few seconds and retry.",
+        );
+        assert_eq!(safe, "class=rate_limit");
+    }
+
+    #[test]
+    fn kimi_quota_authentication_failures_are_not_misclassified_as_rate_limits() {
+        let unauthorized = summarize_error_for_display(
+            "ROUTER_KIMI_CREDENTIAL_REJECTED: Kimi Coding Plan quota query failed (HTTP 401).",
+        );
+        assert_eq!(
+            unauthorized,
+            "class=authentication | status=401 | marker=ROUTER_KIMI_CREDENTIAL_REJECTED"
+        );
+
+        let forbidden = summarize_error_for_display(
+            "ROUTER_KIMI_CREDENTIAL_REJECTED: Kimi Coding Plan quota query failed (HTTP 403).",
+        );
+        assert_eq!(
+            forbidden,
+            "class=permission | status=403 | marker=ROUTER_KIMI_CREDENTIAL_REJECTED"
+        );
+    }
+
+    #[test]
     fn lifecycle_deferrals_remain_explicit_after_error_sanitization() {
         let safe = summarize_error_for_display(
-            "ROUTER_LIFECYCLE_DEFERRED: Stop Router was deferred for an active request",
+            "ROUTER_LIFECYCLE_DEFERRED: Apply Router configuration was deferred; Sub2API, Redis, and PostgreSQL were left unchanged",
         );
-        assert!(safe.contains("class=lifecycle_deferred"));
-        assert!(!safe.contains("active request"));
+        assert_eq!(safe, "class=lifecycle_deferred");
+    }
+
+    #[test]
+    fn stable_markers_survive_sanitization_without_leaking_details() {
+        let safe = summarize_error_for_display(
+            "ROUTER_DEPLOY_NO_MODELS: at least one model is required, but C:\\Users\\person\\config.json has none.",
+        );
+        assert!(safe.contains("marker=ROUTER_DEPLOY_NO_MODELS"), "{safe}");
+        assert!(!safe.contains("person"));
+        assert!(!safe.contains("config.json"));
+        // Sanitizing an already sanitized summary must stay stable so the marker
+        // still reaches the UI after the deployment log is summarized twice.
+        assert!(summarize_error_for_display(&safe).contains("marker=ROUTER_DEPLOY_NO_MODELS"));
+        assert!(!summarize_error_for_display("plain upstream failure").contains("marker="));
+    }
+
+    #[test]
+    fn chinese_wrapper_does_not_erase_an_existing_error_class() {
+        let inner = summarize_error_for_display(
+            "Unable to connect to the remote server. connection refused 127.0.0.1:18080",
+        );
+        assert!(inner.contains("class=connection_refused"), "{inner}");
+        let wrapped = format!("无法读取 OAuth 账号: {inner}");
+        let safe = summarize_error_for_display(&wrapped);
+        assert!(
+            safe.contains("class=connection_refused"),
+            "expected preserved class, got {safe}"
+        );
+        assert!(
+            !safe.contains("class=request_failure"),
+            "generic failure must not replace a specific class: {safe}"
+        );
     }
 
     #[test]

@@ -39,7 +39,7 @@ try {
     if (@($catalog.models[0].input_modalities) -notcontains 'image') { throw 'Auto multimodal was not enabled.' }
     if (@($catalog.models[1].input_modalities) -contains 'image') { throw 'Explicit text-only override was ignored.' }
     if (@((@($catalog.models) | Where-Object slug -eq 'deepseek/deepseek-v4-pro').input_modalities) -contains 'image') { throw 'DeepSeek was incorrectly marked as multimodal.' }
-    if ((@($catalog.models) | Where-Object slug -eq 'deepseek/deepseek-v4-pro').display_name -ne 'DeepSeek-V4-Flash') { throw 'DeepSeek recommended display name was not applied.' }
+    if ((@($catalog.models) | Where-Object slug -eq 'deepseek/deepseek-v4-pro').display_name -ne 'DeepSeek-V4-Pro') { throw 'DeepSeek Pro recommended display name was not applied.' }
     if (@((@($catalog.models) | Where-Object slug -eq 'mimo-v2.5-pro').input_modalities) -contains 'image') { throw 'MiMo V2.5 Pro was incorrectly marked as multimodal.' }
     if (@((@($catalog.models) | Where-Object slug -eq 'gemini-3.6-flash').input_modalities) -notcontains 'image') { throw 'Gemini 3.6 Flash image support was not detected.' }
     if (@((@($catalog.models) | Where-Object slug -eq 'claude-opus-5').input_modalities) -notcontains 'image') { throw 'Claude Opus 5 image support was not detected.' }
@@ -81,6 +81,20 @@ try {
     $gptSolSpeedTiers = (@($catalog.models) | Where-Object slug -eq 'gpt-5.6-sol').additional_speed_tiers
     if (@($gptSolSpeedTiers) -notcontains 'fast') { throw 'GPT-5.6 Sol did not advertise Fast.' }
     if ((@($catalog.models) | Where-Object slug -eq 'gpt-5.6-sol').default_reasoning_level -ne 'medium') { throw 'Legacy global reasoning incorrectly replaced the per-model official default.' }
+    $oauthConfig = @{
+        version = 'oauth-tool-compat-test'
+        models = @(
+            @{ model = 'gemini-3.1-pro-high'; alias = 'Gemini OAuth'; priority = 1; source = 'oauth'; oauthAccountId = 4; oauthPlatform = 'antigravity'; multimodal = 'auto' }
+        )
+    }
+    [IO.File]::WriteAllText($configPath, ($oauthConfig | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
+    & (Join-Path $PSScriptRoot 'Build-ModelCatalog.ps1') -ConfigPath $configPath -OutputPath $outputPath | Out-Null
+    $oauthCatalog = Get-Content -LiteralPath $outputPath -Raw | ConvertFrom-Json
+    $oauthGemini = @($oauthCatalog.models) | Where-Object slug -eq 'gemini-3.1-pro-high' | Select-Object -First 1
+    if (@($oauthGemini.input_modalities) -notcontains 'image') { throw 'Gemini OAuth lost image input support.' }
+    if ([bool]$oauthGemini.supports_search_tool) { throw 'Gemini OAuth still advertises the incompatible built-in search tool.' }
+    if ($null -ne $oauthGemini.PSObject.Properties['web_search_tool_type']) { throw 'Gemini OAuth still advertises a web search tool type.' }
+    if ([bool]$oauthGemini.use_responses_lite) { throw 'Gemini OAuth must not use Responses Lite.' }
     if ((@($catalog.models) | Where-Object slug -eq 'claude-opus-5').context_window -ne 1000000) { throw 'Claude Opus 5 context window is stale.' }
     foreach ($slug in @('deepseek/deepseek-v4-pro','gemini-3.6-flash','mimo-v2.5-pro')) {
         if ((@($catalog.models) | Where-Object slug -eq $slug).context_window -ne 1048576) { throw "Context window is stale for $slug." }
@@ -154,8 +168,8 @@ try {
         -DiscoveredOAuthModelsByAccount @{'42' = @('gpt-5.6-sol')} | Out-Null
     $implicitMergedCatalog = Get-Content -LiteralPath $outputPath -Raw | ConvertFrom-Json
     if (@($implicitMergedCatalog.models).Count -ne 1 -or
-        $implicitMergedCatalog.models[0].slug -ne 'gpt-5.6-sol') {
-        throw 'Implicit OAuth discovery did not produce one stable merged catalog route.'
+        $implicitMergedCatalog.models[0].slug -ne 'openai/gpt-5.6-sol') {
+        throw 'Account-only OAuth enrollment rewrote the configured API catalog route.'
     }
 
     $splitConfig = $mergedConfig | ConvertTo-Json -Depth 10 | ConvertFrom-Json

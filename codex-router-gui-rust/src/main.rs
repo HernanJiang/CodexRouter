@@ -13,8 +13,8 @@ use config::{CloseBehavior, ModelConfig, RouterConfig, UiPreferences};
 use eframe::egui;
 use profiles::{IsolationKind, IsolationProfile};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -37,7 +37,7 @@ const TRAY_TOOLTIP_EN: &str = concat!(
     " - lightweight tray mode (forwarding protection only)"
 );
 const CURRENT_CONFIG_VERSION: &str = APP_VERSION;
-const CURRENT_TERMS_VERSION: &str = "codex-router-terms-v1.2.1-2026-08-04";
+const CURRENT_TERMS_VERSION: &str = "codex-router-terms-v1.2.2-2026-08-04";
 const OFFICIAL_GITHUB_URL: &str = "https://github.com/HernanJiang/Codex-Router";
 const MAX_LOG_BYTES: usize = 256 * 1024;
 const RETAIN_LOG_BYTES: usize = 192 * 1024;
@@ -46,14 +46,13 @@ const CREATE_NEW_CONSOLE: u32 = 0x00000010;
 const HEALTHY_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 const FAILED_PROBE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 const RECOVERY_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+const CODEX_BINDING_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
 const HEALTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 const EXIT_CONFIG_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-const EXIT_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+const EXIT_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 const EXIT_HELPER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 const EXIT_PROCESS_KILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const EXIT_HELPER_OUTPUT_LIMIT: usize = 64 * 1024;
-const EXIT_TAKEOVER_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
-const STARTUP_TAKEOVER_MUTEX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 // Logical points, not physical pixels. Startup is fitted to the primary
 // monitor's work area, so ordinary displays retain the comfortable desktop
 // size while 200%-scaled displays receive a usable compact window.
@@ -292,6 +291,14 @@ struct UsageWindow {
     requests: i64,
     #[serde(default)]
     tokens: i64,
+    #[serde(default)]
+    remaining_amount: Option<f64>,
+    #[serde(default)]
+    limit_amount: Option<f64>,
+    #[serde(default)]
+    used_amount: Option<f64>,
+    #[serde(default)]
+    currency: String,
 }
 
 fn negative_one() -> i64 {
@@ -353,17 +360,132 @@ struct UsageMonitorCache {
     snapshot: UsageSnapshot,
 }
 
+fn fallback_transition_notification(
+    previous: Option<&UsageSnapshot>,
+    current: &UsageSnapshot,
+    config: &RouterConfig,
+) -> Option<(String, String)> {
+    let previous = previous?;
+    for subscription in &current.subscriptions {
+        if subscription.health != "quotaExhausted"
+            || previous
+                .subscriptions
+                .iter()
+                .any(|account| account.id == subscription.id && account.health == "quotaExhausted")
+        {
+            continue;
+        }
+        let oauth_models = config
+            .models
+            .iter()
+            .filter(|model| model.source == "oauth" && model.oauth_account_id == subscription.id);
+        for oauth_model in oauth_models {
+            if let Some(fallback) = config
+                .models
+                .iter()
+                .filter(|candidate| {
+                    candidate.source != "oauth"
+                        && logic::same_model_identity(&oauth_model.model, &candidate.model)
+                        && logic::is_fallback_channel_selected(config, candidate)
+                })
+                .min_by_key(|candidate| (logic::api_channel_tier(candidate), candidate.priority))
+            {
+                let source = if subscription.name.trim().is_empty() {
+                    logic::recommended_model_display_name(&oauth_model.model)
+                } else {
+                    subscription.name.trim().to_owned()
+                };
+                let target = if fallback.alias.trim().is_empty() {
+                    logic::recommended_model_display_name(&fallback.model)
+                } else {
+                    fallback.alias.trim().to_owned()
+                };
+                return Some((source, target));
+            }
+        }
+    }
+    None
+}
+
+fn failover_account_id(record: &str) -> Option<i64> {
+    if !record.contains("openai.upstream_failover_switching")
+        || !record.contains("upstream_status=429")
+    {
+        return None;
+    }
+    record.split_whitespace().find_map(|field| {
+        field
+            .strip_prefix("account_id=")
+            .and_then(|value| value.trim_end_matches('|').parse().ok())
+    })
+}
+
+fn fallback_names_for_account(
+    config: &RouterConfig,
+    oauth_accounts: &[OAuthAccountSummary],
+    account_id: i64,
+) -> Option<(String, String)> {
+    let oauth_model = config
+        .models
+        .iter()
+        .find(|model| model.source == "oauth" && model.oauth_account_id == account_id)?;
+    let fallback = config
+        .models
+        .iter()
+        .filter(|candidate| {
+            candidate.source != "oauth"
+                && logic::same_model_identity(&oauth_model.model, &candidate.model)
+                && logic::is_fallback_channel_selected(config, candidate)
+        })
+        .min_by_key(|candidate| (logic::api_channel_tier(candidate), candidate.priority))?;
+    let source = oauth_accounts
+        .iter()
+        .find(|account| account.id == account_id)
+        .map(|account| account.name.trim())
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| logic::recommended_model_display_name(&oauth_model.model));
+    let target = if fallback.alias.trim().is_empty() {
+        logic::recommended_model_display_name(&fallback.model)
+    } else {
+        fallback.alias.trim().to_owned()
+    };
+    Some((source, target))
+}
+
+fn show_fallback_notification(zh: bool, source: String, target: String) {
+    let title = if zh {
+        "Codex-Router 已自动切换"
+    } else {
+        "Codex-Router switched automatically"
+    }
+    .to_owned();
+    let description = if zh {
+        format!("{source} 订阅额度已用完，现在已自动切换到 {target} 渠道。")
+    } else {
+        format!("The {source} subscription quota is exhausted. Routing switched automatically to {target}.")
+    };
+    std::thread::spawn(move || {
+        let _ = rfd::MessageDialog::new()
+            .set_title(&title)
+            .set_description(&description)
+            .set_level(rfd::MessageLevel::Info)
+            .show();
+    });
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OAuthRecoverySchedule {
     #[serde(default = "default_oauth_recovery_seconds")]
+    #[allow(dead_code)]
     next_check_seconds: u64,
     #[serde(default)]
     summary: String,
 }
 
 fn default_oauth_recovery_seconds() -> u64 {
-    60 * 60
+    5 * 60 * 60
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -450,8 +572,6 @@ enum AppEvent {
     PreviousConfigurationRestoreError(String),
     RouterModeDisabled(profiles::RestoreOutcome),
     RouterModeSwitchError(String),
-    CodexAccountModeChanged(profiles::CodexAccountModeStatus),
-    CodexAccountModeSwitchError(String),
     OAuthRecoveryFinished(OAuthRecoverySchedule),
     OAuthRecoveryError(String),
     GrokSsoImported,
@@ -461,6 +581,11 @@ enum AppEvent {
         account_name: String,
     },
     OAuthAccountRevokeError(String),
+    OAuthAccountPriorityUpdated {
+        account_id: i64,
+        priority: i32,
+    },
+    OAuthAccountPriorityError(String),
     UpdateResult(Box<GitHubUpdateInfo>),
     UpdateError(String),
     RouterHealthProbeFinished(Result<(), String>),
@@ -490,6 +615,7 @@ struct CodexRouterApp {
     model_from_wizard: bool,
     proxy_from_wizard: bool,
     status_text: String,
+    status_expires_at: Option<std::time::Instant>,
     logs: String,
     event_rx: Receiver<AppEvent>,
     event_tx: Sender<AppEvent>,
@@ -533,9 +659,13 @@ struct CodexRouterApp {
     oauth_accounts: Vec<OAuthAccountSummary>,
     oauth_loading: bool,
     oauth_error: String,
+    oauth_retry_due: Option<std::time::Instant>,
+    oauth_retry_attempts: u8,
     oauth_return_page: Page,
     oauth_provider_draft: String,
     provider_oauth_running: bool,
+    oauth_post_login_prompt_open: bool,
+    oauth_model_hint_seen: bool,
     pending_oauth_provider: Option<String>,
     provider_oauth_preparing: bool,
     provider_oauth_preparing_provider: Option<String>,
@@ -546,6 +676,9 @@ struct CodexRouterApp {
     provider_oauth_cancel: Arc<AtomicBool>,
     oauth_revoke_target: Option<OAuthAccountSummary>,
     oauth_revoking: bool,
+    oauth_priority_target: Option<OAuthAccountSummary>,
+    oauth_priority_draft: i32,
+    oauth_priority_saving: bool,
     oauth_manual_model_target: Option<OAuthAccountSummary>,
     oauth_manual_model_id_draft: String,
     oauth_manual_model_alias_draft: String,
@@ -558,6 +691,7 @@ struct CodexRouterApp {
     usage_error: String,
     usage_return_page: Page,
     usage_refresh_due: Option<std::time::Instant>,
+    notified_quota_accounts: BTreeSet<i64>,
     monitor_subscription_order: Vec<i64>,
     monitor_api_order: Vec<i64>,
     share_codex_state: bool,
@@ -586,9 +720,10 @@ struct CodexRouterApp {
     tray_restore_guard_until: Option<std::time::Instant>,
     health_probe_due: Option<std::time::Instant>,
     health_probe_running: bool,
-    health_probe_failures: u8,
+    health_probe_failures: u32,
     health_recovery_running: bool,
     health_recovery_cancel: Arc<AtomicBool>,
+    codex_binding_check_due: Option<std::time::Instant>,
     update_checking: bool,
     update_downloading: bool,
     update_dialog_open: bool,
@@ -979,7 +1114,241 @@ fn system_ui_language() -> String {
     "en".to_owned()
 }
 
+/// Normal Apply progress that is not one of the `[N/7]` stage headers. These
+/// lines report success, so they must never be relabeled as a diagnostic and
+/// run through the error classifier (which used to tag them
+/// `class=unclassified_error` and made a healthy deploy look broken).
+fn deployment_progress_line(zh: bool, line: &str) -> Option<String> {
+    struct Progress {
+        marker: &'static str,
+        zh: &'static str,
+        en: &'static str,
+    }
+    const PROGRESS: &[Progress] = &[
+        Progress {
+            marker: "Sub2API compliance acknowledgement recorded",
+            zh: "已记录本机管理员的 Sub2API 合规确认",
+            en: "Recorded the Sub2API compliance acknowledgement for this local administrator",
+        },
+        Progress {
+            marker: "Sub2API administrator ready",
+            zh: "Sub2API 管理员已就绪",
+            en: "Sub2API administrator is ready",
+        },
+        Progress {
+            marker: "Codex model catalog generated",
+            zh: "已生成 Codex 模型目录",
+            en: "Generated the Codex model catalog",
+        },
+        Progress {
+            marker: "Composite routes",
+            zh: "已同步组合路由",
+            en: "Synchronized composite routes",
+        },
+        Progress {
+            marker: "Updated channel:",
+            zh: "已更新模型渠道",
+            en: "Updated a model channel",
+        },
+        Progress {
+            marker: "Created channel:",
+            zh: "已创建模型渠道",
+            en: "Created a model channel",
+        },
+        Progress {
+            marker: "isolated until recovery",
+            zh: "OAuth 账号已隔离，等待额度恢复",
+            en: "An OAuth account is isolated until its quota recovers",
+        },
+        Progress {
+            marker: "Outbound proxy reconciliation",
+            zh: "出站代理配置已核对完成",
+            en: "Reconciled the outbound proxy configuration",
+        },
+        Progress {
+            marker: "Catalog availability filter",
+            zh: "已过滤当前不可用的模型",
+            en: "Filtered models that cannot currently serve traffic",
+        },
+        Progress {
+            marker: "OAuth on-demand recovery delegated",
+            zh: "OAuth 按需恢复已交由 Codex-Router 管理",
+            en: "OAuth on-demand recovery is handled by Codex-Router",
+        },
+        Progress {
+            marker: "Autostart registered",
+            zh: "已注册开机自启",
+            en: "Registered autostart",
+        },
+        Progress {
+            marker: "Autostart removed",
+            zh: "已移除开机自启",
+            en: "Removed autostart",
+        },
+        Progress {
+            marker: "will start directly in lightweight tray mode",
+            zh: "下次登录后将直接进入轻量托盘模式",
+            en: "Will start directly in lightweight tray mode next sign-in",
+        },
+        Progress {
+            marker: "model channel(s).",
+            zh: "模型渠道数量已确认",
+            en: "Model channel count confirmed",
+        },
+        Progress {
+            marker: "Codex configuration written to",
+            zh: "已写入 Codex 配置",
+            en: "Wrote the Codex configuration",
+        },
+        Progress {
+            marker: "Local access key is stored in Windows Credential Manager",
+            zh: "本机访问密钥已保存到 Windows 凭据管理器",
+            en: "Stored the local access key in Windows Credential Manager",
+        },
+        Progress {
+            marker: "Codex Router is running at",
+            zh: "本地 Router 服务已启动",
+            en: "Local Router services are running",
+        },
+        Progress {
+            marker: "Codex Router secrets and PostgreSQL",
+            zh: "本地凭据与数据库目录已就绪",
+            en: "Local secrets and database directory are ready",
+        },
+        Progress {
+            marker: "Codex Router is stopped",
+            zh: "本地 Router 服务已停止",
+            en: "Local Router services are stopped",
+        },
+        Progress {
+            marker: "Configured ",
+            zh: "模型渠道数量已确认",
+            en: "Model channel count confirmed",
+        },
+    ];
+    PROGRESS
+        .iter()
+        .find(|progress| line.contains(progress.marker))
+        .map(|progress| if zh { progress.zh } else { progress.en }.to_owned())
+}
+
+/// Stable per-step deployment flags. Every Apply stage and every routing
+/// decision emits one, so the activity log stays diagnosable and searchable:
+/// the code is always kept verbatim next to a human explanation.
+fn localized_router_flag(zh: bool, rest: &str) -> String {
+    let mut parts = rest.trim().splitn(2, ' ');
+    let code = parts.next().unwrap_or_default().trim();
+    let data = parts.next().unwrap_or_default().trim();
+    let meaning = match code {
+        "STAGE-01-INIT-OK" => (
+            "步骤 1/7 完成：本地凭据与数据库已就绪",
+            "Step 1/7 done: local credentials and database are ready",
+        ),
+        "STAGE-02-SERVICES-OK" => (
+            "步骤 2/7 完成：PostgreSQL / Redis / Sub2API 已启动",
+            "Step 2/7 done: PostgreSQL, Redis, and Sub2API are running",
+        ),
+        "STAGE-03-ADMIN-OK" => (
+            "步骤 3/7 完成：管理接口登录成功",
+            "Step 3/7 done: signed in to the admin API",
+        ),
+        "STAGE-04-COMPLIANCE-OK" => (
+            "步骤 4/7 完成：合规状态已确认",
+            "Step 4/7 done: compliance state confirmed",
+        ),
+        "STAGE-06-CODEX-OK" => (
+            "步骤 6/7 完成：Codex 配置与本地密钥已写入",
+            "Step 6/7 done: Codex configuration and local key written",
+        ),
+        "STAGE-07-DONE" => ("步骤 7/7 完成：部署成功", "Step 7/7 done: deployment succeeded"),
+        "OAUTH-PRIMARY" => (
+            "订阅额度可用：优先使用该 OAuth 账号",
+            "Subscription quota available: this OAuth account is preferred",
+        ),
+        "OAUTH-PARKED-WITH-FALLBACK" => (
+            "订阅额度已用完：暂停该账号，改用同名第三方 API 兜底",
+            "Subscription quota exhausted: account parked, same-model API channel serves instead",
+        ),
+        "OAUTH-PARKED-NO-FALLBACK" => (
+            "订阅额度已用完且没有同名第三方兜底：该模型暂时下线",
+            "Subscription quota exhausted with no same-model API fallback: the model is temporarily offline",
+        ),
+        "OAUTH-SKIP-UNSELECTED" => (
+            "该 OAuth 账号未加入当前配置，不参与路由",
+            "This OAuth account is not part of the active profile and does not route",
+        ),
+        "OAUTH-SKIP-NO-MODELS" => (
+            "该 OAuth 账号未导入任何模型，继续使用模型列表中的第三方渠道",
+            "No OAuth models imported for this account; third-party channels keep serving",
+        ),
+        "API-CHANNEL" => (
+            "已配置独立第三方 API 渠道",
+            "Configured a standalone third-party API channel",
+        ),
+        "API-FALLBACK-CHANNEL" => (
+            "已配置同名第三方兜底渠道（OAuth 用尽时接管）",
+            "Configured a same-model API fallback channel (takes over when OAuth is exhausted)",
+        ),
+        "CATALOG-MODEL" => (
+            "模型已写入 Codex 菜单",
+            "Model written into the Codex menu",
+        ),
+        "CATALOG-DROPPED" => (
+            "模型暂时移出 Codex 菜单（当前无可用账号）",
+            "Model temporarily removed from the Codex menu (no serviceable account)",
+        ),
+        "CATALOG-FILTER" => (
+            "Codex 菜单可用性过滤完成",
+            "Codex menu availability filter finished",
+        ),
+        "FALLBACK-ACTIVE" => (
+            "已触发兜底：该模型改由第三方 API 提供",
+            "Fallback active: this model is now served by a third-party API channel",
+        ),
+        "COMPOSITE-SYNC" => ("组合路由已同步", "Composite routes synchronized"),
+        "COMPOSITE-ROUTE" => ("组合路由项已就绪", "Composite route entry is ready"),
+        "ROUTING-SYNC-OK" => (
+            "额度状态变化后已重新同步路由与 Codex 菜单",
+            "Routing and the Codex menu were re-synchronized after a quota change",
+        ),
+        "ROUTING-SYNC-MODEL" => (
+            "路由同步：模型当前的服务来源",
+            "Routing sync: current serving source for this model",
+        ),
+        "ROUTING-SYNC-SKIPPED" => (
+            "路由同步已跳过",
+            "Routing sync was skipped",
+        ),
+        "ROUTING-SYNC-FAILED" => (
+            "路由同步未完成，下次应用会重新对齐",
+            "Routing sync did not finish; the next Apply realigns it",
+        ),
+        "ROUTING-SYNC-ACCOUNT-UNREADABLE" => (
+            "路由同步：无法读取该 OAuth 账号状态",
+            "Routing sync: could not read this OAuth account state",
+        ),
+        "OAUTH-REJOINED" => (
+            "订阅额度已恢复：该账号重新回到优先路由",
+            "Subscription quota recovered: this account is preferred again",
+        ),
+        "OAUTH-PARKED" => (
+            "订阅额度不可用：该账号已移出请求路径",
+            "Subscription quota unavailable: this account left the request path",
+        ),
+        _ => ("部署事件", "Deployment event"),
+    };
+    let text = if zh { meaning.0 } else { meaning.1 };
+    if data.is_empty() {
+        format!("[{code}] {text}")
+    } else {
+        format!("[{code}] {text} · {data}")
+    }
+}
+
 fn localized_deployment_line(zh: bool, line: String) -> String {
+    if let Some(rest) = line.trim().strip_prefix("CR-FLAG ") {
+        return localized_router_flag(zh, rest);
+    }
     let localized = [
         (
             "[1/7]",
@@ -1019,21 +1388,90 @@ fn localized_deployment_line(zh: bool, line: String) -> String {
             line.starts_with(prefix)
                 .then(|| if zh { chinese } else { english }.to_owned())
         })
+        .or_else(|| deployment_progress_line(zh, &line))
         .unwrap_or_else(|| {
-            format!(
-                "{}: {}",
-                if zh {
+            if let Some(rest) = line
+                .strip_prefix("deployment_warning ")
+                .or_else(|| line.strip_prefix("deployment_diagnostic "))
+            {
+                let label = if line.starts_with("deployment_warning ") {
+                    if zh {
+                        "部署提示"
+                    } else {
+                        "Deployment note"
+                    }
+                } else if zh {
                     "部署诊断"
                 } else {
                     "Deployment diagnostic"
-                },
-                localized_error_summary(zh, &line)
-            )
+                };
+                format!("{label}: {}", localized_error_summary(zh, rest))
+            } else {
+                format!(
+                    "{}: {}",
+                    if zh {
+                        "部署诊断"
+                    } else {
+                        "Deployment diagnostic"
+                    },
+                    localized_error_summary(zh, &line)
+                )
+            }
         })
 }
 
 fn localized_error_summary(zh: bool, text: &str) -> String {
     for (marker, chinese, english) in [
+        (
+            "ROUTER_CONFIG_SAVE_LOCK_FAILED",
+            "无法取得配置保存锁。可能有另一个 Router 操作仍在进行，请完全退出重复运行的 Router 后重试。",
+            "Could not acquire the configuration save lock. Another Router operation may still be running; fully exit duplicate Router processes and retry.",
+        ),
+        (
+            "ROUTER_CONFIG_SAVE_CODEX_SNAPSHOT_FAILED",
+            "无法保存 Codex 原始配置快照。请关闭正在运行的 Codex 后再点击保存并应用。",
+            "Could not save the original Codex configuration snapshot. Close Codex completely, then click Save and Apply again.",
+        ),
+        (
+            "ROUTER_CONFIG_SAVE_BACKUP_FAILED",
+            "无法创建应用前配置备份。请检查 UserData 目录是否可写，并关闭占用配置文件的程序。",
+            "Could not create the pre-apply configuration backup. Check that UserData is writable and close programs holding the configuration files.",
+        ),
+        (
+            "ROUTER_CONFIG_SAVE_CREDENTIALS_FAILED",
+            "无法写入 Windows 凭据管理器。请以当前用户重新启动 Router 后重试，不会覆盖现有配置。",
+            "Could not write Windows Credential Manager entries. Restart Router as the current user and retry; the existing configuration was not overwritten.",
+        ),
+        (
+            "ROUTER_CONFIG_SAVE_FILES_FAILED",
+            "无法提交 Router 配置文件。请关闭 Codex-Router 后重新打开 LAB 版本再试。",
+            "Could not commit Router configuration files. Close Codex-Router, reopen the LAB version, and retry.",
+        ),
+        (
+            "ROUTER_CONFIG_SAVE_APPLY_SCRIPT_FAILED",
+            "配置文件已写入，但 Router 应用脚本失败。请查看活动日志中的 STAGE 或 CR-FLAG 原因。",
+            "The configuration files were written, but the Router apply script failed. Check the activity log for the STAGE or CR-FLAG reason.",
+        ),
+        (
+            "ROUTER_CONFIG_SAVE_DEPLOY_FAILED",
+            "保存配置事务失败，已保留应用前配置。请查看活动日志中的具体保存阶段。",
+            "The configuration transaction failed and the previously applied configuration was preserved. Check the activity log for the exact save stage.",
+        ),
+        (
+            "ROUTER_DEPLOY_NO_MODELS",
+            "当前配置没有可部署的模型。请在模型卡片中添加 API 渠道，或在 OAuth 账号卡片中点击「＋ 模型」把官方模型加入本配置后再试。",
+            "This configuration has no deployable model. Add an API channel from the model card, or add an official model from the OAuth account card, then retry.",
+        ),
+        (
+            "ROUTER_OAUTH_ACCOUNTS_UNAVAILABLE",
+            "暂时无法读取 OAuth 账号。请确认本地 Router 已启动并完成初始化，然后点击「刷新」。",
+            "Could not load OAuth accounts. Make sure the local Router is running and initialized, then click Refresh.",
+        ),
+        (
+            "ROUTER_OAUTH_ACCOUNTS_PARSE",
+            "OAuth 账号清单格式异常。请点击「刷新」重试；若仍失败，请重启 Codex-Router 后再试。",
+            "The OAuth account list could not be parsed. Click Refresh; if it still fails, restart Codex-Router and try again.",
+        ),
         (
             "ROUTER_PROFILE_CREDENTIAL_MISSING",
             "无法读取已保存的 API Key。请返回模型页面重新输入并保存后再试。",
@@ -1126,38 +1564,35 @@ fn localized_error_summary(zh: bool, text: &str) -> String {
 }
 
 fn oauth_prepare_error_from_output(output: &std::process::Output) -> String {
-    let raw = if output.stdout.is_empty() {
-        &output.stderr
-    } else {
-        &output.stdout
-    };
-    let text = String::from_utf8_lossy(raw);
-    for line in text
-        .lines()
-        .rev()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-    {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let code = value
-            .get("code")
-            .and_then(serde_json::Value::as_str)
-            .filter(|code| code.starts_with("ROUTER_OAUTH_PREPARE_"))
-            .unwrap_or("ROUTER_OAUTH_PREPARE_PROCESS");
-        let stage = value
-            .get("stage")
-            .and_then(serde_json::Value::as_str)
-            .filter(|stage| {
-                !stage.is_empty()
-                    && stage.len() <= 48
-                    && stage
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-            })
-            .unwrap_or("unknown");
-        return format!("{code} stage={stage}");
+    for raw in [&output.stdout, &output.stderr] {
+        let text = String::from_utf8_lossy(raw);
+        for line in text
+            .lines()
+            .rev()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let code = value
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .filter(|code| code.starts_with("ROUTER_OAUTH_PREPARE_"))
+                .unwrap_or("ROUTER_OAUTH_PREPARE_PROCESS");
+            let stage = value
+                .get("stage")
+                .and_then(serde_json::Value::as_str)
+                .filter(|stage| {
+                    !stage.is_empty()
+                        && stage.len() <= 48
+                        && stage
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                })
+                .unwrap_or("unknown");
+            return format!("{code} stage={stage}");
+        }
     }
     "ROUTER_OAUTH_PREPARE_PROCESS stage=unknown".to_owned()
 }
@@ -1165,6 +1600,29 @@ fn oauth_prepare_error_from_output(output: &std::process::Output) -> String {
 fn oauth_prepare_error_is_retryable(error: &str) -> bool {
     error.contains("ROUTER_OAUTH_PREPARE_LIFECYCLE_BUSY")
         || error.contains("ROUTER_LIFECYCLE_DEFERRED")
+        || error.contains("ROUTER_OAUTH_PREPARE_ROUTER_START")
+        || error.contains("ROUTER_OAUTH_PREPARE_ADMIN_LOGIN")
+        || error.contains("ROUTER_OAUTH_PREPARE_COMPLIANCE")
+        || error.contains("ROUTER_OAUTH_PREPARE_PROCESS")
+}
+
+fn oauth_accounts_error_is_retryable(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("router_oauth_accounts_unavailable")
+        || lower.contains("class=connection_refused")
+        || lower.contains("class=connection_closed")
+        || lower.contains("class=timeout")
+        || lower.contains("class=lifecycle_busy")
+        || lower.contains("class=lifecycle_deferred")
+        || lower.contains("class=authentication")
+        || lower.contains("admin session")
+        || lower.contains("health check failed")
+        || lower.contains("actively refused")
+        || lower.contains("connection refused")
+        || lower.contains("rate-limited")
+        || lower.contains("no access token")
+        || lower.contains("429")
+        || lower.contains("503")
 }
 
 fn usage_error_for_display(zh: bool, text: &str) -> String {
@@ -1181,6 +1639,15 @@ fn usage_error_for_display(zh: bool, text: &str) -> String {
     } else {
         runtime_logs::summarize_error_for_display(trimmed)
     };
+    if summary.contains("marker=ROUTER_KIMI_CREDENTIAL_REJECTED") {
+        return if zh {
+            "Kimi API Key 无效或没有 Coding Plan 权限，请在 Kimi Code 控制台新建 Key 后重新填写。"
+                .to_owned()
+        } else {
+            "The Kimi API Key is invalid or lacks Coding Plan access. Create a new key in the Kimi Code Console and enter it again."
+                .to_owned()
+        };
+    }
     let class = summary
         .split('|')
         .map(str::trim)
@@ -1220,6 +1687,28 @@ fn usage_error_for_display(zh: bool, text: &str) -> String {
                 .to_owned()
         }
     }
+}
+
+fn usage_account_message_for_display(zh: bool, text: &str) -> String {
+    if text.trim().is_empty() {
+        return String::new();
+    }
+    let summary = runtime_logs::summarize_error_for_display(text);
+    if summary == "class=unclassified_error" {
+        return String::new();
+    }
+    usage_error_for_display(zh, &summary)
+}
+
+fn normalize_usage_account_messages(zh: bool, account: &mut UsageAccount) {
+    let status_detail = usage_account_message_for_display(zh, &account.status_detail);
+    let query_note = usage_account_message_for_display(zh, &account.query_note);
+    account.status_detail = if query_note.is_empty() {
+        status_detail
+    } else {
+        query_note
+    };
+    account.query_note.clear();
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1277,16 +1766,27 @@ where
     if cancel.load(Ordering::Acquire) {
         anyhow::bail!("deployment cancelled because Codex-Router is exiting");
     }
-    logic::store_credentials(cfg, router_root)?;
-    on_log(
-        if zh {
-            "API Key 已安全保存到 Windows 凭据管理器"
-        } else {
-            "API keys were stored securely in Windows Credential Manager"
+    // Apply-Router.ps1 refuses a catalog without channels. Failing here keeps
+    // `store_credentials` and `write_all_files` from replacing a working
+    // catalog and channel manifest with empty ones.
+    if cfg.models.is_empty() {
+        anyhow::bail!(
+            "ROUTER_DEPLOY_NO_MODELS: the configuration has no model channel, so nothing can be deployed"
+        );
+    }
+    let updated_model_keys = logic::store_credentials(cfg, router_root)
+        .context("ROUTER_CONFIG_SAVE_CREDENTIALS_FAILED")?;
+    on_log(match (zh, updated_model_keys) {
+        (true, 0) => "未输入新的 API Key；已保留 Windows 凭据管理器中的现有 Key".to_owned(),
+        (false, 0) => {
+            "No new API key was entered; existing Windows credentials were preserved".to_owned()
         }
-        .to_owned(),
-    );
-    logic::write_all_files(cfg, router_root)?;
+        (true, count) => format!("已安全更新 {count} 个 API Key 到 Windows 凭据管理器"),
+        (false, count) => {
+            format!("Updated {count} API key(s) securely in Windows Credential Manager")
+        }
+    });
+    logic::write_all_files(cfg, router_root).context("ROUTER_CONFIG_SAVE_FILES_FAILED")?;
     on_log(
         if zh {
             "无密钥配置和模型目录已写入"
@@ -1298,6 +1798,38 @@ where
     logic::run_apply_script_with_cancel(router_root, cancel, |line| {
         on_log(localized_deployment_line(zh, line));
     })
+    .context("ROUTER_CONFIG_SAVE_APPLY_SCRIPT_FAILED")
+}
+
+/// Redeploys a configuration recovered from a restore point.
+///
+/// A restore point can predate any successful deployment, for example the first
+/// apply of a fresh install. Restoring the Codex snapshot is then the whole
+/// operation: running the deployment script would only fail on the empty model
+/// list and replace the current catalog and channel manifest with empty ones.
+fn redeploy_restored_config<F>(
+    restored: &RouterConfig,
+    router_root: &Path,
+    cancel: &AtomicBool,
+    zh: bool,
+    on_log: &mut F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(String),
+{
+    if restored.models.is_empty() {
+        on_log(
+            if zh {
+                "该备份没有可部署的 Router 配置，仅恢复 Codex 配置快照"
+            } else {
+                "That backup holds no deployable Router configuration; only the Codex snapshot was restored"
+            }
+            .to_owned(),
+        );
+        return Ok(());
+    }
+    let mut restored = restored.clone();
+    deploy_router_config(&mut restored, router_root, cancel, zh, on_log)
 }
 
 fn rollback_failed_deployment<F>(
@@ -1325,14 +1857,7 @@ where
         &backup.config,
         share_codex_state,
         |restored| {
-            let mut restored = restored.clone();
-            deploy_router_config(
-                &mut restored,
-                router_root,
-                &rollback_cancel,
-                zh,
-                &mut on_log,
-            )
+            redeploy_restored_config(restored, router_root, &rollback_cancel, zh, &mut on_log)
         },
     )?;
     on_log(
@@ -1605,6 +2130,20 @@ fn install_lightweight_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+/// Lightweight tray mode drops CJK glyphs. Any path that makes the window
+/// visible again must restore the full font set first, otherwise the UI turns
+/// into tofu boxes (the "zombie" window after a failed full exit).
+pub(crate) fn ensure_full_ui_fonts(app: &mut CodexRouterApp, ctx: &egui::Context) {
+    if !app.fonts_loaded {
+        install_app_fonts(ctx);
+        app.fonts_loaded = true;
+        app.installed_theme.clear();
+    }
+    if app.tray_lightweight_mode {
+        app.tray_lightweight_mode = false;
+    }
+}
+
 impl CodexRouterApp {
     fn new(
         cc: &eframe::CreationContext<'_>,
@@ -1620,9 +2159,11 @@ impl CodexRouterApp {
         let _ = user_data::prepare(&router_root);
         let ui_preferences_path = user_data::preferences_path(&router_root);
         let mut ui_preferences = UiPreferences::load(&ui_preferences_path).unwrap_or_default();
-        if ui_preferences.close_warning_version < 1 {
+        // Bump forces the minimize-to-tray first-close prompt once more after
+        // upgrades that previously remembered Exit.
+        if ui_preferences.close_warning_version < 2 {
             ui_preferences.close_behavior = CloseBehavior::Ask;
-            ui_preferences.close_warning_version = 1;
+            ui_preferences.close_warning_version = 2;
         }
         // Rewrite legacy preference files once so newly defaulted fields are
         // explicit and portable across subsequent versions.
@@ -1632,13 +2173,27 @@ impl CodexRouterApp {
         let monitor_subscription_order = ui_preferences.monitor_subscription_order;
         let monitor_api_order = ui_preferences.monitor_api_order;
         let share_codex_state = ui_preferences.share_codex_state;
+        let oauth_model_hint_seen = ui_preferences.oauth_model_hint_seen;
         let isolation_profiles = profiles::list_profiles(&router_root).unwrap_or_default();
         let config_path = user_data::config_path(&router_root);
         let (mut config, mut page, configured) = match RouterConfig::load(&config_path) {
-            Ok(cfg) => (cfg, Page::Dashboard, true),
+            Ok(cfg) if user_data::config_looks_configured(&cfg) => (cfg, Page::Dashboard, true),
+            Ok(cfg) => {
+                // Partial leftover JSON must not skip the welcome wizard.
+                let mut fresh = RouterConfig::default();
+                if !cfg.ui_theme.trim().is_empty() {
+                    fresh.ui_theme = cfg.ui_theme;
+                }
+                (fresh, Page::Welcome, false)
+            }
             Err(_) => (RouterConfig::default(), Page::Welcome, false),
         };
         config.version = CURRENT_CONFIG_VERSION.to_owned();
+        if config.ui_theme.trim().is_empty()
+            || !matches!(config.ui_theme.as_str(), "sky" | "coffee")
+        {
+            config.ui_theme = "sky".to_owned();
+        }
         logic::normalize_default_model(&mut config);
         if config.accepted_terms_version != CURRENT_TERMS_VERSION {
             config.accept_compliance = false;
@@ -1647,11 +2202,15 @@ impl CodexRouterApp {
                 page = Page::Finish;
             }
         }
+        if !configured {
+            // Fresh installs always start on 雾蓝 unless the user toggles later.
+            config.ui_theme = "sky".to_owned();
+        }
         if let Some(saved_theme) = cc
             .storage
             .and_then(|storage| storage.get_string("codex-router-ui-theme-v3"))
         {
-            if matches!(saved_theme.as_str(), "coffee" | "sky") {
+            if configured && matches!(saved_theme.as_str(), "coffee" | "sky") {
                 config.ui_theme = saved_theme;
             }
         }
@@ -1788,7 +2347,10 @@ impl CodexRouterApp {
             },
         ));
         let project_path_input = router_root.to_string_lossy().to_string();
-        let router_mode_enabled = logic::codex_router_mode_configured(&config);
+        let configured_router_mode = logic::codex_router_mode_configured(&config);
+        // Prefer the explicit dashboard switch intent. Third-party tools that
+        // rewrite model_providers.custom must not silently disable Router mode.
+        let router_mode_enabled = ui_preferences.prefer_router_mode || configured_router_mode;
         let codex_account_mode_status = profiles::codex_account_mode_status(&router_root, &config);
         let has_selected_oauth = config
             .oauth_account_ids
@@ -1809,6 +2371,7 @@ impl CodexRouterApp {
             model_from_wizard: true,
             proxy_from_wizard: true,
             status_text: String::new(),
+            status_expires_at: None,
             logs: String::new(),
             event_rx,
             event_tx,
@@ -1852,9 +2415,13 @@ impl CodexRouterApp {
             oauth_accounts: Vec::new(),
             oauth_loading: false,
             oauth_error: String::new(),
+            oauth_retry_due: None,
+            oauth_retry_attempts: 0,
             oauth_return_page: Page::Dashboard,
             oauth_provider_draft: "openai".to_owned(),
             provider_oauth_running: false,
+            oauth_post_login_prompt_open: false,
+            oauth_model_hint_seen,
             pending_oauth_provider: None,
             provider_oauth_preparing: false,
             provider_oauth_preparing_provider: None,
@@ -1865,6 +2432,9 @@ impl CodexRouterApp {
             provider_oauth_cancel: Arc::new(AtomicBool::new(false)),
             oauth_revoke_target: None,
             oauth_revoking: false,
+            oauth_priority_target: None,
+            oauth_priority_draft: 1,
+            oauth_priority_saving: false,
             oauth_manual_model_target: None,
             oauth_manual_model_id_draft: String::new(),
             oauth_manual_model_alias_draft: String::new(),
@@ -1877,6 +2447,7 @@ impl CodexRouterApp {
             usage_error: String::new(),
             usage_return_page: Page::Dashboard,
             usage_refresh_due: None,
+            notified_quota_accounts: BTreeSet::new(),
             monitor_subscription_order,
             monitor_api_order,
             share_codex_state,
@@ -1910,6 +2481,8 @@ impl CodexRouterApp {
             health_probe_failures: 0,
             health_recovery_running: false,
             health_recovery_cancel: Arc::new(AtomicBool::new(false)),
+            codex_binding_check_due: router_mode_enabled
+                .then(|| std::time::Instant::now() + CODEX_BINDING_WATCH_INTERVAL),
             update_checking: false,
             update_downloading: false,
             update_dialog_open: false,
@@ -1934,6 +2507,10 @@ impl CodexRouterApp {
         );
         if configured || legacy_autostart_shortcut_exists() {
             app.reconcile_autostart_registration();
+        }
+        if router_mode_enabled && !ui_preferences.prefer_router_mode {
+            // Migrate older installs that already bind Codex to Router.
+            let _ = app.persist_ui_preferences();
         }
         app
     }
@@ -2089,6 +2666,7 @@ impl CodexRouterApp {
                             remaining_seconds: 14_400,
                             requests: 148,
                             tokens: 2_300_400,
+                            ..Default::default()
                         },
                         UsageWindow {
                             kind: "weekly".to_owned(),
@@ -2098,6 +2676,7 @@ impl CodexRouterApp {
                             remaining_seconds: 432_000,
                             requests: 512,
                             tokens: 9_842_331,
+                            ..Default::default()
                         },
                     ],
                     ..Default::default()
@@ -2127,6 +2706,7 @@ impl CodexRouterApp {
                         remaining_seconds: 431_340,
                         requests: 74,
                         tokens: 1_540_000,
+                        ..Default::default()
                     }],
                     ..Default::default()
                 },
@@ -2211,6 +2791,7 @@ impl CodexRouterApp {
             model_from_wizard: true,
             proxy_from_wizard: true,
             status_text: "UI audit mode: no system configuration will be changed.".to_owned(),
+            status_expires_at: None,
             logs: "[03:44:58] Router health check: healthy\n[03:45:00] Usage data refreshed\n[03:45:02] OAuth fallback route is ready\n[03:45:04] Unicode check: 中文、模型、连接稳定\n".repeat(8),
             event_rx,
             event_tx,
@@ -2269,9 +2850,13 @@ impl CodexRouterApp {
             oauth_accounts,
             oauth_loading: false,
             oauth_error: String::new(),
+            oauth_retry_due: None,
+            oauth_retry_attempts: 0,
             oauth_return_page: Page::Dashboard,
             oauth_provider_draft: "openai".to_owned(),
             provider_oauth_running: false,
+            oauth_post_login_prompt_open: false,
+            oauth_model_hint_seen: false,
             pending_oauth_provider: None,
             provider_oauth_preparing: false,
             provider_oauth_preparing_provider: None,
@@ -2282,6 +2867,9 @@ impl CodexRouterApp {
             provider_oauth_cancel: Arc::new(AtomicBool::new(false)),
             oauth_revoke_target: None,
             oauth_revoking: false,
+            oauth_priority_target: None,
+            oauth_priority_draft: 1,
+            oauth_priority_saving: false,
             oauth_manual_model_target: None,
             oauth_manual_model_id_draft: "gemini-3.6-flash".to_owned(),
             oauth_manual_model_alias_draft: "Gemini 3.6 Flash / 手动".to_owned(),
@@ -2294,6 +2882,7 @@ impl CodexRouterApp {
             usage_error: String::new(),
             usage_return_page: Page::Dashboard,
             usage_refresh_due: None,
+            notified_quota_accounts: BTreeSet::new(),
             monitor_subscription_order: vec![101, 202],
             monitor_api_order: vec![303],
             share_codex_state: true,
@@ -2328,6 +2917,7 @@ impl CodexRouterApp {
             health_probe_failures: 0,
             health_recovery_running: false,
             health_recovery_cancel: Arc::new(AtomicBool::new(false)),
+            codex_binding_check_due: None,
             update_checking: false,
             update_downloading: false,
             update_dialog_open: false,
@@ -2459,11 +3049,13 @@ impl CodexRouterApp {
         let path = user_data::preferences_path(&self.router_root);
         let preferences = UiPreferences {
             close_behavior: self.close_behavior,
-            close_warning_version: 1,
+            close_warning_version: 2,
             active_profile_id: self.active_profile_id.clone(),
             monitor_subscription_order: self.monitor_subscription_order.clone(),
             monitor_api_order: self.monitor_api_order.clone(),
             share_codex_state: self.share_codex_state,
+            prefer_router_mode: self.router_mode_enabled,
+            oauth_model_hint_seen: self.oauth_model_hint_seen,
         };
         match preferences.save(&path) {
             Ok(()) => true,
@@ -2728,41 +3320,25 @@ impl CodexRouterApp {
         ) {
             Ok(lock) => lock,
             Err(error) => {
-                self.report_error(format!("无法开始恢复：{error}"));
+                self.report_error(format!("无法开始初始化：{error}"));
                 return;
             }
         };
-        if let Err(error) = profiles::capture_restore_point(
-            &self.router_root,
-            &self.config,
-            "恢复 Codex 官方登录配置之前",
-        ) {
-            self.report_error(format!("恢复前备份失败，已停止操作：{error}"));
-            return;
-        }
-        match profiles::restore_original_codex(
-            &self.router_root,
-            &self.config,
-            self.share_codex_state,
-        ) {
+        match profiles::initialize_codex_defaults(&self.router_root, &self.config) {
             Ok(outcome) => {
                 self.active_profile_id.clear();
                 self.pending_profile_activation = None;
                 self.router_mode_enabled = false;
                 self.oauth_recovery_due = None;
                 self.persist_ui_preferences();
-                self.status_text = if outcome.shared_state_preserved && outcome.auth_available {
-                    "已恢复 Codex 官方路由；当前账号、会话记录和个人设置保持共享。请完全退出并重新打开 Codex。".into()
-                } else if outcome.account_changed && outcome.auth_available {
-                    "已恢复 Codex 官方路由及其账号快照；检测到 Codex 账号不同，因此未合并两个账号的会话与设置。请完全退出并重新打开 Codex。".into()
-                } else if outcome.auth_available {
-                    "已恢复 Codex 官方登录配置与有效登录快照。请完全退出并重新打开 Codex。".into()
+                self.status_text = if outcome.auth_available {
+                    "已初始化 Codex 默认配置：Router 的模型提供方与模型目录已移除，你的 Codex 登录、聊天记录、插件与权限设置保持不变。请完全退出并重新打开 Codex。".into()
                 } else {
-                    "已恢复 Codex 官方配置；旧登录快照缺失或无效，已安全移除以避免 Windows 设置循环。重新打开 Codex 后请按官方流程登录。".into()
+                    "已初始化 Codex 默认配置：Router 写入的配置已移除；未检测到有效登录，请重新打开 Codex 并按官方流程登录。".into()
                 };
             }
             Err(error) => {
-                self.report_error(format!("无法恢复 Codex 官方登录配置：{error}"));
+                self.report_error(format!("无法初始化 Codex 默认配置：{error}"));
             }
         }
     }
@@ -2824,8 +3400,7 @@ impl CodexRouterApp {
                     &fallback,
                     share_codex_state,
                     |restored| {
-                        let mut restored = restored.clone();
-                        deploy_router_config(&mut restored, &root, &apply_cancel, zh, |line| {
+                        redeploy_restored_config(restored, &root, &apply_cancel, zh, &mut |line| {
                             tx.send(AppEvent::Log(line)).ok();
                         })
                     },
@@ -2862,12 +3437,113 @@ impl CodexRouterApp {
                     .ok();
                 }
                 Err(error) => {
-                    tx.send(AppEvent::PreviousConfigurationRestoreError(
-                        error.to_string(),
-                    ))
+                    tx.send(AppEvent::PreviousConfigurationRestoreError(format!(
+                        "{error:#}"
+                    )))
                     .ok();
                 }
             }
+        });
+    }
+
+    /// Codex only reloads `config.toml` and the model catalog on a cold start.
+    /// Restarting the desktop client here saves the user from doing it manually
+    /// after every apply. Only ChatGPT / Codex desktop processes are touched,
+    /// and a failure never fails the apply.
+    fn restart_codex_desktop(&mut self) {
+        let zh = self.ui_language == "zh";
+        let script = r#"
+$ErrorActionPreference = 'SilentlyContinue'
+$names = @('ChatGPT', 'codex', 'ChatGPT.exe', 'codex.exe')
+$matched = @()
+$seen = @{}
+foreach ($proc in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) {
+  $name = [string]$proc.Name
+  if ([string]::IsNullOrWhiteSpace($name)) { continue }
+  $base = [IO.Path]::GetFileNameWithoutExtension($name)
+  if ($names -notcontains $name -and $names -notcontains $base) { continue }
+  $path = [string]$proc.ExecutablePath
+  if ([string]::IsNullOrWhiteSpace($path)) {
+    try { $path = [string](Get-Process -Id $proc.ProcessId -ErrorAction Stop).Path } catch { $path = '' }
+  }
+  $key = [string]$proc.ProcessId
+  if ($seen.ContainsKey($key)) { continue }
+  $seen[$key] = $true
+  $matched += [pscustomobject]@{ ProcessId = [int]$proc.ProcessId; Name = $name; ExecutablePath = $path }
+}
+if ($matched.Count -eq 0) {
+  foreach ($proc in @(Get-Process -Name 'ChatGPT','codex' -ErrorAction SilentlyContinue)) {
+    $path = ''
+    try { $path = [string]$proc.Path } catch { $path = '' }
+    $matched += [pscustomobject]@{ ProcessId = [int]$proc.Id; Name = [string]$proc.ProcessName; ExecutablePath = $path }
+  }
+}
+if ($matched.Count -eq 0) { 'codex-router:codex-not-running'; exit 0 }
+$launch = @($matched | Where-Object { $_.Name -like 'ChatGPT*' -and -not [string]::IsNullOrWhiteSpace($_.ExecutablePath) } | ForEach-Object { $_.ExecutablePath } | Select-Object -First 1)
+if ($launch.Count -eq 0) {
+  $launch = @($matched | Where-Object { -not [string]::IsNullOrWhiteSpace($_.ExecutablePath) } | ForEach-Object { $_.ExecutablePath } | Select-Object -First 1)
+}
+foreach ($p in $matched) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
+Start-Sleep -Seconds 2
+$relaunched = $false
+if ($launch.Count -gt 0 -and (Test-Path -LiteralPath $launch[0])) {
+  try { Start-Process -FilePath $launch[0]; $relaunched = $true } catch { }
+}
+if (-not $relaunched) {
+  $pkg = @(Get-AppxPackage -Name '*OpenAI*ChatGPT*','*OpenAI*Codex*','*ChatGPT*' -ErrorAction SilentlyContinue | Select-Object -First 1)
+  if ($pkg.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace([string]$pkg[0].PackageFamilyName)) {
+    try {
+      Start-Process -FilePath "$env:SystemRoot\explorer.exe" -ArgumentList ("shell:AppsFolder\" + $pkg[0].PackageFamilyName + "!App")
+      $relaunched = $true
+    } catch { }
+  }
+}
+if ($relaunched) { 'codex-router:codex-restarted' } else { 'codex-router:codex-relaunch-skipped' }
+"#;
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            let output = std::process::Command::new("powershell.exe")
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    script,
+                ])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+            let message = match output {
+                Ok(output) => {
+                    let text = String::from_utf8_lossy(&output.stdout);
+                    if text.contains("codex-router:codex-restarted") {
+                        if zh {
+                            "已自动关闭并重启 Codex / ChatGPT 客户端，新模型目录已生效"
+                        } else {
+                            "Codex / ChatGPT was restarted automatically; the new model catalog is active"
+                        }
+                    } else if text.contains("codex-router:codex-not-running") {
+                        if zh {
+                            "未检测到正在运行的 Codex / ChatGPT；下次打开即会加载新配置"
+                        } else {
+                            "Codex / ChatGPT was not running; it will load the new configuration on next launch"
+                        }
+                    } else if zh {
+                        "已关闭 Codex / ChatGPT，但未能自动重新打开，请手动启动"
+                    } else {
+                        "Codex / ChatGPT was closed but could not be relaunched automatically"
+                    }
+                }
+                Err(_) => {
+                    if zh {
+                        "无法自动重启 Codex / ChatGPT，请手动完全退出并重新打开"
+                    } else {
+                        "Could not restart Codex / ChatGPT automatically; quit and reopen it manually"
+                    }
+                }
+            };
+            tx.send(AppEvent::Log(message.to_owned())).ok();
         });
     }
 
@@ -2878,10 +3554,9 @@ impl CodexRouterApp {
             self.tray_lightweight_mode = true;
             self.runtime_log_paused.store(true, Ordering::Relaxed);
             self.usage_refresh_due = None;
-            if self.router_mode_enabled && self.oauth_recovery_due.is_none() {
-                self.oauth_recovery_due =
-                    Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
-            }
+            // Do not kick off OAuth recovery merely because the window was
+            // minimized. Recovery runs on startup and when the user opens the
+            // usage monitor or OAuth page.
             if self.fonts_loaded {
                 install_lightweight_fonts(ctx);
                 self.fonts_loaded = false;
@@ -2908,31 +3583,16 @@ impl CodexRouterApp {
     fn restore_from_tray(&mut self, ctx: &egui::Context) {
         self.background_hide_until = None;
         let was_lightweight = self.tray_lightweight_mode;
-        if !self.fonts_loaded {
-            install_app_fonts(ctx);
-            self.fonts_loaded = true;
-            self.installed_theme.clear();
-        }
+        ensure_full_ui_fonts(self, ctx);
         self.tray_lightweight_mode = false;
         self.tray_restore_guard_until =
             Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
         self.load_logo_texture(ctx);
         self.runtime_log_paused.store(false, Ordering::Relaxed);
-        if self.router_mode_enabled
-            && (self
-                .config
-                .oauth_account_ids
-                .as_ref()
-                .is_some_and(|accounts| !accounts.is_empty())
-                || self
-                    .config
-                    .models
-                    .iter()
-                    .any(|model| model.source == "oauth"))
-            && self.oauth_recovery_due.is_none()
-        {
-            self.oauth_recovery_due =
-                Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+        if was_lightweight {
+            // One opportunistic recovery when the user returns from tray, not a
+            // recurring hourly schedule.
+            self.request_oauth_recovery_probe(std::time::Duration::from_secs(2));
         }
         if let Some(tray) = &self.tray_icon {
             let _ = tray.set_tooltip(Some(APP_TITLE));
@@ -3041,6 +3701,7 @@ impl CodexRouterApp {
         }
         match self.close_behavior {
             CloseBehavior::Ask => {
+                ensure_full_ui_fonts(self, ctx);
                 self.close_prompt_open = true;
                 ctx.request_repaint();
             }
@@ -3057,12 +3718,10 @@ impl CodexRouterApp {
             return;
         }
         self.tray_restore_guard_until = None;
-        if !self.tray_lightweight_mode
-            && self.tray_icon.is_some()
-            && ctx.input(|input| input.viewport().minimized == Some(true))
-        {
-            self.minimize_to_tray(ctx);
-        }
+        // The native minimize button must behave like every other Windows app:
+        // the window stays on the taskbar. Only closing with X (when the user
+        // chose "minimize to tray") hides the window into the tray.
+        let _ = ctx;
     }
 
     fn process_app_events(&mut self, ctx: &egui::Context) {
@@ -3086,6 +3745,8 @@ impl CodexRouterApp {
                         Err(error) => {
                             self.runtime_log_paused.store(false, Ordering::Relaxed);
                             self.health_probe_due = None;
+                            self.tray_lightweight_mode = false;
+                            ensure_full_ui_fonts(self, ctx);
                             if let Some(tray) = &self.tray_icon {
                                 let _ = tray.set_visible(true);
                             }
@@ -3093,6 +3754,17 @@ impl CodexRouterApp {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                             let detail = runtime_logs::summarize_error_for_display(&error);
+                            let detail = if detail.contains("class=request_failure")
+                                || detail.contains("class=unclassified_error")
+                            {
+                                if zh {
+                                    "本地服务未能在安全时限内停止。若刚升级过便携包，请再试一次彻底退出；仍失败时请结束占用 18080 / 16379 / 15432 端口的旧进程后重试。"
+                                } else {
+                                    "Local services could not stop within the safety budget. After upgrading portable packages, retry full exit; if it still fails, stop older processes on ports 18080 / 16379 / 15432 and try again."
+                                }
+                            } else {
+                                detail.as_str()
+                            };
                             self.exit_shutdown_error = if zh {
                                 format!("未能彻底关闭本地服务：{detail}")
                             } else {
@@ -3148,6 +3820,7 @@ impl CodexRouterApp {
                     self.apply_success_dialog_open = true;
                     self.configured = true;
                     self.router_mode_enabled = true;
+                    self.persist_ui_preferences();
                     self.codex_account_mode_status =
                         profiles::codex_account_mode_status(&self.router_root, &self.config);
                     self.router_mode_switching = false;
@@ -3156,12 +3829,17 @@ impl CodexRouterApp {
                     self.health_probe_failures = 0;
                     self.health_probe_due =
                         Some(std::time::Instant::now() + FAILED_PROBE_RETRY_INTERVAL);
-                    self.status_text = if zh {
-                        "配置完成：模型渠道、Codex 和所选集成均已生效"
-                    } else {
-                        "Configuration complete: model channels, Codex, and integrations are active"
-                    }
-                    .into();
+                    self.set_status(
+                        if zh {
+                            "配置完成：模型渠道、Codex 和所选集成均已生效"
+                        } else {
+                            "Configuration complete: model channels, Codex, and integrations are active"
+                        },
+                        12,
+                    );
+                    // Codex reads config.toml and the model catalog only at cold
+                    // start, so close and reopen it for the user.
+                    self.restart_codex_desktop();
                     self.log(if zh {
                         "配置完成"
                     } else {
@@ -3169,7 +3847,6 @@ impl CodexRouterApp {
                     });
                     self.schedule_usage_refresh();
                     if let Some(profile_id) = self.pending_profile_activation.take() {
-                        let switched_profile = self.active_profile_id != profile_id;
                         match profiles::update_profile_state(
                             &self.router_root,
                             &profile_id,
@@ -3179,18 +3856,9 @@ impl CodexRouterApp {
                                 self.active_profile_id = profile_id;
                                 self.persist_ui_preferences();
                                 self.refresh_isolation_profiles();
-                                self.status_text = if switched_profile {
-                                    if zh {
-                                        "配置切换完成；已有 Codex 任务不会热切换，请新建任务使用新配置"
-                                    } else {
-                                        "Configuration switched. Existing Codex tasks do not hot-switch; start a new task to use it"
-                                    }
-                                } else if zh {
-                                    "当前配置已保存并应用；OAuth 授权、模型和回退策略已写入本配置"
-                                } else {
-                                    "Current profile saved and applied. Its OAuth bindings, models, and fallback policy were updated"
-                                }
-                                .into();
+                                // The profile switch result is already visible in the
+                                // success dialog and activity log. Do not overwrite the
+                                // transient dashboard status with a persistent banner.
                             }
                             Err(error) => {
                                 // Deployment already committed the selected profile. Keep the
@@ -3212,17 +3880,40 @@ impl CodexRouterApp {
                     self.pending_apply_rollback = None;
                 }
                 AppEvent::Error(error) => {
+                    let was_applying = self.applying;
+                    let was_router_mode_switching = self.router_mode_switching;
                     self.applying = false;
                     if self.exit_shutdown_in_progress {
+                        continue;
+                    }
+                    // A rolled-back attempt can report its failure after a later
+                    // retry already succeeded. Keep that stale error out of the
+                    // dashboard status line; it stays in the activity log.
+                    if !was_applying && self.configured && self.router_mode_enabled {
+                        self.log(format!(
+                            "{}: {}",
+                            if zh {
+                                "已忽略过期的部署错误"
+                            } else {
+                                "Ignored a stale deployment error"
+                            },
+                            localized_error_summary(zh, &error)
+                        ));
                         continue;
                     }
                     self.router_mode_switching = false;
                     if !self.restore_pending_apply_ui_rollback() {
                         self.router_mode_enabled = logic::codex_router_mode_active(&self.config);
                         self.pending_profile_activation = None;
+                    } else if was_router_mode_switching {
+                        // A failed automatic rebind must not retry every watchdog
+                        // interval. A later manual Apply can enable Router mode again.
+                        self.router_mode_enabled =
+                            logic::codex_router_mode_configured(&self.config);
+                        self.persist_ui_preferences();
                     }
                     let detail = localized_error_summary(zh, &error);
-                    self.status_text = format!(
+                    let message = format!(
                         "{}: {detail}",
                         if zh {
                             "配置失败"
@@ -3230,6 +3921,7 @@ impl CodexRouterApp {
                             "Configuration failed"
                         }
                     );
+                    self.set_status(message, 20);
                     self.log(self.status_text.clone());
                 }
                 AppEvent::PreviousConfigurationRestored {
@@ -3288,12 +3980,20 @@ impl CodexRouterApp {
                 AppEvent::OAuthAccountsLoaded(mut accounts) => {
                     self.oauth_loading = false;
                     self.oauth_error.clear();
+                    self.oauth_retry_due = None;
+                    self.oauth_retry_attempts = 0;
                     for account in &mut accounts {
                         if !account.error.trim().is_empty() {
                             account.error =
                                 runtime_logs::summarize_error_for_display(&account.error);
                         }
                     }
+                    accounts.sort_by(|left, right| {
+                        left.priority
+                            .cmp(&right.priority)
+                            .then(left.platform.cmp(&right.platform))
+                            .then(left.id.cmp(&right.id))
+                    });
                     let mut selected = self.config.oauth_account_ids.clone().unwrap_or_default();
                     let mut seen = self.config.oauth_seen_account_ids.clone();
                     let bound_account_ids = accounts
@@ -3353,6 +4053,18 @@ impl CodexRouterApp {
                                 "Added {auto_added} new OAuth account(s) to this profile and refreshed usage statistics"
                             )
                         };
+                        if self.router_mode_enabled
+                            && !self.applying
+                            && !self.router_mode_switching
+                            && user_data::config_looks_configured(&self.config)
+                        {
+                            self.log(if zh {
+                                "OAuth 登录完成，正在自动应用路由以同步模型目录…"
+                            } else {
+                                "OAuth login finished; applying routes to sync the model catalog…"
+                            });
+                            let _ = self.apply_all_with_backup(true, None, None);
+                        }
                     }
                     if self.page == Page::OAuth {
                         self.refresh_usage_monitor();
@@ -3370,6 +4082,21 @@ impl CodexRouterApp {
                             "Could not load OAuth accounts"
                         }
                     ));
+                    // Fresh starts and Apply leave the admin API briefly unavailable.
+                    // Automatically retry a few times while the OAuth page is open so
+                    // users do not have to mash Refresh during that window.
+                    if self.page == Page::OAuth
+                        && self.oauth_retry_attempts < 5
+                        && oauth_accounts_error_is_retryable(&error)
+                    {
+                        self.oauth_retry_attempts = self.oauth_retry_attempts.saturating_add(1);
+                        let delay_ms = 1200u64 + u64::from(self.oauth_retry_attempts) * 800;
+                        self.oauth_retry_due = Some(
+                            std::time::Instant::now() + std::time::Duration::from_millis(delay_ms),
+                        );
+                    } else {
+                        self.oauth_retry_due = None;
+                    }
                 }
                 AppEvent::ProviderOAuthPrepared {
                     provider,
@@ -3390,7 +4117,15 @@ impl CodexRouterApp {
                     self.provider_oauth_preparing_provider = None;
                     self.provider_oauth_prepared_provider = Some(provider.clone());
                     self.provider_oauth_prepare_error.clear();
-                    if self.pending_oauth_provider.as_deref() == Some(provider.as_str()) {
+                    let terms_accepted = self.config.accept_compliance
+                        && self.config.accepted_terms_version == CURRENT_TERMS_VERSION;
+                    if self.pending_oauth_provider.as_deref() == Some(provider.as_str())
+                        && terms_accepted
+                    {
+                        self.pending_oauth_provider = None;
+                        self.terms_open = false;
+                        self.launch_provider_oauth(&provider);
+                    } else if self.pending_oauth_provider.as_deref() == Some(provider.as_str()) {
                         self.status_text = if zh {
                             "安全登录环境已准备好；阅读完条例后即可开始 OAuth".to_owned()
                         } else {
@@ -3436,6 +4171,33 @@ impl CodexRouterApp {
                 }
                 AppEvent::ProviderOAuthFinished => {
                     self.provider_oauth_running = false;
+                    // Wizard / first-run access never shows the tip. After the
+                    // product is configured, the first successful OAuth add
+                    // from a post-setup surface shows it once.
+                    let wizard_surface = matches!(
+                        self.page,
+                        Page::Welcome
+                            | Page::Project
+                            | Page::Auth
+                            | Page::Model
+                            | Page::Proxy
+                            | Page::Finish
+                    ) || matches!(
+                        self.oauth_return_page,
+                        Page::Welcome
+                            | Page::Project
+                            | Page::Auth
+                            | Page::Model
+                            | Page::Proxy
+                            | Page::Finish
+                    );
+                    if self.configured
+                        && !wizard_surface
+                        && !self.oauth_model_hint_seen
+                        && !self.ui_audit_mode
+                    {
+                        self.oauth_post_login_prompt_open = true;
+                    }
                     self.status_text = if zh {
                         "OAuth 登录成功，正在自动同步到当前配置与用量统计…"
                     } else {
@@ -3477,34 +4239,44 @@ impl CodexRouterApp {
                     self.usage_loading = false;
                     self.usage_error.clear();
                     let mut snapshot = *snapshot;
+                    let zh = self.ui_language == "zh";
                     for account in snapshot
                         .subscriptions
                         .iter_mut()
                         .chain(snapshot.api_channels.iter_mut())
                     {
-                        if !account.status_detail.trim().is_empty() {
-                            account.status_detail =
-                                runtime_logs::summarize_error_for_display(&account.status_detail);
-                        }
-                        if !account.query_note.trim().is_empty() {
-                            account.query_note =
-                                runtime_logs::summarize_error_for_display(&account.query_note);
-                        }
+                        normalize_usage_account_messages(zh, account);
                     }
                     Self::sort_usage_accounts(
                         &mut snapshot.subscriptions,
                         &self.monitor_subscription_order,
                     );
                     Self::sort_usage_accounts(&mut snapshot.api_channels, &self.monitor_api_order);
-                    if !snapshot.subscriptions.is_empty() && self.router_mode_enabled {
-                        self.oauth_recovery_due = Some(std::time::Instant::now());
-                    }
+                    // Usage snapshots feed recovery observations on disk. The
+                    // actual OAuth re-bind probe is started only from the usage
+                    // monitor / OAuth page open path, not on every background
+                    // refresh.
                     if let Err(error) = self.save_usage_monitor_cache(&profile_key, &snapshot) {
                         self.log(format!(
                             "用量监控缓存保存失败：{}",
                             runtime_logs::summarize_error_for_display(&error.to_string())
                         ));
                     }
+                    if let Some((source, target)) = fallback_transition_notification(
+                        self.usage_snapshot.as_ref(),
+                        &snapshot,
+                        &self.config,
+                    ) {
+                        show_fallback_notification(self.ui_language == "zh", source, target);
+                    }
+                    let exhausted_ids = snapshot
+                        .subscriptions
+                        .iter()
+                        .filter(|account| account.health == "quotaExhausted")
+                        .map(|account| account.id)
+                        .collect::<BTreeSet<_>>();
+                    self.notified_quota_accounts
+                        .retain(|account_id| exhausted_ids.contains(account_id));
                     self.usage_snapshot = Some(snapshot);
                     self.usage_snapshot_profile_key = profile_key;
                 }
@@ -3529,17 +4301,7 @@ impl CodexRouterApp {
                     }
                     self.usage_loading = false;
                     let detail = usage_error_for_display(zh, &error);
-                    self.usage_error = if self.usage_snapshot.is_some()
-                        && self.usage_snapshot_profile_key == self.active_route_profile_key()
-                    {
-                        if zh {
-                            format!("刷新失败，下面保留上次成功数据；{detail}")
-                        } else {
-                            format!("Refresh failed; the last successful data is retained below. {detail}")
-                        }
-                    } else {
-                        detail.clone()
-                    };
+                    self.usage_error = detail.clone();
                     self.log(format!(
                         "{}: {detail}",
                         if zh {
@@ -3552,6 +4314,7 @@ impl CodexRouterApp {
                 AppEvent::RouterModeDisabled(outcome) => {
                     self.router_mode_switching = false;
                     self.router_mode_enabled = false;
+                    let _ = self.persist_ui_preferences();
                     self.codex_account_mode_status =
                         profiles::codex_account_mode_status(&self.router_root, &self.config);
                     self.oauth_recovery_due = None;
@@ -3593,70 +4356,42 @@ impl CodexRouterApp {
                     };
                     self.log(self.status_text.clone());
                 }
-                AppEvent::CodexAccountModeChanged(status) => {
-                    self.codex_account_mode_switching = false;
-                    self.codex_account_mode_status = status;
-                    self.apply_success_dialog_open = true;
-                    self.status_text = match status.mode {
-                        profiles::CodexAccountMode::ApiOnly if zh => {
-                            "已切换到 API 模式；第三方模型保持可用。完全退出并重开 Codex 后，官方额度提示通常会消失。"
-                        }
-                        profiles::CodexAccountMode::ApiOnly => {
-                            "Switched to API-only mode; third-party models remain available. Fully restart Codex; the official quota banner will usually disappear."
-                        }
-                        profiles::CodexAccountMode::Official if zh => {
-                            "已恢复官方账号登录；Codex 云端、远程控制和工作区能力可继续使用。请完全退出并重开 Codex。"
-                        }
-                        profiles::CodexAccountMode::Official => {
-                            "Restored the official account login, including Codex cloud, remote, and workspace capabilities. Fully restart Codex."
-                        }
-                        _ if zh => "Codex 账号模式已更新，请完全退出并重开 Codex。",
-                        _ => "Codex account mode updated. Fully restart Codex.",
-                    }
-                    .to_owned();
-                    self.log(self.status_text.clone());
-                }
-                AppEvent::CodexAccountModeSwitchError(error) => {
-                    self.codex_account_mode_switching = false;
-                    self.codex_account_mode_status =
-                        profiles::codex_account_mode_status(&self.router_root, &self.config);
-                    let detail = runtime_logs::summarize_error_for_display(&error);
-                    self.status_text = if zh {
-                        format!("Codex 账号模式切换失败：{detail}")
-                    } else {
-                        format!("Could not switch the Codex account mode: {detail}")
-                    };
-                    self.log(self.status_text.clone());
-                }
                 AppEvent::OAuthRecoveryFinished(schedule) => {
                     self.oauth_recovery_running = false;
-                    let delay = std::time::Duration::from_secs(
-                        schedule.next_check_seconds.clamp(30, 7 * 24 * 60 * 60),
-                    );
-                    self.oauth_recovery_due = Some(std::time::Instant::now() + delay);
-                    self.log(if zh {
-                        format!(
-                            "OAuth 恢复调度已更新：{}；下次检查约 {} 秒后",
-                            schedule.summary,
-                            delay.as_secs()
-                        )
-                    } else {
-                        format!(
-                            "OAuth recovery schedule updated: {}; next check in about {} seconds",
-                            schedule.summary,
-                            delay.as_secs()
-                        )
+                    self.oauth_recovery_due = (schedule.next_check_seconds > 0).then(|| {
+                        std::time::Instant::now()
+                            + std::time::Duration::from_secs(schedule.next_check_seconds)
                     });
+                    let recovered = schedule.summary.to_ascii_lowercase().contains("recovered=")
+                        && schedule
+                            .summary
+                            .split_whitespace()
+                            .any(|part| part.starts_with("recovered=") && part != "recovered=0");
+                    self.log(if zh {
+                        format!("OAuth 恢复探测完成：{}", schedule.summary)
+                    } else {
+                        format!("OAuth recovery probe finished: {}", schedule.summary)
+                    });
+                    if recovered {
+                        self.status_text = if zh {
+                            "检测到 OAuth 额度已恢复，已重新接入官方账号".to_owned()
+                        } else {
+                            "OAuth quota recovered; official accounts were re-enabled".to_owned()
+                        };
+                        if self.page == Page::OAuth || self.page == Page::Monitor {
+                            self.refresh_oauth_accounts();
+                            self.refresh_usage_monitor();
+                        }
+                    }
                 }
                 AppEvent::OAuthRecoveryError(error) => {
                     self.oauth_recovery_running = false;
-                    self.oauth_recovery_due =
-                        Some(std::time::Instant::now() + std::time::Duration::from_secs(60 * 60));
+                    self.oauth_recovery_due = None;
                     let detail = runtime_logs::summarize_error_for_display(&error);
                     self.log(if zh {
-                        format!("OAuth 每小时恢复探测未成功：{detail}")
+                        format!("OAuth 恢复探测未成功：{detail}")
                     } else {
-                        format!("Hourly OAuth recovery probe did not succeed: {detail}")
+                        format!("OAuth recovery probe did not succeed: {detail}")
                     });
                 }
                 AppEvent::GrokSsoImported => {
@@ -3745,6 +4480,42 @@ impl CodexRouterApp {
                         format!("Could not revoke OAuth: {detail}")
                     };
                     self.log(self.status_text.clone());
+                }
+                AppEvent::OAuthAccountPriorityUpdated {
+                    account_id,
+                    priority,
+                } => {
+                    self.oauth_priority_saving = false;
+                    self.oauth_priority_target = None;
+                    if let Some(account) = self
+                        .oauth_accounts
+                        .iter_mut()
+                        .find(|account| account.id == account_id)
+                    {
+                        account.priority = priority;
+                    }
+                    self.oauth_accounts.sort_by(|left, right| {
+                        left.priority
+                            .cmp(&right.priority)
+                            .then(left.platform.cmp(&right.platform))
+                            .then(left.id.cmp(&right.id))
+                    });
+                    self.status_text = if zh {
+                        format!("已将 OAuth 调度优先级更新为 P{priority}")
+                    } else {
+                        format!("Updated OAuth scheduling priority to P{priority}")
+                    };
+                    self.log(self.status_text.clone());
+                }
+                AppEvent::OAuthAccountPriorityError(error) => {
+                    self.oauth_priority_saving = false;
+                    let detail = localized_error_summary(zh, &error);
+                    self.oauth_error = if zh {
+                        format!("更新 OAuth 优先级失败：{detail}")
+                    } else {
+                        format!("Could not update OAuth priority: {detail}")
+                    };
+                    self.log(self.oauth_error.clone());
                 }
                 AppEvent::UpdateResult(info) => {
                     self.update_checking = false;
@@ -3839,22 +4610,28 @@ impl CodexRouterApp {
                         Ok(()) => {
                             self.health_probe_due =
                                 Some(std::time::Instant::now() + HEALTHY_PROBE_INTERVAL);
-                            self.status_text = if zh {
-                                "已自动恢复本机转发，连接保护继续运行".to_owned()
-                            } else {
-                                "Local forwarding recovered automatically; connection protection remains active".to_owned()
-                            };
+                            self.set_status(
+                                if zh {
+                                    "已自动恢复本机转发，连接保护继续运行"
+                                } else {
+                                    "Local forwarding recovered automatically; connection protection remains active"
+                                },
+                                8,
+                            );
                             self.log(self.status_text.clone());
                         }
                         Err(error) => {
                             let detail = runtime_logs::summarize_error_for_display(&error);
                             self.health_probe_due =
                                 Some(std::time::Instant::now() + RECOVERY_RETRY_INTERVAL);
-                            self.status_text = if zh {
-                                format!("自动恢复本机转发未成功，稍后重试：{detail}")
-                            } else {
-                                format!("Automatic local forwarding recovery did not succeed; retrying later: {detail}")
-                            };
+                            self.set_status(
+                                if zh {
+                                    format!("自动恢复本机转发未成功，稍后重试：{detail}")
+                                } else {
+                                    format!("Automatic local forwarding recovery did not succeed; retrying later: {detail}")
+                                },
+                                15,
+                            );
                             self.log(self.status_text.clone());
                         }
                     }
@@ -3894,6 +4671,17 @@ impl CodexRouterApp {
                 {
                     self.health_probe_due = Some(std::time::Instant::now());
                 }
+                if let Some(account_id) = failover_account_id(&record) {
+                    if self.notified_quota_accounts.insert(account_id) {
+                        if let Some((source, target)) = fallback_names_for_account(
+                            &self.config,
+                            &self.oauth_accounts,
+                            account_id,
+                        ) {
+                            show_fallback_notification(self.ui_language == "zh", source, target);
+                        }
+                    }
+                }
                 self.log(record);
             }
         }
@@ -3911,6 +4699,19 @@ impl CodexRouterApp {
             self.logo_texture =
                 Some(ctx.load_texture("codex-router-logo", image, egui::TextureOptions::LINEAR));
         }
+    }
+
+    /// Dashboard status text is a transient hint, not a log of past events.
+    /// Assigning it through here stamps a TTL so a stale error or an old
+    /// health-recovery message can never sit on the panel after the work has
+    /// already finished. The full detail still goes to the activity log.
+    fn set_status(&mut self, text: impl Into<String>, ttl_secs: u64) {
+        self.status_text = text.into();
+        self.status_expires_at = if ttl_secs == 0 {
+            None
+        } else {
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(ttl_secs))
+        };
     }
 
     fn log(&mut self, message: impl AsRef<str>) {
@@ -3989,6 +4790,8 @@ impl CodexRouterApp {
         if self.ui_audit_mode {
             return;
         }
+        self.oauth_retry_attempts = 0;
+        self.request_oauth_recovery_probe(std::time::Duration::from_millis(300));
         self.refresh_oauth_accounts();
     }
 
@@ -4001,6 +4804,7 @@ impl CodexRouterApp {
         }
         self.oauth_loading = true;
         self.oauth_error.clear();
+        self.oauth_retry_due = None;
         let root = self.router_root.clone();
         let tx = self.event_tx.clone();
         std::thread::spawn(move || match logic::load_oauth_accounts(&root) {
@@ -4012,6 +4816,20 @@ impl CodexRouterApp {
                     .ok();
             }
         });
+    }
+
+    fn process_scheduled_oauth_account_refresh(&mut self, ctx: &egui::Context) {
+        let Some(due) = self.oauth_retry_due else {
+            return;
+        };
+        if std::time::Instant::now() < due {
+            ctx.request_repaint_after(due.saturating_duration_since(std::time::Instant::now()));
+            return;
+        }
+        self.oauth_retry_due = None;
+        if self.page == Page::OAuth && !self.oauth_loading {
+            self.refresh_oauth_accounts();
+        }
     }
 
     fn open_usage_monitor(&mut self) {
@@ -4029,6 +4847,7 @@ impl CodexRouterApp {
         if self.ui_audit_mode {
             return;
         }
+        self.request_oauth_recovery_probe(std::time::Duration::from_millis(400));
         self.refresh_usage_monitor();
     }
 
@@ -4169,12 +4988,14 @@ impl CodexRouterApp {
         self.health_probe_due = None;
         self.health_recovery_running = true;
         self.health_recovery_cancel.store(false, Ordering::Relaxed);
-        self.status_text = if self.ui_language == "zh" {
-            "连续 3 次健康探测失败，正在无窗口恢复本机转发…".to_owned()
-        } else {
-            "Three health probes failed; recovering local forwarding without a console window…"
-                .to_owned()
-        };
+        self.set_status(
+            if self.ui_language == "zh" {
+                "连续 3 次健康探测失败，正在无窗口恢复本机转发…"
+            } else {
+                "Three health probes failed; recovering local forwarding without a console window…"
+            },
+            0,
+        );
         self.log(self.status_text.clone());
 
         let root = self.router_root.clone();
@@ -4221,16 +5042,52 @@ impl CodexRouterApp {
             self.oauth_recovery_due = None;
             return;
         }
-        let due = self
-            .oauth_recovery_due
-            .get_or_insert_with(|| std::time::Instant::now() + std::time::Duration::from_secs(5));
+        let Some(due) = self.oauth_recovery_due else {
+            return;
+        };
         let now = std::time::Instant::now();
-        if now < *due {
+        if now < due {
             ctx.request_repaint_after(due.saturating_duration_since(now));
             return;
         }
         if self.oauth_recovery_running {
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            return;
+        }
+        self.oauth_recovery_due = None;
+        self.start_oauth_recovery_probe();
+    }
+
+    fn request_oauth_recovery_probe(&mut self, delay: std::time::Duration) {
+        if self.ui_audit_mode || self.exit_shutdown_in_progress || !self.router_mode_enabled {
+            return;
+        }
+        let has_selected_oauth = self
+            .config
+            .oauth_account_ids
+            .as_ref()
+            .is_some_and(|accounts| !accounts.is_empty())
+            || self
+                .config
+                .models
+                .iter()
+                .any(|model| model.source == "oauth");
+        if !has_selected_oauth {
+            self.oauth_recovery_due = None;
+            return;
+        }
+        if self.oauth_recovery_running {
+            return;
+        }
+        let due = std::time::Instant::now() + delay;
+        self.oauth_recovery_due = Some(match self.oauth_recovery_due {
+            Some(existing) if existing <= due => existing,
+            _ => due,
+        });
+    }
+
+    fn start_oauth_recovery_probe(&mut self) {
+        if self.oauth_recovery_running {
             return;
         }
         self.oauth_recovery_due = None;
@@ -4387,6 +5244,78 @@ impl CodexRouterApp {
         );
     }
 
+    fn save_oauth_account_priority(&mut self) {
+        if self.ui_audit_mode {
+            self.oauth_error = "UI audit mode: priority changes are disabled.".to_owned();
+            return;
+        }
+        let Some(account) = self.oauth_priority_target.clone() else {
+            return;
+        };
+        if self.oauth_priority_saving {
+            return;
+        }
+        let priority = self.oauth_priority_draft.clamp(1, 999);
+        self.oauth_priority_draft = priority;
+        self.oauth_priority_saving = true;
+        self.oauth_error.clear();
+        let root = self.router_root.clone();
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            match logic::set_oauth_account_priority(&root, account.id, priority) {
+                Ok(saved) => {
+                    tx.send(AppEvent::OAuthAccountPriorityUpdated {
+                        account_id: account.id,
+                        priority: saved,
+                    })
+                    .ok();
+                }
+                Err(error) => {
+                    tx.send(AppEvent::OAuthAccountPriorityError(error.to_string()))
+                        .ok();
+                }
+            }
+        });
+    }
+
+    fn open_oauth_priority_editor(&mut self, account: OAuthAccountSummary) {
+        self.oauth_priority_draft = account.priority.clamp(1, 999);
+        if self.oauth_priority_draft < 1 {
+            self.oauth_priority_draft = 1;
+        }
+        self.oauth_priority_target = Some(account);
+        self.oauth_error.clear();
+    }
+
+    fn process_codex_binding_watch(&mut self, ctx: &egui::Context) {
+        if self.exit_shutdown_in_progress || !self.router_mode_enabled {
+            self.codex_binding_check_due = None;
+            return;
+        }
+        if self.applying || self.router_mode_switching {
+            return;
+        }
+        if codex_desktop_or_setup_running() {
+            self.codex_binding_check_due =
+                Some(std::time::Instant::now() + CODEX_BINDING_WATCH_INTERVAL);
+            ctx.request_repaint_after(CODEX_BINDING_WATCH_INTERVAL);
+            return;
+        }
+        let now = std::time::Instant::now();
+        let due = self
+            .codex_binding_check_due
+            .get_or_insert_with(|| now + CODEX_BINDING_WATCH_INTERVAL);
+        if now < *due {
+            ctx.request_repaint_after(due.saturating_duration_since(now));
+            return;
+        }
+        self.codex_binding_check_due = Some(now + CODEX_BINDING_WATCH_INTERVAL);
+        if !logic::codex_router_mode_configured(&self.config) {
+            self.enable_router_mode();
+        }
+        ctx.request_repaint_after(CODEX_BINDING_WATCH_INTERVAL);
+    }
+
     fn enable_router_mode(&mut self) {
         if self.ui_audit_mode {
             self.status_text = "UI audit mode: Router switching is disabled.".to_owned();
@@ -4405,6 +5334,8 @@ impl CodexRouterApp {
             return;
         }
         self.health_recovery_cancel.store(true, Ordering::Relaxed);
+        self.router_mode_enabled = true;
+        let _ = self.persist_ui_preferences();
         self.router_mode_switching = true;
         self.log(if self.ui_language == "zh" {
             "正在启用 Router 路由并应用当前配置…"
@@ -4471,70 +5402,22 @@ impl CodexRouterApp {
         });
     }
 
-    fn switch_codex_account_mode(&mut self, target: profiles::CodexAccountMode) {
-        if self.ui_audit_mode {
-            self.status_text = "UI audit mode: account switching is disabled.".to_owned();
-            return;
-        }
-        if self.codex_account_mode_switching || self.applying || self.router_mode_switching {
-            return;
-        }
-        if target == self.codex_account_mode_status.mode {
-            return;
-        }
-        if target == profiles::CodexAccountMode::ApiOnly
-            && (!self.router_mode_enabled || !logic::codex_router_mode_active(&self.config))
-        {
-            self.report_error(if self.ui_language == "zh" {
-                "请先开启 Codex 本地 Router 路由，再切换到 API 模式"
-            } else {
-                "Enable the local Codex Router route before switching to API-only mode"
-            });
-            return;
-        }
-        self.codex_account_mode_switching = true;
-        self.status_text = if self.ui_language == "zh" {
-            "正在校验加密快照并切换 Codex 账号模式…"
-        } else {
-            "Verifying the encrypted snapshot and switching the Codex account mode…"
-        }
-        .to_owned();
-        self.log(self.status_text.clone());
-        let root = self.router_root.clone();
-        let config = self.config.clone();
-        let tx = self.event_tx.clone();
-        std::thread::spawn(move || {
-            let result = (|| -> anyhow::Result<profiles::CodexAccountModeStatus> {
-                let _lock =
-                    profiles::acquire_config_apply_lock(&root, std::time::Duration::from_secs(10))?;
-                match target {
-                    profiles::CodexAccountMode::ApiOnly => {
-                        profiles::switch_to_api_only_mode(&root, &config)?
-                    }
-                    profiles::CodexAccountMode::Official => {
-                        profiles::restore_official_account_mode(&root, &config)?
-                    }
-                    profiles::CodexAccountMode::Unavailable => {
-                        anyhow::bail!("Unsupported Codex account mode")
-                    }
-                }
-                Ok(profiles::codex_account_mode_status(&root, &config))
-            })();
-            match result {
-                Ok(status) => {
-                    tx.send(AppEvent::CodexAccountModeChanged(status)).ok();
-                }
-                Err(error) => {
-                    tx.send(AppEvent::CodexAccountModeSwitchError(error.to_string()))
-                        .ok();
-                }
-            }
-        });
-    }
-
     fn apply_all(&mut self) {
         if self.ui_audit_mode {
             self.status_text = "UI audit mode: configuration apply is disabled.".to_owned();
+            return;
+        }
+        if self.active_profile_id.trim().is_empty() && self.isolation_profiles.is_empty() {
+            let zh = self.ui_language == "zh";
+            self.page = Page::Profiles;
+            self.local_profile_name_input.clear();
+            self.status_text = if zh {
+                "首次保存前请先在上方命名配置分组（例如 工作）。建议先登录 Codex，应用后再完全重启 Codex。"
+            } else {
+                "Name a configuration profile above first (for example Work). Prefer signing in to Codex, then apply, then fully restart Codex."
+            }
+            .to_owned();
+            self.log(self.status_text.clone());
             return;
         }
         let active_profile_id =
@@ -4652,7 +5535,9 @@ impl CodexRouterApp {
                     } else {
                         error
                     };
-                    tx.send(AppEvent::Error(error.to_string())).ok();
+                    // `to_string` would only surface the outermost rollback
+                    // context and hide the deployment failure that caused it.
+                    tx.send(AppEvent::Error(format!("{error:#}"))).ok();
                 }
             }
         });
@@ -4819,6 +5704,48 @@ impl CodexRouterApp {
         url.as_str().trim_end_matches('/').to_owned()
     }
 
+    fn cancel_provider_oauth(&mut self) {
+        if !self.provider_oauth_running && !self.provider_oauth_preparing {
+            return;
+        }
+        self.provider_oauth_cancel.store(true, Ordering::Relaxed);
+        self.provider_oauth_prepare_cancel
+            .store(true, Ordering::Release);
+        self.provider_oauth_running = false;
+        self.provider_oauth_preparing = false;
+        self.provider_oauth_preparing_provider = None;
+        self.pending_oauth_provider = None;
+        // Drop leftover callback listeners held by a previous helper process.
+        let _ = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                r#"
+$ports = 1455,8085,56121
+foreach ($port in $ports) {
+  Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue |
+    Select-Object -ExpandProperty OwningProcess -Unique |
+    ForEach-Object {
+      $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$_" -ErrorAction SilentlyContinue
+      if ($null -ne $proc -and [string]$proc.CommandLine -match 'Start-ProviderOAuth|ProviderOAuth') {
+        Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue
+      }
+    }
+}
+"#,
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+        self.status_text = if self.ui_language == "zh" {
+            "已取消 OAuth 登录。关闭浏览器标签后可重新点击登录。".to_owned()
+        } else {
+            "OAuth login cancelled. Close the browser tab, then try signing in again.".to_owned()
+        };
+        self.log(self.status_text.clone());
+    }
+
     fn start_provider_oauth(&mut self, provider: &str) {
         if self.ui_audit_mode {
             self.status_text = "UI audit mode: OAuth launch is disabled.".to_owned();
@@ -4826,10 +5753,9 @@ impl CodexRouterApp {
         }
         if self.provider_oauth_running {
             self.status_text = if self.ui_language == "zh" {
-                "已有 OAuth 登录正在进行，请先在浏览器中完成或等待其结束".to_owned()
+                "已有 OAuth 登录正在进行。可点击「取消 OAuth」后重试。".to_owned()
             } else {
-                "An OAuth login is already in progress. Complete it in the browser or wait for it to finish"
-                    .to_owned()
+                "An OAuth login is already in progress. Click Cancel OAuth, then retry.".to_owned()
             };
             return;
         }
@@ -4947,18 +5873,23 @@ impl CodexRouterApp {
         if !self.provider_oauth_preparing
             && self.provider_oauth_prepared_provider.as_deref() == Some(provider.as_str())
         {
+            self.pending_oauth_provider = None;
+            self.terms_open = false;
             self.launch_provider_oauth(&provider);
             return;
         }
 
+        // Terms are already accepted. Keep waiting for background prepare without
+        // reopening the dialog or cancelling an in-flight first start.
         self.pending_oauth_provider = Some(provider.clone());
-        self.terms_open = true;
-        self.prewarm_provider_oauth(&provider);
+        self.terms_open = false;
+        if !self.provider_oauth_preparing {
+            self.prewarm_provider_oauth(&provider);
+        }
         self.status_text = if self.ui_language == "zh" {
-            "安全登录环境尚未准备完成；准备成功后才能开始 OAuth".to_owned()
+            "条例已确认，正在完成安全登录环境准备…".to_owned()
         } else {
-            "The secure sign-in environment is not ready yet. OAuth can start after preparation succeeds"
-                .to_owned()
+            "Terms accepted. Finishing secure sign-in preparation…".to_owned()
         };
     }
 
@@ -5532,8 +6463,8 @@ fn run_provider_oauth_process(
     } else {
         command
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .creation_flags(CREATE_NO_WINDOW);
     }
     let mut child = command
@@ -5547,7 +6478,42 @@ fn run_provider_oauth_process(
         }
         match child.try_wait() {
             Ok(Some(status)) if status.success() => return Ok(()),
-            Ok(Some(status)) => anyhow::bail!("exited with {status}"),
+            Ok(Some(status)) => {
+                let mut detail = format!("exited with {status}");
+                if let Some(mut stderr) = child.stderr.take() {
+                    let mut text = String::new();
+                    let _ = std::io::Read::read_to_string(&mut stderr, &mut text);
+                    let tail = text
+                        .lines()
+                        .rev()
+                        .take(8)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    if !tail.trim().is_empty() {
+                        detail = format!("{detail} | {tail}");
+                    }
+                }
+                if let Some(mut stdout) = child.stdout.take() {
+                    let mut text = String::new();
+                    let _ = std::io::Read::read_to_string(&mut stdout, &mut text);
+                    let tail = text
+                        .lines()
+                        .rev()
+                        .take(4)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    if !tail.trim().is_empty() {
+                        detail = format!("{detail} | {tail}");
+                    }
+                }
+                anyhow::bail!("{detail}")
+            }
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(200)),
             Err(error) => anyhow::bail!("could not monitor the OAuth process: {error}"),
         }
@@ -5612,192 +6578,257 @@ fn run_hidden_powershell_output(
     timeout: std::time::Duration,
     cancel: &AtomicBool,
 ) -> anyhow::Result<std::process::Output> {
-    let script = router_root.join("scripts").join(script_name);
-    let mut child = std::process::Command::new("powershell.exe")
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-        ])
-        .arg(script)
-        .args(arguments)
-        .current_dir(router_root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .with_context(|| format!("could not start {script_name}"))?;
-
-    let stdout = child
-        .stdout
-        .take()
-        .with_context(|| format!("{script_name} did not expose stdout"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .with_context(|| format!("{script_name} did not expose stderr"))?;
-    let stdout_drain = spawn_output_drain(stdout);
-    let stderr_drain = spawn_output_drain(stderr);
-    let started = std::time::Instant::now();
-    let status = loop {
-        if cancel.load(Ordering::Relaxed) {
-            terminate_child_process_tree(&mut child);
-            anyhow::bail!("{script_name} was cancelled because Codex-Router is exiting");
+    fn read_bounded_output(path: &Path) -> anyhow::Result<Vec<u8>> {
+        let mut file = std::fs::File::open(path)
+            .with_context(|| format!("could not read helper output {}", path.display()))?;
+        let length = file.metadata()?.len();
+        if length > EXIT_HELPER_OUTPUT_LIMIT as u64 {
+            file.seek(SeekFrom::Start(
+                length.saturating_sub(EXIT_HELPER_OUTPUT_LIMIT as u64),
+            ))?;
         }
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() < timeout => {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            Ok(None) => {
-                terminate_child_process_tree(&mut child);
-                anyhow::bail!("{script_name} exceeded its time budget");
-            }
-            Err(error) => {
-                terminate_child_process_tree(&mut child);
-                return Err(error).with_context(|| format!("could not monitor {script_name}"));
-            }
-        }
-    };
-    let stdout = finish_output_drain(stdout_drain, "background helper output")?;
-    let stderr = finish_output_drain(stderr_drain, "background helper error output")?;
-    Ok(std::process::Output {
-        status,
-        stdout,
-        stderr,
-    })
-}
-
-#[cfg(windows)]
-fn process_name_from_entry(executable: &[u16]) -> String {
-    let end = executable
-        .iter()
-        .position(|character| *character == 0)
-        .unwrap_or(executable.len());
-    String::from_utf16_lossy(&executable[..end])
-}
-
-#[cfg(windows)]
-fn should_take_over_process(current_pid: u32, candidate_pid: u32, executable: &str) -> bool {
-    candidate_pid != current_pid && executable.eq_ignore_ascii_case("Codex-Router.exe")
-}
-
-#[cfg(windows)]
-fn exit_marker_matches_executable(executable: &Path, candidate_pid: u32) -> bool {
-    let Some(router_root) = executable.parent() else {
-        return false;
-    };
-    let marker = user_data::data_root(router_root)
-        .join("pids")
-        .join("gui-exit.pid");
-    std::fs::read_to_string(marker)
-        .ok()
-        .and_then(|value| value.trim().parse::<u32>().ok())
-        == Some(candidate_pid)
-}
-
-#[cfg(windows)]
-unsafe fn process_has_exit_transaction_marker(
-    process: windows_sys::Win32::Foundation::HANDLE,
-    candidate_pid: u32,
-) -> bool {
-    use windows_sys::Win32::System::Threading::QueryFullProcessImageNameW;
-
-    let mut path = vec![0_u16; 32_768];
-    let mut path_len = path.len() as u32;
-    if QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &mut path_len) == 0 {
-        return false;
+        let mut output = Vec::with_capacity(length.min(EXIT_HELPER_OUTPUT_LIMIT as u64) as usize);
+        file.read_to_end(&mut output)?;
+        Ok(output)
     }
-    path.truncate(path_len as usize);
-    let executable = PathBuf::from(String::from_utf16_lossy(&path));
-    exit_marker_matches_executable(&executable, candidate_pid)
+
+    let script = router_root.join("scripts").join(script_name);
+    let output_root = user_data::data_root(router_root).join("process-output");
+    std::fs::create_dir_all(&output_root)?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let output_prefix = format!("helper-{}-{nonce}", std::process::id());
+    let stdout_path = output_root.join(format!("{output_prefix}.stdout"));
+    let stderr_path = output_root.join(format!("{output_prefix}.stderr"));
+
+    let result = (|| -> anyhow::Result<std::process::Output> {
+        let stdout_file = std::fs::File::create(&stdout_path)?;
+        let stderr_file = std::fs::File::create(&stderr_path)?;
+        let mut child = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(script)
+            .args(arguments)
+            .current_dir(router_root)
+            .stdin(Stdio::null())
+            // Long-lived Router services can inherit these handles. Files let
+            // the helper finish without waiting for service-owned pipe EOF.
+            .stdout(Stdio::from(stdout_file))
+            .stderr(Stdio::from(stderr_file))
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .with_context(|| format!("could not start {script_name}"))?;
+
+        let started = std::time::Instant::now();
+        let status = loop {
+            if cancel.load(Ordering::Relaxed) {
+                terminate_child_process_tree(&mut child);
+                anyhow::bail!("{script_name} was cancelled because Codex-Router is exiting");
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if started.elapsed() < timeout => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Ok(None) => {
+                    terminate_child_process_tree(&mut child);
+                    anyhow::bail!("{script_name} exceeded its time budget");
+                }
+                Err(error) => {
+                    terminate_child_process_tree(&mut child);
+                    return Err(error).with_context(|| format!("could not monitor {script_name}"));
+                }
+            }
+        };
+        Ok(std::process::Output {
+            status,
+            stdout: read_bounded_output(&stdout_path)?,
+            stderr: read_bounded_output(&stderr_path)?,
+        })
+    })();
+
+    for path in [&stdout_path, &stderr_path] {
+        if std::fs::remove_file(path).is_err() {
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(path);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    result
 }
 
 #[cfg(windows)]
-fn take_over_older_gui_instances() {
-    use windows_sys::Win32::Foundation::{
-        CloseHandle, INVALID_HANDLE_VALUE, WAIT_ABANDONED, WAIT_OBJECT_0,
-    };
+struct SingleInstanceGuard(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn another_router_gui_running() -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
     };
-    use windows_sys::Win32::System::Threading::{
-        CreateMutexW, GetCurrentProcessId, OpenProcess, ReleaseMutex, TerminateProcess,
-        WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
-    };
-    const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 
-    let mutex_name: Vec<u16> = "Local\\CodexRouterStartupTakeoverV1"
+    unsafe {
+        let current_pid = GetCurrentProcessId();
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut found = false;
+        let mut has_entry = Process32FirstW(snapshot, &mut entry) != 0;
+        while has_entry {
+            let end = entry
+                .szExeFile
+                .iter()
+                .position(|character| *character == 0)
+                .unwrap_or(entry.szExeFile.len());
+            let executable = String::from_utf16_lossy(&entry.szExeFile[..end]);
+            if entry.th32ProcessID != current_pid
+                && executable.eq_ignore_ascii_case("Codex-Router.exe")
+            {
+                found = true;
+                break;
+            }
+            has_entry = Process32NextW(snapshot, &mut entry) != 0;
+        }
+        CloseHandle(snapshot);
+        found
+    }
+}
+
+#[cfg(windows)]
+fn codex_desktop_or_setup_running() -> bool {
+    process_name_running(&["ChatGPT.exe", "codex-windows-sandbox-setup.exe"])
+}
+
+#[cfg(not(windows))]
+fn codex_desktop_or_setup_running() -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn process_name_running(names: &[&str]) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            // Failing closed prevents a process-enumeration error from racing
+            // the Windows setup helper.
+            return true;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut found = false;
+        let mut has_entry = Process32FirstW(snapshot, &mut entry) != 0;
+        while has_entry {
+            let end = entry
+                .szExeFile
+                .iter()
+                .position(|character| *character == 0)
+                .unwrap_or(entry.szExeFile.len());
+            let executable = String::from_utf16_lossy(&entry.szExeFile[..end]);
+            if names
+                .iter()
+                .any(|name| executable.eq_ignore_ascii_case(name))
+            {
+                found = true;
+                break;
+            }
+            has_entry = Process32NextW(snapshot, &mut entry) != 0;
+        }
+        CloseHandle(snapshot);
+        found
+    }
+}
+
+#[cfg(windows)]
+fn show_already_running_message() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
+
+    let title: Vec<u16> = "Codex-Router"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let message: Vec<u16> = "Codex-Router 已经开启，请勿重复开启。\n\nCodex-Router is already running. Do not start another instance."
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
     unsafe {
-        let mutex = CreateMutexW(std::ptr::null(), 0, mutex_name.as_ptr());
-        if mutex.is_null() {
-            return;
-        }
-        let wait = WaitForSingleObject(
-            mutex,
-            STARTUP_TAKEOVER_MUTEX_TIMEOUT
-                .as_millis()
-                .min(u32::MAX as u128) as u32,
+        MessageBoxW(
+            std::ptr::null_mut(),
+            message.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONINFORMATION,
         );
-        if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
-            CloseHandle(mutex);
-            return;
-        }
+    }
+}
 
-        let current_pid = GetCurrentProcessId();
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snapshot != INVALID_HANDLE_VALUE {
-            let mut entry: PROCESSENTRY32W = std::mem::zeroed();
-            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-            let mut has_entry = Process32FirstW(snapshot, &mut entry) != 0;
-            while has_entry {
-                let executable = process_name_from_entry(&entry.szExeFile);
-                if should_take_over_process(current_pid, entry.th32ProcessID, &executable) {
-                    let process = OpenProcess(
-                        PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE_ACCESS,
-                        0,
-                        entry.th32ProcessID,
-                    );
-                    if !process.is_null() {
-                        if process_has_exit_transaction_marker(process, entry.th32ProcessID)
-                            && WaitForSingleObject(
-                                process,
-                                EXIT_TAKEOVER_GRACE.as_millis().min(u32::MAX as u128) as u32,
-                            ) == WAIT_OBJECT_0
-                        {
-                            CloseHandle(process);
-                            has_entry = Process32NextW(snapshot, &mut entry) != 0;
-                            continue;
-                        }
-                        if TerminateProcess(process, 0) != 0 {
-                            WaitForSingleObject(process, 5_000);
-                        }
-                        CloseHandle(process);
-                    }
-                }
-                has_entry = Process32NextW(snapshot, &mut entry) != 0;
-            }
-            CloseHandle(snapshot);
+#[cfg(windows)]
+fn acquire_single_instance() -> Option<SingleInstanceGuard> {
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+
+    let mutex_name: Vec<u16> = "Local\\CodexRouterSingleInstanceV1"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let mutex = CreateMutexW(std::ptr::null(), 1, mutex_name.as_ptr());
+        if mutex.is_null() {
+            return None;
         }
-        ReleaseMutex(mutex);
-        CloseHandle(mutex);
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            windows_sys::Win32::Foundation::CloseHandle(mutex);
+            show_already_running_message();
+            return None;
+        }
+        if another_router_gui_running() {
+            windows_sys::Win32::Foundation::CloseHandle(mutex);
+            show_already_running_message();
+            return None;
+        }
+        Some(SingleInstanceGuard(mutex))
     }
 }
 
 fn main() -> eframe::Result<()> {
     let ui_audit = UiAuditOptions::from_args();
     #[cfg(windows)]
-    if ui_audit.is_none() {
-        take_over_older_gui_instances();
-    }
+    let _single_instance = if ui_audit.is_none() {
+        let Some(guard) = acquire_single_instance() else {
+            return Ok(());
+        };
+        Some(guard)
+    } else {
+        None
+    };
     let start_in_background =
         std::env::args_os().any(|argument| argument == "--background" || argument == "--watchdog");
     let compact = ui_audit.as_ref().is_some_and(|options| options.compact);
@@ -5833,20 +6864,92 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod main_tests {
     use super::{
-        append_bounded_log, decode_icon, drain_bounded_output, fit_window_to_monitor,
+        append_bounded_log, decode_icon, deploy_router_config, drain_bounded_output,
+        failover_account_id, fallback_transition_notification, fit_window_to_monitor,
         fit_window_to_work_area, initial_window_logical_size, localized_deployment_line,
-        localized_error_summary, next_request_generation, oauth_prepare_error_from_output,
-        oauth_prepare_error_is_retryable, request_result_disposition, restore_apply_ui_fields,
-        restore_codex_and_stop_router_for_exit, restore_codex_for_exit, usage_error_for_display,
-        ApplyUiRollback, RequestResultDisposition, RouterConfig, APP_TITLE, APP_VERSION,
-        COMPACT_WINDOW_LOGICAL_SIZE, DEFAULT_WINDOW_LOGICAL_SIZE, EXIT_HELPER_OUTPUT_LIMIT,
-        MAX_LOG_BYTES, MIN_WINDOW_LOGICAL_SIZE, RETAIN_LOG_BYTES,
+        localized_error_summary, next_request_generation, normalize_usage_account_messages,
+        oauth_prepare_error_from_output, oauth_prepare_error_is_retryable,
+        request_result_disposition, restore_apply_ui_fields,
+        restore_codex_and_stop_router_for_exit, restore_codex_for_exit,
+        run_hidden_powershell_output, usage_error_for_display, ApplyUiRollback, ModelConfig,
+        RequestResultDisposition, RouterConfig, UsageAccount, UsageSnapshot, APP_TITLE,
+        APP_VERSION, COMPACT_WINDOW_LOGICAL_SIZE, DEFAULT_WINDOW_LOGICAL_SIZE,
+        EXIT_HELPER_OUTPUT_LIMIT, MAX_LOG_BYTES, MIN_WINDOW_LOGICAL_SIZE, RETAIN_LOG_BYTES,
         WINDOWS_1080P_200_WORK_AREA_LOGICAL_SIZE, WINDOWS_NON_CLIENT_LOGICAL_ALLOWANCE,
     };
 
     #[test]
     fn native_window_title_contains_the_exact_package_version() {
         assert_eq!(APP_TITLE, format!("Codex-Router v{APP_VERSION}"));
+    }
+
+    #[test]
+    fn quota_notification_is_transition_based_and_requires_a_real_fallback_pair() {
+        let mut config = RouterConfig {
+            oauth_account_ids: Some(vec![4]),
+            models: vec![
+                ModelConfig {
+                    model: "grok-4.5".into(),
+                    source: "oauth".into(),
+                    oauth_account_id: 4,
+                    alias: "Grok OAuth".into(),
+                    ..Default::default()
+                },
+                ModelConfig {
+                    model: "x-ai/grok-4.5".into(),
+                    source: "apikey".into(),
+                    alias: "OpenRouter Grok".into(),
+                    base_url: "https://openrouter.ai/api/v1".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let previous = UsageSnapshot {
+            subscriptions: vec![UsageAccount {
+                id: 4,
+                name: "SuperGrok".into(),
+                health: "healthy".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let exhausted = UsageSnapshot {
+            subscriptions: vec![UsageAccount {
+                id: 4,
+                name: "SuperGrok".into(),
+                health: "quotaExhausted".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            fallback_transition_notification(Some(&previous), &exhausted, &config),
+            Some(("SuperGrok".into(), "OpenRouter Grok".into()))
+        );
+        assert_eq!(
+            fallback_transition_notification(Some(&exhausted), &exhausted, &config),
+            None
+        );
+        config.models[1].model = "x-ai/grok-4.3".into();
+        assert_eq!(
+            fallback_transition_notification(Some(&previous), &exhausted, &config),
+            None
+        );
+    }
+
+    #[test]
+    fn structured_429_failover_notification_is_precise_and_safe() {
+        assert_eq!(
+            failover_account_id("[Sub2API/WARN] openai.upstream_failover_switching | upstream_status=429 | account_id=7 | class=quota"),
+            Some(7)
+        );
+        assert_eq!(
+            failover_account_id("[Sub2API/WARN] openai.upstream_failover_switching | upstream_status=500 | account_id=7"),
+            None
+        );
+        assert_eq!(failover_account_id("quota 429 account_id=7"), None);
     }
 
     #[test]
@@ -5909,19 +7012,7 @@ mod main_tests {
     }
 
     #[cfg(windows)]
-    use super::{
-        exit_marker_matches_executable, should_take_over_process, stop_router_for_exit,
-        stop_router_for_exit_with_timeout, ExitTransactionMarker,
-    };
-
-    #[cfg(windows)]
-    #[test]
-    fn only_an_older_router_gui_is_selected_for_takeover() {
-        assert!(should_take_over_process(20, 10, "Codex-Router.exe"));
-        assert!(should_take_over_process(20, 10, "codex-router.EXE"));
-        assert!(!should_take_over_process(20, 20, "Codex-Router.exe"));
-        assert!(!should_take_over_process(20, 10, "sub2api.exe"));
-    }
+    use super::{stop_router_for_exit, stop_router_for_exit_with_timeout, ExitTransactionMarker};
 
     #[cfg(windows)]
     #[test]
@@ -5934,17 +7025,12 @@ mod main_tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let executable = root.join("Codex-Router.exe");
         std::fs::create_dir_all(&root).unwrap();
         let marker = ExitTransactionMarker::create(&root).unwrap();
-        assert!(exit_marker_matches_executable(
-            &executable,
-            std::process::id()
-        ));
-        assert!(!exit_marker_matches_executable(
-            &executable,
-            std::process::id().saturating_add(1)
-        ));
+        assert_eq!(
+            std::fs::read_to_string(&marker.path).unwrap(),
+            std::process::id().to_string()
+        );
         let marker_path = marker.path.clone();
         drop(marker);
         assert!(!marker_path.exists());
@@ -6215,10 +7301,155 @@ mod main_tests {
     }
 
     #[test]
+    fn successful_deployment_progress_is_never_reported_as_a_diagnostic() {
+        // Every one of these is normal Apply output. Before this fix they were
+        // relabeled "Deployment diagnostic: class=unclassified_error".
+        for line in [
+            "Sub2API administrator ready: admin@admin.com",
+            "Codex model catalog generated: C:\\catalog.json (5 models)",
+            "Composite routes: desired=7; created=2; updated=1; removed=0",
+            "Updated channel: Codex-Router / ChatGPT-5.6-Sol",
+            "Created channel: Codex-Router / DeepSeek-V4-Flash",
+            "OAuth account 1 isolated until recovery: OAuth quota exhausted until reset",
+            "Outbound proxy reconciliation: source=environment; resource=reused",
+            "Catalog availability filter: kept=5; removed-unavailable=gpt-5.6-terra",
+            "OAuth on-demand recovery delegated to Codex-Router: account 1 / gpt-5.6-sol",
+            "Autostart registered: C:\\Users\\x\\Startup\\Codex Router.lnk",
+            "Configured 8 model channel(s).",
+            "Codex configuration written to: C:\\Users\\x\\.codex\\config.toml",
+            "Local access key is stored in Windows Credential Manager and the current user environment.",
+            "Codex Router is running at http://127.0.0.1:18080",
+            "Codex Router secrets and PostgreSQL data directory are initialized.",
+        ] {
+            for zh in [true, false] {
+                // Mimic the deploy pipeline: logic.rs first reduces the line to a
+                // safe marker, then the UI localizes it.
+                let reduced = if line.starts_with('[') {
+                    line.chars().take(5).collect::<String>()
+                } else {
+                    // Keep the same markers logic.rs emits for progress lines.
+                    [
+                        "Sub2API administrator ready",
+                        "Codex model catalog generated",
+                        "Composite routes",
+                        "Updated channel:",
+                        "Created channel:",
+                        "isolated until recovery",
+                        "Outbound proxy reconciliation",
+                        "Catalog availability filter",
+                        "OAuth on-demand recovery delegated",
+                        "Autostart registered",
+                        "model channel(s).",
+                        "Codex configuration written to",
+                        "Local access key is stored in Windows Credential Manager",
+                        "Codex Router is running at",
+                        "Codex Router secrets and PostgreSQL",
+                        "Configured ",
+                    ]
+                    .into_iter()
+                    .find(|marker| line.contains(marker))
+                    .unwrap_or(line)
+                    .to_owned()
+                };
+                let rendered = localized_deployment_line(zh, reduced);
+                assert!(
+                    !rendered.contains("class="),
+                    "normal progress was classified as an error: {line} -> {rendered}"
+                );
+                assert!(
+                    !rendered.contains("Deployment diagnostic") && !rendered.contains("部署诊断"),
+                    "normal progress was labeled a diagnostic: {line} -> {rendered}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_router_flag_keeps_a_searchable_code_and_a_human_meaning() {
+        for (line, zh_needle) in [
+            ("CR-FLAG STAGE-01-INIT-OK", "步骤 1/7"),
+            (
+                "CR-FLAG OAUTH-PRIMARY account=1 platform=openai priority=1 models=3 fallback=yes",
+                "优先使用该 OAuth 账号",
+            ),
+            (
+                "CR-FLAG OAUTH-PARKED-WITH-FALLBACK account=1 platform=openai reason=quota reset=2026-08-08T03:34:03Z models=3",
+                "改用同名第三方 API 兜底",
+            ),
+            (
+                "CR-FLAG FALLBACK-ACTIVE model=gpt-5.6-sol account=1 reason=subscription-quota-parked",
+                "已触发兜底",
+            ),
+            (
+                "CR-FLAG CATALOG-MODEL model=gemini-3.1-pro-high served=oauth suffix=oauth account=4",
+                "模型已写入 Codex 菜单",
+            ),
+            (
+                "CR-FLAG ROUTING-SYNC-OK models=8 listChanged=yes created=1 updated=0 removed=0 parked=1",
+                "重新同步路由",
+            ),
+        ] {
+            let zh_text = localized_deployment_line(true, line.to_owned());
+            let en_text = localized_deployment_line(false, line.to_owned());
+            let code = line
+                .trim_start_matches("CR-FLAG ")
+                .split(' ')
+                .next()
+                .unwrap();
+            for rendered in [&zh_text, &en_text] {
+                assert!(
+                    rendered.contains(code),
+                    "the searchable flag code disappeared: {line} -> {rendered}"
+                );
+                assert!(
+                    !rendered.contains("class="),
+                    "a deployment flag was classified as an error: {line} -> {rendered}"
+                );
+                assert!(
+                    !rendered.contains("部署诊断") && !rendered.contains("Deployment diagnostic"),
+                    "a deployment flag was labeled a diagnostic: {line} -> {rendered}"
+                );
+            }
+            assert!(
+                zh_text.contains(zh_needle),
+                "missing Chinese meaning for {line}: {zh_text}"
+            );
+            assert_ne!(zh_text, en_text, "flag was not localized: {line}");
+        }
+    }
+
+    #[test]
     fn install_root_conflicts_are_actionable_in_both_languages() {
         let marker = "ROUTER_INSTALL_ROOT_CONFLICT: Sub2API port 18080 is owned elsewhere";
         assert!(localized_error_summary(true, marker).contains("另一份 Codex-Router"));
         assert!(localized_error_summary(false, marker).contains("Another Codex-Router"));
+    }
+
+    #[test]
+    fn deployment_refuses_an_empty_model_list_before_touching_any_file() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-router-deploy-no-models-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut config = RouterConfig::default();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut logs = Vec::new();
+        let error = deploy_router_config(&mut config, &root, &cancel, true, |line| logs.push(line))
+            .expect_err("a configuration without models is not deployable");
+        let chained = format!("{error:#}");
+        assert!(chained.contains("ROUTER_DEPLOY_NO_MODELS"), "{chained}");
+        // Credentials, the catalog, and the channel manifest must stay untouched
+        // so a failed rollback cannot erase a working deployment.
+        assert!(logs.is_empty());
+        assert!(!root.join("config").exists());
+        assert!(localized_error_summary(true, &chained).contains("没有可部署的模型"));
+        assert!(localized_error_summary(false, &chained).contains("no deployable model"));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -6232,6 +7463,27 @@ mod main_tests {
             "The usage query temporarily failed. The last successful data is retained; retry shortly."
         );
         assert!(!usage_error_for_display(true, "class=configuration").contains("class="));
+    }
+
+    #[test]
+    fn kimi_usage_errors_are_actionable_and_deduplicated() {
+        let mut account = UsageAccount {
+            status_detail: "Kimi Coding Plan quota query failed (HTTP 403).".to_owned(),
+            query_note:
+                "class=authentication | status=401 | marker=ROUTER_KIMI_CREDENTIAL_REJECTED"
+                    .to_owned(),
+            ..UsageAccount::default()
+        };
+
+        normalize_usage_account_messages(true, &mut account);
+
+        assert_eq!(
+            account.status_detail,
+            "Kimi API Key 无效或没有 Coding Plan 权限，请在 Kimi Code 控制台新建 Key 后重新填写。"
+        );
+        assert!(account.query_note.is_empty());
+        assert!(!account.status_detail.contains("class="));
+        assert!(!account.status_detail.contains("rate_limit"));
     }
 
     #[test]
@@ -6296,6 +7548,89 @@ mod main_tests {
     }
 
     #[test]
+    fn hidden_helper_completion_does_not_wait_for_inherited_service_handles() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-router-helper-output-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let scripts = root.join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::write(
+            scripts.join("Start-ProviderOAuth.ps1"),
+            r#"$child = Start-Process powershell.exe -ArgumentList @('-NoLogo','-NoProfile','-Command','Start-Sleep -Seconds 4') -NoNewWindow -PassThru
+[ordered]@{ status = 'ready'; childPid = $child.Id } | ConvertTo-Json -Compress
+"#,
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let output = run_hidden_powershell_output(
+            &root,
+            "Start-ProviderOAuth.ps1",
+            &[],
+            std::time::Duration::from_secs(3),
+            &cancel,
+        )
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            oauth_prepare_error_from_output(&output)
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["status"], "ready");
+        if let Some(child_pid) = result["childPid"].as_u64() {
+            let _ = std::process::Command::new("taskkill.exe")
+                .args(["/PID", &child_pid.to_string(), "/T", "/F"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly selected packaged release and starts local Router services"]
+    fn packaged_oauth_prepare_smoke() {
+        let root = std::env::var_os("CODEX_ROUTER_SMOKE_ROOT")
+            .map(std::path::PathBuf::from)
+            .expect("CODEX_ROUTER_SMOKE_ROOT must select the packaged release");
+        assert!(root.join("release-manifest.json").is_file());
+        assert!(root.join("scripts/Start-ProviderOAuth.ps1").is_file());
+
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        let output = run_hidden_powershell_output(
+            &root,
+            "Start-ProviderOAuth.ps1",
+            &["-Provider", "openai", "-PrepareOnly"],
+            std::time::Duration::from_secs(180),
+            &cancel,
+        )
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            oauth_prepare_error_from_output(&output)
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(180));
+        let ready = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .rev()
+            .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .expect("OAuth preparation did not return structured output");
+        assert_eq!(ready["status"], "ready");
+        assert_eq!(ready["stage"], "ready");
+    }
+
+    #[test]
     fn oauth_prepare_errors_keep_only_safe_structured_stage_codes() {
         use std::os::windows::process::ExitStatusExt;
 
@@ -6313,12 +7648,36 @@ mod main_tests {
     }
 
     #[test]
-    fn lifecycle_busy_is_the_only_automatically_retried_prepare_failure() {
+    fn oauth_prepare_errors_are_found_in_stderr_when_stdout_contains_noise() {
+        use std::os::windows::process::ExitStatusExt;
+
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(1),
+            stdout: b"ordinary helper output\n".to_vec(),
+            stderr: br#"{"status":"error","provider":"openai","stage":"router_start","code":"ROUTER_OAUTH_PREPARE_ROUTER_START","unsafe":"token-value"}"#
+                .to_vec(),
+        };
+        let safe = oauth_prepare_error_from_output(&output);
+        assert_eq!(safe, "ROUTER_OAUTH_PREPARE_ROUTER_START stage=router_start");
+        assert!(!safe.contains("token-value"));
+    }
+
+    #[test]
+    fn transient_oauth_prepare_failures_are_automatically_retried() {
         assert!(oauth_prepare_error_is_retryable(
             "ROUTER_OAUTH_PREPARE_LIFECYCLE_BUSY stage=lifecycle_lock"
         ));
-        assert!(!oauth_prepare_error_is_retryable(
+        assert!(oauth_prepare_error_is_retryable(
             "ROUTER_OAUTH_PREPARE_ADMIN_LOGIN stage=admin_login"
+        ));
+        assert!(oauth_prepare_error_is_retryable(
+            "ROUTER_OAUTH_PREPARE_PROCESS stage=unknown"
+        ));
+        assert!(!oauth_prepare_error_is_retryable(
+            "ROUTER_OAUTH_PREPARE_COMPONENTS stage=components"
+        ));
+        assert!(!oauth_prepare_error_is_retryable(
+            "ROUTER_OAUTH_PREPARE_TIMEOUT stage=router_start"
         ));
     }
 

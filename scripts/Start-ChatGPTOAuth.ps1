@@ -38,7 +38,7 @@ $previousLifecycleLockMarker = [Environment]::GetEnvironmentVariable(
     'Process')
 [Environment]::SetEnvironmentVariable('CODEX_ROUTER_LIFECYCLE_LOCK_HELD', [string]$PID, 'Process')
 try {
-    & "$routerRoot\scripts\Start-Router.ps1" | Out-Null
+    & "$routerRoot\scripts\Start-Router.ps1" -RepairUnhealthy | Out-Null
 $session = New-RouterAdminSession
 $group = (Get-RouterGroups -Session $session | Where-Object { $_.name -in @('Codex-Router', 'Codex Unified Router') } | Select-Object -First 1)
 if (-not $group) { throw 'Run the Codex-Router one-click configuration before starting ChatGPT OAuth.' }

@@ -1,8 +1,7 @@
-use anyhow::{bail, Context};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 const LAYOUT_MARKER: &str = ".codex-router-user-data-v1";
+const PACKAGE_VERSION_MARKER: &str = ".codex-router-package-version";
 
 fn stable_state_enabled(router_root: &Path) -> bool {
     if std::env::var_os("CODEX_ROUTER_PORTABLE_STATE").is_some_and(|value| value == "1") {
@@ -44,105 +43,51 @@ pub fn backups_root(router_root: &Path) -> PathBuf {
     state_root(router_root).join("backups")
 }
 
-fn candidate_score(path: &Path) -> u32 {
-    let mut score = 0;
-    if path.join("codex-router-config.json").is_file() {
-        score += 1_000;
+fn package_version(router_root: &Path) -> Option<String> {
+    let manifest = router_root.join("release-manifest.json");
+    if !manifest.is_file() {
+        return Some(env!("CARGO_PKG_VERSION").to_owned());
     }
-    if path.join("backups").join("config-profiles").is_dir() {
-        score += 500;
-    }
-    if path
-        .join("data")
-        .join("postgres")
-        .join("PG_VERSION")
-        .is_file()
-    {
-        score += 300;
-    }
-    if path.join("data").join("sub2api").is_dir() {
-        score += 50;
-    }
-    if path.join("codex-router-ui-preferences.json").is_file() {
-        score += 25;
-    }
-    score
+    let text = std::fs::read_to_string(manifest).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value
+        .get("version")
+        .and_then(|item| item.as_str())
+        .map(str::to_owned)
+        .or_else(|| Some(env!("CARGO_PKG_VERSION").to_owned()))
 }
 
-fn candidate_modified(path: &Path) -> SystemTime {
-    [
-        path.join("codex-router-config.json"),
-        path.join("codex-router-ui-preferences.json"),
-        path.join("backups").join("config-profiles"),
-        path.join("data").join("postgres").join("PG_VERSION"),
-    ]
-    .into_iter()
-    .filter_map(|item| item.metadata().ok()?.modified().ok())
-    .max()
-    .unwrap_or(SystemTime::UNIX_EPOCH)
+fn stored_package_version(root: &Path) -> Option<String> {
+    std::fs::read_to_string(root.join(PACKAGE_VERSION_MARKER))
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
-fn legacy_candidates(router_root: &Path, persistent_root: &Path) -> Vec<PathBuf> {
-    let mut candidates = vec![router_root.to_path_buf()];
-    if let Some(parent) = router_root.parent() {
-        if let Ok(entries) = std::fs::read_dir(parent) {
-            for entry in entries.filter_map(Result::ok) {
-                let path = entry.path();
-                if !path.is_dir() || path == router_root || path == persistent_root {
-                    continue;
-                }
-                let portable_release = entry.file_name().to_str().is_some_and(|name| {
-                    name.to_ascii_lowercase()
-                        .starts_with("codex-router-portable-")
-                });
-                if portable_release {
-                    candidates.push(path);
-                }
-            }
-        }
-    }
-    candidates.retain(|path| candidate_score(path) > 0);
-    candidates.sort_by(|left, right| {
-        candidate_score(right)
-            .cmp(&candidate_score(left))
-            .then_with(|| candidate_modified(right).cmp(&candidate_modified(left)))
-    });
-    candidates
+fn write_package_version(root: &Path, version: &str) -> anyhow::Result<()> {
+    crate::config::atomic_write(
+        &root.join(PACKAGE_VERSION_MARKER),
+        format!("{version}\n").as_bytes(),
+    )
 }
 
-fn copy_file_if_present(source: &Path, destination: &Path) -> anyhow::Result<()> {
-    if !source.is_file() || destination.exists() {
+/// Record the package version without modifying stable user data. Portable
+/// releases share this directory, so deleting it during an upgrade destroys
+/// the configuration and OAuth database the next package must reuse.
+pub fn migrate_package_version(router_root: &Path) -> anyhow::Result<()> {
+    let Some(version) = package_version(router_root) else {
+        return Ok(());
+    };
+    let root = state_root(router_root);
+    if root == router_root {
+        let _ = write_package_version(&root, &version);
         return Ok(());
     }
-    if let Some(parent) = destination.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::copy(source, destination)
-        .with_context(|| format!("could not migrate {}", source.display()))?;
-    Ok(())
-}
-
-fn copy_directory_if_present(source: &Path, destination: &Path) -> anyhow::Result<()> {
-    if !source.is_dir() || destination.exists() {
+    std::fs::create_dir_all(&root)?;
+    if stored_package_version(&root).as_deref() == Some(version.as_str()) {
         return Ok(());
     }
-    std::fs::create_dir_all(destination)?;
-    for entry in std::fs::read_dir(source)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let target = destination.join(entry.file_name());
-        if file_type.is_symlink() {
-            bail!(
-                "refusing to migrate a linked user-data entry: {}",
-                entry.path().display()
-            );
-        }
-        if file_type.is_dir() {
-            copy_directory_if_present(&entry.path(), &target)?;
-        } else if file_type.is_file() {
-            copy_file_if_present(&entry.path(), &target)?;
-        }
-    }
+    write_package_version(&root, &version)?;
     Ok(())
 }
 
@@ -162,7 +107,16 @@ fn write_layout_marker(root: &Path, source: Option<&Path>) -> anyhow::Result<()>
     Ok(())
 }
 
+/// True when the saved config represents a finished first-run setup, not a
+/// leftover empty/partial JSON that should still show the welcome wizard.
+pub fn config_looks_configured(config: &crate::config::RouterConfig) -> bool {
+    !config.accepted_terms_version.trim().is_empty()
+        && config.accept_compliance
+        && !config.models.is_empty()
+}
+
 pub fn prepare(router_root: &Path) -> anyhow::Result<PathBuf> {
+    migrate_package_version(router_root)?;
     let root = state_root(router_root);
     if root == router_root {
         return Ok(root);
@@ -172,30 +126,10 @@ pub fn prepare(router_root: &Path) -> anyhow::Result<PathBuf> {
         return Ok(root);
     }
 
-    let source = legacy_candidates(router_root, &root).into_iter().next();
-    if let Some(source) = source.as_deref() {
-        copy_file_if_present(
-            &source.join("codex-router-config.json"),
-            &root.join("codex-router-config.json"),
-        )?;
-        copy_file_if_present(
-            &source.join("codex-router-ui-preferences.json"),
-            &root.join("codex-router-ui-preferences.json"),
-        )?;
-        copy_directory_if_present(&source.join("backups"), &root.join("backups"))?;
-        // PostgreSQL contains OAuth accounts. Redis, PID files, locks, and UI
-        // caches are deliberately rebuilt so an upgrade cannot inherit stale
-        // process ownership or transient state.
-        copy_directory_if_present(
-            &source.join("data").join("postgres"),
-            &root.join("data").join("postgres"),
-        )?;
-        copy_directory_if_present(
-            &source.join("data").join("sub2api"),
-            &root.join("data").join("sub2api"),
-        )?;
+    write_layout_marker(&root, None)?;
+    if let Some(version) = package_version(router_root) {
+        let _ = write_package_version(&root, &version);
     }
-    write_layout_marker(&root, source.as_deref())?;
     Ok(root)
 }
 
@@ -219,73 +153,39 @@ mod tests {
     }
 
     #[test]
-    fn legacy_candidate_prefers_configured_release_over_newer_empty_runtime() {
-        let parent = temporary_test_dir("candidate");
-        let current = parent.join("Codex-Router-Portable-1.2.1-test");
-        let configured = parent.join("Codex-Router-Portable-1.1.8-test");
-        let empty = parent.join("Codex-Router-Portable-1.2.0-test");
-        let persistent = parent.join("stable");
-        for path in [&current, &configured, &empty] {
-            std::fs::create_dir_all(path).unwrap();
-        }
-        std::fs::write(configured.join("codex-router-config.json"), "{}").unwrap();
-        std::fs::create_dir_all(empty.join("data").join("sub2api")).unwrap();
-        std::fs::write(empty.join("codex-router-ui-preferences.json"), "{}").unwrap();
-        let candidates = legacy_candidates(&current, &persistent);
-        assert_eq!(candidates.first(), Some(&configured));
-        std::fs::remove_dir_all(parent).unwrap();
+    fn empty_config_is_not_treated_as_configured() {
+        let config = crate::config::RouterConfig::default();
+        assert!(!config_looks_configured(&config));
     }
 
     #[test]
-    fn migration_copies_persistent_state_but_not_transient_process_files() {
-        let parent = temporary_test_dir("migration");
-        let release = parent.join("Codex-Router-Portable-1.2.0-test");
-        let persistent = parent.join("stable");
-        std::fs::create_dir_all(release.join("backups").join("config-profiles")).unwrap();
-        std::fs::create_dir_all(release.join("data").join("postgres")).unwrap();
-        std::fs::create_dir_all(release.join("data").join("pids")).unwrap();
-        std::fs::write(release.join("codex-router-config.json"), "{}").unwrap();
-        std::fs::write(
-            release
-                .join("backups")
-                .join("config-profiles")
-                .join("state.json"),
-            "{}",
-        )
-        .unwrap();
-        std::fs::write(
-            release.join("data").join("postgres").join("PG_VERSION"),
-            "18",
-        )
-        .unwrap();
-        std::fs::write(release.join("data").join("pids").join("sub2api.pid"), "123").unwrap();
+    fn package_version_update_preserves_all_user_data() {
+        let root = temporary_test_dir("preserve-upgrade");
+        std::fs::create_dir_all(root.join("data").join("postgres")).unwrap();
+        std::fs::create_dir_all(root.join("backups")).unwrap();
+        std::fs::write(root.join("codex-router-config.json"), b"config").unwrap();
+        std::fs::write(root.join("codex-router-ui-preferences.json"), b"prefs").unwrap();
+        std::fs::write(root.join("data").join("postgres").join("PG_VERSION"), b"17").unwrap();
+        std::fs::write(root.join("backups").join("point.json"), b"backup").unwrap();
+        write_package_version(&root, "1.2.15").unwrap();
 
-        std::fs::create_dir_all(&persistent).unwrap();
-        let source = legacy_candidates(&release, &persistent).remove(0);
-        copy_file_if_present(
-            &source.join("codex-router-config.json"),
-            &persistent.join("codex-router-config.json"),
-        )
-        .unwrap();
-        copy_directory_if_present(&source.join("backups"), &persistent.join("backups")).unwrap();
-        copy_directory_if_present(
-            &source.join("data").join("postgres"),
-            &persistent.join("data").join("postgres"),
-        )
-        .unwrap();
+        write_package_version(&root, "1.2.17").unwrap();
 
-        assert!(persistent.join("codex-router-config.json").is_file());
-        assert!(persistent
-            .join("backups")
-            .join("config-profiles")
-            .join("state.json")
-            .is_file());
-        assert!(persistent
+        assert_eq!(stored_package_version(&root).as_deref(), Some("1.2.17"));
+        assert_eq!(
+            std::fs::read(root.join("codex-router-config.json")).unwrap(),
+            b"config"
+        );
+        assert_eq!(
+            std::fs::read(root.join("codex-router-ui-preferences.json")).unwrap(),
+            b"prefs"
+        );
+        assert!(root
             .join("data")
             .join("postgres")
             .join("PG_VERSION")
             .is_file());
-        assert!(!persistent.join("data").join("pids").exists());
-        std::fs::remove_dir_all(parent).unwrap();
+        assert!(root.join("backups").join("point.json").is_file());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

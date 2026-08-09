@@ -1,0 +1,67 @@
+diff --git a/backend/internal/handler/admin/grok_oauth_handler.go b/backend/internal/handler/admin/grok_oauth_handler.go
+index 1f679b956..667cf8332 100644
+--- a/backend/internal/handler/admin/grok_oauth_handler.go
++++ b/backend/internal/handler/admin/grok_oauth_handler.go
+@@ -517,7 +517,12 @@ func (h *GrokOAuthHandler) QueryQuota(c *gin.Context) {
+ 		response.BadRequest(c, "grok quota service is not enabled")
+ 		return
+ 	}
+-	result, err := h.quotaService.QueryQuota(c.Request.Context(), accountID)
++	var result *service.GrokQuotaProbeResult
++	if c.Query("billing_only") == "true" {
++		result, err = h.quotaService.ProbeBilling(c.Request.Context(), accountID)
++	} else {
++		result, err = h.quotaService.QueryQuota(c.Request.Context(), accountID)
++	}
+ 	if err != nil {
+ 		response.ErrorFrom(c, err)
+ 		return
+diff --git a/backend/internal/handler/admin/grok_oauth_handler_test.go b/backend/internal/handler/admin/grok_oauth_handler_test.go
+index 621439488..6aabda5ce 100644
+--- a/backend/internal/handler/admin/grok_oauth_handler_test.go
++++ b/backend/internal/handler/admin/grok_oauth_handler_test.go
+@@ -147,6 +147,44 @@ func TestGrokOAuthHandlerQueryQuotaProbesUpstream(t *testing.T) {
+ 	require.NotNil(t, repo.updates[42])
+ }
+ 
++func TestGrokOAuthHandlerQueryQuotaBillingOnlySkipsActiveProbe(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++
++	repo := &grokQuotaHandlerAccountRepo{account: &service.Account{
++		ID:          44,
++		Platform:    service.PlatformGrok,
++		Type:        service.AccountTypeOAuth,
++		Status:      service.StatusActive,
++		Schedulable: true,
++		Concurrency: 1,
++		Credentials: map[string]any{
++			"access_token":  "access-token",
++			"refresh_token": "refresh-token",
++			"expires_at":    time.Now().Add(2 * time.Hour).UTC().Format(time.RFC3339),
++		},
++	}}
++	upstream := &grokQuotaHandlerUpstream{}
++	quotaService := service.NewGrokQuotaService(repo, nil, service.NewGrokTokenProvider(repo, nil), upstream, nil)
++	handler := NewGrokOAuthHandler(nil, nil, quotaService, nil)
++
++	router := gin.New()
++	router.GET("/api/v1/admin/grok/accounts/:id/quota", handler.QueryQuota)
++	rec := httptest.NewRecorder()
++	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/grok/accounts/44/quota?billing_only=true", nil)
++	router.ServeHTTP(rec, req)
++
++	require.Equal(t, http.StatusOK, rec.Code)
++	require.Contains(t, rec.Body.String(), `"source":"billing_probe"`)
++	require.NotContains(t, rec.Body.String(), `"snapshot":`)
++	upstream.mu.Lock()
++	requests := append([]*http.Request(nil), upstream.requests...)
++	upstream.mu.Unlock()
++	require.Len(t, requests, 2)
++	for _, upstreamReq := range requests {
++		require.Equal(t, "/v1/billing", upstreamReq.URL.Path)
++	}
++}
++
+ func TestGrokOAuthHandlerResetQuotaReturnsUnsupported(t *testing.T) {
+ 	gin.SetMode(gin.TestMode)
+ 

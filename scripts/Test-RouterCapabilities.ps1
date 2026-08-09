@@ -18,6 +18,7 @@ $RouterRoot = [IO.Path]::GetFullPath($RouterRoot)
 $credentialModule = Join-Path $RouterRoot 'scripts\CredentialStore.psm1'
 Import-Module $credentialModule -Force
 Import-Module (Join-Path $RouterRoot 'scripts\ProxyDiscovery.psm1') -Force
+Import-Module (Join-Path $RouterRoot 'scripts\UserData.psm1') -Force
 
 $results = [Collections.Generic.List[object]]::new()
 $failed = $false
@@ -109,9 +110,9 @@ function New-RequestMessage {
 function Invoke-JsonModelRequest {
     param([Parameter(Mandatory)][string]$Model, [string]$Path = '/v1/responses')
     $body = if ($Path -eq '/v1/chat/completions') {
-        @{ model = $Model; messages = @(@{ role = 'user'; content = 'Reply exactly OK.' }); max_tokens = 16; stream = $false }
+        @{ model = $Model; messages = @(@{ role = 'user'; content = 'Reply exactly OK.' }); max_tokens = 128; stream = $false }
     } else {
-        @{ model = $Model; input = 'Reply exactly OK.'; max_output_tokens = 16; stream = $false }
+        @{ model = $Model; input = 'Reply exactly OK.'; max_output_tokens = 128; stream = $false }
     }
     $message = New-RequestMessage -Path $Path -Body $body
     $watch = [Diagnostics.Stopwatch]::StartNew()
@@ -139,7 +140,7 @@ function Invoke-StreamModelRequest {
     $message = New-RequestMessage -Path '/v1/responses' -Body @{
         model = $Model
         input = 'Reply exactly OK.'
-        max_output_tokens = 16
+        max_output_tokens = 128
         stream = $true
     }
     $watch = [Diagnostics.Stopwatch]::StartNew()
@@ -216,7 +217,7 @@ function Invoke-StreamModelRequest {
 }
 
 try {
-    $configPath = Join-Path $RouterRoot 'codex-router-config.json'
+    $configPath = Get-RouterConfigPath -RouterRoot $RouterRoot
     if (-not (Test-Path -LiteralPath $configPath)) { throw "Router configuration is missing: $configPath" }
     $config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
     $baseUriText = if ($config.deploy.sub2apiHost) { [string]$config.deploy.sub2apiHost } else { 'http://127.0.0.1:18080' }
@@ -260,12 +261,7 @@ try {
     $localKey = Get-RouterCredential -Name 'LocalApiKey' -AllowMissing
     Invoke-CriticalCheck -Name 'local-key-visibility' -Action {
         if ([string]::IsNullOrWhiteSpace($localKey)) { throw 'LocalApiKey is missing from Windows Credential Manager.' }
-        $userValue = [Environment]::GetEnvironmentVariable('CODEX_ROUTER_API_KEY', 'User')
-        if ([string]::IsNullOrWhiteSpace($userValue)) { throw 'CODEX_ROUTER_API_KEY is not visible to a new user process.' }
-        if ($localKey -cne $userValue) {
-            throw 'Credential Manager and user environment contain different local Router keys.'
-        }
-        'present and consistent; value not printed'
+        'present in Credential Manager; value not printed'
     }
 
     $handler = [Net.Http.HttpClientHandler]::new()
@@ -286,24 +282,11 @@ try {
     Invoke-Check -Name 'codex-provider' -Action {
         $codexHome = if ($config.deploy.codexHome) { [string]$config.deploy.codexHome } elseif ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path ([Environment]::GetFolderPath('UserProfile')) '.codex' }
         $text = [IO.File]::ReadAllText((Join-Path $codexHome 'config.toml'))
-        if ($text -notmatch '(?m)^model_provider\s*=\s*"(?:custom|sub2api)"\s*$' -or
+        if ($text -notmatch '(?m)^model_provider\s*=\s*"codex_router"\s*$' -or
             $text -notmatch [regex]::Escape($baseUri.GetLeftPart([UriPartial]::Authority) + '/v1')) {
             throw 'Codex does not point to this local Router.'
         }
         'local provider and Router base URL verified'
-    }
-
-    Invoke-Check -Name 'opencode-provider-preservation' -Action {
-        $openCodePath = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.config\opencode\opencode.json'
-        if (-not (Test-Path -LiteralPath $openCodePath)) { return 'OpenCode is not installed; integration check skipped by environment.' }
-        $openCode = [IO.File]::ReadAllText($openCodePath) | ConvertFrom-Json
-        $providerProperty = $openCode.PSObject.Properties['provider']
-        if ($null -eq $providerProperty -or
-            $null -eq $providerProperty.Value.PSObject.Properties['codex-router']) {
-            throw 'OpenCode codex-router provider is missing.'
-        }
-        $providerCount = @($providerProperty.Value.PSObject.Properties).Count
-        "codex-router present; total providers preserved=$providerCount"
     }
 
     Invoke-Check -Name 'configured-fallback-pairs' -Action {
@@ -336,7 +319,16 @@ try {
         "$($proxySettings.Source) proxy reachable; endpoint and credentials not printed"
     }
 
-    $configuredModels = @($config.models | ForEach-Object { [string]$_.model } | Where-Object { $_ } | Select-Object -Unique)
+    $publicModelsResponse = $httpClient.GetAsync('/v1/models').GetAwaiter().GetResult()
+    try {
+        if (-not $publicModelsResponse.IsSuccessStatusCode) {
+            throw "models HTTP $([int]$publicModelsResponse.StatusCode)"
+        }
+        $publicModelsPayload = $publicModelsResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult() | ConvertFrom-Json
+        $configuredModels = @($publicModelsPayload.data | ForEach-Object { [string]$_.id } | Where-Object { $_ } | Select-Object -Unique)
+    } finally {
+        $publicModelsResponse.Dispose()
+    }
     $models = if (@($OnlyModel).Count -gt 0) {
         @($OnlyModel | Where-Object { $configuredModels -contains $_ } | Select-Object -Unique)
     } else {

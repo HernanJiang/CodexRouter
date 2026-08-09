@@ -379,11 +379,13 @@ fn restore_full_state(
     } else {
         String::new()
     };
-    let merged_config = if let Some(current) = original_config.as_deref() {
-        merge_codex_route_config(
-            std::str::from_utf8(current).context("当前 Codex config.toml 不是 UTF-8")?,
-            &snapshot_config,
-        )?
+    let current_text = original_config
+        .as_deref()
+        .map(|bytes| std::str::from_utf8(bytes).context("当前 Codex config.toml 不是 UTF-8"))
+        .transpose()?;
+    let merged_config = if let Some(current) = current_text {
+        let merged = merge_codex_route_config(current, &snapshot_config)?;
+        logic::preserve_windows_sandbox_config(current, &merged)
     } else {
         logic::normalize_windows_sandbox_config(&snapshot_config)
     };
@@ -437,6 +439,7 @@ fn read_optional(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
     }
 }
 
+#[allow(dead_code)]
 fn sha256_hex(content: &[u8]) -> String {
     Sha256::digest(content)
         .iter()
@@ -444,6 +447,7 @@ fn sha256_hex(content: &[u8]) -> String {
         .collect()
 }
 
+#[allow(dead_code)]
 fn optional_toml_string(document: &DocumentMut, key: &str) -> anyhow::Result<Option<String>> {
     match document.get(key) {
         Some(item) => item
@@ -467,6 +471,7 @@ fn router_requires_openai_auth(document: &DocumentMut) -> Option<bool> {
     provider.get("requires_openai_auth")?.as_bool()
 }
 
+#[allow(dead_code)]
 fn prepare_account_mode_config(
     content: &str,
     target: CodexAccountMode,
@@ -507,15 +512,15 @@ fn prepare_account_mode_config(
         .and_then(|providers| providers.get_mut(&provider_id))
         .and_then(Item::as_table_like_mut)
         .context("无法更新 Codex-Router 模型提供方")?;
-    provider.insert(
-        "requires_openai_auth",
-        toml_edit::value(target == CodexAccountMode::Official),
-    );
+    // Apply/account switching must never force API-only login. Codex keeps the
+    // user's sign-in UI while Router requests still use the local bearer.
+    provider.insert("requires_openai_auth", toml_edit::value(true));
 
     match target {
         CodexAccountMode::ApiOnly => {
-            document.remove("forced_login_method");
-            document.insert("cli_auth_credentials_store", toml_edit::value("file"));
+            bail!(
+                "已取消 API 登录模式：Codex-Router 只增量写入本地路由，并保持当前 Codex 登录状态"
+            );
         }
         CodexAccountMode::Official => {
             if let Some(value) = forced_login_method {
@@ -558,6 +563,7 @@ fn active_official_auth_snapshot(
     Ok((source, manifest))
 }
 
+#[allow(dead_code)]
 fn capture_official_auth_snapshot(
     router_root: &Path,
     auth_path: &Path,
@@ -626,6 +632,7 @@ fn capture_official_auth_snapshot(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn load_official_auth_snapshot(
     router_root: &Path,
 ) -> anyhow::Result<(Vec<u8>, OfficialAuthManifest)> {
@@ -644,6 +651,7 @@ fn load_official_auth_snapshot(
     Ok((result?, manifest))
 }
 
+#[allow(dead_code)]
 fn replace_codex_account_state(
     config_path: &Path,
     config_content: &[u8],
@@ -676,20 +684,22 @@ pub fn codex_account_mode_status(router_root: &Path, cfg: &RouterConfig) -> Code
         .and_then(|text| text.parse::<DocumentMut>().ok())
         .as_ref()
         .and_then(router_requires_openai_auth);
-    let mode = if auth.valid_chatgpt {
-        CodexAccountMode::Official
-    } else if requires_auth == Some(false) {
+    let mode = if cfg.auth_mode == "local_api_key" && requires_auth == Some(false) {
         CodexAccountMode::ApiOnly
+    } else if auth.valid_chatgpt {
+        CodexAccountMode::Official
     } else {
         CodexAccountMode::Unavailable
     };
-    let official_snapshot_available = active_official_auth_snapshot(router_root).is_ok();
+    let official_snapshot_available =
+        auth.valid_chatgpt || active_official_auth_snapshot(router_root).is_ok();
     CodexAccountModeStatus {
         mode,
         official_snapshot_available,
     }
 }
 
+#[allow(dead_code)]
 pub fn switch_to_api_only_mode(router_root: &Path, cfg: &RouterConfig) -> anyhow::Result<()> {
     let codex_home = logic::resolve_codex_home(cfg);
     let config_path = codex_home.join("config.toml");
@@ -706,31 +716,58 @@ pub fn switch_to_api_only_mode(router_root: &Path, cfg: &RouterConfig) -> anyhow
     let credentials_store = optional_toml_string(&document, "cli_auth_credentials_store")?;
     let api_config = prepare_account_mode_config(&config, CodexAccountMode::ApiOnly, None, None)?;
 
-    capture_official_auth_snapshot(
-        router_root,
+    let auth = read_optional(&auth_path)?;
+    if read_auth_info(&auth_path).valid_chatgpt {
+        capture_official_auth_snapshot(
+            router_root,
+            &auth_path,
+            forced_login_method,
+            credentials_store,
+        )?;
+    }
+    replace_codex_account_state(
+        &config_path,
+        api_config.as_bytes(),
         &auth_path,
-        forced_login_method,
-        credentials_store,
+        auth.as_deref(),
     )?;
-    replace_codex_account_state(&config_path, api_config.as_bytes(), &auth_path, None)?;
     if codex_account_mode_status(router_root, cfg).mode != CodexAccountMode::ApiOnly {
         bail!("Codex API 模式提交后校验失败");
     }
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn restore_official_account_mode(router_root: &Path, cfg: &RouterConfig) -> anyhow::Result<()> {
-    let (auth, manifest) = load_official_auth_snapshot(router_root)?;
     let codex_home = logic::resolve_codex_home(cfg);
     let config_path = codex_home.join("config.toml");
     let auth_path = codex_home.join("auth.json");
     let config = std::fs::read_to_string(&config_path)
         .context("Codex config.toml 不存在；无法恢复 Router 官方账号模式")?;
+    let document = config
+        .parse::<DocumentMut>()
+        .context("Codex config.toml 不是有效 TOML")?;
+    let current_auth = read_optional(&auth_path)?;
+    let (auth, forced_login_method, credentials_store) = if read_auth_info(&auth_path).valid_chatgpt
+    {
+        (
+            current_auth.context("Codex 官方登录状态不可读")?,
+            optional_toml_string(&document, "forced_login_method")?,
+            optional_toml_string(&document, "cli_auth_credentials_store")?,
+        )
+    } else {
+        let (auth, manifest) = load_official_auth_snapshot(router_root)?;
+        (
+            auth,
+            manifest.forced_login_method,
+            manifest.credentials_store,
+        )
+    };
     let official_config = prepare_account_mode_config(
         &config,
         CodexAccountMode::Official,
-        manifest.forced_login_method.as_deref(),
-        manifest.credentials_store.as_deref(),
+        forced_login_method.as_deref(),
+        credentials_store.as_deref(),
     )?;
     replace_codex_account_state(
         &config_path,
@@ -864,16 +901,17 @@ pub(crate) fn merge_codex_route_config(current: &str, target: &str) -> anyhow::R
     let current_router_provider = current_doc
         .get("model_provider")
         .and_then(Item::as_str)
-        .filter(|provider_id| matches!(*provider_id, "custom" | "sub2api"))
+        .filter(|provider_id| matches!(*provider_id, "codex_router" | "custom" | "sub2api"))
         .filter(|provider_id| {
-            current_doc
-                .get("model_providers")
-                .and_then(Item::as_table_like)
-                .and_then(|providers| providers.get(provider_id))
-                .and_then(Item::as_table_like)
-                .and_then(|provider| provider.get("name"))
-                .and_then(Item::as_str)
-                == Some("Codex-Router")
+            *provider_id == "codex_router"
+                || current_doc
+                    .get("model_providers")
+                    .and_then(Item::as_table_like)
+                    .and_then(|providers| providers.get(provider_id))
+                    .and_then(Item::as_table_like)
+                    .and_then(|provider| provider.get("name"))
+                    .and_then(Item::as_str)
+                    == Some("Codex-Router")
         })
         .map(str::to_owned);
     for key in [
@@ -920,7 +958,7 @@ pub(crate) fn merge_codex_route_config(current: &str, target: &str) -> anyhow::R
             if current_doc.get("model_providers").is_none() {
                 current_doc.insert("model_providers", Item::Table(Table::new()));
             }
-            let target_is_router_owned = provider_name == "sub2api"
+            let target_is_router_owned = matches!(provider_name, "codex_router" | "sub2api")
                 || provider
                     .as_table_like()
                     .and_then(|table| table.get("name"))
@@ -935,11 +973,26 @@ pub(crate) fn merge_codex_route_config(current: &str, target: &str) -> anyhow::R
             if target_is_router_owned || providers.get(provider_name).is_none() {
                 providers.insert(provider_name, provider);
             }
+            if target_is_router_owned {
+                providers.remove("sub2api");
+                if provider_name != "custom" {
+                    let remove_legacy_custom = providers
+                        .get("custom")
+                        .and_then(Item::as_table_like)
+                        .and_then(|table| table.get("name"))
+                        .and_then(Item::as_str)
+                        == Some("Codex-Router");
+                    if remove_legacy_custom {
+                        providers.remove("custom");
+                    }
+                }
+            }
         }
     }
 
-    Ok(logic::normalize_windows_sandbox_config(
-        &current_doc.to_string(),
+    Ok(logic::preserve_windows_sandbox_config(
+        current,
+        &logic::normalize_windows_sandbox_config(&current_doc.to_string()),
     ))
 }
 
@@ -956,11 +1009,17 @@ fn restore_shared_config(
     } else {
         String::new()
     };
-    let merged = if target_path.is_file() {
-        merge_codex_route_config(&std::fs::read_to_string(&target_path)?, &snapshot)?
+    let current = if target_path.is_file() {
+        std::fs::read_to_string(&target_path)?
+    } else {
+        String::new()
+    };
+    let merged = if !current.is_empty() {
+        merge_codex_route_config(&current, &snapshot)?
     } else {
         logic::normalize_windows_sandbox_config(&snapshot)
     };
+    let merged = logic::preserve_windows_sandbox_config(&current, &merged);
     if merged.trim().is_empty() {
         clear_optional_file(&target_path)?;
     } else {
@@ -1030,16 +1089,17 @@ fn sanitize_router_config(text: &str) -> String {
     let router_provider = document
         .get("model_provider")
         .and_then(Item::as_str)
-        .filter(|provider_id| matches!(*provider_id, "custom" | "sub2api"))
+        .filter(|provider_id| matches!(*provider_id, "codex_router" | "custom" | "sub2api"))
         .filter(|provider_id| {
-            document
-                .get("model_providers")
-                .and_then(Item::as_table_like)
-                .and_then(|providers| providers.get(provider_id))
-                .and_then(Item::as_table_like)
-                .and_then(|provider| provider.get("name"))
-                .and_then(Item::as_str)
-                == Some("Codex-Router")
+            *provider_id == "codex_router"
+                || document
+                    .get("model_providers")
+                    .and_then(Item::as_table_like)
+                    .and_then(|providers| providers.get(provider_id))
+                    .and_then(Item::as_table_like)
+                    .and_then(|provider| provider.get("name"))
+                    .and_then(Item::as_str)
+                    == Some("Codex-Router")
         })
         .map(str::to_owned);
     let Some(provider_id) = router_provider else {
@@ -1067,7 +1127,17 @@ fn sanitize_router_config(text: &str) -> String {
         .and_then(Item::as_table_like_mut)
     {
         providers.remove(&provider_id);
+        providers.remove("codex_router");
         providers.remove("sub2api");
+        let remove_legacy_custom = providers
+            .get("custom")
+            .and_then(Item::as_table_like)
+            .and_then(|table| table.get("name"))
+            .and_then(Item::as_str)
+            == Some("Codex-Router");
+        if remove_legacy_custom {
+            providers.remove("custom");
+        }
     }
     let remove_empty_providers = document
         .get("model_providers")
@@ -1076,7 +1146,12 @@ fn sanitize_router_config(text: &str) -> String {
     if remove_empty_providers {
         document.remove("model_providers");
     }
-    let cleaned = document.to_string().trim().to_owned();
+    let cleaned = logic::preserve_windows_sandbox_config(
+        text,
+        &logic::normalize_windows_sandbox_config(&document.to_string()),
+    )
+    .trim()
+    .to_owned();
     if cleaned.is_empty() {
         String::new()
     } else {
@@ -1147,6 +1222,53 @@ pub fn restore_original_codex(
 ) -> anyhow::Result<RestoreOutcome> {
     ensure_original_codex_snapshot(router_root, cfg)?;
     restore_state(&original_root(router_root), cfg, share_codex_state, true)
+}
+
+/// Reset Codex to its own factory defaults instead of replaying a Router
+/// snapshot. Restoring an old snapshot could re-apply stale `[windows]` or auth
+/// state and leave the desktop client stuck in the Windows setup / UAC loop.
+/// This keeps the user's unrelated Codex settings (plugins, MCP servers,
+/// projects, permissions) and only removes what Codex-Router itself added.
+pub fn initialize_codex_defaults(
+    router_root: &Path,
+    cfg: &RouterConfig,
+) -> anyhow::Result<RestoreOutcome> {
+    // Keep a restore point first so this stays reversible.
+    let _ = capture_restore_point(router_root, cfg, "初始化 Codex 默认配置之前");
+
+    let codex_home = logic::resolve_codex_home(cfg);
+    std::fs::create_dir_all(&codex_home)?;
+    let config_path = codex_home.join("config.toml");
+
+    if config_path.is_file() {
+        let current = std::fs::read_to_string(&config_path)?;
+        let cleaned = sanitize_router_config(&current);
+        if cleaned.trim().is_empty() {
+            clear_optional_file(&config_path)?;
+        } else {
+            atomic_write(&config_path, cleaned.as_bytes())?;
+        }
+    }
+
+    // Codex owns its own login. Only remove an auth file that is unusable; a
+    // valid ChatGPT session must survive so the user is not signed out.
+    let auth_path = codex_home.join("auth.json");
+    let auth_available = if auth_path.is_file() {
+        if read_auth_info(&auth_path).valid_chatgpt {
+            true
+        } else {
+            clear_optional_file(&auth_path)?;
+            false
+        }
+    } else {
+        false
+    };
+
+    Ok(RestoreOutcome {
+        auth_available,
+        shared_state_preserved: true,
+        account_changed: false,
+    })
 }
 
 pub fn capture_restore_point(
@@ -1588,6 +1710,7 @@ sandbox = "unelevated"
         assert!(!output.contains("model_providers.sub2api"));
         assert!(output.contains("approval_policy"));
         assert!(output.contains("[windows]"));
+        assert!(output.contains("sandbox = \"unelevated\""));
     }
 
     #[test]
@@ -1634,11 +1757,78 @@ experimental_bearer_token = "local-router-secret"
     }
 
     #[test]
-    fn restored_config_cannot_reintroduce_elevated_windows_sandbox() {
+    fn initialize_codex_defaults_strips_router_keys_and_keeps_user_settings() {
+        let root = temporary_test_dir("codex-defaults");
+        let codex_home = root.join("codex-home");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let mut cfg = RouterConfig::default();
+        cfg.deploy.codex_home = codex_home.display().to_string();
+        let sessions = codex_home.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("chat.jsonl"), "chat").unwrap();
+        let auth = r#"{"auth_mode":"chatgpt","tokens":{"access_token":"keep-me"}}"#;
+        std::fs::write(codex_home.join("auth.json"), auth).unwrap();
+        std::fs::write(
+            codex_home.join("config.toml"),
+            r#"model_provider = "codex_router"
+model = "gpt-5.6-sol"
+model_catalog_json = "C:\\catalog.json"
+model_reasoning_effort = "high"
+approval_policy = "never"
+
+[windows]
+sandbox = "elevated"
+
+[features]
+fast_mode = false
+
+[mcp_servers.node_repl]
+command = "node_repl.exe"
+
+[plugins."browser@openai-bundled"]
+enabled = true
+
+[model_providers.codex_router]
+name = "Codex-Router"
+base_url = "http://127.0.0.1:18080/v1"
+requires_openai_auth = true
+experimental_bearer_token = "sk-local-test"
+"#,
+        )
+        .unwrap();
+
+        let outcome = initialize_codex_defaults(&root, &cfg).unwrap();
+        let cleaned = std::fs::read_to_string(codex_home.join("config.toml")).unwrap();
+
+        // Router-owned keys are gone.
+        assert!(!cleaned.contains("model_provider"));
+        assert!(!cleaned.contains("model_catalog_json"));
+        assert!(!cleaned.contains("codex_router"));
+        assert!(!cleaned.contains("experimental_bearer_token"));
+        // The user's own Codex settings survive untouched.
+        assert!(cleaned.contains("approval_policy = \"never\""));
+        assert!(cleaned.contains("sandbox = \"elevated\""));
+        assert!(cleaned.contains("mcp_servers.node_repl"));
+        assert!(cleaned.contains("plugins.\"browser@openai-bundled\""));
+        // A valid sign-in and chat history are preserved.
+        assert!(outcome.auth_available);
+        assert_eq!(
+            std::fs::read_to_string(codex_home.join("auth.json")).unwrap(),
+            auth
+        );
+        assert_eq!(
+            std::fs::read_to_string(sessions.join("chat.jsonl")).unwrap(),
+            "chat"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restore_keeps_completed_windows_setup_state() {
         let input = "model = \"custom\"\n[windows]\nsandbox = \"elevated\"\n";
         let output = logic::normalize_windows_sandbox_config(input);
-        assert!(output.contains("sandbox = \"unelevated\""));
-        assert!(!output.contains("sandbox = \"elevated\""));
+        assert!(output.contains("sandbox = \"elevated\""));
+        assert!(!output.contains("sandbox = \"unelevated\""));
     }
 
     #[test]
@@ -1655,7 +1845,7 @@ experimental_bearer_token = "local-router-secret"
         assert_eq!(restored.deploy.codex_home, cfg.deploy.codex_home);
         assert_eq!(
             std::fs::read_to_string(codex_home.join("config.toml")).unwrap(),
-            "model = \"first\"\n\n[windows]\nsandbox = \"unelevated\"\n"
+            "model = \"first\"\n"
         );
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1734,16 +1924,15 @@ experimental_bearer_token = "local-router-secret"
 
     #[cfg(windows)]
     #[test]
-    fn api_only_mode_round_trips_official_login_without_exposing_credentials() {
-        let root = temporary_test_dir("account-mode-round-trip");
+    fn api_only_mode_is_disabled_and_keeps_login_state() {
+        let root = temporary_test_dir("account-mode-disabled");
         let codex_home = root.join("codex-home");
         std::fs::create_dir_all(&codex_home).unwrap();
         let mut cfg = RouterConfig::default();
         cfg.deploy.codex_home = codex_home.to_string_lossy().to_string();
         let config = r#"model_provider = "custom"
 model = "third-party-model"
-forced_login_method = "chatgpt"
-cli_auth_credentials_store = "auto"
+model_catalog_json = "shared-catalog.json"
 approval_policy = "never"
 
 [model_providers.custom]
@@ -1754,43 +1943,28 @@ requires_openai_auth = true
 experimental_bearer_token = "local-router-key"
 "#;
         let auth = r#"{"auth_mode":"chatgpt","tokens":{"account_id":"account-a","access_token":"official-secret"}}"#;
+        let sessions = codex_home.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
         std::fs::write(codex_home.join("config.toml"), config).unwrap();
         std::fs::write(codex_home.join("auth.json"), auth).unwrap();
+        std::fs::write(sessions.join("shared-chat.jsonl"), "shared-chat").unwrap();
 
-        switch_to_api_only_mode(&root, &cfg).unwrap();
-
-        assert!(!codex_home.join("auth.json").exists());
-        let api_config = std::fs::read_to_string(codex_home.join("config.toml")).unwrap();
-        assert!(api_config.contains("requires_openai_auth = false"));
-        assert!(api_config.contains("experimental_bearer_token = \"local-router-key\""));
-        assert!(api_config.contains("approval_policy = \"never\""));
-        assert!(api_config.contains("cli_auth_credentials_store = \"file\""));
-        assert!(!api_config.contains("forced_login_method"));
-        let (snapshot, manifest) = active_official_auth_snapshot(&root).unwrap();
-        let manifest_text = std::fs::read_to_string(snapshot.join("state.json")).unwrap();
-        let protected = std::fs::read(snapshot.join("auth.json.dpapi")).unwrap();
-        assert!(!manifest_text.contains("official-secret"));
-        assert!(!protected
-            .windows("official-secret".len())
-            .any(|window| window == b"official-secret"));
-        assert_eq!(manifest.forced_login_method.as_deref(), Some("chatgpt"));
-        assert_eq!(manifest.credentials_store.as_deref(), Some("auto"));
-        assert_eq!(
-            codex_account_mode_status(&root, &cfg).mode,
-            CodexAccountMode::ApiOnly
-        );
-
-        restore_official_account_mode(&root, &cfg).unwrap();
-
+        let error = switch_to_api_only_mode(&root, &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("已取消 API 登录模式"));
         assert_eq!(
             std::fs::read_to_string(codex_home.join("auth.json")).unwrap(),
             auth
         );
-        let restored = std::fs::read_to_string(codex_home.join("config.toml")).unwrap();
-        assert!(restored.contains("requires_openai_auth = true"));
-        assert!(restored.contains("forced_login_method = \"chatgpt\""));
-        assert!(restored.contains("cli_auth_credentials_store = \"auto\""));
-        assert!(restored.contains("approval_policy = \"never\""));
+        assert_eq!(
+            std::fs::read_to_string(codex_home.join("config.toml")).unwrap(),
+            config
+        );
+        assert_eq!(
+            std::fs::read_to_string(sessions.join("shared-chat.jsonl")).unwrap(),
+            "shared-chat"
+        );
         assert_eq!(
             codex_account_mode_status(&root, &cfg).mode,
             CodexAccountMode::Official
@@ -1800,42 +1974,8 @@ experimental_bearer_token = "local-router-key"
 
     #[cfg(windows)]
     #[test]
-    fn api_only_mode_refuses_to_remove_unrestorable_login() {
-        let root = temporary_test_dir("account-mode-refuse");
-        let codex_home = root.join("codex-home");
-        std::fs::create_dir_all(&codex_home).unwrap();
-        let mut cfg = RouterConfig::default();
-        cfg.deploy.codex_home = codex_home.to_string_lossy().to_string();
-        let config = r#"model_provider = "custom"
-[model_providers.custom]
-name = "Codex-Router"
-base_url = "http://localhost:18080/v1"
-requires_openai_auth = true
-"#;
-        std::fs::write(codex_home.join("config.toml"), config).unwrap();
-        std::fs::write(codex_home.join("auth.json"), "{}").unwrap();
-
-        let error = switch_to_api_only_mode(&root, &cfg)
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("未执行退出"));
-        assert_eq!(
-            std::fs::read_to_string(codex_home.join("config.toml")).unwrap(),
-            config
-        );
-        assert_eq!(
-            std::fs::read_to_string(codex_home.join("auth.json")).unwrap(),
-            "{}"
-        );
-        assert!(!account_mode_root(&root).join("current.json").exists());
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn corrupted_official_snapshot_does_not_damage_api_only_state() {
-        let root = temporary_test_dir("account-mode-corrupt");
+    fn official_mode_keeps_requires_openai_auth_true() {
+        let root = temporary_test_dir("account-mode-official-true");
         let codex_home = root.join("codex-home");
         std::fs::create_dir_all(&codex_home).unwrap();
         let mut cfg = RouterConfig::default();
@@ -1846,7 +1986,7 @@ requires_openai_auth = true
 [model_providers.custom]
 name = "Codex-Router"
 base_url = "http://127.0.0.1:18080/v1"
-requires_openai_auth = true
+requires_openai_auth = false
 experimental_bearer_token = "local-key"
 "#,
         )
@@ -1856,17 +1996,10 @@ experimental_bearer_token = "local-key"
             r#"{"auth_mode":"chatgpt","tokens":{"access_token":"secret"}}"#,
         )
         .unwrap();
-        switch_to_api_only_mode(&root, &cfg).unwrap();
-        let api_config = std::fs::read(codex_home.join("config.toml")).unwrap();
-        let (snapshot, _) = active_official_auth_snapshot(&root).unwrap();
-        std::fs::write(snapshot.join("auth.json.dpapi"), b"corrupt").unwrap();
-
-        assert!(restore_official_account_mode(&root, &cfg).is_err());
-        assert_eq!(
-            std::fs::read(codex_home.join("config.toml")).unwrap(),
-            api_config
-        );
-        assert!(!codex_home.join("auth.json").exists());
+        restore_official_account_mode(&root, &cfg).unwrap();
+        let restored = std::fs::read_to_string(codex_home.join("config.toml")).unwrap();
+        assert!(restored.contains("requires_openai_auth = true"));
+        assert!(codex_home.join("auth.json").exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 

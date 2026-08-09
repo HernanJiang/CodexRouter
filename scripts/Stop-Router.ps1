@@ -222,6 +222,19 @@ function Test-TcpListenerPort {
         Where-Object { $_.Port -eq $Port }).Count -gt 0
 }
 
+function Wait-TcpListenerPortReleased {
+    param(
+        [Parameter(Mandatory)][int]$Port,
+        [ValidateRange(1, 10)][int]$TimeoutSeconds = 2
+    )
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        if (-not (Test-TcpListenerPort -Port $Port)) { return $true }
+        Start-Sleep -Milliseconds 50
+    } while ([DateTime]::UtcNow -lt $deadline)
+    return -not (Test-TcpListenerPort -Port $Port)
+}
+
 function Assert-ManagedServiceStopped {
     param(
         [Parameter(Mandatory)][int]$Port,
@@ -234,7 +247,7 @@ function Assert-ManagedServiceStopped {
             throw "$ServiceName process $processId is still running after shutdown."
         }
     }
-    if (Test-TcpListenerPort -Port $Port) {
+    if (-not (Wait-TcpListenerPortReleased -Port $Port)) {
         throw "$ServiceName is still listening on port $Port after shutdown."
     }
     $remaining = @(Get-ProcessesByExecutablePath -ExpectedPath $ExpectedPath)
@@ -418,6 +431,70 @@ function Invoke-PortableOwnerShutdown {
     }
 }
 
+function Test-PortableLayoutPath {
+    param(
+        [Parameter(Mandatory)][string]$ExecutablePath,
+        [Parameter(Mandatory)][string]$RelativeExecutable
+    )
+    if ([string]::IsNullOrWhiteSpace($ExecutablePath)) { return $false }
+    $actual = [IO.Path]::GetFullPath($ExecutablePath)
+    $relativeWindows = $RelativeExecutable.Replace('/', [IO.Path]::DirectorySeparatorChar)
+    $suffix = [string][IO.Path]::DirectorySeparatorChar + $relativeWindows
+    if (-not $actual.EndsWith($suffix, [StringComparison]::OrdinalIgnoreCase)) {
+        return $false
+    }
+    $ownerRoot = [IO.Path]::GetFullPath($actual.Substring(0, $actual.Length - $suffix.Length))
+    # Accept both fully verified packages and partially deleted older stages that
+    # still own loopback listeners after an upgrade.
+    $markers = @(
+        (Join-Path $ownerRoot 'Codex-Router.exe'),
+        (Join-Path $ownerRoot 'scripts\Stop-Router.ps1'),
+        (Join-Path $ownerRoot 'release-manifest.json'),
+        (Join-Path $ownerRoot 'dependency-manifest.json')
+    )
+    foreach ($marker in $markers) {
+        if (Test-Path -LiteralPath $marker -PathType Leaf) { return $true }
+    }
+    return $false
+}
+
+function Stop-ForeignPortableLayoutListeners {
+    # Force-exit fallback when an older portable stage still owns the ports but
+    # no longer has intact release metadata for verified adoption.
+    $listenerSpecs = @(
+        [pscustomobject]@{ Port = $sub2apiPort; Relative = 'app/sub2api.exe'; Service = 'Sub2API' },
+        [pscustomobject]@{ Port = $RedisPort; Relative = 'redis/Redis-8.10.0-Windows-x64-msys2/redis-server.exe'; Service = 'Redis' },
+        [pscustomobject]@{ Port = $PostgresPort; Relative = 'postgres/pgsql/bin/postgres.exe'; Service = 'PostgreSQL' }
+    )
+    foreach ($spec in $listenerSpecs) {
+        $process = $null
+        try {
+            $process = Get-LoopbackListenerProcess -Port $spec.Port -ServiceName $spec.Service
+        } catch {
+            continue
+        }
+        if ($null -eq $process) { continue }
+        $expectedCurrent = [IO.Path]::GetFullPath((Join-Path $routerRoot $spec.Relative))
+        $actualPath = if ([string]::IsNullOrWhiteSpace([string]$process.ExecutablePath)) {
+            ''
+        } else {
+            [IO.Path]::GetFullPath([string]$process.ExecutablePath)
+        }
+        if ($actualPath.Equals($expectedCurrent, [StringComparison]::OrdinalIgnoreCase)) {
+            continue
+        }
+        if (-not (Test-PortableLayoutPath -ExecutablePath $actualPath -RelativeExecutable $spec.Relative)) {
+            continue
+        }
+        $managedPid = [int]$process.ProcessId
+        Stop-ProcessTree -ProcessId $managedPid
+        if (-not (Wait-ProcessExit -ProcessId $managedPid -TimeoutSeconds 2)) {
+            throw "$($spec.Service) from a previous portable release did not exit after forced termination."
+        }
+        Stop-RemainingManagedProcesses -ExpectedPath $actualPath -ServiceName $spec.Service
+    }
+}
+
 function Wait-ProcessExit {
     param([Parameter(Mandatory)][int]$ProcessId, [Parameter(Mandatory)][int]$TimeoutSeconds)
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
@@ -503,12 +580,22 @@ if ($Force -and $AdoptActivePortableOwner) {
     # and release-manifest ownership scans. Any incomplete/mixed stack still takes the full
     # portable-owner verification path below.
     if (-not (Test-CurrentPortableStackOwned)) {
-        $activePortableOwner = Get-ActivePortableOwnerRoot
-        if ($null -ne $activePortableOwner) {
-            Invoke-PortableOwnerShutdown -OwnerRoot $activePortableOwner
-            Write-Output "Codex Router services from the active verified portable release are stopped."
-            return
+        try {
+            $activePortableOwner = Get-ActivePortableOwnerRoot
+            if ($null -ne $activePortableOwner) {
+                Invoke-PortableOwnerShutdown -OwnerRoot $activePortableOwner
+                Write-Output "Codex Router services from the active verified portable release are stopped."
+                return
+            }
+        } catch {
+            # Older stages can lose release-manifest / dependency-manifest files
+            # after a partial cleanup while their listeners still hold the ports.
+            # A deliberate full GUI exit must still reclaim those listeners.
+            Stop-ForeignPortableLayoutListeners
+            Write-Output 'Codex Router services from a previous portable layout were force-stopped.'
         }
+        # Fall through into the local stop path so pid files and remaining
+        # current-release processes are cleaned even after a foreign force-stop.
     }
 }
 

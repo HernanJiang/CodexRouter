@@ -12,6 +12,21 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
+function Initialize-StandardPowerShellModulePath {
+    if ($PSVersionTable.PSEdition -eq 'Desktop') {
+        $desktopModuleRoot = Join-Path $PSHOME 'Modules'
+        $modulePaths = @($env:PSModulePath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if ($modulePaths -notcontains $desktopModuleRoot) {
+            $env:PSModulePath = $desktopModuleRoot + ';' + ($modulePaths -join ';')
+        }
+        Import-Module (Join-Path $desktopModuleRoot 'Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1') -ErrorAction Stop
+    } else {
+        Import-Module Microsoft.PowerShell.Utility -ErrorAction Stop
+    }
+}
+
+Initialize-StandardPowerShellModulePath
+
 $routerRoot = Split-Path -Parent $PSScriptRoot
 $releaseBuilder = Join-Path $PSScriptRoot 'Build-PortableRelease.ps1'
 $acceptanceRoot = Join-Path ([IO.Path]::GetTempPath()) ('codex-router-acceptance-' + [Guid]::NewGuid().ToString('N'))
@@ -406,7 +421,6 @@ try {
             'Test-CredentialStore.ps1',
             'Test-OAuthRouting.ps1',
             'Test-OpenAIChannelPolicy.ps1',
-            'Test-OpenCodeIntegration.ps1',
             'Test-ManagedProxy.ps1',
             'Test-ProxyDiscovery.ps1',
             'Test-RouterBaseUri.ps1',

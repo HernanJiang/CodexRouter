@@ -21,38 +21,40 @@ pub struct Palette {
 
 pub fn palette(name: &str) -> Palette {
     if name == "sky" {
+        // Clearer sky blue with soft acrylic glass layers.
         Palette {
-            background: egui::Color32::from_rgb(111, 143, 163),
-            background_dark: egui::Color32::from_rgb(64, 94, 112),
-            background_light: egui::Color32::from_rgb(168, 194, 208),
-            paper: egui::Color32::from_rgb(247, 250, 251),
-            paper_alt: egui::Color32::from_rgb(234, 240, 243),
-            ink: egui::Color32::from_rgb(12, 16, 24),
-            ink_soft: egui::Color32::from_rgb(45, 58, 67),
-            muted: egui::Color32::from_rgb(99, 113, 122),
-            line: egui::Color32::from_rgb(202, 215, 222),
-            action: egui::Color32::from_rgb(23, 43, 58),
-            accent: egui::Color32::from_rgb(42, 91, 119),
-            glass: egui::Color32::from_rgba_unmultiplied(235, 243, 246, 224),
-            glass_dark: egui::Color32::from_rgba_unmultiplied(36, 55, 65, 218),
+            background: egui::Color32::from_rgb(142, 186, 214),
+            background_dark: egui::Color32::from_rgb(78, 128, 162),
+            background_light: egui::Color32::from_rgb(198, 224, 240),
+            paper: egui::Color32::from_rgb(248, 252, 255),
+            paper_alt: egui::Color32::from_rgb(232, 243, 250),
+            ink: egui::Color32::from_rgb(14, 28, 42),
+            ink_soft: egui::Color32::from_rgb(48, 72, 92),
+            muted: egui::Color32::from_rgb(96, 122, 140),
+            line: egui::Color32::from_rgb(196, 218, 232),
+            action: egui::Color32::from_rgb(28, 72, 108),
+            accent: egui::Color32::from_rgb(46, 118, 158),
+            glass: egui::Color32::from_rgba_unmultiplied(244, 250, 255, 168),
+            glass_dark: egui::Color32::from_rgba_unmultiplied(42, 78, 104, 176),
             success: egui::Color32::from_rgb(29, 130, 89),
             danger: egui::Color32::from_rgb(190, 54, 51),
         }
     } else {
+        // Coffee theme with the same acrylic translucency treatment.
         Palette {
-            background: egui::Color32::from_rgb(154, 120, 98),
-            background_dark: egui::Color32::from_rgb(90, 64, 49),
-            background_light: egui::Color32::from_rgb(203, 169, 139),
-            paper: egui::Color32::from_rgb(251, 245, 234),
-            paper_alt: egui::Color32::from_rgb(239, 226, 208),
+            background: egui::Color32::from_rgb(168, 136, 114),
+            background_dark: egui::Color32::from_rgb(102, 74, 58),
+            background_light: egui::Color32::from_rgb(214, 184, 156),
+            paper: egui::Color32::from_rgb(252, 246, 236),
+            paper_alt: egui::Color32::from_rgb(242, 230, 214),
             ink: egui::Color32::from_rgb(42, 29, 21),
             ink_soft: egui::Color32::from_rgb(83, 64, 52),
             muted: egui::Color32::from_rgb(125, 101, 84),
-            line: egui::Color32::from_rgb(216, 194, 169),
+            line: egui::Color32::from_rgb(220, 200, 178),
             action: egui::Color32::from_rgb(61, 39, 27),
             accent: egui::Color32::from_rgb(82, 91, 67),
-            glass: egui::Color32::from_rgba_unmultiplied(248, 238, 222, 224),
-            glass_dark: egui::Color32::from_rgba_unmultiplied(63, 47, 38, 218),
+            glass: egui::Color32::from_rgba_unmultiplied(250, 242, 228, 168),
+            glass_dark: egui::Color32::from_rgba_unmultiplied(70, 52, 42, 176),
             success: egui::Color32::from_rgb(58, 119, 83),
             danger: egui::Color32::from_rgb(166, 66, 52),
         }
@@ -128,6 +130,44 @@ pub fn install(ctx: &egui::Context, palette: &Palette) {
 
 pub fn paint_background(painter: &egui::Painter, rect: egui::Rect, palette: &Palette) {
     painter.rect_filled(rect, 0.0, palette.background);
+    // Soft acrylic-style light wells: translucent orbs that read as frosted glass.
+    let orbs = [
+        (
+            rect.left_top() + egui::vec2(rect.width() * 0.18, rect.height() * 0.22),
+            rect.width().max(rect.height()) * 0.42,
+            palette.background_light,
+            58,
+        ),
+        (
+            rect.right_top() + egui::vec2(-rect.width() * 0.12, rect.height() * 0.48),
+            rect.width().max(rect.height()) * 0.36,
+            egui::Color32::WHITE,
+            34,
+        ),
+        (
+            rect.center_bottom() + egui::vec2(-rect.width() * 0.08, -rect.height() * 0.08),
+            rect.width().max(rect.height()) * 0.48,
+            palette.background_dark,
+            28,
+        ),
+    ];
+    for (center, radius, color, alpha) in orbs {
+        painter.circle_filled(
+            center,
+            radius,
+            egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha),
+        );
+    }
+    // Top sheen to sell the acrylic depth without heavy blur cost.
+    let sheen = egui::Rect::from_min_max(
+        rect.left_top(),
+        egui::pos2(rect.right(), rect.top() + rect.height() * 0.34),
+    );
+    painter.rect_filled(
+        sheen,
+        0.0,
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 22),
+    );
 }
 
 pub fn paper_frame(palette: &Palette) -> egui::Frame {
@@ -135,15 +175,15 @@ pub fn paper_frame(palette: &Palette) -> egui::Frame {
         .fill(palette.paper)
         .stroke(egui::Stroke::new(
             1.0_f32,
-            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 180),
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 196),
         ))
-        .corner_radius(egui::CornerRadius::same(2))
+        .corner_radius(egui::CornerRadius::same(12))
         .inner_margin(egui::Margin::same(28))
         .shadow(egui::epaint::Shadow {
-            offset: [0, 10],
-            blur: 28,
+            offset: [0, 12],
+            blur: 36,
             spread: 0,
-            color: egui::Color32::from_rgba_unmultiplied(26, 20, 16, 42),
+            color: egui::Color32::from_rgba_unmultiplied(20, 28, 40, 48),
         })
 }
 
@@ -152,15 +192,15 @@ pub fn glass_frame(palette: &Palette) -> egui::Frame {
         .fill(palette.glass)
         .stroke(egui::Stroke::new(
             1.0_f32,
-            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 188),
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 210),
         ))
-        .corner_radius(egui::CornerRadius::same(14))
+        .corner_radius(egui::CornerRadius::same(16))
         .inner_margin(egui::Margin::same(26))
         .shadow(egui::epaint::Shadow {
-            offset: [0, 12],
-            blur: 40,
+            offset: [0, 14],
+            blur: 48,
             spread: 0,
-            color: egui::Color32::from_rgba_unmultiplied(25, 18, 12, 54),
+            color: egui::Color32::from_rgba_unmultiplied(18, 26, 36, 58),
         })
 }
 
@@ -169,15 +209,15 @@ pub fn dark_glass_frame(palette: &Palette) -> egui::Frame {
         .fill(palette.glass_dark)
         .stroke(egui::Stroke::new(
             1.0_f32,
-            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 46),
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 58),
         ))
-        .corner_radius(egui::CornerRadius::same(10))
+        .corner_radius(egui::CornerRadius::same(12))
         .inner_margin(egui::Margin::same(22))
         .shadow(egui::epaint::Shadow {
-            offset: [0, 8],
-            blur: 28,
+            offset: [0, 10],
+            blur: 34,
             spread: 0,
-            color: egui::Color32::from_rgba_unmultiplied(25, 18, 12, 40),
+            color: egui::Color32::from_rgba_unmultiplied(16, 22, 30, 46),
         })
 }
 

@@ -113,7 +113,7 @@ class Client:
                 "Authorization": "Bearer " + key,
                 "Content-Type": "application/json",
                 "Accept": "text/event-stream" if stream else "application/json",
-                "User-Agent": "Codex-Router-Protocol-Probe/1.2.1",
+                "User-Agent": "Codex-Router-Protocol-Probe/1.2.3",
                 "HTTP-Referer": "https://github.com/HernanJiang/Codex-Router",
                 "X-Title": "Codex-Router protocol probe",
             },
@@ -828,6 +828,8 @@ def main():
         {"name": "chiral-sol", "base": "https://api.430123.xyz/v1", "model": "gpt-5.6-sol", "env": "PROBE_KEY_CHIRAL_SOL", "representative": True},
         {"name": "chiral-luna", "base": "https://api.430123.xyz/v1", "model": "gpt-5.6-luna", "env": "PROBE_KEY_CHIRAL_LUNA", "representative": False},
         {"name": "openrouter-deepseek", "base": "https://openrouter.ai/api/v1", "model": "deepseek/deepseek-v4-flash", "env": "PROBE_KEY_OPENROUTER", "representative": True},
+        {"name": "openrouter-grok", "base": "https://openrouter.ai/api/v1", "model": "x-ai/grok-4.5", "env": "PROBE_KEY_OPENROUTER", "representative": True},
+        {"name": "openrouter-gemini", "base": "https://openrouter.ai/api/v1", "model": "google/gemini-2.5-flash", "env": "PROBE_KEY_OPENROUTER", "representative": True},
         {"name": "kimi-coding", "base": "https://api.kimi.com/coding/v1", "model": "kimi-for-coding", "env": "PROBE_KEY_KIMI", "representative": True},
     ]
     selected = {item.strip() for item in args.providers.split(",") if item.strip()}

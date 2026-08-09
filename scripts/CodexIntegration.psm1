@@ -9,7 +9,7 @@ function ConvertTo-CodexTomlString {
 function Get-CodexRouterDefaultModel {
     param(
         [AllowNull()]$RouterConfig,
-        [string]$Fallback = 'deepseek-v4-flash'
+        [string]$Fallback = 'gpt-5.6-sol'
     )
 
     if ($null -eq $RouterConfig) { return $Fallback }
@@ -154,9 +154,21 @@ function Copy-CodexPermissionSettings {
             $text = Set-CodexTopLevelValue -Content $text -Key $key -Value $value
         }
     }
-    $windowsSandbox = Get-CodexTableRawValue -Content $SourceContent -Table 'windows' -Key 'sandbox'
-    if (-not [string]::IsNullOrWhiteSpace($windowsSandbox)) {
-        $text = Set-CodexTableValue -Content $text -Table 'windows' -Key 'sandbox' -Value $windowsSandbox
+    # Codex Desktop owns this one-time Windows installation state.
+    # Prefer a completed elevated marker from either the live config or the
+    # permission baseline. Never delete a completion marker during Apply.
+    $liveWindowsSandbox = Get-CodexTableRawValue -Content $text -Table 'windows' -Key 'sandbox'
+    $sourceWindowsSandbox = Get-CodexTableRawValue -Content $SourceContent -Table 'windows' -Key 'sandbox'
+    $liveValue = if ($null -eq $liveWindowsSandbox) { '' } else { $liveWindowsSandbox.Trim().Trim('"') }
+    $sourceValue = if ($null -eq $sourceWindowsSandbox) { '' } else { $sourceWindowsSandbox.Trim().Trim('"') }
+    if ($liveValue -eq 'elevated') {
+        # already complete
+    }
+    elseif ($sourceValue -eq 'elevated') {
+        $text = Set-CodexTableValue -Content $text -Table 'windows' -Key 'sandbox' -Value '"elevated"'
+    }
+    elseif ([string]::IsNullOrWhiteSpace($liveValue) -and -not [string]::IsNullOrWhiteSpace($sourceWindowsSandbox)) {
+        $text = Set-CodexTableValue -Content $text -Table 'windows' -Key 'sandbox' -Value $sourceWindowsSandbox
     }
     return $text
 }
@@ -170,18 +182,9 @@ function Get-CodexPermissionSourceContent {
     # First-time installs already carry the user's permission settings in Content.
     # Only consult Router backups when upgrading a configuration managed by an
     # older Router release that forced [windows].sandbox to "unelevated".
-    $providerMatch = [Text.RegularExpressions.Regex]::Match(
-        $Content,
-        '(?m)^model_provider\s*=\s*"(?<id>[A-Za-z0-9_-]+)"\s*$')
-    if (-not $providerMatch.Success) { return $Content }
-    $providerID = [Text.RegularExpressions.Regex]::Escape($providerMatch.Groups['id'].Value)
-    $providerBlock = [Text.RegularExpressions.Regex]::Match(
-        $Content,
-        '(?ms)^\[model_providers\.' + $providerID + '\]\s*(?<body>.*?)(?=^\[|\z)')
-    $providerBody = if ($providerBlock.Success) { $providerBlock.Groups['body'].Value } else { '' }
-    $routerProvider = $providerBlock.Success -and
-        $providerBody -match '(?m)^name\s*=\s*"Codex-Router"\s*$' -and
-        $providerBody -match '(?m)^base_url\s*=\s*"http://(?:127\.0\.0\.1|localhost):'
+    $routerBody = Get-CodexRouterProviderBody -Content $Content
+    $routerProvider = -not [string]::IsNullOrWhiteSpace($routerBody) -and
+        $routerBody -match '(?m)^base_url\s*=\s*"http://(?:127\.0\.0\.1|localhost):'
     if (-not $routerProvider) { return $Content }
 
     $directory = Split-Path -Parent $CodexConfigPath
@@ -194,7 +197,7 @@ function Get-CodexPermissionSourceContent {
         $windowsSandbox = Get-CodexTableRawValue -Content $candidate -Table 'windows' -Key 'sandbox'
         if (-not [string]::IsNullOrWhiteSpace($approval) -or
             -not [string]::IsNullOrWhiteSpace($sandboxMode) -or
-            (-not [string]::IsNullOrWhiteSpace($windowsSandbox) -and $windowsSandbox -ne '"unelevated"')) {
+            -not [string]::IsNullOrWhiteSpace($windowsSandbox)) {
             return $candidate
         }
     }
@@ -214,6 +217,13 @@ function Get-CodexRouterModelDefaults {
     if (Test-Path -LiteralPath $CatalogPath) {
         $catalog = Get-Content -LiteralPath $CatalogPath -Raw | ConvertFrom-Json
         $entry = @($catalog.models) | Where-Object { [string]$_.slug -eq $Model } | Select-Object -First 1
+        if ($null -eq $entry) {
+            $entry = @($catalog.models) | Where-Object {
+                -not [string]::IsNullOrWhiteSpace([string]$_.slug) -and
+                ($null -eq $_.PSObject.Properties['supported_in_api'] -or [bool]$_.supported_in_api)
+            } | Select-Object -First 1
+            if ($null -ne $entry) { $Model = [string]$entry.slug }
+        }
         if ($null -ne $entry) {
             if (-not [string]::IsNullOrWhiteSpace([string]$entry.default_reasoning_level)) {
                 $effort = ([string]$entry.default_reasoning_level).Trim().ToLowerInvariant()
@@ -240,14 +250,36 @@ function Remove-CodexTable {
     return [Text.RegularExpressions.Regex]::Replace($Content, $pattern, '')
 }
 
+function Get-CodexRouterProviderBody {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Content)
+
+    foreach ($providerId in @('codex_router', 'custom', 'sub2api')) {
+        $escaped = [Text.RegularExpressions.Regex]::Escape($providerId)
+        $blockMatch = [Text.RegularExpressions.Regex]::Match(
+            $Content,
+            "(?ms)^\[model_providers\.$escaped\]\s*(?<body>.*?)(?=^\[|\z)")
+        if (-not $blockMatch.Success) { continue }
+        $body = $blockMatch.Groups['body'].Value
+        if ($providerId -eq 'codex_router' -or
+            $body -match '(?m)^name\s*=\s*"Codex-Router"\s*$') {
+            return $body
+        }
+    }
+    return ''
+}
+
 function Remove-LegacyCodexRouterProvider {
     param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Content)
-    $pattern = '(?ms)^\[model_providers\.custom\]\s*\r?\n.*?(?=^\[|\z)'
-    $match = [Text.RegularExpressions.Regex]::Match($Content, $pattern)
-    if ($match.Success -and ($match.Value -match '(?i)Codex(?: Unified)? Router|127\.0\.0\.1:18081')) {
-        return $Content.Remove($match.Index, $match.Length)
+    $text = $Content
+    foreach ($providerId in @('custom', 'sub2api')) {
+        $pattern = '(?ms)^\[' + [Text.RegularExpressions.Regex]::Escape("model_providers.$providerId") + '\]\s*\r?\n.*?(?=^\[|\z)'
+        $match = [Text.RegularExpressions.Regex]::Match($text, $pattern)
+        if ($match.Success -and ($match.Value -match '(?m)^name\s*=\s*"Codex(?:-Router|(?: Unified)? Router)"\s*$' -or
+                $match.Value -match '127\.0\.0\.1:18081')) {
+            $text = $text.Remove($match.Index, $match.Length)
+        }
     }
-    return $Content
+    return $text
 }
 
 function Remove-LegacyCodexLoopbackProxyProvider {
@@ -262,21 +294,36 @@ function Remove-LegacyCodexLoopbackProxyProvider {
     return $Content
 }
 
-function Get-CodexRouterRequiresOpenAiAuth {
-    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Content)
+function Test-CodexHomeHasChatGptAuth {
+    param([AllowEmptyString()][string]$CodexHome = '')
+    $home = if ([string]::IsNullOrWhiteSpace($CodexHome)) {
+        if ($env:CODEX_HOME) { [string]$env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+    } else { $CodexHome }
+    $authPath = Join-Path $home 'auth.json'
+    if (-not (Test-Path -LiteralPath $authPath)) { return $false }
+    try {
+        $auth = Get-Content -LiteralPath $authPath -Raw | ConvertFrom-Json
+        $mode = [string]$auth.auth_mode
+        if ($mode -ne 'chatgpt') { return $false }
+        $tokens = $auth.tokens
+        return $null -ne $tokens
+    } catch {
+        return $false
+    }
+}
 
-    $providerMatch = [Text.RegularExpressions.Regex]::Match(
-        $Content,
-        '(?m)^model_provider\s*=\s*"(?<id>[A-Za-z0-9_-]+)"\s*$')
-    if (-not $providerMatch.Success) { return $true }
-    $providerID = [Text.RegularExpressions.Regex]::Escape($providerMatch.Groups['id'].Value)
-    $blockMatch = [Text.RegularExpressions.Regex]::Match(
-        $Content,
-        "(?ms)^\[model_providers\.$providerID\]\s*(?<body>.*?)(?=^\[|\z)")
-    if (-not $blockMatch.Success) { return $true }
-    $body = $blockMatch.Groups['body'].Value
-    if ($body -notmatch '(?m)^name\s*=\s*"Codex-Router"\s*$') { return $true }
-    return $body -notmatch '(?m)^requires_openai_auth\s*=\s*false\s*$'
+function Get-CodexRouterRequiresOpenAiAuth {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Content,
+        [AllowEmptyString()][string]$CodexHome = ''
+    )
+
+    # Always keep Codex in account/sign-in UI mode. Local Router traffic still
+    # uses experimental_bearer_token; Apply must never force API-only mode or
+    # hide the Router model catalog behind a third-party login state.
+    $null = $Content
+    $null = $CodexHome
+    return $true
 }
 
 function New-CodexRouterConfig {
@@ -289,7 +336,8 @@ function New-CodexRouterConfig {
         [string]$ReasoningEffort = 'medium',
         [bool]$FastMode = $false,
         [Nullable[bool]]$RequireOpenAiAuth = $null,
-        [AllowNull()][string]$PermissionSourceContent = $null
+        [AllowNull()][string]$PermissionSourceContent = $null,
+        [AllowEmptyString()][string]$CodexHome = ''
     )
 
     $uri = $null
@@ -307,18 +355,24 @@ function New-CodexRouterConfig {
         throw 'The local Router credential is required for Codex integration.'
     }
     if ($null -eq $RequireOpenAiAuth) {
-        $RequireOpenAiAuth = Get-CodexRouterRequiresOpenAiAuth -Content $Content
+        $RequireOpenAiAuth = Get-CodexRouterRequiresOpenAiAuth -Content $Content -CodexHome $CodexHome
     }
 
     $text = Remove-CodexTopLevelValues -Content $Content -Keys @(
+        'base_url',
+        'wire_api',
+        'experimental_bearer_token',
         'openai_base_url',
         'service_tier',
         'disable_response_storage'
     )
-    $text = Set-CodexTopLevelValue -Content $text -Key 'model_provider' -Value '"custom"'
+    $text = Set-CodexTopLevelValue -Content $text -Key 'model_provider' -Value '"codex_router"'
     $text = Set-CodexTopLevelValue -Content $text -Key 'model' -Value ('"' + (ConvertTo-CodexTomlString $Model) + '"')
     $text = Set-CodexTopLevelValue -Content $text -Key 'model_catalog_json' -Value ('"' + (ConvertTo-CodexTomlString $CatalogPath) + '"')
     $text = Set-CodexTopLevelValue -Content $text -Key 'model_reasoning_effort' -Value ('"' + $ReasoningEffort + '"')
+    # Antigravity Claude rejects the provider-side Apps tool schemas. Keep the
+    # local coding tools, MCP, shell, files, and multi-agent features available.
+    $text = Set-CodexTableValue -Content $text -Table 'features' -Key 'apps' -Value 'false'
     $text = Set-CodexTableValue -Content $text -Table 'models.new_thread' -Key 'model' -Value ('"' + (ConvertTo-CodexTomlString $Model) + '"')
     $text = Set-CodexTableValue -Content $text -Table 'models.new_thread' -Key 'model_reasoning_effort' -Value ('"' + $ReasoningEffort + '"')
     if ($FastMode) {
@@ -332,18 +386,32 @@ function New-CodexRouterConfig {
     $permissionSource = if ($null -eq $PermissionSourceContent) { $Content } else { $PermissionSourceContent }
     $text = Copy-CodexPermissionSettings -Content $text -SourceContent $permissionSource
     $text = Set-CodexTableValue -Content $text -Table 'desktop' -Key 'enabled-reasoning-efforts' -Value '["low", "medium", "high", "xhigh", "ultra", "max"]'
-    $text = Remove-LegacyCodexRouterProvider -Content $text
     $text = Remove-LegacyCodexLoopbackProxyProvider -Content $text
-    # Keep provider definitions owned by Codex, other switchers, and the user.
-    # Router owns the active custom provider and its legacy sub2api alias only.
-    foreach ($routerOwned in @('model_providers.sub2api', 'model_providers.custom')) {
+    $text = Remove-LegacyCodexRouterProvider -Content $text
+    # Own a dedicated provider id so third-party tools that rewrite
+    # model_providers.custom (Chiral/micu, other switchers) cannot steal the
+    # active Codex route away from the local Router.
+    foreach ($routerOwned in @('model_providers.codex_router', 'model_providers.sub2api')) {
         $text = Remove-CodexTable -Content $text -Table $routerOwned
+    }
+    # Deduplicate accidental [model_providers.custom] blocks left by external
+    # tools that clobber the active provider id onto custom.
+    $customMatches = [Text.RegularExpressions.Regex]::Matches(
+        $text,
+        '(?ms)^\[model_providers\.custom\]\s*\r?\n.*?(?=^\[|\z)')
+    if ($customMatches.Count -gt 1) {
+        $keep = $customMatches[$customMatches.Count - 1].Value
+        $text = [Text.RegularExpressions.Regex]::Replace(
+            $text,
+            '(?ms)^\[model_providers\.custom\]\s*\r?\n.*?(?=^\[|\z)',
+            '')
+        $text = $text.TrimEnd() + "`r`n`r`n" + $keep.TrimEnd() + "`r`n"
     }
 
     $localBearer = ConvertTo-CodexTomlString $LocalApiKey
     $requiresOpenAiAuthLiteral = if ([bool]$RequireOpenAiAuth) { 'true' } else { 'false' }
     $providerBlock = @"
-[model_providers.custom]
+[model_providers.codex_router]
 name = "Codex-Router"
 base_url = "$base/v1"
 wire_api = "responses"
@@ -403,4 +471,4 @@ function Limit-CodexRouterBackups {
     }
 }
 
-Export-ModuleMember -Function ConvertTo-CodexTomlString, Get-CodexRouterDefaultModel, Get-CodexRouterModelDefaults, Get-CodexRouterRequiresOpenAiAuth, Get-CodexPermissionSourceContent, New-CodexRouterConfig, Set-CodexUserEnvironmentVariable, Limit-CodexRouterBackups
+Export-ModuleMember -Function ConvertTo-CodexTomlString, Get-CodexRouterDefaultModel, Get-CodexRouterModelDefaults, Get-CodexRouterRequiresOpenAiAuth, Test-CodexHomeHasChatGptAuth, Get-CodexPermissionSourceContent, New-CodexRouterConfig, Set-CodexUserEnvironmentVariable, Limit-CodexRouterBackups

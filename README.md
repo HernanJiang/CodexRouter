@@ -39,21 +39,6 @@ Codex-Router keeps the original Codex workflow while adding a unified model menu
 
 Codex-Router is a Windows desktop router built around Sub2API and a Rust desktop console. PostgreSQL, Redis, Sub2API, the router runtime, and the required app-local VC++ runtime are included in the portable package. Services listen on the local loopback interface.
 
-### What is new in 1.5.2
-
-- Applying a configuration no longer fails merely because an active Codex connection is using the local Router. Restart protection remains active only when a real backend switch or restart is required.
-- Kimi Coding Plan usage distinguishes rejected credentials from permission and rate-limit failures, keeps bounded last-good quota data, and refreshes providers independently so one slow channel does not block the dashboard.
-- API Key replacement now reports the actual number of credentials updated. The model editor clearly separates staging a new Key from the final **Save and apply** action.
-- OAuth and API channels can remain merged for automatic subscription-first continuity or appear as separate model choices when automatic continuity is disabled.
-
-### Why it is useful
-
-- Keep working in Codex while switching between providers and accounts from one model menu.
-- Prefer subscription capacity and continue through an API fallback when a subscription is limited or unavailable.
-- Observe OAuth accounts, coding plans, token usage, windows, balances, reset times, and API usage from one aggregated dashboard.
-- Keep per-model context, compaction, multimodal, and reasoning settings independent.
-- Run the router from the tray with very low background overhead.
-
 ## Model Routing
 
 ### One menu, many channels
@@ -113,6 +98,21 @@ The 1.5.2 runtime retains the memory and background-work optimizations. Idle tra
 <p align="center">
   <img src="assets/release/usage-performance.png" alt="Codex-Router idle resource usage" width="900">
 </p>
+
+### What is new in 1.5.2
+
+- Applying a configuration no longer fails merely because an active Codex connection is using the local Router. Restart protection remains active only when a real backend switch or restart is required.
+- Kimi Coding Plan usage distinguishes rejected credentials from permission and rate-limit failures, keeps bounded last-good quota data, and refreshes providers independently so one slow channel does not block the dashboard.
+- API Key replacement now reports the actual number of credentials updated. The model editor clearly separates staging a new Key from the final **Save and apply** action.
+- OAuth and API channels can remain merged for automatic subscription-first continuity or appear as separate model choices when automatic continuity is disabled.
+
+### Why it is useful
+
+- Keep working in Codex while switching between providers and accounts from one model menu.
+- Prefer subscription capacity and continue through an API fallback when a subscription is limited or unavailable.
+- Observe OAuth accounts, coding plans, token usage, windows, balances, reset times, and API usage from one aggregated dashboard.
+- Keep per-model context, compaction, multimodal, and reasoning settings independent.
+- Run the router from the tray with very low background overhead.
 
 ## Download And First Run
 
