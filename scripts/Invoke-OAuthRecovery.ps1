@@ -62,7 +62,8 @@ try {
             $observedResetAt = if ($null -eq $observation) { $null } else { $observation.resetAt }
             $state = Get-RouterOAuthRecoveryState -Account $account `
                 -ObservedResetAt $observedResetAt `
-                -ObservedExhausted:($null -ne $observation -and [bool]$observation.exhausted)
+                -ObservedExhausted:($null -ne $observation -and [bool]$observation.exhausted) `
+                -ObservedAt $(if ($null -eq $observation) { $null } else { [string]$observation.observedAt })
             $nextCheckSeconds = [Math]::Min($nextCheckSeconds, [long]$state.NextCheckSeconds)
 
             if ($state.Action -eq 'defer') {

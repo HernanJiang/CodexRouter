@@ -318,13 +318,32 @@ function Get-CodexRouterRequiresOpenAiAuth {
         [AllowEmptyString()][string]$CodexHome = ''
     )
 
-    # Always keep Codex in account/sign-in UI mode. Local Router traffic still
-    # uses experimental_bearer_token; Apply must never force API-only mode or
-    # hide the Router model catalog behind a third-party login state.
+    # Match the proven v1.5.2 behavior: keep Codex in its normal ChatGPT
+    # account flow while Router traffic uses the local bearer.
     $null = $Content
     $null = $CodexHome
     return $true
 }
+
+
+
+function Get-CodexRouterExecutablePath {
+    if ($env:CODEX_ROUTER_EXE -and (Test-Path -LiteralPath $env:CODEX_ROUTER_EXE)) {
+        return (Resolve-Path -LiteralPath $env:CODEX_ROUTER_EXE).Path
+    }
+    $candidates = @(
+        (Join-Path $PSScriptRoot '..\Codex-Router.exe'),
+        (Join-Path $PSScriptRoot '..\codex-router-gui-rust\target\release\Codex-Router.exe'),
+        (Join-Path $PSScriptRoot '..\codex-router-gui-rust\target\debug\Codex-Router.exe')
+    )
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate) {
+            return (Resolve-Path -LiteralPath $candidate).Path
+        }
+    }
+    throw 'Codex-Router.exe not found. Set $env:CODEX_ROUTER_EXE to its path.'
+}
+
 
 function New-CodexRouterConfig {
     param(
@@ -336,93 +355,83 @@ function New-CodexRouterConfig {
         [string]$ReasoningEffort = 'medium',
         [bool]$FastMode = $false,
         [Nullable[bool]]$RequireOpenAiAuth = $null,
+        [Alias('ForceChatGptLogin')][bool]$DisplayOpenAiProvider = $false,
         [AllowNull()][string]$PermissionSourceContent = $null,
         [AllowEmptyString()][string]$CodexHome = ''
     )
 
-    $uri = $null
-    if (-not [Uri]::TryCreate($BaseUrl.TrimEnd('/'), [UriKind]::Absolute, [ref]$uri) -or
-        $uri.Scheme -ne 'http' -or
-        $uri.Host -notin @('127.0.0.1', 'localhost')) {
-        throw 'Codex-Router provider URL must be a local HTTP URL (127.0.0.1 or localhost).'
-    }
-    $base = $uri.GetLeftPart([UriPartial]::Authority).TrimEnd('/')
-    $ReasoningEffort = $ReasoningEffort.Trim().ToLowerInvariant()
-    if ($ReasoningEffort -notin @('none','minimal','low','medium','high','xhigh','max','ultra')) {
-        throw "Unsupported Codex reasoning effort: '$ReasoningEffort'."
-    }
-    if ([string]::IsNullOrWhiteSpace($LocalApiKey)) {
-        throw 'The local Router credential is required for Codex integration.'
-    }
-    if ($null -eq $RequireOpenAiAuth) {
-        $RequireOpenAiAuth = Get-CodexRouterRequiresOpenAiAuth -Content $Content -CodexHome $CodexHome
-    }
+    $routerExe = Get-CodexRouterExecutablePath
 
-    $text = Remove-CodexTopLevelValues -Content $Content -Keys @(
-        'base_url',
-        'wire_api',
-        'experimental_bearer_token',
-        'openai_base_url',
-        'service_tier',
-        'disable_response_storage'
-    )
-    $text = Set-CodexTopLevelValue -Content $text -Key 'model_provider' -Value '"codex_router"'
-    $text = Set-CodexTopLevelValue -Content $text -Key 'model' -Value ('"' + (ConvertTo-CodexTomlString $Model) + '"')
-    $text = Set-CodexTopLevelValue -Content $text -Key 'model_catalog_json' -Value ('"' + (ConvertTo-CodexTomlString $CatalogPath) + '"')
-    $text = Set-CodexTopLevelValue -Content $text -Key 'model_reasoning_effort' -Value ('"' + $ReasoningEffort + '"')
-    # Antigravity Claude rejects the provider-side Apps tool schemas. Keep the
-    # local coding tools, MCP, shell, files, and multi-agent features available.
-    $text = Set-CodexTableValue -Content $text -Table 'features' -Key 'apps' -Value 'false'
-    $text = Set-CodexTableValue -Content $text -Table 'models.new_thread' -Key 'model' -Value ('"' + (ConvertTo-CodexTomlString $Model) + '"')
-    $text = Set-CodexTableValue -Content $text -Table 'models.new_thread' -Key 'model_reasoning_effort' -Value ('"' + $ReasoningEffort + '"')
-    if ($FastMode) {
-        $text = Set-CodexTopLevelValue -Content $text -Key 'service_tier' -Value '"fast"'
-        $text = Set-CodexTableValue -Content $text -Table 'models.new_thread' -Key 'service_tier' -Value '"fast"'
-        $text = Set-CodexTableValue -Content $text -Table 'features' -Key 'fast_mode' -Value 'true'
+    $temporaryCodexHome = [string]::IsNullOrWhiteSpace($CodexHome)
+    $resolvedCodexHome = if ($temporaryCodexHome) {
+        Join-Path ([IO.Path]::GetTempPath()) ('codex-router-config-' + [Guid]::NewGuid().ToString('N'))
     } else {
-        $text = Remove-CodexTableValue -Content $text -Table 'models.new_thread' -Key 'service_tier'
-        $text = Set-CodexTableValue -Content $text -Table 'features' -Key 'fast_mode' -Value 'false'
+        $CodexHome
     }
-    $permissionSource = if ($null -eq $PermissionSourceContent) { $Content } else { $PermissionSourceContent }
-    $text = Copy-CodexPermissionSettings -Content $text -SourceContent $permissionSource
-    $text = Set-CodexTableValue -Content $text -Table 'desktop' -Key 'enabled-reasoning-efforts' -Value '["low", "medium", "high", "xhigh", "ultra", "max"]'
-    $text = Remove-LegacyCodexLoopbackProxyProvider -Content $text
-    $text = Remove-LegacyCodexRouterProvider -Content $text
-    # Own a dedicated provider id so third-party tools that rewrite
-    # model_providers.custom (Chiral/micu, other switchers) cannot steal the
-    # active Codex route away from the local Router.
-    foreach ($routerOwned in @('model_providers.codex_router', 'model_providers.sub2api')) {
-        $text = Remove-CodexTable -Content $text -Table $routerOwned
-    }
-    # Deduplicate accidental [model_providers.custom] blocks left by external
-    # tools that clobber the active provider id onto custom.
-    $customMatches = [Text.RegularExpressions.Regex]::Matches(
-        $text,
-        '(?ms)^\[model_providers\.custom\]\s*\r?\n.*?(?=^\[|\z)')
-    if ($customMatches.Count -gt 1) {
-        $keep = $customMatches[$customMatches.Count - 1].Value
-        $text = [Text.RegularExpressions.Regex]::Replace(
-            $text,
-            '(?ms)^\[model_providers\.custom\]\s*\r?\n.*?(?=^\[|\z)',
-            '')
-        $text = $text.TrimEnd() + "`r`n`r`n" + $keep.TrimEnd() + "`r`n"
+    $permissionSourcePath = $null
+    $result = $null
+    try {
+    [IO.Directory]::CreateDirectory($resolvedCodexHome) | Out-Null
+    $configPath = Join-Path $resolvedCodexHome 'config.toml'
+    if (-not [string]::IsNullOrWhiteSpace($Content)) {
+        [IO.File]::WriteAllText($configPath, $Content)
     }
 
-    $localBearer = ConvertTo-CodexTomlString $LocalApiKey
-    $requiresOpenAiAuthLiteral = if ([bool]$RequireOpenAiAuth) { 'true' } else { 'false' }
-    $providerBlock = @"
-[model_providers.codex_router]
-name = "Codex-Router"
-base_url = "$base/v1"
-wire_api = "responses"
-requires_openai_auth = $requiresOpenAiAuthLiteral
-experimental_bearer_token = "$localBearer"
-request_max_retries = 2
-stream_max_retries = 2
-stream_idle_timeout_ms = 300000
-supports_websockets = false
-"@
-    return $text.TrimEnd() + "`r`n`r`n" + $providerBlock.Trim() + "`r`n"
+    if (-not [string]::IsNullOrWhiteSpace($PermissionSourceContent)) {
+        $permissionSourcePath = Join-Path ([IO.Path]::GetTempPath()) ('codex-router-permsource-' + [Guid]::NewGuid().ToString('N') + '.toml')
+        [IO.File]::WriteAllText($permissionSourcePath, $PermissionSourceContent)
+    }
+
+    if ($null -eq $RequireOpenAiAuth) {
+        $RequireOpenAiAuth = Get-CodexRouterRequiresOpenAiAuth -Content $Content -CodexHome $resolvedCodexHome
+    }
+    $authFlag = if ($RequireOpenAiAuth -eq $true) { '--require-openai-auth' } else { '--no-require-openai-auth' }
+    $providerLabelFlag = if ($DisplayOpenAiProvider) { '--display-openai-provider' } else { '--display-router-provider' }
+    $fastFlag = if ($FastMode) { '--fast-mode' } else { '--no-fast-mode' }
+    $arguments = @(
+        '--write-codex-config',
+        "--codex-home=$resolvedCodexHome",
+        "--model=$Model",
+        "--catalog=$CatalogPath",
+        "--base-url=$BaseUrl",
+        "--reasoning-effort=$ReasoningEffort",
+        $fastFlag,
+        $authFlag,
+        $providerLabelFlag,
+        '--local-api-key-stdin'
+    )
+    if ($permissionSourcePath) {
+        $arguments += "--permission-source-path=$permissionSourcePath"
+    }
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $routerExe
+    $psi.Arguments = ($arguments | ForEach-Object { if ($_.Contains(' ')) { '"' + $_ + '"' } else { $_ } }) -join ' '
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $process = [System.Diagnostics.Process]::Start($psi)
+    $process.StandardInput.Write($LocalApiKey)
+    $process.StandardInput.Close()
+    $process.WaitForExit()
+    if ($process.ExitCode -ne 0) {
+        $stderr = $process.StandardError.ReadToEnd()
+        throw "Codex-Router.exe failed to write Codex configuration (exit $($process.ExitCode)): $stderr"
+    }
+    if (-not (Test-Path -LiteralPath $configPath)) {
+        throw 'Codex-Router.exe did not write the expected config.toml file.'
+    }
+        $result = [IO.File]::ReadAllText($configPath)
+    } finally {
+        if ($permissionSourcePath -and (Test-Path -LiteralPath $permissionSourcePath)) {
+            Remove-Item -LiteralPath $permissionSourcePath -Force -ErrorAction SilentlyContinue
+        }
+        if ($temporaryCodexHome -and (Test-Path -LiteralPath $resolvedCodexHome)) {
+            Remove-Item -LiteralPath $resolvedCodexHome -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    return $result
 }
 
 function Set-CodexUserEnvironmentVariable {

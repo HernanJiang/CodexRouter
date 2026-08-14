@@ -418,7 +418,7 @@ $configPath = Get-RouterConfigPath -RouterRoot $routerRoot
 $routerConfig = $null
 $proxyConfig = $null
 $proxyPassword = $null
-if (Test-Path -LiteralPath $configPath) {
+if ($env:CODEX_ROUTER_NATIVE_PROXY -ne '1' -and (Test-Path -LiteralPath $configPath)) {
     $routerConfig = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
     $proxyProperty = $routerConfig.PSObject.Properties['proxy']
     if ($null -ne $proxyProperty) { $proxyConfig = $proxyProperty.Value }
@@ -437,9 +437,19 @@ if (Test-Path -LiteralPath $configPath) {
         $proxyPassword = Get-RouterCredential -Name $proxyCredential -AllowMissing
     }
 }
-$proxySettings = Resolve-RouterProxySettings `
-    -ProxyConfig $proxyConfig `
-    -ProxyPassword $proxyPassword
+$proxySettings = if ($env:CODEX_ROUTER_NATIVE_PROXY -eq '1') {
+    [pscustomobject][ordered]@{
+        Mode = [string]$env:CODEX_ROUTER_PROXY_MODE
+        Source = [string]$env:CODEX_ROUTER_PROXY_SOURCE
+        ProxyUrl = if ([string]::IsNullOrWhiteSpace($env:CODEX_ROUTER_PROXY_URL)) { $null } else { [string]$env:CODEX_ROUTER_PROXY_URL }
+        NoProxy = [string]$env:CODEX_ROUTER_NO_PROXY
+        HasCredentials = $env:CODEX_ROUTER_PROXY_HAS_CREDENTIALS -eq '1'
+        SupportsAccountBinding = $env:CODEX_ROUTER_PROXY_SUPPORTS_ACCOUNT_BINDING -eq '1'
+        Diagnostic = ''
+    }
+} else {
+    Resolve-RouterProxySettings -ProxyConfig $proxyConfig -ProxyPassword $proxyPassword
+}
 $networkFingerprint = Get-NetworkSettingsFingerprint `
     -Value (([string]$proxySettings.ProxyUrl) + "`n" + $proxySettings.NoProxy) `
     -Secret $jwtSecret

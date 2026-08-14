@@ -1,0 +1,314 @@
+diff --git a/backend/internal/pkg/antigravity/oauth.go b/backend/internal/pkg/antigravity/oauth.go
+index 4ffb0cbad..4c129475f 100644
+--- a/backend/internal/pkg/antigravity/oauth.go
++++ b/backend/internal/pkg/antigravity/oauth.go
+@@ -53,8 +53,9 @@ const (
+ 	URLAvailabilityTTL = 5 * time.Minute
+ 
+ 	// Antigravity API 端点
+-	antigravityProdBaseURL  = "https://cloudcode-pa.googleapis.com"
+-	antigravityDailyBaseURL = "https://daily-cloudcode-pa.sandbox.googleapis.com"
++	antigravityProdBaseURL         = "https://cloudcode-pa.googleapis.com"
++	antigravityDailyBaseURL        = "https://daily-cloudcode-pa.sandbox.googleapis.com"
++	antigravityForwardDailyBaseURL = "https://daily-cloudcode-pa.googleapis.com"
+ )
+ 
+ var userAgentVersionPattern = regexp.MustCompile(`^\d+\.\d+\.\d+$`)
+@@ -154,31 +155,11 @@ var BaseURLs = []string{
+ // BaseURL 默认 URL（保持向后兼容）
+ var BaseURL = BaseURLs[0]
+ 
+-// ForwardBaseURLs 返回 API 转发用的 URL 顺序（daily 优先）
++// ForwardBaseURLs 返回生成请求专用的 URL 顺序。
++// OAuth、额度和模型目录仍使用 BaseURLs；生成请求优先使用 non-sandbox daily，
++// 避免生产 OAuth token 被发送到 sandbox，同时保留生产端点作为有限回退。
+ func ForwardBaseURLs() []string {
+-	if len(BaseURLs) == 0 {
+-		return nil
+-	}
+-	urls := append([]string(nil), BaseURLs...)
+-	dailyIndex := -1
+-	for i, url := range urls {
+-		if url == antigravityDailyBaseURL {
+-			dailyIndex = i
+-			break
+-		}
+-	}
+-	if dailyIndex <= 0 {
+-		return urls
+-	}
+-	reordered := make([]string, 0, len(urls))
+-	reordered = append(reordered, urls[dailyIndex])
+-	for i, url := range urls {
+-		if i == dailyIndex {
+-			continue
+-		}
+-		reordered = append(reordered, url)
+-	}
+-	return reordered
++	return []string{antigravityForwardDailyBaseURL, antigravityProdBaseURL}
+ }
+ 
+ // URLAvailability 管理 URL 可用性状态（带 TTL 自动恢复和动态优先级）
+diff --git a/backend/internal/pkg/antigravity/oauth_test.go b/backend/internal/pkg/antigravity/oauth_test.go
+index 69d9ddc4f..2f65d48ab 100644
+--- a/backend/internal/pkg/antigravity/oauth_test.go
++++ b/backend/internal/pkg/antigravity/oauth_test.go
+@@ -89,38 +89,29 @@ func TestGetClientSecret_环境变量有前后空格(t *testing.T) {
+ // ForwardBaseURLs
+ // ---------------------------------------------------------------------------
+ 
+-func TestForwardBaseURLs_Daily优先(t *testing.T) {
++func TestForwardBaseURLs_NonSandboxDaily优先(t *testing.T) {
+ 	urls := ForwardBaseURLs()
+-	if len(urls) == 0 {
+-		t.Fatal("ForwardBaseURLs 返回空列表")
++	if len(urls) != 2 {
++		t.Fatalf("ForwardBaseURLs 数量错误: got %d, want 2", len(urls))
+ 	}
+ 
+-	// daily URL 应排在第一位
+-	if urls[0] != antigravityDailyBaseURL {
+-		t.Errorf("第一个 URL 应为 daily: got %s, want %s", urls[0], antigravityDailyBaseURL)
++	if urls[0] != antigravityForwardDailyBaseURL {
++		t.Errorf("第一个 URL 应为 non-sandbox daily: got %s, want %s", urls[0], antigravityForwardDailyBaseURL)
+ 	}
+-
+-	// 应包含所有 URL
+-	if len(urls) != len(BaseURLs) {
+-		t.Errorf("URL 数量不匹配: got %d, want %d", len(urls), len(BaseURLs))
++	if urls[1] != antigravityProdBaseURL {
++		t.Errorf("第二个 URL 应为 prod: got %s, want %s", urls[1], antigravityProdBaseURL)
+ 	}
+-
+-	// 验证 prod URL 也在列表中
+-	found := false
+ 	for _, u := range urls {
+-		if u == antigravityProdBaseURL {
+-			found = true
+-			break
++		if u == antigravityDailyBaseURL {
++			t.Errorf("sandbox URL 不应默认参与生成请求: %s", u)
+ 		}
+ 	}
+-	if !found {
+-		t.Error("ForwardBaseURLs 中缺少 prod URL")
+-	}
+ }
+ 
+ func TestForwardBaseURLs_不修改原切片(t *testing.T) {
+ 	originalFirst := BaseURLs[0]
+-	_ = ForwardBaseURLs()
++	urls := ForwardBaseURLs()
++	urls[0] = "https://modified.test"
+ 	// 确保原始 BaseURLs 未被修改
+ 	if BaseURLs[0] != originalFirst {
+ 		t.Errorf("ForwardBaseURLs 不应修改原始 BaseURLs: got %s, want %s", BaseURLs[0], originalFirst)
+diff --git a/backend/internal/service/antigravity_gateway_retry.go b/backend/internal/service/antigravity_gateway_retry.go
+index f2f5d44f8..df99fff4d 100644
+--- a/backend/internal/service/antigravity_gateway_retry.go
++++ b/backend/internal/service/antigravity_gateway_retry.go
+@@ -46,28 +46,26 @@ type antigravityRetryLoopResult struct {
+ 	resp *http.Response
+ }
+ 
+-// resolveAntigravityForwardBaseURL 解析转发用 base URL。
++// resolveAntigravityForwardBaseURLs 解析生成请求使用的 base URL 顺序。
+ //
+-// 默认使用生产端点 cloudcode-pa.googleapis.com（antigravity.BaseURLs 的首个地址，
+-// 与账号 OAuth 登录/测试连接所用的 antigravity.BaseURL 一致）。
++// 真实账号验证表明，生成请求应优先使用 daily-cloudcode-pa.googleapis.com；
++// cloudcode-pa.googleapis.com 保留为连接错误和 URL 级 429 的回退。
+ //
+-// 历史上这里改用 ForwardBaseURLs()（把 daily/sandbox 排到首位）并默认取首个地址，
+-// 导致网关把带生产 OAuth token 的请求发到 daily-cloudcode-pa.sandbox.googleapis.com，
+-// 上游拒绝 → 账号被 401「Invalid bearer token」/502 打入临时不可调度且无法恢复
+-// （见 #3611 / #2962）。后台「测试连接」用的是生产端点，所以「测试成功但网关 401」。
++// sandbox 不参与默认生成；只有显式设置
++// GATEWAY_ANTIGRAVITY_FORWARD_BASE_URL=sandbox 时才启用。
+ //
+-// daily/sandbox 端点仅供内部联调，需显式设置
+-// GATEWAY_ANTIGRAVITY_FORWARD_BASE_URL=daily（或 sandbox）才启用。
+-func resolveAntigravityForwardBaseURL() string {
+-	baseURLs := antigravity.BaseURLs
+-	if len(baseURLs) == 0 {
+-		return ""
+-	}
++// daily / prod 显式模式用于诊断并只访问指定端点；未设置时返回默认回退链。
++func resolveAntigravityForwardBaseURLs() []string {
+ 	mode := strings.ToLower(strings.TrimSpace(os.Getenv(antigravityForwardBaseURLEnv)))
+-	if (mode == "daily" || mode == "sandbox") && len(baseURLs) > 1 {
+-		return baseURLs[1]
+-	}
+-	return baseURLs[0]
++	switch mode {
++	case "daily":
++		return []string{"https://daily-cloudcode-pa.googleapis.com"}
++	case "prod", "production":
++		return []string{"https://cloudcode-pa.googleapis.com"}
++	case "sandbox":
++		return []string{"https://daily-cloudcode-pa.sandbox.googleapis.com"}
++	}
++	return antigravity.ForwardBaseURLs()
+ }
+ 
+ // smartRetryAction 智能重试的处理结果
+@@ -90,7 +88,7 @@ type smartRetryResult struct {
+ // handleSmartRetry 处理 OAuth 账号的智能重试逻辑
+ // 将 429/503 限流处理逻辑抽取为独立函数，减少 antigravityRetryLoop 的复杂度
+ func (s *AntigravityGatewayService) handleSmartRetry(p antigravityRetryLoopParams, resp *http.Response, respBody []byte, baseURL string, urlIdx int, availableURLs []string) *smartRetryResult {
+-	// "Resource has been exhausted" 是 URL 级别限流，切换 URL（仅 429）
++	// 保留函数级防御：主循环会在错误策略前优先处理该分支。
+ 	if resp.StatusCode == http.StatusTooManyRequests && isURLLevelRateLimit(respBody) && urlIdx < len(availableURLs)-1 {
+ 		logger.LegacyPrintf("service.antigravity_gateway", "%s URL fallback (429): %s -> %s", p.prefix, baseURL, availableURLs[urlIdx+1])
+ 		return &smartRetryResult{action: smartRetryActionContinueURL}
+@@ -488,11 +486,10 @@ func (s *AntigravityGatewayService) antigravityRetryLoop(p antigravityRetryLoopP
+ 		}
+ 	}
+ 
+-	baseURL := resolveAntigravityForwardBaseURL()
+-	if baseURL == "" {
++	availableURLs := resolveAntigravityForwardBaseURLs()
++	if len(availableURLs) == 0 {
+ 		return nil, errors.New("no antigravity forward base url configured")
+ 	}
+-	availableURLs := []string{baseURL}
+ 
+ 	var resp *http.Response
+ 	var usedBaseURL string
+@@ -571,6 +568,13 @@ urlFallbackLoop:
+ 					}, nil)
+ 				}
+ 
++				// 端点级 429 必须先尝试备用生成端点，不能让账号错误策略将其
++				// 误判成账号/模型额度耗尽并提前终止调度。
++				if resp.StatusCode == http.StatusTooManyRequests && isURLLevelRateLimit(respBody) && urlIdx < len(availableURLs)-1 {
++					logger.LegacyPrintf("service.antigravity_gateway", "%s URL fallback (429): %s -> %s", p.prefix, baseURL, availableURLs[urlIdx+1])
++					continue urlFallbackLoop
++				}
++
+ 				// ★ 统一入口：自定义错误码 + 临时不可调度
+ 				if handled, outStatus, policyErr := s.applyErrorPolicy(p, resp.StatusCode, resp.Header, respBody); handled {
+ 					if policyErr != nil {
+diff --git a/backend/internal/service/antigravity_rate_limit_test.go b/backend/internal/service/antigravity_rate_limit_test.go
+index 374b29f61..c5908dc0f 100644
+--- a/backend/internal/service/antigravity_rate_limit_test.go
++++ b/backend/internal/service/antigravity_rate_limit_test.go
+@@ -104,19 +104,18 @@ func (s *stubAntigravityAccountRepo) UpdateExtra(ctx context.Context, id int64,
+ 	return nil
+ }
+ 
+-func TestAntigravityRetryLoop_NoURLFallback_UsesConfiguredBaseURL(t *testing.T) {
++func TestAntigravityRetryLoop_URLFallback_OnEndpointResourceExhausted(t *testing.T) {
+ 	t.Setenv(antigravityForwardBaseURLEnv, "")
+ 
+-	oldBaseURLs := append([]string(nil), antigravity.BaseURLs...)
+ 	oldAvailability := antigravity.DefaultURLAvailability
+ 	defer func() {
+-		antigravity.BaseURLs = oldBaseURLs
+ 		antigravity.DefaultURLAvailability = oldAvailability
+ 	}()
+ 
+-	base1 := "https://ag-1.test"
+-	base2 := "https://ag-2.test"
+-	antigravity.BaseURLs = []string{base1, base2}
++	forwardURLs := antigravity.ForwardBaseURLs()
++	require.GreaterOrEqual(t, len(forwardURLs), 2)
++	base1 := forwardURLs[0]
++	base2 := forwardURLs[1]
+ 	antigravity.DefaultURLAvailability = antigravity.NewURLAvailability(time.Minute)
+ 
+ 	upstream := &stubAntigravityUpstream{firstBase: base1, secondBase: base2}
+@@ -124,13 +123,17 @@ func TestAntigravityRetryLoop_NoURLFallback_UsesConfiguredBaseURL(t *testing.T)
+ 		ID:          1,
+ 		Name:        "acc-1",
+ 		Platform:    PlatformAntigravity,
++		Type:        AccountTypeAPIKey,
+ 		Schedulable: true,
+ 		Status:      StatusActive,
+ 		Concurrency: 1,
++		Credentials: map[string]any{
++			"custom_error_codes_enabled": true,
++		},
+ 	}
+ 
+ 	var handleErrorCalled bool
+-	svc := &AntigravityGatewayService{}
++	svc := &AntigravityGatewayService{rateLimitService: &RateLimitService{}}
+ 	result, err := svc.antigravityRetryLoop(antigravityRetryLoopParams{
+ 		prefix:         "[test]",
+ 		ctx:            context.Background(),
+@@ -151,16 +154,12 @@ func TestAntigravityRetryLoop_NoURLFallback_UsesConfiguredBaseURL(t *testing.T)
+ 	require.NotNil(t, result)
+ 	require.NotNil(t, result.resp)
+ 	defer func() { _ = result.resp.Body.Close() }()
+-	require.Equal(t, http.StatusTooManyRequests, result.resp.StatusCode)
+-	require.True(t, handleErrorCalled)
+-	require.Len(t, upstream.calls, antigravityMaxRetries)
+-	for _, callURL := range upstream.calls {
+-		require.True(t, strings.HasPrefix(callURL, base1))
+-	}
+-
+-	available := antigravity.DefaultURLAvailability.GetAvailableURLs()
+-	require.NotEmpty(t, available)
+-	require.Equal(t, base1, available[0])
++	require.Equal(t, http.StatusOK, result.resp.StatusCode)
++	require.False(t, handleErrorCalled)
++	require.Equal(t, []string{
++		base1 + "/v1internal:generateContent",
++		base2 + "/v1internal:generateContent",
++	}, upstream.calls)
+ }
+ 
+ // TestHandleUpstreamError_429_ModelRateLimit 测试 429 模型限流场景
+@@ -1009,20 +1008,39 @@ func TestIsAntigravityAccountSwitchError(t *testing.T) {
+ 	}
+ }
+ 
+-func TestResolveAntigravityForwardBaseURL_DefaultDaily(t *testing.T) {
++func TestResolveAntigravityForwardBaseURLs_DefaultDailyThenProd(t *testing.T) {
+ 	t.Setenv(antigravityForwardBaseURLEnv, "")
+ 
+-	oldBaseURLs := append([]string(nil), antigravity.BaseURLs...)
+-	defer func() {
+-		antigravity.BaseURLs = oldBaseURLs
+-	}()
+-
+-	prodURL := "https://prod.test"
+-	dailyURL := "https://daily.test"
+-	antigravity.BaseURLs = []string{dailyURL, prodURL}
++	oldAvailability := antigravity.DefaultURLAvailability
++	defer func() { antigravity.DefaultURLAvailability = oldAvailability }()
++	antigravity.DefaultURLAvailability = antigravity.NewURLAvailability(time.Minute)
++	antigravity.DefaultURLAvailability.MarkSuccess("https://cloudcode-pa.googleapis.com")
++
++	resolved := resolveAntigravityForwardBaseURLs()
++	require.Equal(t, []string{
++		"https://daily-cloudcode-pa.googleapis.com",
++		"https://cloudcode-pa.googleapis.com",
++	}, resolved)
++	for _, baseURL := range resolved {
++		require.NotContains(t, baseURL, ".sandbox.")
++	}
++}
+ 
+-	resolved := resolveAntigravityForwardBaseURL()
+-	require.Equal(t, dailyURL, resolved)
++func TestResolveAntigravityForwardBaseURLs_ExplicitModes(t *testing.T) {
++	tests := []struct {
++		mode string
++		want string
++	}{
++		{mode: "daily", want: "https://daily-cloudcode-pa.googleapis.com"},
++		{mode: "prod", want: "https://cloudcode-pa.googleapis.com"},
++		{mode: "sandbox", want: "https://daily-cloudcode-pa.sandbox.googleapis.com"},
++	}
++	for _, tt := range tests {
++		t.Run(tt.mode, func(t *testing.T) {
++			t.Setenv(antigravityForwardBaseURLEnv, tt.mode)
++			require.Equal(t, []string{tt.want}, resolveAntigravityForwardBaseURLs())
++		})
++	}
+ }
+ 
+ func TestAntigravityAccountSwitchError_Error(t *testing.T) {

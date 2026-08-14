@@ -4,6 +4,7 @@ param(
     [switch]$SkipArchive,
     [string]$ValidateStage,
     [string]$ScanOnlyPath,
+    [string]$Sub2ApiExecutablePath,
     [string]$VcRedistCrtDir = $env:VC_REDIST_CRT_DIR
 )
 
@@ -26,47 +27,16 @@ if ($PSVersionTable.PSEdition -eq 'Desktop') {
 
 $routerRoot = Split-Path -Parent $PSScriptRoot
 $routerRootPath = [IO.Path]::GetFullPath($routerRoot).TrimEnd([char[]]@('\', '/'))
+$sub2ApiSourcePath = if ([string]::IsNullOrWhiteSpace($Sub2ApiExecutablePath)) {
+    Join-Path $routerRoot 'app\sub2api.exe'
+} else {
+    [IO.Path]::GetFullPath($Sub2ApiExecutablePath)
+}
 $utf8NoBom = [Text.UTF8Encoding]::new($false)
 
-$runtimeScripts = @(
-    'apply-codex-router.ps1',
-    'Apply-Router.ps1',
-    'Build-ModelCatalog.ps1',
-    'CodexIntegration.psm1',
-    'Copy-AdminPassword.ps1',
-    'Copy-LocalApiKey.ps1',
-    'Copy-Sub2ApiLogin.ps1',
-    'CredentialStore.psm1',
-    'Ensure-RouterHealthy.ps1',
-    'Ensure-Sub2ApiAdmin.ps1',
-    'Get-LocalApiKey.ps1',
-    'Get-OAuthAccounts.ps1',
-    'Get-RouterStatus.ps1',
-    'Get-UsageMonitor.ps1',
-    'GitHub-Update.ps1',
-    'Import-GrokSSO.ps1',
-    'Initialize-Router.ps1',
-    'Install-CodexIntegration.ps1',
-    'Invoke-OAuthRecovery.ps1',
-    'Launch-ChatGPTOAuth.ps1',
-    'ProxyDiscovery.psm1',
-    'Register-Autostart.ps1',
-    'Remove-OAuthAccount.ps1',
-    'RouterAdmin.psm1',
-    'Set-OAuthAccountPriority.ps1',
-    'Set-ProviderKeys.ps1',
-    'Start-ChatGPTOAuth.ps1',
-    'Start-CodexRouter.ps1',
-    'Start-ProviderOAuth.ps1',
-    'Start-Router.ps1',
-    'Stop-Router.ps1',
-    'Sync-RouterRoutingState.ps1',
-    'Test-RouterCapabilities.ps1',
-    'Test-RealOAuthFallback.ps1',
-    'Repair-CodexWindowsSetup.ps1',
-    'Unregister-Autostart.ps1',
-    'UserData.psm1'
-)
+# End-user runtime operations are implemented by Codex-Router.exe. PowerShell
+# remains in the source repository for Windows build, release, and test tasks.
+$runtimeScripts = @()
 
 $configFiles = @(
     'model-catalog.example.json',
@@ -85,7 +55,14 @@ $staticLicenseFiles = @(
     'sub2api-0.1.170-codex-router.3.patch',
     'sub2api-0.1.170-codex-router.4.patch',
     'sub2api-0.1.170-codex-router.5.patch',
-    'sub2api-0.1.170-codex-router.6.patch'
+    'sub2api-0.1.170-codex-router.6.patch',
+    'sub2api-0.1.170-codex-router.7.patch',
+    'sub2api-0.1.170-codex-router.8.patch',
+    'sub2api-0.1.170-codex-router.9.patch',
+    'sub2api-0.1.170-codex-router.10.patch',
+    'sub2api-0.1.170-codex-router.11.patch',
+    'sub2api-0.1.170-codex-router.12.patch',
+    'sub2api-0.1.170-codex-router.13.patch'
 )
 
 $generatedLicenseFiles = @(
@@ -381,6 +358,7 @@ function Assert-ReleaseLayout {
     $allowedExact = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($path in @(
         'Codex-Router.exe',
+        'Start-Codex-Router.cmd',
         'LICENSE',
         'CHANGELOG.md',
         'README.md',
@@ -428,6 +406,7 @@ function Assert-ReleaseLayout {
 
     $required = @(
         'Codex-Router.exe',
+        'Start-Codex-Router.cmd',
         'CHANGELOG.md',
         'README.md',
         'README.zh-CN.md',
@@ -438,8 +417,6 @@ function Assert-ReleaseLayout {
         'postgres\pgsql\bin\postgres.exe',
         'redis\Redis-8.10.0-Windows-x64-msys2\redis-server.exe',
         'redis\Redis-8.10.0-Windows-x64-msys2\redis-cli.exe',
-        'scripts\Start-Router.ps1',
-        'scripts\Apply-Router.ps1',
         'config\postgresql.conf',
         'config\redis.conf'
     )
@@ -1214,7 +1191,7 @@ if (-not $SkipBuild) {
 $releaseExe = Join-Path $routerRoot 'codex-router-gui-rust\target\release\codex-router.exe'
 foreach ($required in @(
     $releaseExe,
-    (Join-Path $routerRoot 'app\sub2api.exe'),
+    $sub2ApiSourcePath,
     (Join-Path $routerRoot 'app\data\model_pricing.json'),
     (Join-Path $routerRoot 'postgres\pgsql\bin\initdb.exe'),
     (Join-Path $routerRoot 'redis\Redis-8.10.0-Windows-x64-msys2\redis-server.exe')
@@ -1224,8 +1201,7 @@ foreach ($required in @(
 $vcRuntimeSource = Resolve-VcRedistCrtDirectory -OverridePath $VcRedistCrtDir
 
 [IO.Directory]::CreateDirectory($outputRootPath) | Out-Null
-$stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
-$stage = Join-Path $outputRootPath "Codex-Router-Portable-$version-windows-x64-$stamp"
+$stage = Join-Path $outputRootPath "Codex-Router-Portable-$version-windows-x64"
 $staging = Join-Path $outputRootPath ('.codex-router-staging-' + [Guid]::NewGuid().ToString('N'))
 if (Test-Path -LiteralPath $stage) { throw "Release stage already exists: $stage" }
 [IO.Directory]::CreateDirectory($staging) | Out-Null
@@ -1237,7 +1213,11 @@ function Copy-ReleaseItem {
         [Parameter(Mandatory)][string]$RelativePath,
         [string]$DestinationRelativePath = $RelativePath
     )
-    $source = Join-Path $routerRoot $RelativePath
+    $source = if ($RelativePath.Equals('app\sub2api.exe', [StringComparison]::OrdinalIgnoreCase)) {
+        $sub2ApiSourcePath
+    } else {
+        Join-Path $routerRoot $RelativePath
+    }
     if (-not (Test-Path -LiteralPath $source)) { throw "Release input is missing: $RelativePath" }
     Assert-NoReparsePoints -Root $source
     $destination = Join-Path $staging $DestinationRelativePath
@@ -1344,6 +1324,7 @@ function Remove-PostgresOptionalPayload {
 
 try {
     Copy-Item -LiteralPath $releaseExe -Destination (Join-Path $staging 'Codex-Router.exe')
+    Copy-ReleaseItem -RelativePath 'Start-Codex-Router.cmd'
     foreach ($relative in @(
         'app\sub2api.exe',
         'app\data\model_pricing.json',

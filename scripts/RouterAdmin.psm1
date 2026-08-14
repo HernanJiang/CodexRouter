@@ -386,6 +386,7 @@ function Get-RouterOAuthRecoveryState {
         [Parameter(Mandatory)]$Account,
         [AllowNull()]$ObservedResetAt,
         [switch]$ObservedExhausted,
+        [AllowNull()][string]$ObservedAt,
         [DateTimeOffset]$NowUtc = [DateTimeOffset]::UtcNow
     )
 
@@ -459,6 +460,17 @@ function Get-RouterOAuthRecoveryState {
     $looksExhausted = $ObservedExhausted.IsPresent -or $usageExhausted -or
         $reason -match '(?i)quota|usage limit|rate.?limit|billing|payment|insufficient|exhaust|402|credit'
 
+    # An observed timestamp belongs to the first unknown-state observation, not
+    # to the latest polling attempt. Unknown provider failures may be isolated
+    # for at most five hours; a confirmed quota exhaustion is never force
+    # recovered by this cap and remains governed by its reset/probe state.
+    $observedAtUtc = ConvertTo-RouterResetAtUtc -Value $ObservedAt
+    $confirmedExhaustion = $usageExhausted -or $reason -match '(?i)quota|usage limit|rate.?limit|billing|payment|insufficient|exhaust|402|credit'
+    $unknownRecoveryDue = $null
+    if ($null -ne $observedAtUtc -and -not $confirmedExhaustion) {
+        $unknownRecoveryDue = $observedAtUtc.AddHours(5)
+    }
+
     if ($null -ne $resetAt -and $resetAt -gt $NowUtc) {
         $seconds = [Math]::Max(1L, [long][Math]::Ceiling(($resetAt - $NowUtc).TotalSeconds))
         return [pscustomobject][ordered]@{
@@ -471,11 +483,35 @@ function Get-RouterOAuthRecoveryState {
     }
 
     $resetReached = $null -ne $resetAt -and $resetAt -le $NowUtc
+    if ($unknownRecoveryDue -and $NowUtc -ge $unknownRecoveryDue) {
+        return [pscustomobject][ordered]@{
+            Action = 'force_recover'
+            ShouldIsolate = $false
+            NextCheckSeconds = 0L
+            ResetAt = ''
+            Reason = 'unknown OAuth state reached the five-hour recovery cap'
+        }
+    }
+
     if ($resetReached -or -not $schedulable -or $looksExhausted) {
+        # Confirmed quota exhaustion is governed by the provider reset window.
+        # When that window is missing, keep the recovery probe bounded to one
+        # attempt per five hours; transient/unknown failures remain on the
+        # ten-minute passive probe cadence and still honor the five-hour cap.
+        $probeSeconds = if ($confirmedExhaustion) {
+            5L * 60L * 60L
+        } else {
+            10L * 60L
+        }
+        if ($unknownRecoveryDue) {
+            $probeSeconds = [Math]::Min(
+                $probeSeconds,
+                [Math]::Max(1L, [long][Math]::Ceiling(($unknownRecoveryDue - $NowUtc).TotalSeconds)))
+        }
         return [pscustomobject][ordered]@{
             Action = 'probe'
             ShouldIsolate = $true
-            NextCheckSeconds = 18000L
+            NextCheckSeconds = $probeSeconds
             ResetAt = if ($null -eq $resetAt) { '' } else { $resetAt.UtcDateTime.ToString('o') }
             Reason = if ($reason) { $reason } elseif ($resetReached) { 'quota reset time reached' } else { 'quota exhausted without a reset time' }
         }
@@ -517,6 +553,51 @@ function Set-RouterAccountGroupMembership {
     return $true
 }
 
+function Invoke-RouterNativeCalculation {
+    param(
+        [Parameter(Mandatory)][string]$Executable,
+        [Parameter(Mandatory)][string[]]$Arguments
+    )
+    $outputPath = Join-Path ([IO.Path]::GetTempPath()) ('codex-router-native-' + [Guid]::NewGuid().ToString('N') + '.txt')
+    $previousOutput = [Environment]::GetEnvironmentVariable('CODEX_ROUTER_CLI_OUTPUT', 'Process')
+    try {
+        [Environment]::SetEnvironmentVariable('CODEX_ROUTER_CLI_OUTPUT', $outputPath, 'Process')
+        $process = Start-Process `
+            -FilePath $Executable `
+            -ArgumentList $Arguments `
+            -Wait `
+            -PassThru `
+            -WindowStyle Hidden
+        if ($process.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $outputPath -PathType Leaf)) {
+            throw "Codex-Router native calculation failed with exit code $($process.ExitCode)."
+        }
+        return [IO.File]::ReadAllText($outputPath)
+    } finally {
+        [Environment]::SetEnvironmentVariable('CODEX_ROUTER_CLI_OUTPUT', $previousOutput, 'Process')
+        if (Test-Path -LiteralPath $outputPath) {
+            Remove-Item -LiteralPath $outputPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Resolve-RouterNativeExecutable {
+    $override = [Environment]::GetEnvironmentVariable('CODEX_ROUTER_NATIVE_EXECUTABLE', 'Process')
+    $executables = @(
+        $override,
+        (Join-Path $script:RouterRoot 'Codex-Router.exe'),
+        (Join-Path $script:RouterRoot 'codex-router-gui-rust\target\debug\codex-router.exe'),
+        (Join-Path $script:RouterRoot 'codex-router-gui-rust\target\release\codex-router.exe')
+    )
+    $executable = @($executables | Where-Object {
+        -not [string]::IsNullOrWhiteSpace([string]$_) -and
+        (Test-Path -LiteralPath $_ -PathType Leaf)
+    } | Select-Object -First 1)
+    if ($executable.Count -eq 0) {
+        throw 'Codex-Router Rust executable is unavailable for native calculation.'
+    }
+    return [IO.Path]::GetFullPath([string]$executable[0])
+}
+
 function Get-RouterOAuthRoutingPriorities {
     param([AllowNull()]$OAuthFallback)
 
@@ -539,20 +620,19 @@ function Get-RouterOAuthRoutingPriorities {
         }
     }
 
-    if (-not $enabled) {
-        return [pscustomobject][ordered]@{
-            Enabled = $false
-            PreferOAuth = $true
-            OAuthPriority = 1
-            ApiPriority = 10
-        }
+    $executable = Resolve-RouterNativeExecutable
+    $arguments = @(
+        '--routing-priorities',
+        ('--fallback-enabled=' + ([string]$enabled).ToLowerInvariant()),
+        ('--prefer-oauth=' + ([string]$preferOAuth).ToLowerInvariant()),
+        "--official-priority=$configuredOAuthPriority",
+        "--fallback-priority=$configuredApiPriority"
+    )
+    $json = Invoke-RouterNativeCalculation -Executable $executable -Arguments $arguments
+    if ([string]::IsNullOrWhiteSpace($json)) {
+        throw 'Codex-Router Rust routing-priority calculation failed.'
     }
-    return [pscustomobject][ordered]@{
-        Enabled = $true
-        PreferOAuth = $preferOAuth
-        OAuthPriority = if ($preferOAuth) { $configuredOAuthPriority } else { $configuredApiPriority }
-        ApiPriority = if ($preferOAuth) { $configuredApiPriority } else { $configuredOAuthPriority }
-    }
+    return ($json | ConvertFrom-Json)
 }
 
 function Get-RouterCanonicalModelId {
@@ -766,21 +846,10 @@ function Get-RouterModelDisplayName {
     if ((Test-RouterModelAliasCustomized -Model $Model) -and -not [string]::IsNullOrWhiteSpace($alias)) {
         return $alias
     }
-    $displayName = Get-RouterRecommendedDisplayName -ModelId ([string]$Model.model)
-    $source = Get-RouterModelSource -Model $Model
-    # The suffix reflects which quota actually serves this model after Apply, so
-    # Codex shows "(OAuth)" only while the subscription is the live route.
-    $servedByProperty = if ($null -eq $Route) { $null } else { $Route.PSObject.Properties['ServedBy'] }
-    if ($null -ne $servedByProperty) {
-        $servedBy = ([string]$servedByProperty.Value).Trim().ToLowerInvariant()
-        if ($servedBy -eq 'oauth') { return $displayName + '(OAuth)' }
-        if ($servedBy -eq 'api') { return $displayName }
-    }
-    $mergedOAuth = $null -ne $Route -and
-        $null -ne $Route.PSObject.Properties['IsMergedOAuthRoute'] -and
-        [bool]$Route.IsMergedOAuthRoute
-    if ($source -eq 'oauth' -and -not $mergedOAuth) { return $displayName + '(OAuth)' }
-    return $displayName
+    # OAuth and API channels keep one user-facing model name. Their internal
+    # public route IDs remain distinct in manual mode, while historical
+    # "(OAuth)" aliases are still recognized as automatic names above.
+    return Get-RouterRecommendedDisplayName -ModelId ([string]$Model.model)
 }
 
 function Get-RouterModelSource {
@@ -1036,48 +1105,21 @@ function Get-RouterEffectiveApiPriority {
         [Parameter(Mandatory)][int]$OAuthPriority,
         [Parameter(Mandatory)][bool]$PreferOAuth
     )
-    $offset = [Math]::Max(0, $ConfiguredPriority - $MinimumMatchingPriority)
-    $effective = [Math]::Max(1, $ApiBasePriority + $offset)
-    if (-not $PreferOAuth -and $OAuthPriority -gt 1) {
-        $effective = [Math]::Min($effective, $OAuthPriority - 1)
+    $executable = Resolve-RouterNativeExecutable
+    $arguments = @(
+        '--effective-api-priority',
+        "--configured-priority=$ConfiguredPriority",
+        "--minimum-matching-priority=$MinimumMatchingPriority",
+        "--api-base-priority=$ApiBasePriority",
+        "--oauth-priority=$OAuthPriority",
+        ('--prefer-oauth=' + ([string]$PreferOAuth).ToLowerInvariant())
+    )
+    $result = Invoke-RouterNativeCalculation -Executable $executable -Arguments $arguments
+    $effective = 0
+    if (-not [int]::TryParse($result.Trim(), [ref]$effective)) {
+        throw 'Codex-Router Rust API-priority calculation failed.'
     }
-    return [int]$effective
-}
-
-function Get-RouterOAuthModelSuggestions {
-    param([Parameter(Mandatory)][string]$Platform)
-    switch ($Platform.Trim().ToLowerInvariant()) {
-        'openai' {
-            return @(
-                [pscustomobject][ordered]@{ id = 'gpt-5.6-sol'; displayName = 'ChatGPT-5.6-Sol' }
-                [pscustomobject][ordered]@{ id = 'gpt-5.6-terra'; displayName = 'ChatGPT-5.6-Terra' }
-                [pscustomobject][ordered]@{ id = 'gpt-5.6-luna'; displayName = 'ChatGPT-5.6-Luna' }
-                [pscustomobject][ordered]@{ id = 'gpt-5.5'; displayName = 'ChatGPT-5.5' }
-                [pscustomobject][ordered]@{ id = 'gpt-5.4'; displayName = 'ChatGPT-5.4' }
-                [pscustomobject][ordered]@{ id = 'gpt-5.4-mini'; displayName = 'ChatGPT-5.4-mini' }
-                [pscustomobject][ordered]@{ id = 'gpt-5.3-codex-spark'; displayName = 'ChatGPT-5.3-Codex-Spark' }
-                [pscustomobject][ordered]@{ id = 'codex-auto-review'; displayName = 'Codex Auto Review' }
-                [pscustomobject][ordered]@{ id = 'gpt-5.2'; displayName = 'ChatGPT-5.2' }
-            )
-        }
-        'antigravity' {
-            return @(
-                [pscustomobject][ordered]@{ id = 'gemini-3-flash'; displayName = 'Gemini-3-Flash' }
-                [pscustomobject][ordered]@{ id = 'gemini-3.1-pro-high'; displayName = 'Gemini-3.1-Pro-High' }
-                [pscustomobject][ordered]@{ id = 'gemini-3.1-pro-low'; displayName = 'Gemini-3.1-Pro-Low' }
-                [pscustomobject][ordered]@{ id = 'gemini-3-pro-high'; displayName = 'Gemini-3-Pro-High' }
-                [pscustomobject][ordered]@{ id = 'claude-sonnet-4-5'; displayName = 'Claude-Sonnet-4.5' }
-                [pscustomobject][ordered]@{ id = 'claude-opus-4-6'; displayName = 'Claude-Opus-4.6' }
-            )
-        }
-        'grok' {
-            return @(
-                [pscustomobject][ordered]@{ id = 'grok-4.5'; displayName = 'Grok-4.5' }
-                [pscustomobject][ordered]@{ id = 'grok-4.3'; displayName = 'Grok-4.3' }
-            )
-        }
-        default { return @() }
-    }
+    return $effective
 }
 
 function Get-RouterAccountPlatformMap {
@@ -1859,7 +1901,6 @@ Export-ModuleMember -Function `
     Get-RouterFallbackChannelKey, `
     Test-RouterFallbackChannelSelected, `
     Get-RouterEffectiveApiPriority, `
-    Get-RouterOAuthModelSuggestions, `
     Get-RouterAccountPlatformMap, `
     Get-RouterOpenRouterUpstreamModelId, `
     Get-RouterUpstreamModelId, `

@@ -1,0 +1,45 @@
+diff --git a/backend/internal/service/account.go b/backend/internal/service/account.go
+index 2ea61a878..6b42830a1 100644
+--- a/backend/internal/service/account.go
++++ b/backend/internal/service/account.go
+@@ -695,6 +695,6 @@ func applyAntigravityGemini31ProAliases(mapping map[string]string) {
+-	target := strings.TrimSpace(mapping[domain.AntigravityGemini31ProAgentModel])
+-	if target == "" {
+-		return
++	target := domain.AntigravityGemini31ProAgentModel
++	if configured := strings.TrimSpace(mapping[domain.AntigravityGemini31ProAgentModel]); configured != "" {
++		target = configured
+ 	}
+ 
+ 	aliases := []struct {
+diff --git a/backend/internal/service/account_wildcard_test.go b/backend/internal/service/account_wildcard_test.go
+index 6ce804bb1..d8da350ad 100644
+--- a/backend/internal/service/account_wildcard_test.go
++++ b/backend/internal/service/account_wildcard_test.go
+@@ -348,7 +348,26 @@ func TestAccountGetModelMapping_AntigravityNormalizesGemini31ProAliases(t *testi
+ 		t.Fatalf("expected gemini-3.1-pro-preview to map to %q, got %q", domain.AntigravityGemini31ProAgentModel, got)
+ 	}
+ }
+ 
++func TestAccountGetModelMapping_AntigravityNormalizesSparseGemini31ProMapping(t *testing.T) {
++	t.Parallel()
++
++	account := &Account{
++		Platform: PlatformAntigravity,
++		Credentials: map[string]any{
++			"model_mapping": map[string]any{
++				"gemini-3.1-pro-high": "gemini-3.1-pro-high",
++				"gemini-3.1-pro-low":  "gemini-3.1-pro-low",
++			},
++		},
++	}
++
++	mapping := account.GetModelMapping()
++	if got := mapping["gemini-3.1-pro-high"]; got != domain.AntigravityGemini31ProAgentModel {
++		t.Fatalf("expected sparse live mapping to normalize Gemini 3.1 Pro High to %q, got %q", domain.AntigravityGemini31ProAgentModel, got)
++	}
++}
++
+ func TestAccountGetModelMapping_AntigravityPreservesGemini31ProOverrides(t *testing.T) {
+ 	t.Parallel()
+ 
