@@ -340,20 +340,6 @@ pub fn primary_button(
     )
 }
 
-pub fn accent_button(
-    ui: &mut egui::Ui,
-    label: impl Into<egui::WidgetText>,
-    palette: &Palette,
-) -> egui::Response {
-    ui.add(
-        egui::Button::new(label)
-            .fill(palette.accent)
-            .stroke(egui::Stroke::NONE)
-            .corner_radius(egui::CornerRadius::same(24))
-            .min_size(egui::vec2(48.0, 48.0)),
-    )
-}
-
 pub fn secondary_button(
     ui: &mut egui::Ui,
     label: impl Into<egui::WidgetText>,
@@ -366,32 +352,6 @@ pub fn secondary_button(
             .corner_radius(egui::CornerRadius::same(8))
             .min_size(egui::vec2(112.0, 42.0)),
     )
-}
-
-pub fn elevated_control_frame(palette: &Palette, strong: bool) -> egui::Frame {
-    egui::Frame::new()
-        .fill(if strong {
-            palette.paper
-        } else {
-            egui::Color32::from_rgba_unmultiplied(
-                palette.paper.r(),
-                palette.paper.g(),
-                palette.paper.b(),
-                126,
-            )
-        })
-        .stroke(egui::Stroke::new(
-            1.0_f32,
-            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 156),
-        ))
-        .corner_radius(egui::CornerRadius::same(10))
-        .inner_margin(egui::Margin::symmetric(6, 4))
-        .shadow(egui::epaint::Shadow {
-            offset: [0, if strong { 8 } else { 5 }],
-            blur: if strong { 24 } else { 16 },
-            spread: 0,
-            color: egui::Color32::from_rgba_unmultiplied(32, 22, 16, if strong { 68 } else { 46 }),
-        })
 }
 
 pub fn soft_card_shadow() -> egui::epaint::Shadow {

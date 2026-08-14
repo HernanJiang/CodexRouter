@@ -29,15 +29,15 @@
 Codex 用户级配置必须满足：
 
 ```toml
-model_provider = "custom"
+model_provider = "codex_router"
 model = "deepseek-v4-flash"
 model_catalog_json = 'C:\path\to\Codex-Router\config\models.json'
 
-[model_providers.custom]
+[model_providers.codex_router]
 name = "Codex-Router"
 wire_api = "responses"
 base_url = "http://127.0.0.1:18080/v1"
-requires_openai_auth = true
+requires_openai_auth = false
 experimental_bearer_token = "<当前电脑随机生成的 LocalApiKey>"
 supports_websockets = false
 
@@ -52,8 +52,8 @@ fast_mode = true
 
 - 不设置全局 `service_tier`。
 - Fast 由当前模型目录动态决定，不强制应用到所有模型。
-- `custom` 是 CC Switch 统一会话历史使用的共享第三方 Provider 桶；不得创建 `[model_providers.openai]` 覆盖 Codex 内置 Provider。
-- `requires_openai_auth=true` 保留 ChatGPT 登录态和远端控制；`experimental_bearer_token` 只使用当前电脑随机生成的本地 Router Key，把模型请求直接导向本机 `18080`。
+- `codex_router` 是本机 Router 的独立 Provider；不得创建 `[model_providers.openai]` 覆盖 Codex 内置 Provider，也不得复用其他第三方 Provider 的认证。
+- `requires_openai_auth=false` 防止 Codex 在请求到达 Router 前套用 ChatGPT 模型白名单；ChatGPT 登录态仍保留在 `auth.json`，`experimental_bearer_token` 只使用当前电脑随机生成的本地 Router Key，把模型请求直接导向本机 `18080`。
 - `supports_websockets=false` 让当前 7 个模型使用已验证的 HTTP Responses 流，避免无 WSv2 账号时反复重连。
 - 默认模型为 `deepseek-v4-flash`。
 - 模型目录发生变化后，需要完全退出并重新打开 Codex 才能可靠刷新菜单。
@@ -243,7 +243,9 @@ fast_mode = true
 
 ## 16. 自动恢复
 
-- 上游账号定期探测，目标周期为每小时整点一次：`0 * * * *`。
+- 上游账号、额度、备用路由和 Codex 配置绑定属于统一自检系统，默认每 10 分钟探测一次；手动点击实时用量或当前配置 OAuth 也会立即触发。
+- 自检发现 OAuth 额度耗尽时，只更新本机 Router 的实时后端路由并弹窗提醒，不关闭或重启 Codex / ChatGPT，不中断当前任务；额度恢复后同样热切回。完整手动应用配置才可以触发需要的 Codex 重启。
+- OAuth 恢复探测独立遵守最长 5 小时边界：有明确重置时间时按重置时间恢复；未知状态每 10 分钟探测，最长 5 小时后执行恢复尝试。
 - 暂停或冷却账号探测成功后自动恢复。
 - Plus 恢复后重新成为 GPT 首选。
 - Kimi 主 Key 恢复后重新成为 Kimi 首选。
@@ -283,7 +285,7 @@ fast_mode = true
 - 请求模型和上游模型是否一致；
 - Fast 请求是否记录为 `service_tier=priority`；
 - 发生回退的原因和预计恢复时间；
-- 每小时探测计划是否启用。
+- 每 10 分钟统一自检是否启用；自检包括 OAuth 健康、配置覆写、token/Coding Plan 用量和 fallback 资格。
 
 ## 20. 验收标准
 

@@ -1,13 +1,22 @@
 use crate::config::{atomic_write, ModelConfig, ReasoningConfig, RouterConfig};
 use anyhow::{bail, Context};
-use serde_json::json;
+use serde_json::{json, Value};
+#[cfg(test)]
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::io::{BufRead, BufReader};
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+#[cfg(test)]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+#[cfg(test)]
+use std::sync::atomic::Ordering;
+#[cfg(test)]
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use toml_edit::{DocumentMut, Item};
@@ -17,8 +26,65 @@ use windows_sys::Win32::Security::Credentials::{
     CRED_TYPE_GENERIC,
 };
 use windows_sys::Win32::Security::Cryptography::{
-    CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    BCryptGenRandom, CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN,
+    CRYPT_INTEGER_BLOB,
 };
+use zeroize::Zeroizing;
+
+pub mod catalog;
+pub mod codex_toml;
+pub mod deployment;
+pub mod oauth;
+mod usage;
+pub use catalog::*;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OAuthRoutingPriorities {
+    pub enabled: bool,
+    pub prefer_oauth: bool,
+    pub oauth_priority: i32,
+    pub api_priority: i32,
+}
+
+pub fn oauth_routing_priorities(
+    fallback: Option<&crate::config::OAuthFallback>,
+) -> OAuthRoutingPriorities {
+    let enabled = fallback.is_some_and(|value| value.enabled);
+    if !enabled {
+        return OAuthRoutingPriorities {
+            enabled: false,
+            prefer_oauth: true,
+            oauth_priority: 1,
+            api_priority: 10,
+        };
+    }
+    let fallback = fallback.expect("enabled fallback exists");
+    let official = fallback.official_priority.max(1);
+    let api = fallback.fallback_priority.max(1);
+    OAuthRoutingPriorities {
+        enabled: true,
+        prefer_oauth: fallback.prefer_oauth,
+        oauth_priority: if fallback.prefer_oauth { official } else { api },
+        api_priority: if fallback.prefer_oauth { api } else { official },
+    }
+}
+
+pub fn effective_api_priority(
+    configured_priority: i32,
+    minimum_matching_priority: i32,
+    api_base_priority: i32,
+    oauth_priority: i32,
+    prefer_oauth: bool,
+) -> i32 {
+    let offset = configured_priority
+        .saturating_sub(minimum_matching_priority)
+        .max(0);
+    let mut effective = api_base_priority.saturating_add(offset).max(1);
+    if !prefer_oauth && oauth_priority > 1 {
+        effective = effective.min(oauth_priority - 1);
+    }
+    effective
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReasoningSpec {
@@ -550,24 +616,26 @@ pub fn resolve_multimodal(model: &ModelConfig) -> bool {
     }
 }
 
-fn is_non_openai_oauth_model(model: &ModelConfig) -> bool {
-    if model.source != "oauth" {
-        return false;
-    }
-    let platform = model.oauth_platform.trim().to_ascii_lowercase();
-    !platform.is_empty() && platform != "openai" && platform != "chatgpt"
+pub fn resolve_default_route(cfg: &RouterConfig) -> Option<catalog::ModelRoute> {
+    let routes = catalog::build_route_plan(cfg);
+    routes
+        .iter()
+        .find(|route| route.include_in_catalog && route.public_model_id == cfg.default_model)
+        .or_else(|| {
+            routes
+                .iter()
+                .find(|route| route.include_in_catalog && route.model.model == cfg.default_model)
+        })
+        .or_else(|| routes.iter().find(|route| route.include_in_catalog))
+        .cloned()
 }
 
-pub fn resolve_default_model(cfg: &RouterConfig) -> Option<&str> {
-    cfg.models
-        .iter()
-        .find(|model| model.model == cfg.default_model)
-        .or_else(|| cfg.models.first())
-        .map(|model| model.model.as_str())
+pub fn resolve_default_model(cfg: &RouterConfig) -> Option<String> {
+    resolve_default_route(cfg).map(|route| route.public_model_id)
 }
 
 pub fn normalize_default_model(cfg: &mut RouterConfig) {
-    cfg.default_model = resolve_default_model(cfg).unwrap_or_default().to_owned();
+    cfg.default_model = resolve_default_model(cfg).unwrap_or_default();
 }
 
 pub fn canonical_route_model_id(model_id: &str) -> String {
@@ -738,6 +806,28 @@ pub fn model_routing_explanation(cfg: &RouterConfig, model: &ModelConfig, zh: bo
     } else {
         "Standalone API channel".to_owned()
     }
+}
+
+pub fn model_route_badge(cfg: &RouterConfig, model: &ModelConfig, zh: bool) -> String {
+    let matched = if model.source == "oauth" {
+        cfg.models.iter().any(|candidate| {
+            is_oauth_fallback_model(cfg, candidate)
+                && same_model_identity(&candidate.model, &model.model)
+        })
+    } else {
+        is_oauth_fallback_model(cfg, model)
+    };
+    match (model.source == "oauth", matched, zh) {
+        (true, true, true) => "OAuth · 订阅优先",
+        (true, true, false) => "OAuth · subscription first",
+        (true, false, true) => "OAuth · 独立路由",
+        (true, false, false) => "OAuth · standalone",
+        (false, true, true) => "API · 自动兜底",
+        (false, true, false) => "API · automatic fallback",
+        (false, false, true) => "API · 独立渠道",
+        (false, false, false) => "API · standalone",
+    }
+    .to_owned()
 }
 
 pub fn recommended_model_display_name(model_id: &str) -> String {
@@ -934,25 +1024,13 @@ pub fn is_model_alias_customized(model: &ModelConfig) -> bool {
         .any(|candidate| normalized_display_name(candidate) == alias)
 }
 
+#[allow(dead_code)]
 pub fn resolved_model_display_name(cfg: &RouterConfig, model: &ModelConfig) -> String {
     if is_model_alias_customized(model) && !model.alias.trim().is_empty() {
         return model.alias.trim().to_owned();
     }
-    let recommended = recommended_model_display_name(&model.model);
-    if model.source != "oauth" {
-        return recommended;
-    }
-    let merged = cfg.oauth_fallback.enabled
-        && cfg.models.iter().any(|candidate| {
-            candidate.source != "oauth"
-                && same_model_identity(&candidate.model, &model.model)
-                && is_fallback_channel_selected(cfg, candidate)
-        });
-    if merged {
-        recommended
-    } else {
-        format!("{recommended}(OAuth)")
-    }
+    let _ = cfg;
+    recommended_model_display_name(&model.model)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1075,86 +1153,6 @@ pub fn slugify(value: &str) -> String {
     }
 }
 
-pub fn build_model_catalog(cfg: &RouterConfig) -> Vec<serde_json::Value> {
-    let mut seen_model_ids = std::collections::HashSet::new();
-    cfg.models
-        .iter()
-        .filter(|model| {
-            let mut public_id = model.model.trim().to_ascii_lowercase();
-            if public_id == "gpt-5.6" {
-                public_id = "gpt-5.6-sol".to_owned();
-            }
-            seen_model_ids.insert(public_id)
-        })
-        .enumerate()
-        .map(|(index, model)| {
-            let reasoning = resolve_reasoning(model, None);
-            let reasoning_levels: Vec<_> = reasoning
-                .levels
-                .iter()
-                .map(|effort| json!({"effort": effort, "description": format!("{} reasoning level", effort)}))
-                .collect();
-            let supports_images = resolve_multimodal(model);
-            let context_window = resolve_context_window(model);
-            let auto_compact_token_limit = resolve_auto_compact_token_limit(model);
-            let base_instructions = "You are Codex, a coding agent. Work in the user's workspace, follow the user's instructions, preserve unrelated changes, and verify completed work.";
-            let service_tiers = if reasoning.supports_fast {
-                vec![json!({
-                    "id": "priority",
-                    "name": "Fast",
-                    "description": "1.5x speed, increased usage",
-                })]
-            } else {
-                Vec::new()
-            };
-            json!({
-                "slug": model.model,
-                "display_name": resolved_model_display_name(cfg, model),
-                "description": format!("Codex-Router model #{}", index + 1),
-                "default_reasoning_level": reasoning.default_level,
-                "supported_reasoning_levels": reasoning_levels,
-                "input_modalities": if supports_images { vec!["text", "image"] } else { vec!["text"] },
-                "supports_image_detail_original": supports_images,
-                "supports_vision": supports_images,
-                "context_window": context_window,
-                "max_context_window": context_window,
-                "auto_compact_token_limit": auto_compact_token_limit,
-                "shell_type": "shell_command",
-                "visibility": "list",
-                "supported_in_api": true,
-                "priority": model.priority,
-                "additional_speed_tiers": if reasoning.supports_fast { vec!["fast"] } else { vec![] },
-                "service_tiers": service_tiers,
-                "availability_nux": null,
-                "upgrade": null,
-                "base_instructions": base_instructions,
-                "model_messages": {
-                    "instructions_template": base_instructions,
-                    "instructions_variables": null,
-                    "approvals": null,
-                    "auto_review": null,
-                    "permissions": null,
-                },
-                "include_skills_usage_instructions": false,
-                "default_reasoning_summary": "none",
-                "support_verbosity": true,
-                "default_verbosity": "low",
-                "apply_patch_tool_type": "freeform",
-            "web_search_tool_type": if is_non_openai_oauth_model(model) { serde_json::Value::Null } else { json!("text_and_image") },
-                "truncation_policy": { "mode": "tokens", "limit": 10_000 },
-                "supports_parallel_tool_calls": true,
-                "comp_hash": "codex-router-v1",
-                "effective_context_window_percent": model.auto_compact_percent,
-                "experimental_supported_tools": Vec::<String>::new(),
-            "supports_search_tool": !is_non_openai_oauth_model(model),
-                "use_responses_lite": true,
-                "tool_mode": "code_mode_only",
-                "multi_agent_version": "v2",
-            })
-        })
-        .collect()
-}
-
 /// This manifest intentionally contains credential references, never API keys.
 pub fn build_channel_manifest(cfg: &RouterConfig) -> Vec<serde_json::Value> {
     cfg.models
@@ -1200,7 +1198,7 @@ pub fn write_all_files(cfg: &RouterConfig, router_root: &Path) -> anyhow::Result
             "fetched_at": chrono::Utc::now().to_rfc3339(),
             "etag": "codex-router-local-v2",
             "client_version": env!("CARGO_PKG_VERSION"),
-            "models": build_model_catalog(cfg),
+            "models": build_model_catalog_with_root(cfg, router_root),
             }))?,
         ),
         (
@@ -1239,43 +1237,6 @@ pub fn write_all_files(cfg: &RouterConfig, router_root: &Path) -> anyhow::Result
         }
     }
     Ok(())
-}
-
-pub(crate) fn ps_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-pub(crate) fn run_powershell_stdin(script: &str) -> anyhow::Result<String> {
-    let mut child = Command::new("powershell.exe")
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            "-",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .creation_flags(0x08000000)
-        .spawn()
-        .context("无法启动 Windows PowerShell")?;
-    child
-        .stdin
-        .as_mut()
-        .context("无法打开 PowerShell 标准输入")?
-        .write_all(script.as_bytes())?;
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        let details = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "PowerShell 执行失败: {}",
-            crate::runtime_logs::summarize_error_for_display(details.trim())
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 struct SecretWide(Vec<u16>);
@@ -1333,6 +1294,9 @@ fn read_router_credential(name: &str) -> anyhow::Result<Option<SecretWide>> {
 }
 
 fn write_router_credential(name: &str, secret: &[u16]) -> anyhow::Result<()> {
+    if name.trim().is_empty() || name.contains('\0') {
+        bail!("Windows credential name is invalid");
+    }
     let mut target = router_credential_target(name);
     let mut username = std::env::var("USERNAME")
         .unwrap_or_default()
@@ -1341,6 +1305,9 @@ fn write_router_credential(name: &str, secret: &[u16]) -> anyhow::Result<()> {
         .collect::<Vec<_>>();
     let blob_size = u32::try_from(secret.len().saturating_mul(std::mem::size_of::<u16>()))
         .context("Windows credential is too large")?;
+    if blob_size > 2560 {
+        bail!("Windows credential exceeds 2560 bytes");
+    }
     let credential = CREDENTIALW {
         Type: CRED_TYPE_GENERIC,
         TargetName: target.as_mut_ptr(),
@@ -1358,6 +1325,26 @@ fn write_router_credential(name: &str, secret: &[u16]) -> anyhow::Result<()> {
             .context("Windows Credential Manager write failed");
     }
     Ok(())
+}
+
+pub(crate) fn read_router_credential_text(name: &str) -> anyhow::Result<Option<Zeroizing<String>>> {
+    read_router_credential(name)?
+        .map(|value| String::from_utf16(&value.0).map(Zeroizing::new))
+        .transpose()
+        .context("Windows credential contains invalid UTF-16")
+}
+
+pub(crate) fn write_router_credential_text(name: &str, secret: &str) -> anyhow::Result<()> {
+    let mut encoded = secret.encode_utf16().collect::<Vec<_>>();
+    let result = write_router_credential(name, &encoded);
+    encoded.fill(0);
+    result
+}
+
+pub(crate) fn random_hex_secret(byte_count: usize) -> anyhow::Result<Zeroizing<String>> {
+    let mut bytes = Zeroizing::new(vec![0u8; byte_count]);
+    secure_random_bytes(&mut bytes)?;
+    Ok(Zeroizing::new(hex_encode(&bytes)))
 }
 
 fn delete_router_credential(name: &str) -> anyhow::Result<()> {
@@ -1389,12 +1376,73 @@ pub(crate) fn remove_isolated_profile_credentials(names: &[String]) -> anyhow::R
     }
 }
 
-pub fn store_credentials(cfg: &mut RouterConfig, router_root: &Path) -> anyhow::Result<usize> {
-    let module = router_root.join("scripts").join("CredentialStore.psm1");
-    let mut script = format!(
-        "$ErrorActionPreference='Stop'\nImport-Module {} -Force\n",
-        ps_literal(&module.to_string_lossy())
+fn secure_random_bytes(buf: &mut [u8]) -> anyhow::Result<()> {
+    const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x00000002;
+    if unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    } != 0
+    {
+        bail!("BCryptGenRandom failed");
+    }
+    Ok(())
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0xf) as usize] as char);
+    }
+    out
+}
+
+pub fn ensure_local_api_key() -> anyhow::Result<String> {
+    if let Some(secret) = read_router_credential("LocalApiKey")? {
+        if !secret.0.is_empty() {
+            return String::from_utf16(&secret.0)
+                .context("the local Router credential has invalid UTF-16 encoding");
+        }
+    }
+    let mut bytes = [0u8; 32];
+    secure_random_bytes(&mut bytes).context("failed to generate local Router key")?;
+    let key = format!("sk-local-{}", hex_encode(&bytes));
+    write_router_credential("LocalApiKey", &key.encode_utf16().collect::<Vec<_>>())
+        .context("failed to store local Router key")?;
+    Ok(key)
+}
+
+pub fn resolve_proxy_runtime(cfg: &RouterConfig) -> anyhow::Result<crate::proxy::ProxyRuntime> {
+    let password = if !cfg.proxy.password.is_empty() {
+        Some(Zeroizing::new(cfg.proxy.password.clone()))
+    } else if cfg.proxy.enabled && !cfg.proxy.username.trim().is_empty() {
+        read_router_credential(&cfg.proxy.password_credential)?
+            .map(|value| String::from_utf16(&value.0))
+            .transpose()
+            .context("the proxy credential has invalid UTF-16 encoding")?
+            .map(Zeroizing::new)
+    } else {
+        None
+    };
+    let settings =
+        crate::proxy::resolve_current(&cfg.proxy, password.as_deref().map(String::as_str))?;
+    let targets = crate::proxy::evaluate_targets(
+        &settings,
+        cfg.models
+            .iter()
+            .filter(|model| model.source != "oauth")
+            .map(|model| model.base_url.as_str()),
     );
+    Ok(crate::proxy::ProxyRuntime { settings, targets })
+}
+
+pub fn store_credentials(cfg: &mut RouterConfig, _router_root: &Path) -> anyhow::Result<usize> {
+    let mut writes = Vec::<(String, SecretWide)>::new();
     let mut updated_model_keys = 0usize;
     for (index, model) in cfg.models.iter_mut().enumerate() {
         if model.source == "oauth" {
@@ -1405,10 +1453,9 @@ pub fn store_credentials(cfg: &mut RouterConfig, router_root: &Path) -> anyhow::
             model.credential_name = format!("ModelApiKey-{}-{}", index + 1, slugify(&model.model));
         }
         if !model.api_key.trim().is_empty() {
-            script.push_str(&format!(
-                "Set-RouterCredential -Name {} -Secret {}\n",
-                ps_literal(&model.credential_name),
-                ps_literal(model.api_key.trim())
+            writes.push((
+                model.credential_name.clone(),
+                SecretWide(model.api_key.trim().encode_utf16().collect()),
             ));
             updated_model_keys += 1;
         }
@@ -1418,15 +1465,27 @@ pub fn store_credentials(cfg: &mut RouterConfig, router_root: &Path) -> anyhow::
             .contains("ark.cn-beijing.volces.com/api/coding")
         {
             if !model.volcengine_access_key_id.trim().is_empty() {
-                script.push_str(&format!(
-                    "Set-RouterCredential -Name 'VolcengineAccessKeyId' -Secret {}\n",
-                    ps_literal(model.volcengine_access_key_id.trim())
+                writes.push((
+                    "VolcengineAccessKeyId".to_owned(),
+                    SecretWide(
+                        model
+                            .volcengine_access_key_id
+                            .trim()
+                            .encode_utf16()
+                            .collect(),
+                    ),
                 ));
             }
             if !model.volcengine_secret_access_key.trim().is_empty() {
-                script.push_str(&format!(
-                    "Set-RouterCredential -Name 'VolcengineSecretAccessKey' -Secret {}\n",
-                    ps_literal(model.volcengine_secret_access_key.trim())
+                writes.push((
+                    "VolcengineSecretAccessKey".to_owned(),
+                    SecretWide(
+                        model
+                            .volcengine_secret_access_key
+                            .trim()
+                            .encode_utf16()
+                            .collect(),
+                    ),
                 ));
             }
         }
@@ -1435,16 +1494,19 @@ pub fn store_credentials(cfg: &mut RouterConfig, router_root: &Path) -> anyhow::
         cfg.proxy.password_credential = "ProxyPassword".to_string();
     }
     if !cfg.proxy.password.is_empty() {
-        script.push_str(&format!(
-            "Set-RouterCredential -Name {} -Secret {}\n",
-            ps_literal(&cfg.proxy.password_credential),
-            ps_literal(&cfg.proxy.password)
+        writes.push((
+            cfg.proxy.password_credential.clone(),
+            SecretWide(cfg.proxy.password.encode_utf16().collect()),
         ));
     }
-    script.push_str("'credentials-saved'\n");
-    let _ = run_powershell_stdin(&script)?;
+    for (name, secret) in &writes {
+        write_router_credential(name, &secret.0)
+            .with_context(|| format!("failed to store Windows credential {name}"))?;
+    }
     for model in &mut cfg.models {
         model.api_key.clear();
+        model.volcengine_access_key_id.clear();
+        model.volcengine_secret_access_key.clear();
     }
     cfg.proxy.password.clear();
     cfg.local_api_key.clear();
@@ -1610,6 +1672,7 @@ fn crypt_dpapi(data: &[u8], protect: bool) -> anyhow::Result<Vec<u8>> {
     Ok(result)
 }
 
+#[cfg(test)]
 fn terminate_deployment_process_tree(child: &mut std::process::Child) {
     let taskkill = std::env::var_os("SystemRoot")
         .map(PathBuf::from)
@@ -1635,12 +1698,14 @@ where
     F: FnMut(String),
 {
     let cancel = AtomicBool::new(false);
-    run_apply_script_with_cancel(router_root, &cancel, on_line)
+    run_apply_script_with_cancel(router_root, &cancel, None, on_line)
 }
 
+#[cfg(test)]
 pub fn run_apply_script_with_cancel<F>(
     router_root: &Path,
     cancel: &AtomicBool,
+    proxy: Option<&crate::proxy::ProxyRuntime>,
     mut on_line: F,
 ) -> anyhow::Result<()>
 where
@@ -1726,10 +1791,40 @@ where
         .arg(&script)
         .current_dir(router_root)
         .env("CODEX_ROUTER_CONFIG_LOCK_HELD", "1")
+        .env("CODEX_ROUTER_NATIVE_LIFECYCLE", "1")
+        .env("CODEX_ROUTER_NATIVE_AUTOSTART", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .creation_flags(0x08000000);
+    if let Some(proxy) = proxy {
+        let settings = &proxy.settings;
+        command
+            .env("CODEX_ROUTER_NATIVE_PROXY", "1")
+            .env("CODEX_ROUTER_PROXY_MODE", &settings.mode)
+            .env("CODEX_ROUTER_PROXY_SOURCE", &settings.source)
+            .env("CODEX_ROUTER_NO_PROXY", &settings.no_proxy)
+            .env(
+                "CODEX_ROUTER_PROXY_HAS_CREDENTIALS",
+                if settings.has_credentials { "1" } else { "0" },
+            )
+            .env(
+                "CODEX_ROUTER_PROXY_SUPPORTS_ACCOUNT_BINDING",
+                if settings.supports_account_binding {
+                    "1"
+                } else {
+                    "0"
+                },
+            );
+        if let Ok(targets) = serde_json::to_string(&proxy.targets) {
+            command.env("CODEX_ROUTER_PROXY_TARGET_POLICIES", targets);
+        }
+        if let Some(proxy_url) = &settings.proxy_url {
+            command.env("CODEX_ROUTER_PROXY_URL", proxy_url);
+        } else {
+            command.env_remove("CODEX_ROUTER_PROXY_URL");
+        }
+    }
     let mut child = command
         .spawn()
         .with_context(|| format!("无法运行 {}", script.display()))?;
@@ -1857,42 +1952,7 @@ where
 }
 
 pub fn run_stop_router_script(router_root: &Path) -> anyhow::Result<()> {
-    let script = router_root.join("scripts").join("Stop-Router.ps1");
-    let output = Command::new("powershell.exe")
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-        ])
-        .arg(&script)
-        .current_dir(router_root)
-        .stdin(Stdio::null())
-        .creation_flags(0x08000000)
-        .output()
-        .with_context(|| format!("无法运行 {}", script.display()))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let details = if stderr.trim().is_empty() {
-        stdout.trim()
-    } else {
-        stderr.trim()
-    };
-    let safe_details = if details.is_empty() {
-        "class=unclassified_error".to_owned()
-    } else {
-        crate::runtime_logs::summarize_error_for_display(details)
-    };
-    bail!(
-        "停止 Router 失败（退出代码 {}）: {}",
-        output.status.code().unwrap_or(-1),
-        safe_details
-    )
+    crate::lifecycle::stop_services(router_root, false, false).map(|_| ())
 }
 
 fn is_router_provider_id(provider_id: &str) -> bool {
@@ -1926,11 +1986,29 @@ pub(crate) fn codex_config_uses_router(config_text: &str, router_base_url: &str)
     if !base_matches {
         return false;
     }
+    if provider.get("requires_openai_auth").and_then(Item::as_bool) != Some(true)
+        || provider
+            .get("wire_api")
+            .and_then(Item::as_str)
+            .filter(|value| *value == "responses")
+            .is_none()
+        || provider
+            .get("experimental_bearer_token")
+            .and_then(Item::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .is_none()
+        || document
+            .get("model_catalog_json")
+            .and_then(Item::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .is_none()
+    {
+        return false;
+    }
     // Reject third-party profiles that reuse the custom id but point at a local
     // URL while naming themselves something other than Codex-Router.
     match provider.get("name").and_then(Item::as_str) {
         None | Some("Codex-Router") => true,
-        Some(_) if provider_id == "codex_router" => true,
         Some(_) => false,
     }
 }
@@ -1992,24 +2070,19 @@ pub fn codex_router_mode_active(cfg: &RouterConfig) -> bool {
 }
 
 pub fn load_oauth_accounts(router_root: &Path) -> anyhow::Result<Vec<crate::OAuthAccountSummary>> {
-    let script = router_root.join("scripts").join("Get-OAuthAccounts.ps1");
-    let mut last_failure = "ROUTER_OAUTH_ACCOUNTS_UNAVAILABLE".to_owned();
-    // Prefer PowerShell 7 when present: JSON arrays and StrictMode edge cases
-    // are substantially more reliable than Windows PowerShell 5.1.
-    let shell = prefer_powershell_executable();
+    let config = RouterConfig::load(&crate::user_data::config_path(router_root))
+        .context("ROUTER_OAUTH_ACCOUNTS_CONFIGURATION: class=configuration")?;
+    let mut last_failure = "ROUTER_OAUTH_ACCOUNTS_UNAVAILABLE: class=request_failure".to_owned();
     let mut attempted_repair = false;
     for attempt in 0..5 {
         if attempt == 0 {
-            // Soft wait for the local admin API without failing the whole load.
             for _ in 0..6 {
-                if local_router_health_available("http://127.0.0.1:18080") {
+                if local_router_health_available(&config.deploy.sub2api_host) {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(250));
             }
         }
-        // When admin login is rate-limited or services are from an older package
-        // folder, repair once from the current install root before retrying.
         if !attempted_repair
             && attempt > 0
             && oauth_accounts_failure_needs_router_repair(&last_failure)
@@ -2018,55 +2091,12 @@ pub fn load_oauth_accounts(router_root: &Path) -> anyhow::Result<Vec<crate::OAut
             let _ = ensure_router_healthy(router_root);
             std::thread::sleep(Duration::from_millis(800));
         }
-        let output_result = Command::new(&shell)
-            .args([
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-            ])
-            .arg(&script)
-            .current_dir(router_root)
-            .stdin(Stdio::null())
-            .creation_flags(0x08000000)
-            .output();
-
-        match output_result {
-            Ok(output) if output.status.success() => {
-                let text = String::from_utf8_lossy(&output.stdout);
-                let trimmed = extract_json_payload(text.as_ref());
-                if trimmed.is_empty() || trimmed == "null" {
-                    return Ok(Vec::new());
-                }
-                let parsed = if trimmed.starts_with('[') {
-                    serde_json::from_str::<Vec<crate::OAuthAccountSummary>>(trimmed)
-                        .map_err(|error| error.to_string())
-                } else {
-                    serde_json::from_str::<crate::OAuthAccountSummary>(trimmed)
-                        .map(|account| vec![account])
-                        .map_err(|error| error.to_string())
-                };
-                match parsed {
-                    Ok(accounts) => return Ok(accounts),
-                    Err(error) => {
-                        last_failure = format!(
-                            "ROUTER_OAUTH_ACCOUNTS_PARSE: {}",
-                            crate::runtime_logs::summarize_error_for_display(&error)
-                        );
-                    }
-                }
-            }
-            Ok(output) => {
-                last_failure = oauth_accounts_process_failure_summary(&output);
-            }
+        match load_oauth_accounts_native(router_root, &config) {
+            Ok(accounts) => return Ok(accounts),
             Err(error) => {
                 last_failure = format!(
                     "ROUTER_OAUTH_ACCOUNTS_UNAVAILABLE: {}",
-                    crate::runtime_logs::summarize_error_for_display(&format!(
-                        "oauth accounts process start failed: {error}"
-                    ))
+                    native_admin_error(&error)
                 );
             }
         }
@@ -2080,9 +2110,273 @@ pub fn load_oauth_accounts(router_root: &Path) -> anyhow::Result<Vec<crate::OAut
     bail!("{last_failure}")
 }
 
+fn load_oauth_accounts_native(
+    router_root: &Path,
+    config: &RouterConfig,
+) -> anyhow::Result<Vec<crate::OAuthAccountSummary>> {
+    let admin = usage::retry_admin_read(|| usage::AdminClient::connect(router_root, config))?;
+    let groups = usage::data(usage::retry_account_read(|| {
+        admin.get(
+            "/api/v1/admin/groups/all?include_inactive=true",
+            Duration::from_secs(10),
+        )
+    })?);
+    let router_group_id = usage::array(&groups)
+        .iter()
+        .find(|group| usage::string(group, "name") == "Codex-Router")
+        .map(|group| usage::integer(group, "id"))
+        .unwrap_or_default();
+    let accounts_body = usage::data(usage::retry_account_read(|| {
+        admin.get(
+            "/api/v1/admin/accounts?page=1&page_size=200",
+            Duration::from_secs(10),
+        )
+    })?);
+    let accounts = usage::get(&accounts_body, "items").unwrap_or(&accounts_body);
+    let selected = config
+        .oauth_account_ids
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let mut summaries = Vec::<(String, crate::OAuthAccountSummary)>::new();
+    let mut summary_by_identity = HashMap::<String, usize>::new();
+    let mut detail_failures = 0;
+    let mut oauth_count = 0;
+
+    for account in usage::array(accounts) {
+        if usage::string(account, "type") != "oauth" {
+            continue;
+        }
+        oauth_count += 1;
+        let account_id = usage::integer(account, "id");
+        if account_id <= 0 {
+            continue;
+        }
+        let path = format!("/api/v1/admin/accounts/{account_id}");
+        let detail = match usage::retry_account_read(|| admin.get(&path, Duration::from_secs(10))) {
+            Ok(detail) => usage::data(detail),
+            Err(_) => {
+                detail_failures += 1;
+                continue;
+            }
+        };
+        let platform = usage::string(&detail, "platform").to_ascii_lowercase();
+        let (models, models_error) =
+            oauth_model_catalog_result(load_live_oauth_models(&admin, account_id, &platform));
+
+        let credentials = usage::get(&detail, "credentials").unwrap_or(&Value::Null);
+        let extra = usage::get(&detail, "extra").unwrap_or(&Value::Null);
+        let email = first_nonempty([
+            usage::string(credentials, "email"),
+            usage::string(extra, "email"),
+        ]);
+        let plan = first_nonempty([
+            usage::string(credentials, "plan_type"),
+            usage::string(credentials, "tier_id"),
+            usage::string(extra, "subscription_tier"),
+        ]);
+        let group_ids = group_ids(&detail, account);
+        let mut expires_at = first_nonempty([
+            usage::string(&detail, "expires_at"),
+            usage::string(credentials, "expires_at"),
+        ]);
+        if expires_at.len() >= 9
+            && expires_at.len() <= 12
+            && expires_at.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            expires_at = expires_at
+                .parse::<i64>()
+                .ok()
+                .and_then(|timestamp| chrono::DateTime::from_timestamp(timestamp, 0))
+                .map(|date| date.to_rfc3339())
+                .unwrap_or(expires_at);
+        }
+        let error = first_nonempty([
+            usage::string(&detail, "error_message"),
+            usage::string(&detail, "temp_unschedulable_reason"),
+        ]);
+        let summary = crate::OAuthAccountSummary {
+            id: usage::integer(&detail, "id").max(account_id),
+            name: usage::string(&detail, "name"),
+            platform: platform.clone(),
+            status: usage::string(&detail, "status"),
+            email,
+            plan,
+            priority: usage::integer(&detail, "priority")
+                .try_into()
+                .unwrap_or_default(),
+            bound_to_router: router_group_id > 0 && group_ids.contains(&router_group_id),
+            error,
+            expires_at,
+            models,
+            models_error,
+        };
+        let identity = oauth_stable_identity(&platform, credentials, extra, account_id);
+        if let Some(index) = summary_by_identity.get(&identity).copied() {
+            if prefer_oauth_summary(&summaries[index].1, &summary, &selected) {
+                summaries[index] = (identity, summary);
+            }
+        } else {
+            summary_by_identity.insert(identity.clone(), summaries.len());
+            summaries.push((identity, summary));
+        }
+    }
+    if oauth_count > 0 && summaries.is_empty() && detail_failures > 0 {
+        bail!("class=request_failure")
+    }
+    Ok(summaries.into_iter().map(|(_, summary)| summary).collect())
+}
+
+fn load_live_oauth_models(
+    admin: &usage::AdminClient,
+    account_id: i64,
+    platform: &str,
+) -> anyhow::Result<Vec<crate::OAuthModelSummary>> {
+    let sync_path = format!("/api/v1/admin/accounts/{account_id}/models/sync-upstream");
+    let sync_result = admin
+        .post(&sync_path, None, Duration::from_secs(15))
+        .map(|body| oauth_models_from_response(platform, body));
+
+    // Some providers do not implement sync-upstream, while providers that do
+    // return a string array instead of the stable catalog's model objects. The
+    // canonical GET endpoint is account-scoped and remains the best UI source
+    // after sync has refreshed it.
+    let catalog_path = format!("/api/v1/admin/accounts/{account_id}/models");
+    let catalog_result =
+        usage::retry_account_read(|| admin.get(&catalog_path, Duration::from_secs(15)))
+            .map(|body| oauth_models_from_response(platform, body));
+
+    match catalog_result {
+        Ok(models) if !models.is_empty() => Ok(models),
+        Ok(_) => match sync_result {
+            Ok(models) => Ok(models),
+            Err(_) => Ok(Vec::new()),
+        },
+        Err(catalog_error) => match sync_result {
+            Ok(models) if !models.is_empty() => Ok(models),
+            Ok(_) | Err(_) => Err(catalog_error),
+        },
+    }
+}
+
+fn oauth_models_from_response(platform: &str, response: Value) -> Vec<crate::OAuthModelSummary> {
+    let body = usage::data(response);
+    let items = usage::get(&body, "models")
+        .or_else(|| usage::get(&body, "items"))
+        .unwrap_or(&body);
+    discovered_oauth_models(platform, items)
+}
+
+fn oauth_model_catalog_result(
+    result: anyhow::Result<Vec<crate::OAuthModelSummary>>,
+) -> (Vec<crate::OAuthModelSummary>, String) {
+    match result {
+        Ok(models) => (models, String::new()),
+        Err(error) => (Vec::new(), native_admin_error(&error)),
+    }
+}
+
+fn group_ids(detail: &Value, summary: &Value) -> Vec<i64> {
+    let parse = |value: &Value| {
+        usage::array(value)
+            .iter()
+            .filter_map(|item| item.as_i64().or_else(|| item.as_str()?.parse().ok()))
+            .filter(|id| *id >= 0)
+            .collect::<Vec<_>>()
+    };
+    let detailed = usage::get(detail, "group_ids")
+        .map(parse)
+        .unwrap_or_default();
+    if detailed.is_empty() {
+        usage::get(summary, "group_ids")
+            .map(parse)
+            .unwrap_or_default()
+    } else {
+        detailed
+    }
+}
+
+fn first_nonempty<const N: usize>(values: [String; N]) -> String {
+    values
+        .into_iter()
+        .find(|value| !value.trim().is_empty())
+        .unwrap_or_default()
+}
+
+fn oauth_stable_identity(
+    platform: &str,
+    credentials: &Value,
+    extra: &Value,
+    account_id: i64,
+) -> String {
+    oauth::stable_identity(platform, credentials, extra)
+        .unwrap_or_else(|| format!("row|{account_id}"))
+}
+
+fn prefer_oauth_summary(
+    current: &crate::OAuthAccountSummary,
+    candidate: &crate::OAuthAccountSummary,
+    selected: &HashSet<i64>,
+) -> bool {
+    let candidate_selected = selected.contains(&candidate.id);
+    let current_selected = selected.contains(&current.id);
+    (candidate_selected && !current_selected)
+        || (candidate_selected == current_selected
+            && candidate.bound_to_router
+            && !current.bound_to_router)
+        || (candidate_selected == current_selected
+            && candidate.bound_to_router == current.bound_to_router
+            && candidate.id > 0
+            && (current.id <= 0 || candidate.id < current.id))
+}
+
+fn discovered_oauth_models(platform: &str, models: &Value) -> Vec<crate::OAuthModelSummary> {
+    let mut discovered = Vec::new();
+    let mut seen = HashSet::new();
+    for model in usage::array(models) {
+        let mut model_id = model
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| usage::string(model, "id"));
+        if platform == "openai" && model_id == "gpt-5.6" {
+            model_id = "gpt-5.6-sol".to_owned();
+        } else if platform == "antigravity"
+            && matches!(
+                model_id.as_str(),
+                "gemini-3.7-flash-high" | "gemini-3.7-flash-medium" | "gemini-3.7-flash-low"
+            )
+        {
+            model_id = "gemini-3.7-flash".to_owned();
+        }
+        if model_id.is_empty() || !seen.insert(model_id.clone()) {
+            continue;
+        }
+        let mut display_name = usage::string(model, "display_name");
+        if display_name.is_empty() {
+            display_name = usage::string(model, "displayName");
+        }
+        if model_id == "gpt-5.6-sol" {
+            display_name = "ChatGPT-5.6-Sol".to_owned();
+        } else if model_id == "gemini-3.7-flash" {
+            display_name = "Gemini 3.7 Flash".to_owned();
+        } else if display_name.is_empty() {
+            display_name.clone_from(&model_id);
+        }
+        discovered.push(crate::OAuthModelSummary {
+            id: model_id,
+            display_name,
+        });
+    }
+    discovered
+}
+
 fn oauth_accounts_failure_needs_router_repair(summary: &str) -> bool {
     let lower = summary.to_ascii_lowercase();
-    lower.contains("rate-limited")
+    lower.contains("class=request_failure")
+        || lower.contains("rate-limited")
         || lower.contains("429")
         || lower.contains("no access token")
         || lower.contains("503")
@@ -2092,79 +2386,24 @@ fn oauth_accounts_failure_needs_router_repair(summary: &str) -> bool {
 }
 
 fn ensure_router_healthy(router_root: &Path) -> bool {
-    let script = router_root.join("scripts").join("Ensure-RouterHealthy.ps1");
-    if !script.is_file() {
-        return false;
-    }
-    let shell = prefer_powershell_executable();
-    Command::new(shell)
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-        ])
-        .arg(&script)
-        .current_dir(router_root)
-        .stdin(Stdio::null())
-        .creation_flags(0x08000000)
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+    let cancel = AtomicBool::new(false);
+    crate::lifecycle::ensure_services(router_root, true, &cancel, false).is_ok()
 }
 
-fn prefer_powershell_executable() -> String {
-    let candidates = [
-        r"C:\Program Files\PowerShell\7\pwsh.exe",
-        r"C:\Program Files\PowerShell\7-preview\pwsh.exe",
-    ];
-    for candidate in candidates {
-        if Path::new(candidate).is_file() {
-            return candidate.to_owned();
-        }
-    }
-    "powershell.exe".to_owned()
-}
-
-fn extract_json_payload(text: &str) -> &str {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return "";
-    }
-    if let Some(start) = trimmed.find(['[', '{']) {
-        let payload = trimmed[start..].trim();
-        if payload.starts_with('[') || payload.starts_with('{') {
-            return payload;
-        }
-    }
-    trimmed
-}
-
-fn oauth_accounts_process_failure_summary(output: &std::process::Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let combined = [stderr.trim(), stdout.trim()]
-        .into_iter()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let detail = if combined.is_empty() {
-        "oauth accounts script failed without output".to_owned()
+fn native_admin_error(error: &anyhow::Error) -> String {
+    let message = error.to_string();
+    if message.starts_with("class=") {
+        message
     } else {
-        combined
-    };
-    format!(
-        "ROUTER_OAUTH_ACCOUNTS_UNAVAILABLE: {}",
-        crate::runtime_logs::summarize_error_for_display(&detail)
-    )
+        "class=request_failure".to_owned()
+    }
 }
 
 fn oauth_accounts_failure_is_retryable(summary: &str) -> bool {
     [
         "class=connection_refused",
         "class=connection_closed",
+        "class=request_failure",
         "class=timeout",
         "class=lifecycle_busy",
         "class=lifecycle_deferred",
@@ -2194,125 +2433,110 @@ pub fn load_usage_snapshot(
     load_usage_snapshot_with_timeout(router_root, profile_name, cfg, Duration::from_secs(120))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OAuthRecoveryResult {
+    pub next_check_seconds: u64,
+    pub summary: String,
+}
+
+pub fn probe_oauth_recovery(
+    router_root: &Path,
+    cfg: &RouterConfig,
+    cancel: &AtomicBool,
+) -> anyhow::Result<OAuthRecoveryResult> {
+    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+        bail!("class=cancelled")
+    }
+    let mut selected_ids = cfg.oauth_account_ids.clone().unwrap_or_default();
+    selected_ids.extend(
+        cfg.models
+            .iter()
+            .filter(|model| model.source == "oauth" && model.oauth_account_id > 0)
+            .map(|model| model.oauth_account_id),
+    );
+    selected_ids.sort_unstable();
+    selected_ids.dedup();
+    if selected_ids.is_empty() {
+        return Ok(OAuthRecoveryResult {
+            next_check_seconds: 0,
+            summary: "healthy=0 deferred=0 recovered=0".to_owned(),
+        });
+    }
+
+    let admin = usage::retry_admin_read(|| usage::AdminClient::connect(router_root, cfg))?;
+    let accounts_body = usage::data(usage::retry_account_read(|| {
+        admin.get(
+            "/api/v1/admin/accounts?page=1&page_size=200",
+            Duration::from_secs(10),
+        )
+    })?);
+    let accounts = usage::get(&accounts_body, "items").unwrap_or(&accounts_body);
+    let disabled_before = usage::array(accounts)
+        .iter()
+        .filter(|account| {
+            let id = usage::integer(account, "id");
+            selected_ids.contains(&id)
+                && usage::string(account, "type") == "oauth"
+                && (usage::string(account, "status") == "error"
+                    || usage::get(account, "schedulable").and_then(Value::as_bool) == Some(false))
+        })
+        .map(|account| usage::integer(account, "id"))
+        .collect::<HashSet<_>>();
+
+    let snapshot = usage::query_usage(
+        router_root,
+        "OAuth recovery",
+        cfg,
+        Instant::now() + Duration::from_secs(120),
+    )?;
+    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+        bail!("class=cancelled")
+    }
+    let recovered = snapshot
+        .subscriptions
+        .iter()
+        .filter(|account| disabled_before.contains(&account.id) && account.status == "active")
+        .count();
+    let healthy = snapshot
+        .subscriptions
+        .iter()
+        .filter(|account| account.health == "healthy")
+        .count();
+    let deferred = snapshot
+        .subscriptions
+        .len()
+        .saturating_sub(healthy)
+        .saturating_sub(recovered);
+    if snapshot.routing_changed {
+        deployment::sync_routing_only(router_root, cfg)?;
+    }
+    Ok(OAuthRecoveryResult {
+        next_check_seconds: usage::next_oauth_recovery_seconds(router_root, chrono::Utc::now()),
+        summary: format!("healthy={healthy} deferred={deferred} recovered={recovered}"),
+    })
+}
+
 fn load_usage_snapshot_with_timeout(
     router_root: &Path,
     profile_name: &str,
     cfg: &RouterConfig,
     timeout: Duration,
 ) -> anyhow::Result<crate::UsageSnapshot> {
-    let script = router_root.join("scripts").join("Get-UsageMonitor.ps1");
-    let state_dir = crate::user_data::data_root(router_root).join("ui");
-    std::fs::create_dir_all(&state_dir)?;
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let config_snapshot = state_dir.join(format!(
-        "usage-monitor-config-{}-{nonce}.tmp.json",
-        std::process::id(),
-    ));
-    cfg.save(&config_snapshot)?;
-    let result = (|| -> anyhow::Result<crate::UsageSnapshot> {
-        let mut last_failure = "class=unclassified_error".to_owned();
-        for attempt in 0..USAGE_MONITOR_MAX_ATTEMPTS {
-            let shell = prefer_powershell_executable();
-            let mut child = match Command::new(shell)
-                .args([
-                    "-NoLogo",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-File",
-                ])
-                .arg(&script)
-                .args(["-ProfileName", profile_name])
-                .arg("-ConfigPath")
-                .arg(&config_snapshot)
-                .current_dir(router_root)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .creation_flags(0x08000000)
-                .spawn()
-            {
-                Ok(child) => child,
-                Err(error) => {
-                    last_failure = crate::runtime_logs::summarize_error_for_display(&format!(
-                        "usage monitor process start failed: {error}"
-                    ));
-                    break;
-                }
-            };
-            let stdout = child
-                .stdout
-                .take()
-                .context("usage monitor stdout unavailable")?;
-            let stderr = child
-                .stderr
-                .take()
-                .context("usage monitor stderr unavailable")?;
-            let stdout_reader = std::thread::spawn(move || {
-                let mut bytes = Vec::new();
-                let _ = BufReader::new(stdout).read_to_end(&mut bytes);
-                bytes
-            });
-            let stderr_reader = std::thread::spawn(move || {
-                let mut bytes = Vec::new();
-                let _ = BufReader::new(stderr).read_to_end(&mut bytes);
-                bytes
-            });
-            let started = Instant::now();
-            let status = loop {
-                match child.try_wait() {
-                    Ok(Some(status)) => break Some(status),
-                    Ok(None) if started.elapsed() < timeout => {
-                        std::thread::sleep(Duration::from_millis(50));
-                    }
-                    Ok(None) => {
-                        terminate_deployment_process_tree(&mut child);
-                        last_failure = "class=timeout".to_owned();
-                        break None;
-                    }
-                    Err(error) => {
-                        terminate_deployment_process_tree(&mut child);
-                        last_failure = crate::runtime_logs::summarize_error_for_display(&format!(
-                            "usage monitor process wait failed: {error}"
-                        ));
-                        break None;
-                    }
-                }
-            };
-            let stdout = stdout_reader.join().unwrap_or_default();
-            let stderr = stderr_reader.join().unwrap_or_default();
-            let Some(status) = status else { break };
-            let output = std::process::Output {
-                status,
-                stdout,
-                stderr,
-            };
-
-            if output.status.success() {
-                match parse_usage_snapshot_output(&output.stdout) {
-                    Ok(snapshot) => return Ok(snapshot),
-                    Err(error) => last_failure = error.to_string(),
-                }
-            } else {
-                last_failure = usage_process_failure_summary(&output);
-            }
-
-            if attempt + 1 < USAGE_MONITOR_MAX_ATTEMPTS
-                && usage_failure_is_locally_retryable(&last_failure)
-            {
-                std::thread::sleep(usage_monitor_retry_delay(attempt));
-            } else {
-                break;
-            }
+    let mut last_failure = "class=unclassified_error".to_owned();
+    for attempt in 0..USAGE_MONITOR_MAX_ATTEMPTS {
+        match usage::query_usage(router_root, profile_name, cfg, Instant::now() + timeout) {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(error) => last_failure = error.to_string(),
         }
-        bail!(last_failure)
-    })();
-    let _ = std::fs::remove_file(&config_snapshot);
-    result
+        if attempt + 1 < USAGE_MONITOR_MAX_ATTEMPTS
+            && usage_failure_is_locally_retryable(&last_failure)
+        {
+            std::thread::sleep(usage_monitor_retry_delay(attempt));
+        } else {
+            break;
+        }
+    }
+    bail!(last_failure)
 }
 
 const USAGE_MONITOR_MAX_ATTEMPTS: usize = 5;
@@ -2356,80 +2580,115 @@ fn usage_failure_is_locally_retryable(summary: &str) -> bool {
     .any(|class| lower.contains(class))
 }
 
-fn parse_usage_snapshot_output(stdout: &[u8]) -> anyhow::Result<crate::UsageSnapshot> {
-    let text = std::str::from_utf8(stdout)
-        .map_err(|_| anyhow::anyhow!("class=invalid_response_encoding"))?;
-    let trimmed = text.trim().trim_start_matches('\u{feff}');
-    if trimmed.is_empty() || trimmed == "null" {
-        bail!("class=empty_response");
-    }
-    let json = trimmed
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|line| line.starts_with('{') && line.ends_with('}'))
-        .unwrap_or(trimmed);
-    serde_json::from_str(json).map_err(|_| anyhow::anyhow!("class=invalid_response"))
-}
-
-fn usage_process_failure_summary(output: &std::process::Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let raw = if !stderr.trim().is_empty() {
-        stderr.trim()
-    } else {
-        stdout.trim()
-    };
-    let exit_code = output.status.code().unwrap_or(-1);
-    if raw.is_empty() {
-        return format!("class=process_failure | exit_code={exit_code}");
-    }
-    let summary = crate::runtime_logs::summarize_error_for_display(raw);
-    if summary == "class=unclassified_error" {
-        format!("{summary} | exit_code={exit_code}")
-    } else {
-        summary
-    }
-}
-
 pub fn import_grok_sso(router_root: &Path, authorization: &str) -> anyhow::Result<String> {
-    if authorization.trim().is_empty() {
+    let tokens = authorization
+        .lines()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    if tokens.is_empty() {
         bail!("Grok authorization code / SSO token is empty");
     }
-    let script = router_root.join("scripts").join("Import-GrokSSO.ps1");
-    let mut child = Command::new("powershell.exe")
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-        ])
-        .arg(&script)
-        .current_dir(router_root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .creation_flags(0x08000000)
-        .spawn()
-        .with_context(|| format!("无法启动 Grok 授权码导入: {}", script.display()))?;
-    let mut secret_bytes = authorization.as_bytes().to_vec();
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(&secret_bytes)?;
+    let config = RouterConfig::load(&crate::user_data::config_path(router_root))
+        .context("Grok 授权码导入失败: class=configuration")?;
+    let admin = usage::retry_admin_read(|| usage::AdminClient::connect(router_root, &config))
+        .context("Grok 授权码导入失败: class=authentication")?;
+    let groups = usage::data(usage::retry_account_read(|| {
+        admin.get(
+            "/api/v1/admin/groups/all?include_inactive=true",
+            Duration::from_secs(10),
+        )
+    })?);
+    let group_id = usage::array(&groups)
+        .iter()
+        .find(|group| usage::string(group, "name") == "Codex-Router")
+        .map(|group| usage::integer(group, "id"))
+        .filter(|id| *id > 0)
+        .context("Grok 授权码导入失败: class=configuration")?;
+    let priority = oauth_routing_priorities(Some(&config.oauth_fallback)).oauth_priority;
+    let body = json!({
+        "sso_tokens": tokens,
+        "name": "Grok OAuth",
+        "notes": "Imported by Codex-Router using an authorization code / SSO token.",
+        "group_ids": [group_id],
+        "credentials": {},
+        "concurrency": 3,
+        "priority": priority,
+        "rate_multiplier": 1,
+        "auto_pause_on_expired": false,
+    });
+    let timeout = Duration::from_secs((90 + 30 * tokens.len() as u64).min(300));
+    // Conversion creates accounts, so an ambiguous transport failure must not
+    // be retried automatically: the server may already have accepted it.
+    let response = usage::data(
+        admin
+            .post("/api/v1/admin/grok/sso-to-oauth", Some(&body), timeout)
+            .context("Grok 授权码导入失败")?,
+    );
+    let created = usage::get(&response, "created")
+        .map(usage::array)
+        .unwrap_or_default();
+    let failed = usage::get(&response, "failed")
+        .map(usage::array)
+        .unwrap_or_default();
+    for account in created {
+        let account_id = usage::integer(account, "id");
+        if account_id > 0 {
+            let _ = ensure_scheduled_oauth_recovery(&admin, account_id, "grok-4.5");
+        }
     }
-    secret_bytes.fill(0);
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        let details = if stderr.is_empty() { &stdout } else { &stderr };
-        bail!(
-            "Grok 授权码导入失败: {}",
-            crate::runtime_logs::summarize_error_for_display(details)
-        );
+    if created.is_empty() {
+        let summary = failed
+            .first()
+            .map(|failure| usage::string(failure, "error"))
+            .filter(|message| !message.trim().is_empty())
+            .map(|message| crate::runtime_logs::summarize_error_for_display(&message))
+            .unwrap_or_else(|| "class=upstream".to_owned());
+        bail!("Grok 授权码导入失败: {summary}")
     }
-    Ok("Grok authorization imported".to_owned())
+    Ok(format!(
+        "Grok authorization imported: created={} failed={}",
+        created.len(),
+        failed.len()
+    ))
+}
+
+fn ensure_scheduled_oauth_recovery(
+    admin: &usage::AdminClient,
+    account_id: i64,
+    model_id: &str,
+) -> anyhow::Result<()> {
+    let path = format!("/api/v1/admin/accounts/{account_id}/scheduled-test-plans");
+    let plans = usage::data(usage::retry_account_read(|| {
+        admin.get(&path, Duration::from_secs(10))
+    })?);
+    let hourly_plan_id = usage::array(&plans)
+        .iter()
+        .find(|plan| usage::string(plan, "cron_expression") == "0 * * * *")
+        .map(|plan| usage::integer(plan, "id"))
+        .unwrap_or_default();
+    let body = json!({
+        "account_id": account_id,
+        "model_id": model_id,
+        "cron_expression": "0 * * * *",
+        "enabled": true,
+        "max_results": 48,
+        "auto_recover": true,
+    });
+    if hourly_plan_id > 0 {
+        admin.put(
+            &format!("/api/v1/admin/scheduled-test-plans/{hourly_plan_id}"),
+            &body,
+            Duration::from_secs(10),
+        )?;
+    } else {
+        admin.post(
+            "/api/v1/admin/scheduled-test-plans",
+            Some(&body),
+            Duration::from_secs(10),
+        )?;
+    }
+    Ok(())
 }
 
 pub fn set_oauth_account_priority(
@@ -2443,76 +2702,28 @@ pub fn set_oauth_account_priority(
     if !(1..=999).contains(&priority) {
         bail!("OAuth 优先级必须在 1 到 999 之间");
     }
-    let script = router_root
-        .join("scripts")
-        .join("Set-OAuthAccountPriority.ps1");
-    let shell = prefer_powershell_executable();
-    let output = Command::new(&shell)
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-        ])
-        .arg(&script)
-        .args([
-            "-AccountId",
-            &account_id.to_string(),
-            "-Priority",
-            &priority.to_string(),
-        ])
-        .current_dir(router_root)
-        .stdin(Stdio::null())
-        .creation_flags(0x08000000)
-        .output()
-        .with_context(|| format!("无法更新 OAuth 优先级: {}", script.display()))?;
-    if !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        bail!(
-            "无法更新 OAuth 优先级: {}",
-            crate::runtime_logs::summarize_error_for_display(&message)
-        );
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let trimmed = extract_json_payload(text.as_ref());
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
-        if let Some(saved) = value.get("priority").and_then(|v| v.as_i64()) {
-            return Ok(saved as i32);
-        }
-    }
-    Ok(priority)
+    usage::set_oauth_account_priority(router_root, account_id, priority)
+        .context("无法更新 OAuth 优先级")
 }
 
 pub fn revoke_oauth_account(router_root: &Path, account_id: i64) -> anyhow::Result<()> {
     if account_id <= 0 {
         bail!("OAuth 账号 ID 无效");
     }
-    let script = router_root.join("scripts").join("Remove-OAuthAccount.ps1");
-    let output = Command::new("powershell.exe")
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-        ])
-        .arg(&script)
-        .args(["-AccountId", &account_id.to_string()])
-        .current_dir(router_root)
-        .stdin(Stdio::null())
-        .creation_flags(0x08000000)
-        .output()
-        .with_context(|| format!("无法撤销 OAuth 账号: {}", script.display()))?;
-    if !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        bail!(
-            "无法撤销 OAuth 账号: {}",
-            crate::runtime_logs::summarize_error_for_display(&message)
-        );
+    let config = RouterConfig::load(&crate::user_data::config_path(router_root))
+        .context("无法撤销 OAuth 账号: class=configuration")?;
+    let admin = usage::retry_admin_read(|| usage::AdminClient::connect(router_root, &config))
+        .context("无法撤销 OAuth 账号: class=authentication")?;
+    let path = format!("/api/v1/admin/accounts/{account_id}");
+    let account = usage::data(usage::retry_account_read(|| {
+        admin.get(&path, Duration::from_secs(10))
+    })?);
+    if usage::string(&account, "type") != "oauth" {
+        bail!("无法撤销 OAuth 账号: class=configuration")
     }
+    admin
+        .delete(&path, Duration::from_secs(15))
+        .context("无法撤销 OAuth 账号")?;
     Ok(())
 }
 
@@ -2533,6 +2744,31 @@ pub fn remove_oauth_account_references(cfg: &mut RouterConfig, account_id: i64) 
         normalize_default_model(cfg);
     }
     changed
+}
+
+pub fn remove_oauth_model_reference(
+    cfg: &mut RouterConfig,
+    account_id: i64,
+    model_id: &str,
+) -> bool {
+    let canonical = canonical_route_model_id(model_id);
+    let before = cfg.models.len();
+    cfg.models.retain(|model| {
+        !(model.source == "oauth"
+            && model.oauth_account_id == account_id
+            && same_model_identity(&model.model, model_id))
+    });
+    if cfg.models.len() == before {
+        return false;
+    }
+    let still_imported = cfg.models.iter().any(|model| {
+        model.source == "oauth" && canonical_route_model_id(&model.model) == canonical
+    });
+    if !still_imported {
+        cfg.fallback_channel_selections.remove(&canonical);
+    }
+    normalize_default_model(cfg);
+    true
 }
 
 pub fn enroll_unseen_oauth_accounts(
@@ -2677,13 +2913,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn routing_priorities_match_subscription_first_api_first_and_split_modes() {
+        let mut fallback = crate::config::OAuthFallback {
+            enabled: true,
+            prefer_oauth: true,
+            official_priority: 1,
+            fallback_priority: 100,
+        };
+        assert_eq!(
+            oauth_routing_priorities(Some(&fallback)),
+            OAuthRoutingPriorities {
+                enabled: true,
+                prefer_oauth: true,
+                oauth_priority: 1,
+                api_priority: 100,
+            }
+        );
+        fallback.prefer_oauth = false;
+        assert_eq!(
+            oauth_routing_priorities(Some(&fallback)),
+            OAuthRoutingPriorities {
+                enabled: true,
+                prefer_oauth: false,
+                oauth_priority: 100,
+                api_priority: 1,
+            }
+        );
+        fallback.enabled = false;
+        assert_eq!(
+            oauth_routing_priorities(Some(&fallback)),
+            OAuthRoutingPriorities {
+                enabled: false,
+                prefer_oauth: true,
+                oauth_priority: 1,
+                api_priority: 10,
+            }
+        );
+    }
+
+    #[test]
+    fn effective_api_priority_preserves_configured_channel_order() {
+        assert_eq!(effective_api_priority(10, 10, 100, 1, true), 100);
+        assert_eq!(effective_api_priority(20, 10, 100, 1, true), 110);
+        assert_eq!(effective_api_priority(10, 10, 1, 100, false), 1);
+        assert_eq!(effective_api_priority(20, 10, 1, 100, false), 11);
+    }
+
+    #[test]
     fn router_mode_requires_the_selected_provider_and_matching_local_url() {
         let config = r#"model_provider = "codex_router"
 model = "gpt-5.6-sol"
+model_catalog_json = "C:/Users/test/.codex-router/model-catalog.json"
 
 [model_providers.codex_router]
 name = "Codex-Router"
 base_url = "http://127.0.0.1:18080/v1"
+wire_api = "responses"
+requires_openai_auth = true
+experimental_bearer_token = "local-router-test-key"
 "#;
         assert!(codex_config_uses_router(config, "http://127.0.0.1:18080"));
         assert!(!codex_config_uses_router(config, "http://127.0.0.1:19090"));
@@ -2702,10 +2989,10 @@ model = "gpt-5.6-sol"
 name = "Codex-Router"
 base_url = "http://127.0.0.1:18080/v1"
 "#;
-        assert!(codex_config_uses_router(
-            legacy_custom,
-            "http://127.0.0.1:18080"
-        ));
+        assert!(
+            !codex_config_uses_router(legacy_custom, "http://127.0.0.1:18080"),
+            "an incomplete legacy provider must be migrated before it is considered healthy"
+        );
 
         let chiral = r#"model_provider = "custom"
 model = "grok-4.5"
@@ -2715,6 +3002,15 @@ name = "micu"
 base_url = "https://api.430123.xyz/v1"
 "#;
         assert!(!codex_config_uses_router(chiral, "http://127.0.0.1:18080"));
+
+        let third_party = config.replace(
+            "requires_openai_auth = true",
+            "requires_openai_auth = false",
+        );
+        assert!(
+            !codex_config_uses_router(&third_party, "http://127.0.0.1:18080"),
+            "a Router provider switched into third-party API mode must be repaired"
+        );
 
         let legacy = config
             .replace(
@@ -2739,18 +3035,10 @@ base_url = "https://api.430123.xyz/v1"
     }
 
     #[test]
-    fn credential_storage_reports_only_actual_model_key_updates() {
+    fn credential_storage_is_native_and_reports_only_actual_model_key_updates() {
         let root = temporary_test_dir("credential-update-count");
-        let scripts = root.join("scripts");
-        std::fs::create_dir_all(&scripts).unwrap();
-        std::fs::write(
-            scripts.join("CredentialStore.psm1"),
-            "function Set-RouterCredential { param([string]$Name, [string]$Secret)\n\
-             if ([string]::IsNullOrWhiteSpace($Secret)) { throw 'empty test secret' }\n\
-             }\n\
-             Export-ModuleMember -Function Set-RouterCredential\n",
-        )
-        .unwrap();
+        let nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+        let updated_credential = format!("Test-Store-Credential-{nonce}");
         let mut config = RouterConfig {
             models: vec![
                 ModelConfig {
@@ -2761,18 +3049,25 @@ base_url = "https://api.430123.xyz/v1"
                 ModelConfig {
                     model: "updated-model".to_owned(),
                     api_key: "not-a-real-key".to_owned(),
-                    credential_name: "UpdatedCredential".to_owned(),
+                    credential_name: updated_credential.clone(),
                     ..ModelConfig::default()
                 },
             ],
             ..RouterConfig::default()
         };
 
-        let updated = store_credentials(&mut config, &root).unwrap();
-
-        assert_eq!(updated, 1);
-        assert!(config.models.iter().all(|model| model.api_key.is_empty()));
+        let result = (|| -> anyhow::Result<()> {
+            let updated = store_credentials(&mut config, &root)?;
+            assert_eq!(updated, 1);
+            assert!(config.models.iter().all(|model| model.api_key.is_empty()));
+            let saved = read_router_credential(&updated_credential)?
+                .context("native credential was not written")?;
+            assert_eq!(saved.0, "not-a-real-key".encode_utf16().collect::<Vec<_>>());
+            Ok(())
+        })();
+        let _ = delete_router_credential(&updated_credential);
         std::fs::remove_dir_all(root).unwrap();
+        result.unwrap();
     }
 
     #[test]
@@ -2784,9 +3079,13 @@ base_url = "https://api.430123.xyz/v1"
         std::fs::write(
             root.join("config.toml"),
             "model_provider = \"codex_router\"\n\
+             model_catalog_json = \"C:/Users/test/.codex-router/model-catalog.json\"\n\
              [model_providers.codex_router]\n\
              name = \"Codex-Router\"\n\
-             base_url = \"http://127.0.0.1:1/v1\"\n",
+             base_url = \"http://127.0.0.1:1/v1\"\n\
+             wire_api = \"responses\"\n\
+             requires_openai_auth = true\n\
+             experimental_bearer_token = \"local-router-test-key\"\n",
         )
         .unwrap();
 
@@ -2846,7 +3145,7 @@ base_url = "https://api.430123.xyz/v1"
     }
 
     #[test]
-    fn oauth_display_name_tracks_merge_state_without_overwriting_user_aliases() {
+    fn oauth_display_name_stays_unified_without_overwriting_user_aliases() {
         let oauth = ModelConfig {
             model: "gpt-5.6-sol".into(),
             alias: "GPT-5.6 Sol".into(),
@@ -2867,7 +3166,7 @@ base_url = "https://api.430123.xyz/v1"
         };
         assert_eq!(
             resolved_model_display_name(&config, &oauth),
-            "ChatGPT-5.6-Sol(OAuth)"
+            "ChatGPT-5.6-Sol"
         );
         config.models.push(fallback);
         assert_eq!(
@@ -2877,7 +3176,7 @@ base_url = "https://api.430123.xyz/v1"
         config.oauth_fallback.enabled = false;
         assert_eq!(
             resolved_model_display_name(&config, &oauth),
-            "ChatGPT-5.6-Sol(OAuth)"
+            "ChatGPT-5.6-Sol"
         );
         let custom = ModelConfig {
             alias: "My paid account".into(),
@@ -3028,6 +3327,320 @@ base_url = "https://api.430123.xyz/v1"
     }
 
     #[test]
+    fn oauth_account_request_failures_retry_and_trigger_one_router_repair() {
+        let failure = "ROUTER_OAUTH_ACCOUNTS_UNAVAILABLE: class=request_failure";
+        assert!(oauth_accounts_failure_is_retryable(failure));
+        assert!(oauth_accounts_failure_needs_router_repair(failure));
+    }
+
+    #[test]
+    fn oauth_duplicate_identity_prefers_selected_then_bound_then_lower_id() {
+        let credentials = json!({ "chatgpt_account_id": "acct-123" });
+        assert_eq!(
+            oauth_stable_identity("openai", &credentials, &Value::Null, 9),
+            "openai|account|acct-123"
+        );
+
+        let summary = |id, bound_to_router| crate::OAuthAccountSummary {
+            id,
+            name: String::new(),
+            platform: "openai".to_owned(),
+            status: String::new(),
+            email: String::new(),
+            plan: String::new(),
+            priority: 0,
+            bound_to_router,
+            error: String::new(),
+            expires_at: String::new(),
+            models: Vec::new(),
+            models_error: String::new(),
+        };
+        let selected = HashSet::from([9]);
+        assert!(prefer_oauth_summary(
+            &summary(3, true),
+            &summary(9, false),
+            &selected
+        ));
+        assert!(prefer_oauth_summary(
+            &summary(9, false),
+            &summary(4, true),
+            &HashSet::new()
+        ));
+        assert!(prefer_oauth_summary(
+            &summary(9, true),
+            &summary(4, true),
+            &HashSet::new()
+        ));
+    }
+
+    #[test]
+    fn oauth_model_catalog_only_exposes_live_account_declarations() {
+        let models = discovered_oauth_models(
+            "antigravity",
+            &json!([
+                {"id": "gemini-3.1-pro-high", "display_name": "Gemini 3.1 Pro High"},
+                {"id": "claude-fable-5"},
+                {"id": "gemini-3.1-pro-high", "display_name": "duplicate"},
+                {"display_name": "missing id"}
+            ]),
+        );
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gemini-3.1-pro-high", "claude-fable-5"]
+        );
+        assert_eq!(models[1].display_name, "claude-fable-5");
+        assert!(!models.iter().any(|model| model.id == "gemini-3-flash"));
+
+        let openai = discovered_oauth_models(
+            "openai",
+            &json!([{"id": "gpt-5.6", "displayName": "GPT 5.6"}]),
+        );
+        assert_eq!(openai[0].id, "gpt-5.6-sol");
+        assert_eq!(openai[0].display_name, "ChatGPT-5.6-Sol");
+
+        let antigravity_flash = discovered_oauth_models(
+            "antigravity",
+            &json!([
+                {"id": "gemini-3.6-flash-high", "display_name": "Gemini 3.6 Flash High"},
+                {"id": "gemini-3.7-flash-high", "display_name": "Gemini 3.7 Flash High"},
+                {"id": "gemini-3.7-flash-medium", "display_name": "Gemini 3.7 Flash Medium"},
+                {"id": "gemini-3.7-flash-low", "display_name": "Gemini 3.7 Flash Low"}
+            ]),
+        );
+        let gemini_37 = antigravity_flash
+            .iter()
+            .filter(|model| model.id == "gemini-3.7-flash")
+            .collect::<Vec<_>>();
+        assert_eq!(gemini_37.len(), 1);
+        assert_eq!(gemini_37[0].display_name, "Gemini 3.7 Flash");
+        assert!(
+            !discovered_oauth_models("antigravity", &json!([{"id": "gemini-3.6-flash-low"}]))
+                .iter()
+                .any(|model| model.id == "gemini-3.7-flash")
+        );
+    }
+
+    #[test]
+    fn oauth_model_catalog_accepts_sync_upstream_string_ids() {
+        let models = discovered_oauth_models("grok", &json!(["grok-4.5", "grok-4.6"]));
+
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["grok-4.5", "grok-4.6"]
+        );
+        assert_eq!(models[1].display_name, "grok-4.6");
+    }
+
+    #[test]
+    fn oauth_model_catalog_parses_live_sub2api_response_wrappers() {
+        let antigravity = oauth_models_from_response(
+            "antigravity",
+            json!({
+                "code": 0,
+                "message": "success",
+                "data": [
+                    {"id": "gemini-3.7-flash-medium", "display_name": "Gemini 3.7 Flash Medium"},
+                    {"id": "gemini-3.1-pro-high", "display_name": "Gemini 3.1 Pro High"}
+                ]
+            }),
+        );
+        assert_eq!(
+            antigravity
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gemini-3.7-flash", "gemini-3.1-pro-high"]
+        );
+
+        let grok = oauth_models_from_response(
+            "grok",
+            json!({
+                "code": 0,
+                "message": "success",
+                "data": {"models": ["grok-4.5", "grok-4.6"]}
+            }),
+        );
+        assert_eq!(
+            grok.iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["grok-4.5", "grok-4.6"]
+        );
+
+        let chatgpt = oauth_models_from_response(
+            "openai",
+            json!({
+                "code": 0,
+                "message": "success",
+                "data": [{"id": "gpt-5.6", "displayName": "GPT 5.6"}]
+            }),
+        );
+        assert_eq!(chatgpt.len(), 1);
+        assert_eq!(chatgpt[0].id, "gpt-5.6-sol");
+        assert_eq!(chatgpt[0].display_name, "ChatGPT-5.6-Sol");
+    }
+
+    #[test]
+    fn oauth_model_refresh_posts_to_the_live_upstream_catalog() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]).into_owned();
+            let body = r#"{"data":{"models":[{"id":"grok-4.6","display_name":"Grok 4.6"}]}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            request
+        });
+        let admin = usage::AdminClient::for_test(format!("http://{address}"));
+
+        let models = load_live_oauth_models(&admin, 24, "grok").unwrap();
+        let request = server.join().unwrap();
+
+        assert!(request.starts_with("POST /api/v1/admin/accounts/24/models/sync-upstream HTTP/1.1"));
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "grok-4.6");
+    }
+
+    #[test]
+    fn oauth_model_refresh_falls_back_to_stable_catalog_when_sync_is_unsupported() {
+        use std::io::{ErrorKind, Read, Write};
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while requests.len() < 2 && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = [0_u8; 4096];
+                        let read = stream.read(&mut request).unwrap();
+                        let request = String::from_utf8_lossy(&request[..read]).into_owned();
+                        let first_line = request.lines().next().unwrap_or_default().to_owned();
+                        let (status, body) = if first_line.starts_with("POST ") {
+                            ("404 Not Found", r#"{"error":"sync unsupported"}"#)
+                        } else {
+                            (
+                                "200 OK",
+                                r#"{"data":[{"id":"gpt-5.6-sol","display_name":"ChatGPT-5.6-Sol"}]}"#,
+                            )
+                        };
+                        write!(
+                            stream,
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .unwrap();
+                        requests.push(first_line);
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("mock OAuth catalog server failed: {error}"),
+                }
+            }
+            requests
+        });
+        let admin = usage::AdminClient::for_test(format!("http://{address}"));
+
+        let result = load_live_oauth_models(&admin, 31, "openai");
+        let requests = server.join().unwrap();
+
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0].starts_with("POST /api/v1/admin/accounts/31/models/sync-upstream HTTP/1.1")
+        );
+        assert!(requests[1].starts_with("GET /api/v1/admin/accounts/31/models HTTP/1.1"));
+        let models = result.unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn oauth_model_refresh_failure_is_preserved_instead_of_becoming_an_empty_catalog() {
+        let (models, error) =
+            oauth_model_catalog_result(Err(anyhow::anyhow!("class=request_failure")));
+
+        assert!(models.is_empty());
+        assert_eq!(error, "class=request_failure");
+    }
+
+    #[test]
+    fn oauth_model_removal_is_account_scoped_and_cleans_fallback_only_when_last_copy_is_gone() {
+        let oauth_model = |account_id| ModelConfig {
+            model: "gemini-3.1-pro-high".into(),
+            source: "oauth".into(),
+            oauth_account_id: account_id,
+            oauth_platform: "antigravity".into(),
+            ..Default::default()
+        };
+        let mut config = RouterConfig {
+            models: vec![
+                oauth_model(4),
+                oauth_model(26),
+                ModelConfig {
+                    model: "google/gemini-3.1-pro-high".into(),
+                    base_url: "https://example.invalid/v1".into(),
+                    ..Default::default()
+                },
+            ],
+            default_model: "gemini-3.1-pro-high".into(),
+            ..Default::default()
+        };
+        config.fallback_channel_selections.insert(
+            "gemini-3.1-pro-high".into(),
+            vec!["gemini-3.1-pro-high|https://example.invalid/v1".into()],
+        );
+
+        assert!(remove_oauth_model_reference(
+            &mut config,
+            4,
+            "gemini-3.1-pro-high"
+        ));
+        assert!(config
+            .models
+            .iter()
+            .any(|model| model.source == "oauth" && model.oauth_account_id == 26));
+        assert!(config
+            .fallback_channel_selections
+            .contains_key("gemini-3.1-pro-high"));
+        assert!(!remove_oauth_model_reference(
+            &mut config,
+            4,
+            "gemini-3.1-pro-high"
+        ));
+
+        assert!(remove_oauth_model_reference(
+            &mut config,
+            26,
+            "gemini-3.1-pro-high"
+        ));
+        assert!(config.models.iter().all(|model| model.source != "oauth"));
+        assert!(!config
+            .fallback_channel_selections
+            .contains_key("gemini-3.1-pro-high"));
+    }
+
+    #[test]
     fn multimodal_can_be_auto_detected_or_overridden() {
         let mut model = ModelConfig {
             model: "kimi-k3".into(),
@@ -3092,16 +3705,54 @@ base_url = "https://api.430123.xyz/v1"
             ..Default::default()
         });
 
-        assert_eq!(resolve_default_model(&config), Some("first"));
+        assert_eq!(resolve_default_model(&config), Some("first".to_owned()));
         normalize_default_model(&mut config);
         assert_eq!(config.default_model, "first");
 
         config.default_model = "second".into();
-        assert_eq!(resolve_default_model(&config), Some("second"));
+        assert_eq!(resolve_default_model(&config), Some("second".to_owned()));
 
         config.models.remove(1);
         normalize_default_model(&mut config);
         assert_eq!(config.default_model, "first");
+    }
+
+    #[test]
+    fn split_mode_default_api_model_uses_its_public_route_id() {
+        let mut config = RouterConfig {
+            oauth_account_ids: Some(vec![7]),
+            oauth_fallback: crate::config::OAuthFallback {
+                enabled: false,
+                ..Default::default()
+            },
+            models: vec![
+                ModelConfig {
+                    source: "oauth".into(),
+                    model: "gpt-5.6-sol".into(),
+                    oauth_account_id: 7,
+                    ..Default::default()
+                },
+                ModelConfig {
+                    source: "apikey".into(),
+                    model: "gpt-5.6-sol".into(),
+                    base_url: "https://api.example.test/v1".into(),
+                    credential_name: "test-credential".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let api_route = catalog::build_route_plan(&config)
+            .into_iter()
+            .find(|route| route.source == "apikey")
+            .unwrap();
+        assert!(api_route.public_model_id.contains("--api-"));
+
+        config.default_model = api_route.public_model_id.clone();
+        normalize_default_model(&mut config);
+
+        assert_eq!(config.default_model, api_route.public_model_id);
+        assert_eq!(resolve_default_route(&config).unwrap().source, "apikey");
     }
 
     #[test]
@@ -3532,233 +4183,6 @@ Write-Output '[7/7] Deployment complete.'
             .iter()
             .all(|line| !line.contains("deployment-complete")));
         std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn usage_monitor_retries_once_after_a_transient_process_failure() {
-        let root = temporary_test_dir("usage-retry");
-        let scripts = root.join("scripts");
-        std::fs::create_dir_all(&scripts).unwrap();
-        std::fs::write(
-            scripts.join("Get-UsageMonitor.ps1"),
-            r#"param([string]$ProfileName, [string]$ConfigPath)
-$marker = Join-Path $PSScriptRoot 'attempted.marker'
-if (-not (Test-Path -LiteralPath $marker)) {
-    [IO.File]::WriteAllText($marker, 'first')
-    Write-Output 'connection refused during startup'
-    exit 1
-}
-Write-Output '{}'
-"#,
-        )
-        .unwrap();
-
-        let snapshot = load_usage_snapshot(&root, "test", &RouterConfig::default()).unwrap();
-
-        assert!(snapshot.subscriptions.is_empty());
-        assert!(scripts.join("attempted.marker").is_file());
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn usage_monitor_retries_after_a_sanitized_request_failure() {
-        let root = temporary_test_dir("usage-request-failure-retry");
-        let scripts = root.join("scripts");
-        std::fs::create_dir_all(&scripts).unwrap();
-        std::fs::write(
-            scripts.join("Get-UsageMonitor.ps1"),
-            r#"param([string]$ProfileName, [string]$ConfigPath)
-$marker = Join-Path $PSScriptRoot 'attempted.marker'
-if (-not (Test-Path -LiteralPath $marker)) {
-    [IO.File]::WriteAllText($marker, 'first')
-    Write-Output 'class=request_failure'
-    exit 1
-}
-Write-Output '{}'
-"#,
-        )
-        .unwrap();
-
-        let snapshot = load_usage_snapshot(&root, "test", &RouterConfig::default()).unwrap();
-
-        assert!(snapshot.subscriptions.is_empty());
-        assert!(scripts.join("attempted.marker").is_file());
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn usage_monitor_retries_after_a_rate_limited_admin_login() {
-        let root = temporary_test_dir("usage-admin-login-rate-limit-retry");
-        let scripts = root.join("scripts");
-        std::fs::create_dir_all(&scripts).unwrap();
-        std::fs::write(
-            scripts.join("Get-UsageMonitor.ps1"),
-            r#"param([string]$ProfileName, [string]$ConfigPath)
-$marker = Join-Path $PSScriptRoot 'attempted.marker'
-if (-not (Test-Path -LiteralPath $marker)) {
-    [IO.File]::WriteAllText($marker, 'first')
-    Write-Output 'Sub2API admin login is rate-limited. Wait a few seconds and retry.'
-    exit 1
-}
-Write-Output '{}'
-"#,
-        )
-        .unwrap();
-
-        let snapshot = load_usage_snapshot(&root, "test", &RouterConfig::default()).unwrap();
-
-        assert!(snapshot.subscriptions.is_empty());
-        assert!(scripts.join("attempted.marker").is_file());
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn usage_monitor_retry_budget_is_five_attempts_with_increasing_backoff() {
-        assert_eq!(USAGE_MONITOR_MAX_ATTEMPTS, 5);
-        assert!(usage_monitor_retry_delay(0) < usage_monitor_retry_delay(1));
-        assert!(usage_monitor_retry_delay(1) < usage_monitor_retry_delay(2));
-        assert!(usage_monitor_retry_delay(2) < usage_monitor_retry_delay(3));
-        assert_eq!(usage_monitor_retry_delay(4), usage_monitor_retry_delay(3));
-        assert!(usage_failure_is_locally_retryable("class=authentication"));
-        assert!(usage_failure_is_locally_retryable("class=rate_limit"));
-        assert!(usage_failure_is_locally_retryable(
-            "class=unclassified_error | exit_code=1"
-        ));
-        assert!(!usage_failure_is_locally_retryable("class=configuration"));
-        assert!(!usage_failure_is_locally_retryable("class=permission"));
-    }
-
-    #[test]
-    fn usage_monitor_does_not_repeat_a_configuration_failure() {
-        let root = temporary_test_dir("usage-config-no-retry");
-        let scripts = root.join("scripts");
-        std::fs::create_dir_all(&scripts).unwrap();
-        std::fs::write(
-            scripts.join("Get-UsageMonitor.ps1"),
-            r#"$attemptPath = Join-Path $PSScriptRoot 'attempt-count.txt'
-$attempt = if (Test-Path -LiteralPath $attemptPath) { [int](Get-Content -LiteralPath $attemptPath -Raw) } else { 0 }
-[IO.File]::WriteAllText($attemptPath, [string]($attempt + 1))
-Write-Output 'configuration snapshot unavailable'
-exit 1
-"#,
-        )
-        .unwrap();
-
-        let error = load_usage_snapshot(&root, "test", &RouterConfig::default())
-            .unwrap_err()
-            .to_string();
-
-        assert_eq!(error, "class=configuration");
-        assert_eq!(
-            std::fs::read_to_string(scripts.join("attempt-count.txt")).unwrap(),
-            "1"
-        );
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    #[allow(clippy::permissions_set_readonly_false)]
-    fn usage_monitor_uses_a_unique_snapshot_when_a_stale_process_file_exists() {
-        let root = temporary_test_dir("usage-unique-snapshot");
-        let scripts = root.join("scripts");
-        let state = root.join("data").join("ui");
-        std::fs::create_dir_all(&scripts).unwrap();
-        std::fs::create_dir_all(&state).unwrap();
-        std::fs::write(scripts.join("Get-UsageMonitor.ps1"), "Write-Output '{}'\n").unwrap();
-        let stale = state.join(format!(
-            "usage-monitor-config-{}.tmp.json",
-            std::process::id()
-        ));
-        std::fs::write(&stale, "stale").unwrap();
-        let mut permissions = std::fs::metadata(&stale).unwrap().permissions();
-        permissions.set_readonly(true);
-        std::fs::set_permissions(&stale, permissions).unwrap();
-
-        let snapshot = load_usage_snapshot(&root, "test", &RouterConfig::default()).unwrap();
-
-        assert!(snapshot.subscriptions.is_empty());
-        assert_eq!(std::fs::read_to_string(&stale).unwrap(), "stale");
-        let mut permissions = std::fs::metadata(&stale).unwrap().permissions();
-        permissions.set_readonly(false);
-        std::fs::set_permissions(&stale, permissions).unwrap();
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn usage_monitor_uses_stdout_when_stderr_is_empty() {
-        let root = temporary_test_dir("usage-stdout-error");
-        let scripts = root.join("scripts");
-        std::fs::create_dir_all(&scripts).unwrap();
-        std::fs::write(
-            scripts.join("Get-UsageMonitor.ps1"),
-            "Write-Output 'connection refused during startup'\nexit 1\n",
-        )
-        .unwrap();
-
-        let error = load_usage_snapshot(&root, "test", &RouterConfig::default())
-            .unwrap_err()
-            .to_string();
-
-        assert_eq!(error, "class=connection_refused");
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn usage_monitor_reports_an_exit_code_when_process_output_is_empty() {
-        let root = temporary_test_dir("usage-empty-error");
-        let scripts = root.join("scripts");
-        std::fs::create_dir_all(&scripts).unwrap();
-        std::fs::write(scripts.join("Get-UsageMonitor.ps1"), "exit 7\n").unwrap();
-
-        let error = load_usage_snapshot(&root, "test", &RouterConfig::default())
-            .unwrap_err()
-            .to_string();
-
-        assert_eq!(error, "class=process_failure | exit_code=7");
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn usage_monitor_times_out_and_terminates_the_helper() {
-        let root = temporary_test_dir("usage-timeout");
-        let scripts = root.join("scripts");
-        std::fs::create_dir_all(&scripts).unwrap();
-        std::fs::write(
-            scripts.join("Get-UsageMonitor.ps1"),
-            "Start-Sleep -Seconds 30\nWrite-Output '{}'\n",
-        )
-        .unwrap();
-
-        let started = Instant::now();
-        let error = load_usage_snapshot_with_timeout(
-            &root,
-            "test",
-            &RouterConfig::default(),
-            Duration::from_millis(250),
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert_eq!(error, "class=timeout");
-        assert!(started.elapsed() < Duration::from_secs(5));
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn usage_monitor_parser_accepts_utf8_names_and_ignores_prefix_noise() {
-        let output = "warning: cached data follows\n{\"profileName\":\"中文配置\",\"subscriptions\":[],\"apiChannels\":[]}\n";
-        let snapshot = parse_usage_snapshot_output(output.as_bytes()).unwrap();
-        assert_eq!(snapshot.profile_name, "中文配置");
-        assert!(snapshot.subscriptions.is_empty());
-        assert!(snapshot.api_channels.is_empty());
-    }
-
-    #[test]
-    fn usage_monitor_parser_classifies_non_utf8_output() {
-        let error = parse_usage_snapshot_output(&[0x81, 0x40])
-            .unwrap_err()
-            .to_string();
-        assert_eq!(error, "class=invalid_response_encoding");
     }
 
     #[test]

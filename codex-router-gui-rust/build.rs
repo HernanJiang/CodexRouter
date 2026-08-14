@@ -84,7 +84,8 @@ BEGIN
     BEGIN
         BLOCK "040904B0"
         BEGIN
-            VALUE "CompanyName", "Hernan_Jiang\0"
+            VALUE "LegalCopyright", "Copyright (c) 2026 Hernan_JIANG. All rights reserved.\0"
+            VALUE "CompanyName", "Hernan_JIANG\0"
             VALUE "FileDescription", "Codex-Router\0"
             VALUE "FileVersion", "{package_version}\0"
             VALUE "InternalName", "Codex-Router\0"

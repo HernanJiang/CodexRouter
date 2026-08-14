@@ -1,7 +1,7 @@
 # Codex-Router 使用与分发承诺
 
-软件版本：v1.5.2
-发布日期：2026-08-09
+软件版本：v1.6.11
+发布日期：2026-08-14
 承诺修订：v1.1（2026-08-01）
 版权所有：Hernan_Jiang
 官方发布地址：https://github.com/HernanJiang/Codex-Router

@@ -6,9 +6,9 @@ Codex-Router combines original project material with independent third-party sof
 
 - Project: Sub2API
 - Upstream: https://github.com/Wei-Shaw/sub2api
-- Bundled release: v0.1.170-codex-router.6
+- Bundled release: v0.1.170-codex-router.13
 - Upstream source commit: https://github.com/Wei-Shaw/sub2api/commit/c043c24774228ba891ddf90d783aa6dc7d0855b5
-- Codex-Router compatibility patch series (apply in order): `licenses/sub2api-0.1.170-codex-router.2.patch`, `licenses/sub2api-0.1.170-codex-router.3.patch`, `licenses/sub2api-0.1.170-codex-router.4.patch`, `licenses/sub2api-0.1.170-codex-router.5.patch`, and `licenses/sub2api-0.1.170-codex-router.6.patch`
+- Codex-Router compatibility patch series (apply in order): `licenses/sub2api-0.1.170-codex-router.2.patch`, `licenses/sub2api-0.1.170-codex-router.3.patch`, `licenses/sub2api-0.1.170-codex-router.4.patch`, `licenses/sub2api-0.1.170-codex-router.5.patch`, `licenses/sub2api-0.1.170-codex-router.6.patch`, `licenses/sub2api-0.1.170-codex-router.7.patch`, `licenses/sub2api-0.1.170-codex-router.8.patch`, `licenses/sub2api-0.1.170-codex-router.9.patch`, `licenses/sub2api-0.1.170-codex-router.10.patch`, `licenses/sub2api-0.1.170-codex-router.11.patch`, `licenses/sub2api-0.1.170-codex-router.12.patch`, and `licenses/sub2api-0.1.170-codex-router.13.patch`
 - License: GNU Lesser General Public License v3.0 or later
 - License text: https://github.com/Wei-Shaw/sub2api/blob/c043c24774228ba891ddf90d783aa6dc7d0855b5/LICENSE
 - Deployment and operations commitment: https://github.com/Wei-Shaw/sub2api/blob/main/docs/legal/admin-compliance.zh.md

@@ -7,6 +7,7 @@ $inputConfig = @'
 service_tier = "priority"
 disable_response_storage = true
 openai_base_url = "https://example.invalid/v1"
+forced_login_method = "chatgpt"
 base_url = "http://127.0.0.1:15721/v1"
 wire_api = "responses"
 experimental_bearer_token = "PROXY_MANAGED"
@@ -86,7 +87,8 @@ Assert-True ($resultAgain -match '(?m)^sandbox_mode\s*=\s*"danger-full-access"\s
 Assert-True ($resultAgain -match '(?m)^personality\s*=\s*"pragmatic"\s*$') 'An unrelated user preference was not preserved.'
 Assert-True ($resultAgain -match '(?m)^base_url\s*=\s*"http://127\.0\.0\.1:18080/v1"\s*$') 'Router base URL is incorrect.'
 Assert-True ($resultAgain -match '(?m)^experimental_bearer_token\s*=\s*"local-router-test-token"\s*$') 'The local Router bearer was not written.'
-Assert-True ($resultAgain -match '(?m)^requires_openai_auth\s*=\s*true\s*$') 'Local Router must keep Codex account sign-in mode while using the local bearer.'
+Assert-True ($resultAgain -match '(?m)^requires_openai_auth\s*=\s*true\s*$') 'Router did not preserve the v1.5.2 ChatGPT account contract.'
+Assert-True ($resultAgain -match '(?ms)^\[model_providers\.codex_router\].*?^name\s*=\s*"Codex-Router"\s*$') 'Router was mislabeled as the OpenAI provider.'
 Assert-True ($resultAgain -match '(?ms)^\[desktop\].*?^enabled-reasoning-efforts\s*=\s*\["low", "medium", "high", "xhigh", "ultra", "max"\]\s*$') 'Desktop reasoning controls were not enabled.'
 Assert-True ($resultAgain -match '(?ms)^\[model_providers\.openai\].*?^base_url\s*=\s*"https://openai-proxy\.example/v1"\s*$') 'An external OpenAI provider was not preserved.'
 Assert-True ($resultAgain -match '(?ms)^\[model_providers\.ollama\].*?^base_url\s*=\s*"http://127\.0\.0\.1:11434/v1"\s*$') 'The user Ollama provider was not preserved.'
@@ -94,6 +96,7 @@ Assert-True ($resultAgain -match '(?ms)^\[model_providers\.lmstudio\].*?^base_ur
 Assert-True ($resultAgain -match '(?ms)^\[model_providers\.custom\].*?^name\s*=\s*"Unrelated provider"\s*$') 'An unrelated custom provider was overwritten instead of preserved.'
 Assert-True ($resultAgain -match '(?ms)^\[mcp_servers\.user-tool\].*?^command\s*=\s*"user-mcp\.exe"\s*$') 'An unrelated MCP server was not preserved.'
 Assert-True ($resultAgain -notmatch '18081|service_tier|disable_response_storage|openai_base_url') 'Legacy provider settings remain.'
+Assert-True ($resultAgain -notmatch '(?m)^forced_login_method\s*=') 'Router upstream mode still restricts the global Codex login method.'
 Assert-True (([regex]::Matches($resultAgain, '(?m)^base_url\s*=')).Count -eq 5) 'A stale top-level base_url remains outside provider tables.'
 Assert-True ($resultAgain -notmatch 'PROXY_MANAGED') 'A stale top-level proxy bearer remains.'
 Assert-True (([regex]::Matches($resultAgain, '\[model_providers\.codex_router\]')).Count -eq 1) 'Router provider is duplicated.'
@@ -142,7 +145,7 @@ $apiOnlyAgain = New-CodexRouterConfig `
     -LocalApiKey $localKey `
     -BaseUrl 'http://127.0.0.1:18080' `
     -CodexHome $isolatedCodexHome
-Assert-True ($apiOnlyAgain -match '(?m)^requires_openai_auth\s*=\s*true\s*$') 'Saving the Router configuration must keep account sign-in mode by default.'
+Assert-True ($apiOnlyAgain -match '(?m)^requires_openai_auth\s*=\s*true\s*$') 'Saving did not restore the normal ChatGPT account contract.'
 
 $officialResult = New-CodexRouterConfig `
     -Content $apiOnlyAgain `
@@ -151,10 +154,13 @@ $officialResult = New-CodexRouterConfig `
     -LocalApiKey $localKey `
     -BaseUrl 'http://127.0.0.1:18080' `
     -RequireOpenAiAuth $true `
+    -DisplayOpenAiProvider $false `
     -CodexHome $isolatedCodexHome
-Assert-True ($officialResult -match '(?m)^requires_openai_auth\s*=\s*true\s*$') 'Official Codex sign-in was not preserved on the Router provider.'
+Assert-True ($officialResult -match '(?m)^requires_openai_auth\s*=\s*true\s*$') 'Official account mode was replaced by third-party API mode.'
+Assert-True ($officialResult -match '(?ms)^\[model_providers\.codex_router\].*?^name\s*=\s*"Codex-Router"\s*$') 'Router is still impersonating the OpenAI provider.'
 Assert-True ($officialResult -match '(?m)^model_catalog_json\s*=\s*".*model-catalog\.json"\s*$') 'Official sign-in lost the Router model catalog.'
 Assert-True ($officialResult -match '(?m)^experimental_bearer_token\s*=\s*"local-router-test-token"\s*$') 'Official sign-in lost the local Router bearer.'
+Assert-True ($officialResult -notmatch '(?m)^forced_login_method\s*=') 'OAuth-labelled Router traffic still forces Codex to use ChatGPT login.'
 
 $legacyRouterConfig = @'
 model_provider = "custom"
@@ -177,7 +183,7 @@ $migratedPermissions = New-CodexRouterConfig `
     -LocalApiKey $localKey `
     -CodexHome $isolatedCodexHome
 Assert-True ($migratedPermissions -match '(?m)^model_provider\s*=\s*"codex_router"\s*$') 'Legacy custom Router provider was not migrated to codex_router.'
-Assert-True ($migratedPermissions -match '(?m)^requires_openai_auth\s*=\s*true\s*$') 'Local Router must keep account sign-in mode and still load the Router catalog.'
+Assert-True ($migratedPermissions -match '(?m)^requires_openai_auth\s*=\s*true\s*$') 'Migrated Router config lost the v1.5.2 account contract.'
 Assert-True ($migratedPermissions -notmatch '(?ms)^\[model_providers\.custom\].*?^name\s*=\s*"Codex-Router"\s*$') 'Legacy custom Codex-Router block was not removed after migration.'
 Assert-True ($migratedPermissions -match '(?ms)^\[windows\].*?^sandbox\s*=\s*"elevated"\s*$') 'An older Router sandbox downgrade was not migrated back to the completed elevated marker.'
 Assert-True ($migratedPermissions -match '(?m)^approval_policy\s*=\s*"never"\s*$') 'Approval policy was not recovered from the permission baseline.'
@@ -204,7 +210,7 @@ Assert-True ($chiralResult -match '(?m)^model_provider\s*=\s*"codex_router"\s*$'
 Assert-True ($chiralResult -match '(?ms)^\[model_providers\.codex_router\].*?^base_url\s*=\s*"http://127\.0\.0\.1:18080/v1"\s*$') 'Router provider was not written beside the Chiral profile.'
 Assert-True ($chiralResult -match '(?ms)^\[model_providers\.custom\].*?^name\s*=\s*"micu"\s*$') 'Chiral/micu custom provider was destroyed instead of preserved.'
 $routerBlock = [regex]::Match($chiralResult, '(?ms)^\[model_providers\.codex_router\]\s*.*?(?=^\[|\z)').Value
-Assert-True ($routerBlock -match '(?m)^requires_openai_auth\s*=\s*true\s*$') 'Local Router must keep account sign-in mode beside preserved third-party providers.'
+Assert-True ($routerBlock -match '(?m)^requires_openai_auth\s*=\s*true\s*$') 'Router switched to third-party API mode beside an unrelated provider.'
 Assert-True ($routerBlock -notmatch '430123|sk-chiral-not-for-router') 'Chiral credentials remained on the active Router route.'
 Assert-True ($chiralResult -match '430123') 'Preserved Chiral profile lost its upstream URL.'
 

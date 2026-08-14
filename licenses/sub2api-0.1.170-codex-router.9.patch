@@ -1,0 +1,221 @@
+diff --git a/backend/internal/domain/constants.go b/backend/internal/domain/constants.go
+index d79b49a4a72464ce07251c9eb6d29a4f34c2e854..fe8600248800da22fd8dcde67094209cb20d9f12 100644
+--- a/backend/internal/domain/constants.go
++++ b/backend/internal/domain/constants.go
+@@ -117,6 +117,13 @@ var DefaultAntigravityModelMapping = map[string]string{
+ 	"gemini-3.1-flash-image": "gemini-3.1-flash-image",
+ 	// Gemini 3.1 image preview 映射
+ 	"gemini-3.1-flash-image-preview": "gemini-3.1-flash-image",
++	// Gemini 3.6 Flash models are returned by the live Antigravity catalog.
++	"gemini-3.6-flash-high":   "gemini-3.6-flash-high",
++	"gemini-3.6-flash-medium": "gemini-3.6-flash-medium",
++	"gemini-3.6-flash-low":    "gemini-3.6-flash-low",
++	"gemini-3.6-flash-tiered": "gemini-3.6-flash-tiered",
++	// Gemini 3.7 Flash is a native Antigravity model released on 2026-08-13.
++	"gemini-3.7-flash": "gemini-3.7-flash",
+ 	// Gemini 3 image 兼容映射（向 3.1 image 迁移）
+ 	"gemini-3-pro-image":         "gemini-3.1-flash-image",
+ 	"gemini-3-pro-image-preview": "gemini-3.1-flash-image",
+diff --git a/backend/internal/domain/constants_test.go b/backend/internal/domain/constants_test.go
+index 0fb9054f7ef404a5bb80e4ec02e188275006fb1a..5d3ef827b1708bf5e19c3ce610a505e3ad0a296d 100644
+--- a/backend/internal/domain/constants_test.go
++++ b/backend/internal/domain/constants_test.go
+@@ -65,6 +65,30 @@ func TestDefaultAntigravityModelMapping_Gemini31ProAliases(t *testing.T) {
+ 	}
+ }
+ 
++func TestDefaultAntigravityModelMapping_ContainsLiveGemini36FlashModels(t *testing.T) {
++	t.Parallel()
++
++	for _, model := range []string{
++		"gemini-3.6-flash-high",
++		"gemini-3.6-flash-medium",
++		"gemini-3.6-flash-low",
++		"gemini-3.6-flash-tiered",
++	} {
++		if got := DefaultAntigravityModelMapping[model]; got != model {
++			t.Fatalf("expected %q to pass through, got %q", model, got)
++		}
++	}
++}
++
++func TestDefaultAntigravityModelMapping_Gemini37FlashNativeRoute(t *testing.T) {
++	t.Parallel()
++
++	const model = "gemini-3.7-flash"
++	if got := DefaultAntigravityModelMapping[model]; got != model {
++		t.Fatalf("expected native model %q to pass through, got %q", model, got)
++	}
++}
++
+ func TestDefaultBedrockModelMapping_ContainsNewClaudeModels(t *testing.T) {
+ 	t.Parallel()
+ 
+diff --git a/backend/internal/pkg/antigravity/claude_types.go b/backend/internal/pkg/antigravity/claude_types.go
+index d8732d26ed416c86e4dcfa9ef4e9cdbc946b69fe..4a4ecea58b23dff974bc015ed3992171b509bcd7 100644
+--- a/backend/internal/pkg/antigravity/claude_types.go
++++ b/backend/internal/pkg/antigravity/claude_types.go
+@@ -178,6 +178,11 @@ var geminiModels = []modelDef{
+ 	{ID: "gemini-3.1-pro-high", DisplayName: "Gemini 3.1 Pro High", CreatedAt: "2026-02-19T00:00:00Z", IsReasoning: true},
+ 	{ID: "gemini-3.1-flash-image", DisplayName: "Gemini 3.1 Flash Image", CreatedAt: "2026-02-19T00:00:00Z"},
+ 	{ID: "gemini-3.1-flash-image-preview", DisplayName: "Gemini 3.1 Flash Image Preview", CreatedAt: "2026-02-19T00:00:00Z"},
++	{ID: "gemini-3.6-flash-high", DisplayName: "Gemini 3.6 Flash High", CreatedAt: "2026-08-01T00:00:00Z"},
++	{ID: "gemini-3.6-flash-medium", DisplayName: "Gemini 3.6 Flash Medium", CreatedAt: "2026-08-01T00:00:00Z"},
++	{ID: "gemini-3.6-flash-low", DisplayName: "Gemini 3.6 Flash Low", CreatedAt: "2026-08-01T00:00:00Z"},
++	{ID: "gemini-3.6-flash-tiered", DisplayName: "Gemini 3.6 Flash Tiered", CreatedAt: "2026-08-01T00:00:00Z"},
++	{ID: "gemini-3.7-flash", DisplayName: "Gemini 3.7 Flash", CreatedAt: "2026-08-13T00:00:00Z"},
+ 	{ID: "gemini-3-pro-preview", DisplayName: "Gemini 3 Pro Preview", CreatedAt: "2025-06-01T00:00:00Z", IsReasoning: true},
+ 	{ID: "gemini-3-pro-image", DisplayName: "Gemini 3 Pro Image", CreatedAt: "2025-06-01T00:00:00Z"},
+ }
+diff --git a/backend/internal/pkg/xai/models.go b/backend/internal/pkg/xai/models.go
+index 3a65f32c51a44b5f4e760a1513e7e9f21f63b087..03c493cf9809fe89857524fe95bf84cf63c0faa9 100644
+--- a/backend/internal/pkg/xai/models.go
++++ b/backend/internal/pkg/xai/models.go
+@@ -10,6 +10,7 @@ type Model struct {
+ }
+ 
+ var defaultModels = []Model{
++	{ID: "grok-4.6", Object: "model", OwnedBy: "xai", DisplayName: "Grok 4.6"},
+ 	{ID: "grok-4.5", Object: "model", OwnedBy: "xai", DisplayName: "Grok 4.5"},
+ 	{ID: "grok-4.3", Object: "model", OwnedBy: "xai", DisplayName: "Grok 4.3"},
+ 	{ID: "grok-build-0.1", Object: "model", OwnedBy: "xai", DisplayName: "Grok Build 0.1"},
+diff --git a/backend/internal/pkg/xai/oauth_test.go b/backend/internal/pkg/xai/oauth_test.go
+index 53c8983103376f50a0d056035e886f93f6c9cd14..1a41f897461ea2a4c3e5b2034bf14e34de2d051f 100644
+--- a/backend/internal/pkg/xai/oauth_test.go
++++ b/backend/internal/pkg/xai/oauth_test.go
+@@ -341,6 +341,7 @@ func TestDefaultModelMappingIncludesGrokAliases(t *testing.T) {
+ 	t.Parallel()
+ 
+ 	mapping := DefaultModelMapping()
++	require.Equal(t, "grok-4.6", mapping["grok-4.6"])
+ 	require.Equal(t, "grok-4.5", mapping["grok"])
+ 	require.Equal(t, "grok-4.5", mapping["grok-latest"])
+ 	require.Equal(t, "grok-4.5", mapping["grok-4.5"])
+diff --git a/backend/internal/service/antigravity_gateway_compat_test.go b/backend/internal/service/antigravity_gateway_compat_test.go
+index ff3d195cbf636dada6454bd36f518d2d069fd161..1f73a80a6c1cd382e71c2fe228d58188de31dbed 100644
+--- a/backend/internal/service/antigravity_gateway_compat_test.go
++++ b/backend/internal/service/antigravity_gateway_compat_test.go
+@@ -3,6 +3,7 @@ package service
+ import (
+ 	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"io"
+ 	"net/http"
+ 	"net/http/httptest"
+@@ -264,6 +265,45 @@ func TestAntigravityCompatPreservesChatTokenLimit(t *testing.T) {
+ 	}
+ }
+ 
++func TestAntigravityCompatResponsesEnablesMixedServerAndFunctionTools(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	upstream := &queuedHTTPUpstreamStub{responses: []*http.Response{antigravityCompatSuccessResponse()}}
++	svc := newAntigravityCompatService(config.GatewayConfig{MaxLineSize: defaultMaxLineSize}, upstream)
++	body := []byte(`{
++		"model":"gemini-3.1-pro-high",
++		"input":"Find the current value and compare it with the local record.",
++		"tools":[
++			{"type":"web_search"},
++			{"type":"function","name":"read_record","description":"Read a local record","parameters":{"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}}
++		]
++	}`)
++	c, _ := newAntigravityCompatContext(http.MethodPost, "/v1/responses", body)
++
++	result, err := svc.ForwardAsResponses(
++		context.Background(),
++		c,
++		newAntigravityCompatAccount(AccountTypeOAuth),
++		body,
++		nil,
++	)
++
++	require.NoError(t, err)
++	require.NotNil(t, result)
++	require.Len(t, upstream.requestBodies, 1)
++	posted := upstream.requestBodies[0]
++	require.True(t, gjson.GetBytes(posted, "request.toolConfig.includeServerSideToolInvocations").Bool())
++	var wrapped map[string]any
++	require.NoError(t, json.Unmarshal(posted, &wrapped))
++	requestBody, ok := wrapped["request"].(map[string]any)
++	require.True(t, ok)
++	tools, ok := requestBody["tools"].([]any)
++	require.True(t, ok)
++	require.Len(t, tools, 2)
++	require.Contains(t, tools[0].(map[string]any), "functionDeclarations")
++	require.Contains(t, tools[1].(map[string]any), "googleSearch")
++	require.Equal(t, "read_record", gjson.GetBytes(posted, "request.tools.0.functionDeclarations.0.name").String())
++}
++
+ func TestAntigravityCompatRoutesByMappedModelFamily(t *testing.T) {
+ 	gin.SetMode(gin.TestMode)
+ 	tests := []struct {
+diff --git a/backend/internal/service/gateway_channel_restriction_test.go b/backend/internal/service/gateway_channel_restriction_test.go
+index 3a2ad2ff7238e6f070f3efbf2b2174b0f33d1e62..03171e4bb904ba5cb50bc1947a49a4d5e8701e1a 100644
+--- a/backend/internal/service/gateway_channel_restriction_test.go
++++ b/backend/internal/service/gateway_channel_restriction_test.go
+@@ -47,6 +47,24 @@ func TestResolveAccountUpstreamModel_Antigravity(t *testing.T) {
+ 	require.Equal(t, "claude-sonnet-4-6", got)
+ }
+ 
++func TestResolveAccountUpstreamModel_AntigravityGemini37NativeRoute(t *testing.T) {
++	t.Parallel()
++
++	defaultAccount := &Account{Platform: PlatformAntigravity}
++	require.Equal(t, "gemini-3.7-flash", resolveAccountUpstreamModel(defaultAccount, "gemini-3.7-flash"))
++
++	configuredAccount := &Account{
++		Platform: PlatformAntigravity,
++		Credentials: map[string]any{
++			"model_mapping": map[string]any{
++				"gemini-3.7-flash": "gemini-3.7-flash",
++			},
++		},
++	}
++	require.Equal(t, "gemini-3.7-flash", resolveAccountUpstreamModel(configuredAccount, "gemini-3.7-flash"))
++	require.True(t, (&GatewayService{}).isModelSupportedByAccount(configuredAccount, "gemini-3.7-flash"))
++}
++
+ func TestResolveAccountUpstreamModel_Antigravity_Unsupported(t *testing.T) {
+ 	t.Parallel()
+ 	account := &Account{
+diff --git a/backend/internal/service/gemini_messages_compat_service.go b/backend/internal/service/gemini_messages_compat_service.go
+index e4df8982d3ba11d53be4fb9bde1aeacf37f0d8c2..f1206f919f7e6f87924c017fc24ff6a9669a8b28 100644
+--- a/backend/internal/service/gemini_messages_compat_service.go
++++ b/backend/internal/service/gemini_messages_compat_service.go
+@@ -3168,6 +3168,11 @@ func convertClaudeMessagesToGeminiGenerateContent(body []byte) ([]byte, error) {
+ 
+ 	if tools := convertClaudeToolsToGeminiTools(req["tools"]); tools != nil {
+ 		out["tools"] = tools
++		if geminiToolsMixServerAndFunctionCalls(tools) {
++			out["toolConfig"] = map[string]any{
++				"includeServerSideToolInvocations": true,
++			}
++		}
+ 	}
+ 
+ 	generationConfig := convertClaudeGenerationConfig(req)
+@@ -3179,6 +3184,24 @@ func convertClaudeMessagesToGeminiGenerateContent(body []byte) ([]byte, error) {
+ 	return json.Marshal(out)
+ }
+ 
++func geminiToolsMixServerAndFunctionCalls(tools []any) bool {
++	hasServerTool := false
++	hasFunctionTool := false
++	for _, tool := range tools {
++		toolMap, ok := tool.(map[string]any)
++		if !ok {
++			continue
++		}
++		if _, ok := toolMap["googleSearch"]; ok {
++			hasServerTool = true
++		}
++		if declarations, ok := toolMap["functionDeclarations"].([]any); ok && len(declarations) > 0 {
++			hasFunctionTool = true
++		}
++	}
++	return hasServerTool && hasFunctionTool
++}
++
+ func stripGeminiFunctionIDs(req map[string]any) {
+ 	// Defensive cleanup: some upstreams reject unexpected `id` fields in functionCall/functionResponse.
+ 	contents, ok := req["contents"].([]any)

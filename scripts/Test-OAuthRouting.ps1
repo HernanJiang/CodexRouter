@@ -268,43 +268,35 @@ $unknownResetState = Get-RouterOAuthRecoveryState -Account ([pscustomobject]@{
 Assert-Equal 'probe' $unknownResetState.Action 'An exhausted OAuth account without reset time was not scheduled for probing.'
 Assert-Equal 18000 $unknownResetState.NextCheckSeconds 'Unknown-reset OAuth recovery is not limited to one probe per five hours.'
 
+$unknownBeforeCap = Get-RouterOAuthRecoveryState -Account ([pscustomobject]@{
+    schedulable = $false
+    temp_unschedulable_reason = 'temporary provider request failure'
+}) -ObservedExhausted -ObservedAt '2026-08-02T19:00:01Z' -NowUtc $now
+Assert-Equal 'probe' $unknownBeforeCap.Action 'Unknown OAuth state was recovered before its five-hour upper bound.'
+Assert-Equal 1 $unknownBeforeCap.NextCheckSeconds 'Unknown OAuth recovery did not preserve the remaining upper-bound delay.'
+
+$unknownAtCap = Get-RouterOAuthRecoveryState -Account ([pscustomobject]@{
+    schedulable = $false
+    temp_unschedulable_reason = 'temporary provider request failure'
+}) -ObservedExhausted -ObservedAt '2026-08-02T19:00:00Z' -NowUtc $now
+Assert-Equal 'force_recover' $unknownAtCap.Action 'Unknown OAuth state was not recovered at the five-hour upper bound.'
+Assert-Equal $false $unknownAtCap.ShouldIsolate 'Unknown OAuth state remained isolated beyond five hours.'
+
+$confirmedExhaustedAtCap = Get-RouterOAuthRecoveryState -Account ([pscustomobject]@{
+    schedulable = $false
+    extra = @{
+        codex_7d_used_percent = 100
+        codex_usage_updated_at = '2026-08-03T00:00:00Z'
+    }
+}) -ObservedExhausted -ObservedAt '2026-08-02T19:00:00Z' -NowUtc $now
+Assert-Equal 'probe' $confirmedExhaustedAtCap.Action 'Freshly confirmed exhaustion was force-recovered incorrectly.'
+Assert-Equal $true $confirmedExhaustedAtCap.ShouldIsolate 'Freshly confirmed exhaustion left isolation incorrectly.'
+
 $healthyState = Get-RouterOAuthRecoveryState -Account ([pscustomobject]@{
     schedulable = $true
     status = 'active'
 }) -NowUtc $now
 Assert-Equal 'healthy' $healthyState.Action 'A healthy OAuth account was incorrectly isolated.'
-
-$openAiSuggestions = @(Get-RouterOAuthModelSuggestions -Platform openai)
-foreach ($requiredModel in @(
-    'gpt-5.6-sol',
-    'gpt-5.6-terra',
-    'gpt-5.6-luna',
-    'gpt-5.5',
-    'gpt-5.4',
-    'gpt-5.4-mini',
-    'gpt-5.3-codex-spark',
-    'codex-auto-review',
-    'gpt-5.2'
-)) {
-    if ($openAiSuggestions.id -notcontains $requiredModel) {
-        throw "OpenAI OAuth discovery suggestion is missing '$requiredModel'."
-    }
-}
-
-$antigravitySuggestions = @(Get-RouterOAuthModelSuggestions -Platform antigravity)
-foreach ($requiredModel in @('gemini-3-flash', 'gemini-3.1-pro-high')) {
-    if ($antigravitySuggestions.id -notcontains $requiredModel) {
-        throw "Antigravity OAuth discovery suggestion is missing '$requiredModel'."
-    }
-}
-if ($antigravitySuggestions.id -contains 'gemini-3.6-flash') {
-    throw 'Antigravity suggestions still advertise gemini-3.6-flash, which Antigravity does not expose.'
-}
-
-$grokSuggestions = @(Get-RouterOAuthModelSuggestions -Platform grok)
-if ($grokSuggestions.id -notcontains 'grok-4.5') {
-    throw 'Grok OAuth discovery suggestion is missing grok-4.5.'
-}
 
 $compositePlan = @(Get-RouterCompositeRoutePlan -RoutePlan @(
     [pscustomobject]@{
@@ -425,10 +417,6 @@ if ($applySource -notmatch 'DiscoveredOAuthModelsByAccount' -or
     $applySource -notmatch '/api/v1/admin/accounts/\$oauthAccountId/models') {
     throw 'Apply-Router.ps1 does not discover implicit OAuth models with a failure-safe fallback.'
 }
-$catalogSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Build-ModelCatalog.ps1') -Raw
-if ($catalogSource -notmatch 'DiscoveredOAuthModelsByAccount') {
-    throw 'Build-ModelCatalog.ps1 does not reuse implicit OAuth discovery for stable public model IDs.'
-}
 if ($applySource -notmatch 'proxy_direct_fallback' -or
     $applySource -notmatch 'Test-RouterDirectFallbackEligible') {
     throw 'Apply-Router.ps1 does not mark verified auto-proxy channels for transport-only direct fallback.'
@@ -446,8 +434,11 @@ $accountSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Get-OAuthAcc
 if ($accountSource -match '/quota') {
     throw 'Get-OAuthAccounts.ps1 duplicates live quota requests instead of reusing the usage snapshot.'
 }
-if ($accountSource -notmatch 'Get-RouterOAuthModelSuggestions') {
-    throw 'Get-OAuthAccounts.ps1 does not append the tested provider model suggestions.'
+if ($accountSource -notmatch '/accounts/\$accountId/models') {
+    throw 'Get-OAuthAccounts.ps1 does not refresh each account live model catalog.'
+}
+if ($accountSource -match 'Get-RouterOAuthModelSuggestions' -or $accountSource -match 'suggested\s*=') {
+    throw 'Get-OAuthAccounts.ps1 still exposes models that the account did not declare.'
 }
 
 $accountTokens = $null
@@ -530,7 +521,7 @@ foreach ($case in $platformCases) {
     Assert-Equal 1 $healthyCatalog.Count "$label healthy catalog should expose exactly one merged model."
     Assert-Equal 'oauth' ([string]$healthyCatalog[0].ServedBy) "$label healthy model must be served by the subscription."
     $healthyDisplay = Get-RouterModelDisplayName -Model $healthyCatalog[0].Model -Route $healthyCatalog[0]
-    if ($healthyDisplay -notlike '*(OAuth)') { throw "$label healthy display name must end with (OAuth): $healthyDisplay" }
+    if ($healthyDisplay -like '*(OAuth)') { throw "$label healthy display name must remain unified without an OAuth suffix: $healthyDisplay" }
     $healthyRouting = @(Get-RouterServableRoutingRoutes -RoutePlan $plan -IsolatedOAuthAccountIds @{} -OAuthAccountIds @($case.Account) -OAuthSelectionInitialized $true)
     $healthyComposite = @(Get-RouterCompositeRoutePlan -RoutePlan $healthyRouting -AccountPlatformById $platformMap -ExcludedOAuthAccountIds @())
     $healthyPlatforms = @($healthyComposite | ForEach-Object { [string]$_.TargetPlatform } | Sort-Object -Unique)
@@ -584,8 +575,8 @@ Assert-Equal 2 $splitHealthyCatalog.Count 'Manual quota selection must expose se
 $splitOAuth = @($splitHealthyCatalog | Where-Object Source -eq 'oauth')[0]
 $splitApi = @($splitHealthyCatalog | Where-Object Source -ne 'oauth')[0]
 Assert-Equal 'gpt-5.6-sol' ([string]$splitOAuth.PublicModelId) 'Manual OAuth row lost its canonical model ID.'
-if ((Get-RouterModelDisplayName -Model $splitOAuth.Model -Route $splitOAuth) -notlike '*(OAuth)') {
-    throw 'Manual OAuth row does not identify its subscription quota with (OAuth).'
+if ((Get-RouterModelDisplayName -Model $splitOAuth.Model -Route $splitOAuth) -like '*(OAuth)') {
+    throw 'Manual OAuth row must use the same display name without an OAuth suffix.'
 }
 if ([string]$splitApi.PublicModelId -notmatch '^gpt-5\.6-sol--api-[0-9a-f]{12}$') {
     throw "Manual API row does not have a stable independent public ID: $($splitApi.PublicModelId)"
