@@ -237,6 +237,6 @@ Codex-Router 可以在 Windows 登录后直接进入轻量托盘模式，不启�
 - 发布包排除用户配置、日志、数据库、OAuth 状态、备份和开发机路径。
 - 本地运行服务默认绑定 `127.0.0.1`，不建议将管理接口暴露到远程网络。
 - 完整条款请查看 [中文条款](TERMS.zh-CN.md) 和 [English Terms](TERMS.en.md)。
-- Codex-Router 原创部分仅授权个人、非商业使用；Sub2API 和其他第三方组件继续遵循各自的上游许可证和声明。
+- Codex-Router 原创部分采用 GNU Affero 通用公共许可证 v3.0（AGPL-3.0）开源授权；Sub2API 和其他第三方组件继续遵循各自的上游许可证和声明。
 
 官方仓库：<https://github.com/HernanJiang/Codex-Router>

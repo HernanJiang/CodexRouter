@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-Codex-Router combines original project material with independent third-party software. The Codex-Router proprietary license does not replace, narrow, or claim ownership of third-party rights.
+Codex-Router combines original project material with independent third-party software. Codex-Router is licensed under AGPL-3.0; this does not replace, narrow, or claim ownership of third-party rights.
 
 ## Sub2API
 
@@ -14,7 +14,7 @@ Codex-Router combines original project material with independent third-party sof
 - Deployment and operations commitment: https://github.com/Wei-Shaw/sub2api/blob/main/docs/legal/admin-compliance.zh.md
 - Upstream copyright and contributor notices remain with the upstream project.
 
-The bundled executable is built from upstream commit `c043c24774228ba891ddf90d783aa6dc7d0855b5` with the documented Codex-Router compatibility patch series applied in order. The series is verified with `git apply --check` against that exact commit. Recipients may exercise the rights granted by Sub2API's upstream license with respect to Sub2API itself. Restrictions in Codex-Router's license apply to original Codex-Router material and the Codex-Router combination/distribution, not to independently obtained upstream Sub2API code.
+The bundled executable is built from upstream commit `c043c24774228ba891ddf90d783aa6dc7d0855b5` with the documented Codex-Router compatibility patch series applied in order. The series is verified with `git apply --check` against that exact commit. Recipients may exercise the rights granted by Sub2API's upstream license with respect to Sub2API itself. Codex-Router's license applies to original Codex-Router material and the Codex-Router combination/distribution, not to independently obtained upstream Sub2API code.
 
 ## PostgreSQL
 
