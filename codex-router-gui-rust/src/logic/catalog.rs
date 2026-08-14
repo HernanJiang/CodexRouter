@@ -249,15 +249,7 @@ fn route_display_name(_cfg: &RouterConfig, route: &ModelRoute) -> String {
     if is_model_alias_customized(&route.model) && !route.model.alias.trim().is_empty() {
         return route.model.alias.trim().to_owned();
     }
-    let base = recommended_model_display_name(&route.model.model);
-    if route.is_merged_oauth_route {
-        return base;
-    }
-    if route.source == "oauth" {
-        format!("{}(OAuth)", base)
-    } else {
-        base
-    }
+    recommended_model_display_name(&route.model.model)
 }
 
 fn load_catalog_template(router_root: &Path) -> Value {
@@ -463,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn split_mode_exposes_both_oauth_and_api_with_suffix() {
+    fn split_mode_exposes_distinct_route_ids_with_one_display_name() {
         let mut cfg = crate::config::RouterConfig {
             oauth_account_ids: Some(vec![1]),
             oauth_fallback: OAuthFallback {
@@ -490,12 +482,21 @@ mod tests {
         let catalog = build_model_catalog(&cfg);
         let visible: Vec<&ModelRoute> = plan.iter().filter(|r| r.include_in_catalog).collect();
         assert_eq!(visible.len(), 2);
-        assert!(catalog
-            .iter()
-            .any(|e| e["display_name"] == "ChatGPT-5.6-Sol(OAuth)"));
+        assert_eq!(
+            catalog
+                .iter()
+                .filter(|entry| entry["display_name"] == "ChatGPT-5.6-Sol")
+                .count(),
+            2
+        );
         let api = catalog
             .iter()
-            .find(|e| e["display_name"] == "ChatGPT-5.6-Sol")
+            .find(|entry| {
+                entry["display_name"] == "ChatGPT-5.6-Sol"
+                    && entry["slug"]
+                        .as_str()
+                        .is_some_and(|slug| slug.contains("--api-"))
+            })
             .unwrap();
         assert!(api["slug"].as_str().unwrap().contains("--api-"));
     }

@@ -338,6 +338,9 @@ pub struct ModelConfig {
     pub oauth_account_id: i64,
     #[serde(default)]
     pub oauth_platform: String,
+    /// True only after the user explicitly adds this OAuth model to a profile.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub user_selected: bool,
 }
 
 fn default_10() -> i32 {
@@ -354,6 +357,10 @@ fn default_empty_json() -> String {
 
 fn default_apikey() -> String {
     "apikey".to_string()
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn default_auto_compact_percent() -> i32 {
@@ -385,6 +392,7 @@ impl Default for ModelConfig {
             source: default_apikey(),
             oauth_account_id: 0,
             oauth_platform: String::new(),
+            user_selected: false,
         }
     }
 }
@@ -472,6 +480,21 @@ impl Default for RouterConfig {
 }
 
 impl RouterConfig {
+    pub fn is_router_root(path: &std::path::Path) -> bool {
+        path.join("app").join("sub2api.exe").is_file()
+            && path
+                .join("postgres")
+                .join("pgsql")
+                .join("bin")
+                .join("pg_ctl.exe")
+                .is_file()
+            && path
+                .join("redis")
+                .join("Redis-8.10.0-Windows-x64-msys2")
+                .join("redis-server.exe")
+                .is_file()
+    }
+
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let mut value: serde_json::Value = serde_json::from_str(&content)?;
@@ -490,6 +513,9 @@ impl RouterConfig {
         if cfg.default_model.eq_ignore_ascii_case("gpt-5.6") {
             cfg.default_model = "gpt-5.6-sol".to_owned();
         }
+        if migrate_legacy_bulk_oauth_catalog(&mut cfg) {
+            crate::logic::normalize_default_model(&mut cfg);
+        }
         Ok(cfg)
     }
 
@@ -501,17 +527,74 @@ impl RouterConfig {
     pub fn find_router_root() -> std::path::PathBuf {
         if let Ok(exe) = std::env::current_exe() {
             let exe_dir = exe.parent().unwrap_or(std::path::Path::new("."));
-            if exe_dir.join("scripts").join("Start-Router.ps1").exists() {
-                return exe_dir.to_path_buf();
-            }
-            let parent = exe_dir.parent().unwrap_or(exe_dir);
-            if parent.join("scripts").join("Start-Router.ps1").exists() {
-                return parent.to_path_buf();
+            if let Some(root) = exe_dir
+                .ancestors()
+                .take(5)
+                .find(|candidate| Self::is_router_root(candidate))
+            {
+                return root.to_path_buf();
             }
             return exe_dir.to_path_buf();
         }
         std::path::PathBuf::from(".")
     }
+}
+
+const LEGACY_BULK_OAUTH_CATALOG_THRESHOLD: usize = 12;
+
+fn migrate_legacy_bulk_oauth_catalog(cfg: &mut RouterConfig) -> bool {
+    if !matches!(cfg.version.trim(), "1.6.4" | "1.6.5" | "1.6.6") {
+        return false;
+    }
+
+    let bulk_catalog_count = cfg
+        .models
+        .iter()
+        .filter(|model| legacy_auto_discovered_oauth_model(model))
+        .count();
+    let mut changed = false;
+    if bulk_catalog_count >= LEGACY_BULK_OAUTH_CATALOG_THRESHOLD {
+        let before = cfg.models.len();
+        cfg.models
+            .retain(|model| !legacy_auto_discovered_oauth_model(model));
+        changed = cfg.models.len() != before;
+    }
+
+    // Small legacy OAuth lists and customized entries cannot be distinguished
+    // from deliberate selections. Preserve them and mark their provenance so a
+    // later migration can never interpret them as automatic catalog entries.
+    for model in &mut cfg.models {
+        if model.source.eq_ignore_ascii_case("oauth") && !model.user_selected {
+            model.user_selected = true;
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn legacy_auto_discovered_oauth_model(model: &ModelConfig) -> bool {
+    model.source.eq_ignore_ascii_case("oauth")
+        && !model.user_selected
+        && model.oauth_account_id > 0
+        && !model.oauth_platform.trim().is_empty()
+        && model
+            .base_url
+            .trim()
+            .to_ascii_lowercase()
+            .starts_with("sub2api oauth / ")
+        && model.alias_customized == Some(false)
+        && model.priority == 1
+        && model.weight == 1
+        && matches!(model.extra.trim(), "" | "{}")
+        && model.multimodal.eq_ignore_ascii_case("auto")
+        && model.context_window == 0
+        && model.auto_compact_percent == default_auto_compact_percent()
+        && model.reasoning_mode.eq_ignore_ascii_case("auto")
+        && model.reasoning_levels.is_empty()
+        && model.default_reasoning_level.trim().is_empty()
+        && !model.fast_supported
+        && !model.fast_mode
+        && model.credential_name.trim().is_empty()
 }
 
 fn normalize_legacy_model_numbers(value: &mut serde_json::Value) -> anyhow::Result<()> {
@@ -798,5 +881,140 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"second");
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_bulk_oauth_catalog_is_not_loaded_as_user_selected_routes() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-router-legacy-oauth-catalog-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.json");
+        let mut models = vec![serde_json::json!({
+            "model": "user-api-model",
+            "alias": "User API model",
+            "source": "apikey",
+            "baseUrl": "https://api.example.test/v1",
+            "aliasCustomized": true
+        })];
+        for index in 0..49 {
+            let platform = if index < 9 {
+                "openai"
+            } else if index < 31 {
+                "grok"
+            } else {
+                "antigravity"
+            };
+            models.push(serde_json::json!({
+                "model": format!("discovered-{index}"),
+                "alias": format!("Discovered {index}"),
+                "aliasCustomized": false,
+                "baseUrl": format!("Sub2API OAuth / {platform}"),
+                "priority": 1,
+                "source": "oauth",
+                "oauthAccountId": index + 1,
+                "oauthPlatform": platform
+            }));
+        }
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "version": "1.6.5",
+                "models": models,
+                "defaultModel": "discovered-0"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let config = RouterConfig::load(&path).unwrap();
+        assert_eq!(config.models.len(), 1);
+        assert_eq!(config.models[0].model, "user-api-model");
+        assert_eq!(config.default_model, "user-api-model");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_bulk_oauth_migration_keeps_explicit_and_customized_routes() {
+        let mut config = RouterConfig {
+            version: "1.6.5".into(),
+            models: (0..LEGACY_BULK_OAUTH_CATALOG_THRESHOLD)
+                .map(|index| ModelConfig {
+                    model: format!("discovered-{index}"),
+                    alias: format!("Discovered {index}"),
+                    alias_customized: Some(false),
+                    base_url: "Sub2API OAuth / antigravity".into(),
+                    priority: 1,
+                    source: "oauth".into(),
+                    oauth_account_id: 7,
+                    oauth_platform: "antigravity".into(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        config.models.push(ModelConfig {
+            model: "explicit-oauth".into(),
+            alias: "Explicit OAuth".into(),
+            alias_customized: Some(false),
+            base_url: "Sub2API OAuth / antigravity".into(),
+            priority: 1,
+            source: "oauth".into(),
+            oauth_account_id: 7,
+            oauth_platform: "antigravity".into(),
+            user_selected: true,
+            ..Default::default()
+        });
+        config.models.push(ModelConfig {
+            model: "customized-oauth".into(),
+            alias: "My Antigravity route".into(),
+            alias_customized: Some(true),
+            base_url: "Sub2API OAuth / antigravity".into(),
+            priority: 1,
+            source: "oauth".into(),
+            oauth_account_id: 7,
+            oauth_platform: "antigravity".into(),
+            ..Default::default()
+        });
+
+        assert!(migrate_legacy_bulk_oauth_catalog(&mut config));
+        assert_eq!(config.models.len(), 2);
+        assert!(config.models.iter().all(|model| model.user_selected));
+        assert!(config
+            .models
+            .iter()
+            .any(|model| model.model == "explicit-oauth"));
+        assert!(config
+            .models
+            .iter()
+            .any(|model| model.model == "customized-oauth"));
+    }
+
+    #[test]
+    fn small_legacy_oauth_selection_is_preserved() {
+        let mut config = RouterConfig {
+            version: "1.6.5".into(),
+            models: vec![ModelConfig {
+                model: "gpt-5.6-sol".into(),
+                alias: "ChatGPT-5.6-Sol".into(),
+                alias_customized: Some(false),
+                base_url: "Sub2API OAuth / openai".into(),
+                priority: 1,
+                source: "oauth".into(),
+                oauth_account_id: 42,
+                oauth_platform: "openai".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(migrate_legacy_bulk_oauth_catalog(&mut config));
+        assert_eq!(config.models.len(), 1);
+        assert!(config.models[0].user_selected);
     }
 }

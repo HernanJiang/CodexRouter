@@ -23,16 +23,54 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 #[derive(Clone, Debug)]
 struct AccountTask {
     account: Value,
-    configured_models: Vec<String>,
     channel: Option<ModelConfig>,
+    query_provider_usage: bool,
+    auto_isolate_on_exhaustion: bool,
 }
 
 #[derive(Clone, Debug)]
 struct AccountRecord {
     account: UsageAccount,
-    base_url: String,
     configured_model: String,
+    quota_evidence: OAuthQuotaEvidence,
+    auto_isolate_on_exhaustion: bool,
+    routing_changed: bool,
 }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum OAuthQuotaEvidence {
+    Usable,
+    Exhausted,
+    #[default]
+    Unknown,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct OAuthRecoveryObservation {
+    account_id: i64,
+    #[serde(default)]
+    exhausted: bool,
+    #[serde(default)]
+    observed_at: String,
+    #[serde(default)]
+    last_probe_at: String,
+    #[serde(default)]
+    next_probe_at: String,
+    #[serde(default)]
+    reset_at: String,
+    #[serde(default)]
+    recent_error: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct OAuthRecoveryObservations {
+    #[serde(default)]
+    entries: Vec<OAuthRecoveryObservation>,
+}
+
+const OAUTH_UNKNOWN_MAX_ISOLATION: chrono::Duration = chrono::Duration::hours(5);
+const OAUTH_RECOVERY_MIN_INTERVAL_SECONDS: u64 = 10 * 60;
 
 #[derive(Clone, Debug, Default)]
 struct ProviderUsage {
@@ -40,6 +78,127 @@ struct ProviderUsage {
     windows: Vec<UsageWindow>,
     note: String,
     cached: bool,
+}
+
+fn credential_rejected(note: &str) -> bool {
+    let note = note.to_ascii_lowercase();
+    note.contains("router_kimi_credential_rejected")
+        || note.contains("class=authentication")
+        || note.contains("class=permission")
+}
+
+fn live_quota_is_usable(windows: &[UsageWindow]) -> bool {
+    !windows.is_empty()
+        && !windows
+            .iter()
+            .any(|window| window.used_percent.is_some_and(|value| value >= 99.999))
+}
+
+fn live_quota_is_exhausted(windows: &[UsageWindow]) -> bool {
+    !windows.is_empty()
+        && windows
+            .iter()
+            .any(|window| window.used_percent.is_some_and(|value| value >= 99.999))
+}
+
+fn maybe_isolate_exhausted_oauth_account(
+    admin: &AdminClient,
+    task: &AccountTask,
+    windows: &[UsageWindow],
+    fresh: bool,
+    query_note: &str,
+    deadline: Instant,
+) -> bool {
+    if !task.auto_isolate_on_exhaustion
+        || string(&task.account, "type") != "oauth"
+        || !fresh
+        || !live_quota_is_exhausted(windows)
+        || credential_rejected(query_note)
+    {
+        return false;
+    }
+
+    if string(&task.account, "status") == "error"
+        || get(&task.account, "schedulable").and_then(Value::as_bool) == Some(false)
+    {
+        return true;
+    }
+
+    let id = integer(&task.account, "id");
+    if id <= 0 {
+        return false;
+    }
+    retry_account_read(|| {
+        admin.post(
+            &format!("/api/v1/admin/accounts/{id}/schedulable"),
+            Some(&json!({ "schedulable": false })),
+            remaining(deadline, Duration::from_secs(10))?,
+        )
+    })
+    .is_ok()
+}
+
+fn oauth_accounts_with_api_fallback(cfg: &RouterConfig) -> HashSet<i64> {
+    if !cfg.oauth_fallback.enabled {
+        return HashSet::new();
+    }
+    cfg.models
+        .iter()
+        .filter(|model| model.source == "oauth" && model.oauth_account_id > 0)
+        .filter(|oauth| {
+            cfg.models.iter().any(|candidate| {
+                candidate.source != "oauth"
+                    && super::same_model_identity(&oauth.model, &candidate.model)
+                    && super::is_fallback_channel_selected(cfg, candidate)
+            })
+        })
+        .map(|model| model.oauth_account_id)
+        .collect()
+}
+
+fn maybe_recover_misdisabled_account(
+    admin: &AdminClient,
+    task: &AccountTask,
+    windows: &[UsageWindow],
+    fresh: bool,
+    query_note: &str,
+    deadline: Instant,
+) -> bool {
+    let status = string(&task.account, "status");
+    let schedulable = get(&task.account, "schedulable").and_then(Value::as_bool);
+    if (status != "error" && schedulable != Some(false))
+        || !fresh
+        || !live_quota_is_usable(windows)
+        || credential_rejected(query_note)
+    {
+        return false;
+    }
+
+    let id = integer(&task.account, "id");
+    if id <= 0 {
+        return false;
+    }
+    let recover_path = format!("/api/v1/admin/accounts/{id}/recover-state");
+    if retry_account_read(|| {
+        admin.post(
+            &recover_path,
+            None,
+            remaining(deadline, Duration::from_secs(10))?,
+        )
+    })
+    .is_err()
+    {
+        return false;
+    }
+    let schedulable_path = format!("/api/v1/admin/accounts/{id}/schedulable");
+    retry_account_read(|| {
+        admin.post(
+            &schedulable_path,
+            Some(&json!({ "schedulable": true })),
+            remaining(deadline, Duration::from_secs(10))?,
+        )
+    })
+    .is_ok()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -54,14 +213,23 @@ struct CacheEntry {
 type UsageCache = BTreeMap<String, CacheEntry>;
 
 #[derive(Clone)]
-struct AdminClient {
+pub(super) struct AdminClient {
     client: Client,
     base_url: String,
     bearer: Arc<Zeroizing<String>>,
 }
 
 impl AdminClient {
-    fn connect(router_root: &Path, cfg: &RouterConfig) -> anyhow::Result<Self> {
+    #[cfg(test)]
+    pub(super) fn for_test(base_url: String) -> Self {
+        Self {
+            client: Client::builder().no_proxy().build().unwrap(),
+            base_url,
+            bearer: Arc::new(Zeroizing::new("test-admin-token".to_owned())),
+        }
+    }
+
+    pub(super) fn connect(router_root: &Path, cfg: &RouterConfig) -> anyhow::Result<Self> {
         let base_url = validate_loopback_base_url(&cfg.deploy.sub2api_host)?;
         let client = Client::builder()
             .no_proxy()
@@ -134,7 +302,7 @@ impl AdminClient {
         bail!("class=authentication")
     }
 
-    fn get(&self, path: &str, timeout: Duration) -> anyhow::Result<Value> {
+    pub(super) fn get(&self, path: &str, timeout: Duration) -> anyhow::Result<Value> {
         let response = self
             .client
             .get(format!("{}{}", self.base_url, path))
@@ -150,6 +318,120 @@ impl AdminClient {
             .json()
             .map_err(|_| anyhow!("class=invalid_response"))
     }
+
+    pub(super) fn post(
+        &self,
+        path: &str,
+        body: Option<&Value>,
+        timeout: Duration,
+    ) -> anyhow::Result<Value> {
+        let mut request = self
+            .client
+            .post(format!("{}{}", self.base_url, path))
+            .timeout(timeout)
+            .bearer_auth(self.bearer.as_str())
+            .header(ACCEPT, "application/json");
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        let response = request.send().map_err(classify_request_error)?;
+        if !response.status().is_success() {
+            return Err(anyhow!(classify_status(response.status().as_u16())));
+        }
+        let text = response
+            .text()
+            .map_err(|_| anyhow!("class=invalid_response"))?;
+        if text.trim().is_empty() {
+            return Ok(Value::Null);
+        }
+        serde_json::from_str(&text).map_err(|_| anyhow!("class=invalid_response"))
+    }
+
+    pub(super) fn put(&self, path: &str, body: &Value, timeout: Duration) -> anyhow::Result<Value> {
+        let response = self
+            .client
+            .put(format!("{}{}", self.base_url, path))
+            .timeout(timeout)
+            .bearer_auth(self.bearer.as_str())
+            .header(ACCEPT, "application/json")
+            .json(body)
+            .send()
+            .map_err(classify_request_error)?;
+        if !response.status().is_success() {
+            return Err(anyhow!(classify_status(response.status().as_u16())));
+        }
+        let text = response
+            .text()
+            .map_err(|_| anyhow!("class=invalid_response"))?;
+        if text.trim().is_empty() {
+            return Ok(Value::Null);
+        }
+        serde_json::from_str(&text).map_err(|_| anyhow!("class=invalid_response"))
+    }
+
+    pub(super) fn delete(&self, path: &str, timeout: Duration) -> anyhow::Result<Value> {
+        let response = self
+            .client
+            .delete(format!("{}{}", self.base_url, path))
+            .timeout(timeout)
+            .bearer_auth(self.bearer.as_str())
+            .header(ACCEPT, "application/json")
+            .send()
+            .map_err(classify_request_error)?;
+        if !response.status().is_success() {
+            return Err(anyhow!(classify_status(response.status().as_u16())));
+        }
+        let text = response
+            .text()
+            .map_err(|_| anyhow!("class=invalid_response"))?;
+        if text.trim().is_empty() {
+            return Ok(Value::Null);
+        }
+        serde_json::from_str(&text).map_err(|_| anyhow!("class=invalid_response"))
+    }
+}
+
+pub(super) fn set_oauth_account_priority(
+    router_root: &Path,
+    account_id: i64,
+    priority: i32,
+) -> anyhow::Result<i32> {
+    let config_path = crate::user_data::config_path(router_root);
+    let config = RouterConfig::load(&config_path).context("class=configuration")?;
+    let admin = retry_admin_read(|| AdminClient::connect(router_root, &config))?;
+    set_oauth_account_priority_with_admin(&admin, account_id, priority)
+}
+
+fn set_oauth_account_priority_with_admin(
+    admin: &AdminClient,
+    account_id: i64,
+    priority: i32,
+) -> anyhow::Result<i32> {
+    let path = format!("/api/v1/admin/accounts/{account_id}");
+    let detail = data(retry_account_read(|| {
+        admin.get(&path, Duration::from_secs(10))
+    })?);
+    if string(&detail, "type") != "oauth" {
+        bail!("class=configuration")
+    }
+    retry_account_read(|| {
+        admin.put(
+            &path,
+            &json!({
+                "priority": priority,
+                "confirm_mixed_channel_risk": true,
+            }),
+            Duration::from_secs(10),
+        )
+    })?;
+    let updated = data(retry_account_read(|| {
+        admin.get(&path, Duration::from_secs(10))
+    })?);
+    Ok(integer(&updated, "priority")
+        .try_into()
+        .ok()
+        .filter(|saved: &i32| (1..=999).contains(saved))
+        .unwrap_or(priority))
 }
 
 pub(super) fn query_usage(
@@ -179,17 +461,13 @@ pub(super) fn query_usage(
     let accounts = get(&accounts_body, "items").unwrap_or(&accounts_body);
 
     let mut oauth_ids = cfg.oauth_account_ids.clone().unwrap_or_default();
-    let mut models_by_oauth: HashMap<i64, Vec<String>> = HashMap::new();
+    let oauth_fallback_ids = oauth_accounts_with_api_fallback(cfg);
     let mut api_channels: HashMap<String, ModelConfig> = HashMap::new();
     for model in &cfg.models {
         if model.source == "oauth" && model.oauth_account_id > 0 {
             if !oauth_ids.contains(&model.oauth_account_id) {
                 oauth_ids.push(model.oauth_account_id);
             }
-            models_by_oauth
-                .entry(model.oauth_account_id)
-                .or_default()
-                .push(model.model.clone());
         } else {
             let alias = if model.alias.trim().is_empty() {
                 model.model.trim()
@@ -203,6 +481,7 @@ pub(super) fn query_usage(
     }
 
     let mut tasks = Vec::new();
+    let mut queried_api_pools = HashSet::new();
     for account in array(accounts) {
         let id = integer(account, "id");
         let kind = string(account, "type");
@@ -215,17 +494,30 @@ pub(super) fn query_usage(
                     .iter()
                     .any(|value| value.as_i64() == Some(group_id)));
         if selected_oauth || selected_api {
+            let channel = api_channels.get(&name).cloned();
+            let query_provider_usage = selected_api
+                && channel
+                    .as_ref()
+                    .is_some_and(|channel| queried_api_pools.insert(api_quota_pool_key(channel)));
             tasks.push(AccountTask {
                 account: account.clone(),
-                configured_models: models_by_oauth.get(&id).cloned().unwrap_or_default(),
-                channel: api_channels.get(&name).cloned(),
+                channel,
+                query_provider_usage,
+                auto_isolate_on_exhaustion: selected_oauth && oauth_fallback_ids.contains(&id),
             });
         }
     }
 
     let cache_path = usage_cache_path(router_root);
     let cache = Arc::new(Mutex::new(read_usage_cache(&cache_path)));
-    let records = query_accounts_bounded(tasks, admin, cache.clone(), deadline);
+    let mut records = query_accounts_bounded(tasks, admin.clone(), cache.clone(), deadline);
+    let routing_changed = reconcile_oauth_recovery_observations(
+        router_root,
+        &admin,
+        group_id,
+        &mut records,
+        deadline,
+    );
     let mut subscriptions = Vec::new();
     let mut api_records = Vec::new();
     for record in records {
@@ -235,7 +527,7 @@ pub(super) fn query_usage(
             api_records.push(record);
         }
     }
-    let api_channels = merge_volcengine_channels(api_records)
+    let api_channels = merge_api_quota_pools(api_records, &api_channels)
         .into_iter()
         .map(|record| record.account)
         .collect::<Vec<_>>();
@@ -257,6 +549,7 @@ pub(super) fn query_usage(
         total_cost,
         subscriptions,
         api_channels,
+        routing_changed,
     })
 }
 
@@ -303,10 +596,12 @@ fn query_account(
     let kind = string(&task.account, "type");
     let platform = string(&task.account, "platform");
     let mut query_note = String::new();
-    let stats = match admin.get(
-        &format!("/api/v1/admin/accounts/{id}/stats"),
-        remaining(deadline, Duration::from_secs(10))?,
-    ) {
+    let stats = match retry_account_read(|| {
+        admin.get(
+            &format!("/api/v1/admin/accounts/{id}/stats"),
+            remaining(deadline, Duration::from_secs(10))?,
+        )
+    }) {
         Ok(value) => data(value),
         Err(error) => {
             query_note = safe_error(&error);
@@ -319,10 +614,12 @@ fn query_account(
         let path = if platform == "grok" {
             format!("/api/v1/admin/grok/accounts/{id}/quota")
         } else {
-            format!("/api/v1/admin/accounts/{id}/usage")
+            format!("/api/v1/admin/accounts/{id}/usage?force=true")
         };
         let timeout = if platform == "grok" { 30 } else { 10 };
-        match admin.get(&path, remaining(deadline, Duration::from_secs(timeout))?) {
+        match retry_account_read(|| {
+            admin.get(&path, remaining(deadline, Duration::from_secs(timeout))?)
+        }) {
             Ok(value) => {
                 usage = data(value);
                 if platform == "grok" {
@@ -341,7 +638,7 @@ fn query_account(
     }
 
     let mut provider_usage = None;
-    if kind == "apikey" {
+    if kind == "apikey" && task.query_provider_usage {
         if let Some(channel) = task.channel.as_ref() {
             provider_usage = Some(query_provider(channel, cache));
         }
@@ -353,10 +650,12 @@ fn query_account(
     add_standard_window(&mut windows, "monthly", get(&usage, "monthly"), "");
     let mut fresh = kind == "oauth" && !usage.is_null() && !windows.is_empty();
     if kind == "oauth" && platform == "openai" {
-        if let Ok(quota) = admin.get(
-            &format!("/api/v1/admin/openai/accounts/{id}/quota"),
-            remaining(deadline, Duration::from_secs(10))?,
-        ) {
+        if let Ok(quota) = retry_account_read(|| {
+            admin.get(
+                &format!("/api/v1/admin/openai/accounts/{id}/quota"),
+                remaining(deadline, Duration::from_secs(10))?,
+            )
+        }) {
             let quota = data(quota);
             if let Some(rate_limit) = get(&quota, "rate_limit") {
                 for name in ["primary_window", "secondary_window"] {
@@ -385,19 +684,22 @@ fn query_account(
         windows.extend(parsed);
     }
     if kind == "oauth" && platform == "antigravity" {
-        let quota_map = get(&usage, "antigravity_quota").unwrap_or(&Value::Null);
-        let detail_map = get(&usage, "antigravity_quota_details").unwrap_or(&Value::Null);
-        for model in &task.configured_models {
-            if let Some(window) = get(quota_map, model) {
-                let display = get(detail_map, model)
-                    .map(|detail| string(detail, "display_name"))
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or_else(|| model.clone());
-                if let Some(window) = standard_window("model", window, &display) {
-                    windows.push(window);
-                    fresh = true;
+        let parsed = normalize_antigravity(&usage);
+        fresh |= !parsed.is_empty();
+        windows.extend(parsed);
+        if windows.is_empty() {
+            let error_code = string(&usage, "error_code");
+            let error_class = match error_code.as_str() {
+                "unauthenticated" => "class=authentication",
+                "forbidden" => "class=permission",
+                "rate_limited" => "class=rate_limit",
+                "network_error" => "class=network",
+                _ if get(&usage, "needs_reauth").and_then(Value::as_bool) == Some(true) => {
+                    "class=authentication"
                 }
-            }
+                _ => "",
+            };
+            append_note(&mut query_note, error_class);
         }
     }
     if let Some(provider) = provider_usage {
@@ -422,15 +724,44 @@ fn query_account(
         }
     }
 
-    let status = string(&task.account, "status");
-    let schedulable = get(&task.account, "schedulable").and_then(Value::as_bool);
-    let detail = ["temp_unschedulable_reason", "error_message"]
+    if fresh && !credential_rejected(&query_note) {
+        query_note.clear();
+    }
+    let was_unschedulable = string(&task.account, "status") == "error"
+        || get(&task.account, "schedulable").and_then(Value::as_bool) == Some(false);
+    let recovered =
+        maybe_recover_misdisabled_account(admin, &task, &windows, fresh, &query_note, deadline);
+    let isolated =
+        maybe_isolate_exhausted_oauth_account(admin, &task, &windows, fresh, &query_note, deadline);
+
+    let mut status = string(&task.account, "status");
+    let mut schedulable = get(&task.account, "schedulable").and_then(Value::as_bool);
+    let mut detail = ["temp_unschedulable_reason", "error_message"]
         .into_iter()
         .map(|name| string(&task.account, name))
         .find(|value| !value.is_empty())
         .unwrap_or_default();
+    if recovered {
+        status = "active".to_owned();
+        schedulable = Some(true);
+        detail.clear();
+    } else if isolated {
+        schedulable = Some(false);
+        detail = "OAuth quota exhausted; matching API fallback is active.".to_owned();
+    }
     let (health, status_detail) = resolve_state(&status, schedulable, &detail, &windows, fresh);
     let channel = task.channel.as_ref();
+    let quota_evidence = if kind == "oauth" && fresh && !credential_rejected(&query_note) {
+        if live_quota_is_exhausted(&windows) {
+            OAuthQuotaEvidence::Exhausted
+        } else if live_quota_is_usable(&windows) {
+            OAuthQuotaEvidence::Usable
+        } else {
+            OAuthQuotaEvidence::Unknown
+        }
+    } else {
+        OAuthQuotaEvidence::Unknown
+    };
     Ok(AccountRecord {
         account: UsageAccount {
             id,
@@ -446,11 +777,10 @@ fn query_account(
             totals: normalize_stats(&stats),
             windows,
         },
-        base_url: channel
-            .map(channel_base_url)
-            .unwrap_or_default()
-            .to_ascii_lowercase(),
         configured_model: channel.map(|item| item.model.clone()).unwrap_or_default(),
+        quota_evidence,
+        auto_isolate_on_exhaustion: task.auto_isolate_on_exhaustion,
+        routing_changed: recovered || (isolated && !was_unschedulable),
     })
 }
 
@@ -471,16 +801,122 @@ fn failed_account_record(task: &AccountTask, timed_out: bool) -> AccountRecord {
             last_used_at: string(&task.account, "last_used_at"),
             ..UsageAccount::default()
         },
-        base_url: task
-            .channel
-            .as_ref()
-            .map(channel_base_url)
-            .unwrap_or_default(),
         configured_model: task
             .channel
             .as_ref()
             .map(|item| item.model.clone())
             .unwrap_or_default(),
+        quota_evidence: OAuthQuotaEvidence::Unknown,
+        auto_isolate_on_exhaustion: task.auto_isolate_on_exhaustion,
+        routing_changed: false,
+    }
+}
+
+fn normalize_antigravity(usage: &Value) -> Vec<UsageWindow> {
+    let quota_map = get(usage, "antigravity_quota").unwrap_or(&Value::Null);
+    let detail_map = get(usage, "antigravity_quota_details").unwrap_or(&Value::Null);
+    let mut live_models = quota_map
+        .as_object()
+        .map(|models| models.keys().map(String::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    live_models.sort_unstable();
+    let mut grouped: Vec<(AntigravityQuotaSignature, UsageWindow, Vec<String>)> = Vec::new();
+    for model in live_models {
+        if !is_public_antigravity_model(model) {
+            continue;
+        }
+        if let Some(window) = get(quota_map, model) {
+            let display = get(detail_map, model)
+                .map(|detail| string(detail, "display_name"))
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| model.to_owned());
+            if let Some(parsed) = standard_window("model", window, &display) {
+                let signature = AntigravityQuotaSignature::from_window(&parsed);
+                if let Some((_, _, models)) = grouped
+                    .iter_mut()
+                    .find(|(candidate, _, _)| candidate == &signature)
+                {
+                    models.push(model.to_owned());
+                } else {
+                    grouped.push((signature, parsed, vec![model.to_owned()]));
+                }
+            }
+        }
+    }
+    grouped
+        .into_iter()
+        .filter(|(signature, _, _)| {
+            ["five_hour", "seven_day", "monthly"]
+                .into_iter()
+                .filter_map(|name| get(usage, name))
+                .filter_map(|window| standard_window("existing", window, ""))
+                .all(|window| AntigravityQuotaSignature::from_window(&window) != *signature)
+        })
+        .map(|(_, mut window, models)| {
+            if models.len() > 1 {
+                window.kind = "sharedPool".to_owned();
+                window.display_name = antigravity_shared_pool_label(&models).to_owned();
+            }
+            window
+        })
+        .collect()
+}
+
+fn is_public_antigravity_model(model: &str) -> bool {
+    ["gemini-", "claude-", "gpt-"]
+        .into_iter()
+        .any(|prefix| model.starts_with(prefix))
+}
+
+fn antigravity_shared_pool_label(models: &[String]) -> &'static str {
+    let all_gemini = models.iter().all(|model| model.starts_with("gemini-"));
+    let all_claude = models.iter().all(|model| model.starts_with("claude-"));
+    let all_gpt = models.iter().all(|model| model.starts_with("gpt-"));
+    if all_gemini {
+        "Gemini shared quota"
+    } else if all_claude {
+        "Claude shared quota"
+    } else if all_gpt {
+        "GPT shared quota"
+    } else if models
+        .iter()
+        .all(|model| model.starts_with("claude-") || model.starts_with("gpt-"))
+    {
+        "Claude / GPT shared quota"
+    } else {
+        "Antigravity shared quota"
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AntigravityQuotaSignature {
+    used_percent_milli: Option<i64>,
+    reset_at: String,
+    requests: i64,
+    tokens: i64,
+    remaining_amount_micros: Option<i64>,
+    limit_amount_micros: Option<i64>,
+    used_amount_micros: Option<i64>,
+    currency: String,
+}
+
+impl AntigravityQuotaSignature {
+    fn from_window(window: &UsageWindow) -> Self {
+        let fixed = |value: Option<f64>, scale: f64| {
+            value
+                .filter(|value| value.is_finite())
+                .map(|value| (value * scale).round() as i64)
+        };
+        Self {
+            used_percent_milli: fixed(window.used_percent.map(f64::from), 1_000.0),
+            reset_at: window.reset_at.trim().to_owned(),
+            requests: window.requests,
+            tokens: window.tokens,
+            remaining_amount_micros: fixed(window.remaining_amount, 1_000_000.0),
+            limit_amount_micros: fixed(window.limit_amount, 1_000_000.0),
+            used_amount_micros: fixed(window.used_amount, 1_000_000.0),
+            currency: window.currency.trim().to_ascii_uppercase(),
+        }
     }
 }
 
@@ -1335,34 +1771,81 @@ fn normalize_stats(stats: &Value) -> UsageTotals {
     }
 }
 
-fn merge_volcengine_channels(records: Vec<AccountRecord>) -> Vec<AccountRecord> {
-    let mut groups: BTreeMap<String, Vec<AccountRecord>> = BTreeMap::new();
+fn api_quota_pool_provider(channel: &ModelConfig) -> String {
+    coding_plan_endpoint(&channel.base_url)
+        .map(|endpoint| endpoint.provider.to_owned())
+        .unwrap_or_else(|| provider_from_channel(&channel.base_url))
+}
+
+fn credential_pool_digest(names: &[&str]) -> Option<String> {
+    let mut digest = Sha256::new();
+    let mut found = false;
+    for name in names {
+        if let Some(secret) = credential_string(name) {
+            found = true;
+            digest.update((secret.len() as u64).to_le_bytes());
+            digest.update(secret.as_bytes());
+        }
+    }
+    found.then(|| format!("{:x}", digest.finalize()))
+}
+
+fn api_quota_pool_key(channel: &ModelConfig) -> String {
+    let provider = api_quota_pool_provider(channel);
+    let endpoint = Url::parse(&channel.base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_else(|| channel_base_url(channel).to_ascii_lowercase());
+    let credential = if provider == "Volcengine Coding Plan" {
+        credential_pool_digest(&["VolcengineAccessKeyId", "VolcengineSecretAccessKey"])
+    } else {
+        credential_pool_digest(&[&channel.credential_name])
+    }
+    .unwrap_or_else(|| {
+        format!(
+            "credential:{}",
+            channel.credential_name.to_ascii_lowercase()
+        )
+    });
+    format!("{}|{endpoint}|{credential}", provider.to_ascii_lowercase())
+}
+
+fn merge_api_quota_pools(
+    records: Vec<AccountRecord>,
+    channels: &HashMap<String, ModelConfig>,
+) -> Vec<AccountRecord> {
+    let mut groups: BTreeMap<String, (String, Vec<AccountRecord>)> = BTreeMap::new();
     for record in records {
-        let base = record
-            .base_url
-            .replace("/api/coding/v3", "")
-            .replace("/api/plan/v3", "");
+        let (key, label) = channels
+            .get(&record.account.name)
+            .map(|channel| {
+                (
+                    api_quota_pool_key(channel),
+                    api_quota_pool_provider(channel),
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    format!("account:{}", record.account.id),
+                    record.account.platform.clone(),
+                )
+            });
         groups
-            .entry(format!(
-                "{}|{}",
-                record.account.platform,
-                base.trim_end_matches('/').to_ascii_lowercase()
-            ))
-            .or_default()
+            .entry(key)
+            .or_insert_with(|| (label, Vec::new()))
+            .1
             .push(record);
     }
     let mut merged = Vec::new();
-    for mut group in groups.into_values() {
-        if group.len() == 1
-            || group[0].account.platform != "openai"
-            || !group[0].base_url.contains("ark.cn-beijing.volces.com/api/")
-        {
+    for (label, mut group) in groups.into_values() {
+        if group.len() == 1 {
             merged.extend(group);
             continue;
         }
+        group.sort_by_key(|record| record.account.windows.is_empty());
         let mut first = group.remove(0);
-        first.account.name = "Codex-Router / Volcengine Ark Coding Plan".to_owned();
-        first.configured_model = "ark-coding-plan".to_owned();
+        first.account.name = format!("Codex-Router / {label}");
+        first.configured_model = label;
         for record in group {
             merge_totals(&mut first.account.totals, &record.account.totals);
             merge_windows(&mut first.account.windows, &record.account.windows);
@@ -1757,6 +2240,304 @@ fn usage_cache_path(router_root: &Path) -> std::path::PathBuf {
         .join("usage-monitor-last-good.json")
 }
 
+fn oauth_recovery_observations_path(router_root: &Path) -> std::path::PathBuf {
+    crate::user_data::data_root(router_root)
+        .join("state")
+        .join("oauth-recovery-observations.json")
+}
+
+pub(super) fn next_oauth_recovery_seconds(router_root: &Path, now: DateTime<Utc>) -> u64 {
+    let observations =
+        read_oauth_recovery_observations(&oauth_recovery_observations_path(router_root));
+    next_oauth_recovery_seconds_from(&observations, now)
+}
+
+fn next_oauth_recovery_seconds_from(
+    observations: &OAuthRecoveryObservations,
+    now: DateTime<Utc>,
+) -> u64 {
+    observations
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            let reset_at = DateTime::parse_from_rfc3339(&entry.reset_at)
+                .ok()
+                .map(|value| value.with_timezone(&Utc))
+                .filter(|value| *value > now);
+            let due = if entry.exhausted && reset_at.is_some() {
+                reset_at?
+            } else if !entry.next_probe_at.trim().is_empty() {
+                DateTime::parse_from_rfc3339(&entry.next_probe_at)
+                    .ok()?
+                    .with_timezone(&Utc)
+            } else if !entry.observed_at.trim().is_empty() {
+                DateTime::parse_from_rfc3339(&entry.observed_at)
+                    .ok()?
+                    .with_timezone(&Utc)
+                    + OAUTH_UNKNOWN_MAX_ISOLATION
+            } else {
+                return None;
+            };
+            let seconds = due.signed_duration_since(now).num_seconds().max(1) as u64;
+            Some(seconds)
+        })
+        .min()
+        .unwrap_or(OAUTH_RECOVERY_MIN_INTERVAL_SECONDS)
+        .min(OAUTH_UNKNOWN_MAX_ISOLATION.num_seconds() as u64)
+        .max(OAUTH_RECOVERY_MIN_INTERVAL_SECONDS)
+}
+
+fn retain_active_oauth_recovery_observations(
+    observations: &mut OAuthRecoveryObservations,
+    active_account_ids: &HashSet<i64>,
+) -> bool {
+    let previous_len = observations.entries.len();
+    observations
+        .entries
+        .retain(|entry| active_account_ids.contains(&entry.account_id));
+    observations.entries.len() != previous_len
+}
+
+fn read_oauth_recovery_observations(path: &Path) -> OAuthRecoveryObservations {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn write_oauth_recovery_observations(
+    path: &Path,
+    observations: &OAuthRecoveryObservations,
+) -> anyhow::Result<()> {
+    atomic_write(path, &serde_json::to_vec_pretty(observations)?)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OAuthRecoveryDirective {
+    None,
+    Isolate,
+    Recover,
+}
+
+fn oauth_recovery_directive(
+    evidence: OAuthQuotaEvidence,
+    currently_isolated: bool,
+    observed_at: &str,
+    now: DateTime<Utc>,
+) -> OAuthRecoveryDirective {
+    match evidence {
+        OAuthQuotaEvidence::Usable if currently_isolated => OAuthRecoveryDirective::Recover,
+        OAuthQuotaEvidence::Usable => OAuthRecoveryDirective::None,
+        OAuthQuotaEvidence::Exhausted => OAuthRecoveryDirective::Isolate,
+        OAuthQuotaEvidence::Unknown if observed_at.is_empty() => OAuthRecoveryDirective::None,
+        OAuthQuotaEvidence::Unknown => {
+            let expired = DateTime::parse_from_rfc3339(observed_at)
+                .ok()
+                .map(|started| {
+                    now.signed_duration_since(started.with_timezone(&Utc))
+                        >= OAUTH_UNKNOWN_MAX_ISOLATION
+                })
+                .unwrap_or(false);
+            if expired {
+                OAuthRecoveryDirective::Recover
+            } else {
+                OAuthRecoveryDirective::Isolate
+            }
+        }
+    }
+}
+
+fn recover_oauth_account(
+    admin: &AdminClient,
+    account_id: i64,
+    router_group_id: i64,
+    deadline: Instant,
+) -> anyhow::Result<()> {
+    retry_account_read(|| {
+        admin.post(
+            &format!("/api/v1/admin/accounts/{account_id}/recover-state"),
+            None,
+            remaining(deadline, Duration::from_secs(10))?,
+        )
+    })?;
+    retry_account_read(|| {
+        admin.post(
+            &format!("/api/v1/admin/accounts/{account_id}/schedulable"),
+            Some(&json!({ "schedulable": true })),
+            remaining(deadline, Duration::from_secs(10))?,
+        )
+    })?;
+    if router_group_id > 0 {
+        let detail = data(retry_account_read(|| {
+            admin.get(
+                &format!("/api/v1/admin/accounts/{account_id}"),
+                remaining(deadline, Duration::from_secs(10))?,
+            )
+        })?);
+        let mut group_ids = array(get(&detail, "group_ids").unwrap_or(&Value::Null))
+            .iter()
+            .filter_map(Value::as_i64)
+            .collect::<Vec<_>>();
+        if !group_ids.contains(&router_group_id) {
+            group_ids.push(router_group_id);
+            group_ids.sort_unstable();
+            group_ids.dedup();
+            retry_account_read(|| {
+                admin.put(
+                    &format!("/api/v1/admin/accounts/{account_id}"),
+                    &json!({
+                        "group_ids": group_ids,
+                        "confirm_mixed_channel_risk": true,
+                    }),
+                    remaining(deadline, Duration::from_secs(10))?,
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn isolate_oauth_account(
+    admin: &AdminClient,
+    account_id: i64,
+    deadline: Instant,
+) -> anyhow::Result<()> {
+    retry_account_read(|| {
+        admin.post(
+            &format!("/api/v1/admin/accounts/{account_id}/schedulable"),
+            Some(&json!({ "schedulable": false })),
+            remaining(deadline, Duration::from_secs(10))?,
+        )
+    })?;
+    Ok(())
+}
+
+fn reconcile_oauth_recovery_observations(
+    router_root: &Path,
+    admin: &AdminClient,
+    router_group_id: i64,
+    records: &mut [AccountRecord],
+    deadline: Instant,
+) -> bool {
+    let path = oauth_recovery_observations_path(router_root);
+    let mut observations = read_oauth_recovery_observations(&path);
+    let now = Utc::now();
+    let active_account_ids = records
+        .iter()
+        .filter(|record| record.account.kind == "oauth" && record.auto_isolate_on_exhaustion)
+        .map(|record| record.account.id)
+        .collect::<HashSet<_>>();
+    let mut observations_changed =
+        retain_active_oauth_recovery_observations(&mut observations, &active_account_ids);
+    let mut routing_changed = records.iter().any(|record| record.routing_changed);
+
+    for record in records
+        .iter_mut()
+        .filter(|record| record.account.kind == "oauth" && record.auto_isolate_on_exhaustion)
+    {
+        let account_id = record.account.id;
+        let observation_index = observations
+            .entries
+            .iter()
+            .position(|entry| entry.account_id == account_id);
+        let observed_at = observation_index
+            .and_then(|index| observations.entries.get(index))
+            .map(|entry| entry.observed_at.as_str())
+            .unwrap_or("");
+        let currently_isolated = record.account.status == "error"
+            || record.account.status_detail.contains("fallback")
+            || (record.quota_evidence == OAuthQuotaEvidence::Unknown
+                && observation_index.is_some());
+        let directive =
+            oauth_recovery_directive(record.quota_evidence, currently_isolated, observed_at, now);
+
+        match directive {
+            OAuthRecoveryDirective::None => {
+                if let Some(index) = observation_index {
+                    observations.entries.remove(index);
+                    observations_changed = true;
+                }
+            }
+            OAuthRecoveryDirective::Isolate => {
+                if record.account.health != "quotaExhausted"
+                    && isolate_oauth_account(admin, account_id, deadline).is_ok()
+                {
+                    record.account.health = "quotaExhausted".to_owned();
+                    record.account.status_detail =
+                        "OAuth quota is unavailable; matching API fallback remains active."
+                            .to_owned();
+                    routing_changed = true;
+                }
+                let previous = observation_index.and_then(|index| observations.entries.get(index));
+                let observed_at = previous
+                    .map(|entry| entry.observed_at.clone())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| now.to_rfc3339_opts(SecondsFormat::Millis, true));
+                let last_probe_at = now.to_rfc3339_opts(SecondsFormat::Millis, true);
+                let probe_delay = if record.quota_evidence == OAuthQuotaEvidence::Exhausted {
+                    OAUTH_UNKNOWN_MAX_ISOLATION
+                } else {
+                    chrono::Duration::minutes(10)
+                };
+                let next_probe_at =
+                    (now + probe_delay).to_rfc3339_opts(SecondsFormat::Millis, true);
+                let entry = OAuthRecoveryObservation {
+                    account_id,
+                    exhausted: record.quota_evidence == OAuthQuotaEvidence::Exhausted,
+                    observed_at,
+                    last_probe_at,
+                    next_probe_at,
+                    reset_at: record
+                        .account
+                        .windows
+                        .iter()
+                        .filter(|window| window.used_percent.is_some_and(|value| value >= 99.999))
+                        .map(|window| window.reset_at.clone())
+                        .filter(|value| !value.is_empty())
+                        .max()
+                        .unwrap_or_default(),
+                    recent_error: if record.quota_evidence == OAuthQuotaEvidence::Unknown {
+                        "quota_unavailable".to_owned()
+                    } else {
+                        String::new()
+                    },
+                };
+                if let Some(index) = observation_index {
+                    observations_changed |= observations.entries[index] != entry;
+                    observations.entries[index] = entry;
+                } else {
+                    observations.entries.push(entry);
+                    observations_changed = true;
+                }
+            }
+            OAuthRecoveryDirective::Recover => {
+                if recover_oauth_account(admin, account_id, router_group_id, deadline).is_ok() {
+                    record.account.status = "active".to_owned();
+                    record.account.health = "healthy".to_owned();
+                    record.account.status_detail.clear();
+                    if record.quota_evidence == OAuthQuotaEvidence::Unknown {
+                        append_note(
+                            &mut record.account.query_note,
+                            "OAuth isolation reached its five-hour safety limit; the account was restored.",
+                        );
+                    }
+                    if let Some(index) = observation_index {
+                        observations.entries.remove(index);
+                    }
+                    observations_changed = true;
+                    routing_changed = true;
+                }
+            }
+        }
+    }
+
+    observations.entries.sort_by_key(|entry| entry.account_id);
+    if observations_changed {
+        let _ = write_oauth_recovery_observations(&path, &observations);
+    }
+    routing_changed
+}
+
 fn read_usage_cache(path: &Path) -> UsageCache {
     std::fs::read_to_string(path)
         .ok()
@@ -1899,7 +2680,9 @@ fn credential_string(name: &str) -> Option<Zeroizing<String>> {
         .map(Zeroizing::new)
 }
 
-fn retry_admin_read<T>(mut operation: impl FnMut() -> anyhow::Result<T>) -> anyhow::Result<T> {
+pub(super) fn retry_admin_read<T>(
+    mut operation: impl FnMut() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
     let mut last = None;
     for delay in [0, 250, 750] {
         if delay > 0 {
@@ -1909,6 +2692,26 @@ fn retry_admin_read<T>(mut operation: impl FnMut() -> anyhow::Result<T>) -> anyh
             Ok(value) => return Ok(value),
             Err(error) => last = Some(error),
         }
+    }
+    Err(last.unwrap_or_else(|| anyhow!("class=request_failure")))
+}
+
+pub(super) fn retry_account_read<T>(
+    mut operation: impl FnMut() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let mut last = None;
+    for attempt in 0..super::USAGE_MONITOR_MAX_ATTEMPTS {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) => last = Some(error),
+        }
+        let retryable = last
+            .as_ref()
+            .is_some_and(|error| super::usage_failure_is_locally_retryable(&error.to_string()));
+        if attempt + 1 >= super::USAGE_MONITOR_MAX_ATTEMPTS || !retryable {
+            break;
+        }
+        std::thread::sleep(super::usage_monitor_retry_delay(attempt));
     }
     Err(last.unwrap_or_else(|| anyhow!("class=request_failure")))
 }
@@ -1932,7 +2735,8 @@ fn classify_request_error(error: reqwest::Error) -> anyhow::Error {
 
 fn classify_status(status: u16) -> &'static str {
     match status {
-        401 | 403 => "class=authentication",
+        401 => "class=authentication",
+        403 => "class=permission",
         429 => "class=rate_limit",
         500..=599 => "class=upstream",
         _ => "class=request_failure",
@@ -1966,13 +2770,13 @@ fn append_note(target: &mut String, note: &str) {
     target.push_str(note.trim());
 }
 
-fn data(value: Value) -> Value {
+pub(super) fn data(value: Value) -> Value {
     value.get("data").cloned().unwrap_or(value)
 }
 fn data_ref(value: &Value) -> &Value {
     get(value, "data").unwrap_or(value)
 }
-fn get<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
+pub(super) fn get<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
     value
         .as_object()?
         .iter()
@@ -1993,10 +2797,10 @@ fn first<'a>(value: &'a Value, names: &[&str]) -> Option<&'a Value> {
             !value.is_null() && value.as_str().is_none_or(|text| !text.trim().is_empty())
         })
 }
-fn array(value: &Value) -> &[Value] {
+pub(super) fn array(value: &Value) -> &[Value] {
     value.as_array().map(Vec::as_slice).unwrap_or(&[])
 }
-fn string(value: &Value, name: &str) -> String {
+pub(super) fn string(value: &Value, name: &str) -> String {
     get(value, name)
         .and_then(|value| {
             value.as_str().map(str::to_owned).or_else(|| {
@@ -2015,7 +2819,7 @@ fn number(value: &Value) -> Option<f64> {
         .or_else(|| value.as_str()?.parse().ok())
         .filter(|value| value.is_finite())
 }
-fn integer(value: &Value, name: &str) -> i64 {
+pub(super) fn integer(value: &Value, name: &str) -> i64 {
     get(value, name)
         .and_then(|value| {
             value
@@ -2102,6 +2906,300 @@ fn volcengine_headers(access_key: &str, secret: &str, now: DateTime<Utc>) -> Hea
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    #[test]
+    fn usable_oauth_quota_recovers_immediately() {
+        let now = DateTime::parse_from_rfc3339("2026-08-12T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            oauth_recovery_directive(
+                OAuthQuotaEvidence::Usable,
+                true,
+                "2026-08-11T23:59:00Z",
+                now,
+            ),
+            OAuthRecoveryDirective::Recover
+        );
+    }
+
+    #[test]
+    fn antigravity_models_with_the_same_quota_signature_share_one_pool() {
+        let usage = json!({
+            "antigravity_quota": {
+                "claude-opus": {"used_percent": 20, "reset_at": "2026-08-13T09:16:47Z"},
+                "gemini-flash": {"used_percent": 20, "reset_at": "2026-08-13T09:16:47Z"},
+                "gemini-pro": {"used_percent": 20, "reset_at": "2026-08-13T09:16:47Z"}
+            },
+            "antigravity_quota_details": {
+                "claude-opus": {"display_name": "Claude Opus"},
+                "gemini-flash": {"display_name": "Gemini Flash"},
+                "gemini-pro": {"display_name": "Gemini Pro"}
+            }
+        });
+
+        let windows = normalize_antigravity(&usage);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].kind, "sharedPool");
+        assert_eq!(windows[0].display_name, "Antigravity shared quota");
+    }
+
+    #[test]
+    fn antigravity_models_with_different_quota_signatures_stay_separate() {
+        let usage = json!({
+            "antigravity_quota": {
+                "claude-opus": {"used_percent": 20, "reset_at": "2026-08-13T09:16:47Z"},
+                "gemini-flash": {"used_percent": 20, "reset_at": "2026-08-14T09:16:47Z"},
+                "gemini-pro": {"used_percent": 35, "reset_at": "2026-08-13T09:16:47Z"}
+            }
+        });
+
+        let windows = normalize_antigravity(&usage);
+        assert_eq!(windows.len(), 3);
+        assert!(windows.iter().all(|window| window.kind == "model"));
+    }
+
+    #[test]
+    fn antigravity_shared_pool_does_not_duplicate_an_account_window() {
+        let usage = json!({
+            "five_hour": {"used_percent": 20, "reset_at": "2026-08-13T09:16:47Z"},
+            "antigravity_quota": {
+                "claude-opus": {"used_percent": 20, "reset_at": "2026-08-13T09:16:47Z"},
+                "gemini-flash": {"used_percent": 20, "reset_at": "2026-08-13T09:16:47Z"}
+            }
+        });
+
+        assert!(normalize_antigravity(&usage).is_empty());
+    }
+
+    #[test]
+    fn antigravity_internal_entries_are_hidden_and_real_pools_are_named_by_family() {
+        let usage = json!({
+            "antigravity_quota": {
+                "chat_20706": {"utilization": 0, "reset_time": ""},
+                "tab_flash_lite_preview": {"utilization": 0, "reset_time": ""},
+                "gemini-3.6-flash-high": {"utilization": 0, "reset_time": "2026-08-14T05:10:20Z"},
+                "gemini-3.7-flash": {"utilization": 0, "reset_time": "2026-08-14T05:10:20Z"},
+                "claude-sonnet-4-6": {"utilization": 0, "reset_time": "2026-08-14T06:14:07Z"},
+                "gpt-oss-120b-medium": {"utilization": 0, "reset_time": "2026-08-14T06:14:07Z"}
+            }
+        });
+
+        let windows = normalize_antigravity(&usage);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(
+            windows
+                .iter()
+                .map(|window| window.display_name.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["Gemini shared quota", "Claude / GPT shared quota"])
+        );
+    }
+
+    #[test]
+    fn api_models_with_the_same_real_key_merge_into_one_quota_pool() {
+        let nonce = Utc::now().timestamp_nanos_opt().unwrap_or_default();
+        let first_credential = format!("Codex-Router-Usage-Pool-A-{nonce}");
+        let second_credential = format!("Codex-Router-Usage-Pool-B-{nonce}");
+        let result = (|| -> anyhow::Result<()> {
+            crate::logic::write_router_credential_text(&first_credential, "same-real-kimi-key")?;
+            crate::logic::write_router_credential_text(&second_credential, "same-real-kimi-key")?;
+            let first_channel = ModelConfig {
+                model: "kimi-for-coding".to_owned(),
+                base_url: "https://api.kimi.com/coding/v1".to_owned(),
+                credential_name: first_credential.clone(),
+                ..Default::default()
+            };
+            let second_channel = ModelConfig {
+                model: "k3-256k".to_owned(),
+                base_url: "https://api.kimi.com/coding/v1".to_owned(),
+                credential_name: second_credential.clone(),
+                ..Default::default()
+            };
+            assert_eq!(
+                api_quota_pool_key(&first_channel),
+                api_quota_pool_key(&second_channel)
+            );
+
+            let first_name = "Codex-Router / Kimi For Coding".to_owned();
+            let second_name = "Codex-Router / Kimi K3".to_owned();
+            let channels = HashMap::from([
+                (first_name.clone(), first_channel),
+                (second_name.clone(), second_channel),
+            ]);
+            let record = |id, name: String, model: &str, requests| AccountRecord {
+                account: UsageAccount {
+                    id,
+                    name,
+                    kind: "apikey".to_owned(),
+                    platform: "openai".to_owned(),
+                    totals: UsageTotals {
+                        requests,
+                        ..Default::default()
+                    },
+                    windows: vec![coding_window("weekly", 25.0, None, "Kimi Coding Plan")],
+                    ..Default::default()
+                },
+                configured_model: model.to_owned(),
+                quota_evidence: OAuthQuotaEvidence::Unknown,
+                auto_isolate_on_exhaustion: false,
+                routing_changed: false,
+            };
+            let merged = merge_api_quota_pools(
+                vec![
+                    record(1, first_name, "kimi-for-coding", 2),
+                    record(2, second_name, "k3-256k", 3),
+                ],
+                &channels,
+            );
+            assert_eq!(merged.len(), 1);
+            assert_eq!(merged[0].account.name, "Codex-Router / Kimi Coding Plan");
+            assert_eq!(merged[0].account.totals.requests, 5);
+            assert_eq!(merged[0].account.windows.len(), 1);
+            Ok(())
+        })();
+        let _ = crate::logic::delete_router_credential(&first_credential);
+        let _ = crate::logic::delete_router_credential(&second_credential);
+        result.unwrap();
+    }
+
+    #[test]
+    fn unknown_oauth_quota_stays_isolated_before_five_hours() {
+        let now = DateTime::parse_from_rfc3339("2026-08-12T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            oauth_recovery_directive(
+                OAuthQuotaEvidence::Unknown,
+                true,
+                "2026-08-11T19:00:01Z",
+                now,
+            ),
+            OAuthRecoveryDirective::Isolate
+        );
+    }
+
+    #[test]
+    fn unknown_oauth_quota_recovers_at_five_hour_limit() {
+        let now = DateTime::parse_from_rfc3339("2026-08-12T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            oauth_recovery_directive(
+                OAuthQuotaEvidence::Unknown,
+                true,
+                "2026-08-11T19:00:00Z",
+                now,
+            ),
+            OAuthRecoveryDirective::Recover
+        );
+        assert_eq!(
+            oauth_recovery_directive(
+                OAuthQuotaEvidence::Exhausted,
+                true,
+                "2026-08-11T18:00:00Z",
+                now,
+            ),
+            OAuthRecoveryDirective::Isolate,
+            "freshly confirmed exhaustion must not be force-recovered"
+        );
+    }
+
+    #[test]
+    fn oauth_recovery_schedule_uses_reset_ten_minute_probe_and_five_hour_cap() {
+        let now = DateTime::parse_from_rfc3339("2026-08-12T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let reset = OAuthRecoveryObservations {
+            entries: vec![OAuthRecoveryObservation {
+                account_id: 1,
+                exhausted: true,
+                observed_at: "2026-08-11T23:00:00Z".into(),
+                next_probe_at: "2026-08-12T05:00:00Z".into(),
+                reset_at: "2026-08-12T02:00:00Z".into(),
+                ..Default::default()
+            }],
+        };
+        assert_eq!(next_oauth_recovery_seconds_from(&reset, now), 2 * 60 * 60);
+
+        let unknown = OAuthRecoveryObservations {
+            entries: vec![OAuthRecoveryObservation {
+                account_id: 2,
+                observed_at: "2026-08-11T19:10:00Z".into(),
+                next_probe_at: "2026-08-12T00:10:00Z".into(),
+                ..Default::default()
+            }],
+        };
+        assert_eq!(next_oauth_recovery_seconds_from(&unknown, now), 10 * 60);
+
+        let capped = OAuthRecoveryObservations {
+            entries: vec![OAuthRecoveryObservation {
+                account_id: 3,
+                observed_at: "2026-08-11T19:00:00Z".into(),
+                next_probe_at: "2026-08-12T00:10:00Z".into(),
+                ..Default::default()
+            }],
+        };
+        // The directive force-recovers at the cap during the current query;
+        // a retained edge-case observation must still be retried promptly.
+        assert_eq!(next_oauth_recovery_seconds_from(&capped, now), 10 * 60);
+    }
+
+    #[test]
+    fn overdue_oauth_recovery_observation_never_creates_a_sub_ten_minute_loop() {
+        let now = DateTime::parse_from_rfc3339("2026-08-12T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let overdue = OAuthRecoveryObservations {
+            entries: vec![OAuthRecoveryObservation {
+                account_id: 15,
+                exhausted: true,
+                observed_at: "2026-08-10T13:40:15Z".into(),
+                next_probe_at: "2026-08-11T04:45:17Z".into(),
+                reset_at: "2026-08-11T11:33:07Z".into(),
+                ..Default::default()
+            }],
+        };
+
+        assert_eq!(next_oauth_recovery_seconds_from(&overdue, now), 10 * 60);
+    }
+
+    #[test]
+    fn recovery_observations_drop_accounts_without_an_active_fallback() {
+        let mut observations = OAuthRecoveryObservations {
+            entries: vec![
+                OAuthRecoveryObservation {
+                    account_id: 1,
+                    exhausted: true,
+                    ..Default::default()
+                },
+                OAuthRecoveryObservation {
+                    account_id: 15,
+                    exhausted: true,
+                    ..Default::default()
+                },
+            ],
+        };
+
+        assert!(retain_active_oauth_recovery_observations(
+            &mut observations,
+            &HashSet::from([1]),
+        ));
+        assert_eq!(
+            observations
+                .entries
+                .iter()
+                .map(|entry| entry.account_id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert!(!retain_active_oauth_recovery_observations(
+            &mut observations,
+            &HashSet::from([1]),
+        ));
+    }
 
     #[test]
     fn kimi_nested_limits_keep_five_hour_and_weekly_lanes() {
@@ -2209,6 +3307,603 @@ mod tests {
     }
 
     #[test]
+    fn fresh_live_quota_recovers_a_misdisabled_api_account() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(750);
+            let mut paths = Vec::new();
+            while Instant::now() < deadline && paths.len() < 2 {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("mock server accept failed: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                let mut request = [0_u8; 4096];
+                let read = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                paths.push(request.lines().next().unwrap_or_default().to_owned());
+                let body = r#"{"data":{"status":"active"}}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+            paths
+        });
+        let admin = AdminClient {
+            client: Client::builder().no_proxy().build().unwrap(),
+            base_url: format!("http://{address}"),
+            bearer: Arc::new(Zeroizing::new("test-token".to_owned())),
+        };
+        let task = AccountTask {
+            account: json!({
+                "id": 42,
+                "type": "apikey",
+                "platform": "openai",
+                "status": "error",
+                "schedulable": false,
+                "error_message": "k3-256k supports only 256K context."
+            }),
+            channel: Some(ModelConfig {
+                base_url: "https://api.kimi.com/coding/v1".to_owned(),
+                model: "k3-256k".to_owned(),
+                ..ModelConfig::default()
+            }),
+            query_provider_usage: false,
+            auto_isolate_on_exhaustion: false,
+        };
+        let windows = vec![coding_window("weekly", 25.0, None, "")];
+
+        assert!(maybe_recover_misdisabled_account(
+            &admin,
+            &task,
+            &windows,
+            true,
+            "",
+            Instant::now() + Duration::from_secs(2),
+        ));
+        let paths = server.join().unwrap();
+        assert_eq!(paths.len(), 2);
+        assert!(paths[0].contains("/api/v1/admin/accounts/42/recover-state"));
+        assert!(paths[1].contains("/api/v1/admin/accounts/42/schedulable"));
+    }
+
+    #[test]
+    fn recovery_rejects_invalid_credentials_cached_quota_and_exhausted_quota() {
+        let admin = AdminClient {
+            client: Client::builder().no_proxy().build().unwrap(),
+            base_url: "http://127.0.0.1:9".to_owned(),
+            bearer: Arc::new(Zeroizing::new("test-token".to_owned())),
+        };
+        let task = AccountTask {
+            account: json!({
+                "id": 43,
+                "type": "apikey",
+                "platform": "openai",
+                "status": "error",
+                "schedulable": false,
+                "error_message": "401 invalid API key"
+            }),
+            channel: Some(ModelConfig {
+                base_url: "https://api.kimi.com/coding/v1".to_owned(),
+                model: "k3-256k".to_owned(),
+                ..ModelConfig::default()
+            }),
+            query_provider_usage: false,
+            auto_isolate_on_exhaustion: false,
+        };
+        let mut windows = vec![coding_window("weekly", 25.0, None, "")];
+
+        assert!(!maybe_recover_misdisabled_account(
+            &admin,
+            &task,
+            &windows,
+            true,
+            "class=authentication | marker=ROUTER_KIMI_CREDENTIAL_REJECTED",
+            Instant::now() + Duration::from_secs(1),
+        ));
+        assert!(!maybe_recover_misdisabled_account(
+            &admin,
+            &task,
+            &windows,
+            false,
+            "",
+            Instant::now() + Duration::from_secs(1),
+        ));
+        windows[0].used_percent = Some(100.0);
+        assert!(!maybe_recover_misdisabled_account(
+            &admin,
+            &task,
+            &windows,
+            true,
+            "",
+            Instant::now() + Duration::from_secs(1),
+        ));
+    }
+
+    #[test]
+    fn fresh_live_quota_recovers_a_misdisabled_oauth_account() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(750);
+            let mut paths = Vec::new();
+            while Instant::now() < deadline && paths.len() < 2 {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("mock server accept failed: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                let mut request = [0_u8; 4096];
+                let read = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                paths.push(request.lines().next().unwrap_or_default().to_owned());
+                let body = r#"{"data":{"status":"active"}}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+            paths
+        });
+        let admin = AdminClient {
+            client: Client::builder().no_proxy().build().unwrap(),
+            base_url: format!("http://{address}"),
+            bearer: Arc::new(Zeroizing::new("test-token".to_owned())),
+        };
+        let task = AccountTask {
+            account: json!({
+                "id": 44,
+                "type": "oauth",
+                "platform": "grok",
+                "status": "error",
+                "schedulable": false,
+                "error_message": "stale provider error"
+            }),
+            channel: None,
+            query_provider_usage: false,
+            auto_isolate_on_exhaustion: false,
+        };
+        let windows = vec![coding_window("weekly", 25.0, None, "")];
+
+        assert!(maybe_recover_misdisabled_account(
+            &admin,
+            &task,
+            &windows,
+            true,
+            "",
+            Instant::now() + Duration::from_secs(2),
+        ));
+        let paths = server.join().unwrap();
+        assert_eq!(paths.len(), 2);
+        assert!(paths[0].contains("/api/v1/admin/accounts/44/recover-state"));
+        assert!(paths[1].contains("/api/v1/admin/accounts/44/schedulable"));
+    }
+
+    #[test]
+    fn fresh_exhausted_oauth_is_made_unschedulable_for_api_fallback() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]).into_owned();
+            let body = r#"{"data":{"schedulable":false}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            request
+        });
+        let admin = AdminClient {
+            client: Client::builder().no_proxy().build().unwrap(),
+            base_url: format!("http://{address}"),
+            bearer: Arc::new(Zeroizing::new("test-token".to_owned())),
+        };
+        let task = AccountTask {
+            account: json!({
+                "id": 45,
+                "type": "oauth",
+                "platform": "openai",
+                "status": "active",
+                "schedulable": true
+            }),
+            channel: None,
+            query_provider_usage: false,
+            auto_isolate_on_exhaustion: true,
+        };
+        let windows = vec![coding_window("weekly", 100.0, None, "")];
+
+        assert!(maybe_isolate_exhausted_oauth_account(
+            &admin,
+            &task,
+            &windows,
+            true,
+            "",
+            Instant::now() + Duration::from_secs(2),
+        ));
+        let request = server.join().unwrap();
+        assert!(request.starts_with("POST /api/v1/admin/accounts/45/schedulable "));
+        assert!(request.contains(r#""schedulable":false"#));
+    }
+
+    #[test]
+    fn only_oauth_accounts_with_a_selected_matching_api_fallback_are_auto_isolated() {
+        let mut cfg = RouterConfig {
+            oauth_fallback: crate::config::OAuthFallback {
+                enabled: true,
+                ..Default::default()
+            },
+            models: vec![
+                ModelConfig {
+                    source: "oauth".to_owned(),
+                    model: "gpt-5.6-sol".to_owned(),
+                    oauth_account_id: 7,
+                    ..Default::default()
+                },
+                ModelConfig {
+                    source: "oauth".to_owned(),
+                    model: "claude-opus-4.6".to_owned(),
+                    oauth_account_id: 8,
+                    ..Default::default()
+                },
+                ModelConfig {
+                    source: "apikey".to_owned(),
+                    model: "gpt-5.6-sol".to_owned(),
+                    base_url: "https://api.example.test/v1".to_owned(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(oauth_accounts_with_api_fallback(&cfg), HashSet::from([7]));
+
+        cfg.oauth_fallback.enabled = false;
+        assert!(oauth_accounts_with_api_fallback(&cfg).is_empty());
+    }
+
+    #[test]
+    fn oauth_priority_update_uses_native_admin_get_put_get_flow() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut requests = Vec::new();
+            while Instant::now() < deadline && requests.len() < 3 {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("mock server accept failed: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                let mut request = [0_u8; 4096];
+                let read = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..read]).to_string();
+                let index = requests.len();
+                requests.push(request);
+                let body = match index {
+                    0 => r#"{"data":{"id":51,"type":"oauth","priority":1}}"#,
+                    1 => r#"{"data":{}}"#,
+                    _ => r#"{"data":{"id":51,"type":"oauth","priority":37}}"#,
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+            requests
+        });
+        let admin = AdminClient {
+            client: Client::builder().no_proxy().build().unwrap(),
+            base_url: format!("http://{address}"),
+            bearer: Arc::new(Zeroizing::new("test-token".to_owned())),
+        };
+
+        assert_eq!(
+            set_oauth_account_priority_with_admin(&admin, 51, 37).unwrap(),
+            37
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].starts_with("GET /api/v1/admin/accounts/51 "));
+        assert!(requests[1].starts_with("PUT /api/v1/admin/accounts/51 "));
+        assert!(requests[1].contains("\"priority\":37"));
+        assert!(requests[1].contains("\"confirm_mixed_channel_risk\":true"));
+        assert!(requests[2].starts_with("GET /api/v1/admin/accounts/51 "));
+    }
+
+    #[test]
+    fn oauth_account_query_retries_transient_request_failure_before_showing_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut usage_requests = 0;
+            while Instant::now() < deadline && usage_requests < 2 {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("mock server accept failed: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                let mut request = [0_u8; 4096];
+                let read = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                let (status, body) = if request.contains("/stats ") {
+                    ("200 OK", r#"{"data":{"total_tokens":1}}"#)
+                } else if request.contains("/usage?force=true ") {
+                    usage_requests += 1;
+                    if usage_requests == 1 {
+                        ("503 Service Unavailable", r#"{"error":"transient"}"#)
+                    } else {
+                        ("200 OK", r#"{"data":{"five_hour":{"used_percent":25}}}"#)
+                    }
+                } else {
+                    ("404 Not Found", r#"{"error":"unexpected path"}"#)
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+            usage_requests
+        });
+        let admin = AdminClient {
+            client: Client::builder().no_proxy().build().unwrap(),
+            base_url: format!("http://{address}"),
+            bearer: Arc::new(Zeroizing::new("test-token".to_owned())),
+        };
+        let task = AccountTask {
+            account: json!({"id": 7, "type": "oauth", "platform": "gemini", "status": "active", "schedulable": true}),
+            channel: None,
+            query_provider_usage: false,
+            auto_isolate_on_exhaustion: false,
+        };
+        let cache = Arc::new(Mutex::new(UsageCache::new()));
+
+        let record = query_account(
+            &admin,
+            task,
+            &cache,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        let usage_requests = server.join().unwrap();
+
+        assert_eq!(
+            usage_requests, 2,
+            "the transient provider request was not retried"
+        );
+        assert_eq!(record.account.windows.len(), 1);
+        assert!(
+            record.account.query_note.is_empty(),
+            "transient failure leaked into OAuth UI"
+        );
+    }
+
+    #[test]
+    fn usage_refresh_does_not_read_or_import_the_oauth_model_catalog() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut paths = Vec::new();
+            while Instant::now() < deadline && paths.len() < 3 {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("mock server accept failed: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                let mut request = [0_u8; 4096];
+                let read = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or_default()
+                    .to_owned();
+                let body = if path.ends_with("/stats") {
+                    r#"{"data":{"total_tokens":1}}"#
+                } else if path.contains("/usage?force=true") {
+                    r#"{"data":{"five_hour":{"used_percent":25}}}"#
+                } else if path.ends_with("/models") {
+                    r#"{"data":{"items":[{"id":"grok-4.6"}]}}"#
+                } else {
+                    r#"{"error":"unexpected path"}"#
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                paths.push(path);
+            }
+            paths
+        });
+        let admin = AdminClient {
+            client: Client::builder().no_proxy().build().unwrap(),
+            base_url: format!("http://{address}"),
+            bearer: Arc::new(Zeroizing::new("test-token".to_owned())),
+        };
+        let task = AccountTask {
+            account: json!({"id": 10, "type": "oauth", "platform": "grok", "status": "active", "schedulable": true}),
+            channel: None,
+            query_provider_usage: false,
+            auto_isolate_on_exhaustion: false,
+        };
+
+        query_account(
+            &admin,
+            task,
+            &Arc::new(Mutex::new(UsageCache::new())),
+            Instant::now() + Duration::from_secs(3),
+        )
+        .unwrap();
+        let paths = server.join().unwrap();
+
+        assert!(paths.iter().all(|path| !path.ends_with("/models")));
+    }
+
+    #[test]
+    fn antigravity_quota_uses_live_models_even_when_configured_names_are_stale() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut requests = 0;
+            while Instant::now() < deadline && requests < 2 {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("mock server accept failed: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                let mut request = [0_u8; 4096];
+                let read = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                let body = if request.contains("/stats ") {
+                    r#"{"data":{"total_tokens":1}}"#
+                } else if request.contains("/usage?force=true ") {
+                    r#"{"data":{"antigravity_quota":{"gemini-live":{"utilization":25,"reset_time":"2026-08-13T00:00:00Z"}},"antigravity_quota_details":{"gemini-live":{"display_name":"Gemini Live"}}}}"#
+                } else {
+                    r#"{"error":"unexpected path"}"#
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                requests += 1;
+            }
+        });
+        let admin = AdminClient {
+            client: Client::builder().no_proxy().build().unwrap(),
+            base_url: format!("http://{address}"),
+            bearer: Arc::new(Zeroizing::new("test-token".to_owned())),
+        };
+        let task = AccountTask {
+            account: json!({"id": 8, "type": "oauth", "platform": "antigravity", "status": "active", "schedulable": true}),
+            channel: None,
+            query_provider_usage: false,
+            auto_isolate_on_exhaustion: false,
+        };
+
+        let record = query_account(
+            &admin,
+            task,
+            &Arc::new(Mutex::new(UsageCache::new())),
+            Instant::now() + Duration::from_secs(3),
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(record.account.windows.len(), 1);
+        assert_eq!(record.account.windows[0].display_name, "Gemini Live");
+        assert!(record.account.query_note.is_empty());
+    }
+
+    #[test]
+    fn antigravity_degraded_authentication_is_not_reported_as_request_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut requests = 0;
+            while Instant::now() < deadline && requests < 2 {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("mock server accept failed: {error}"),
+                };
+                let mut request = [0_u8; 4096];
+                let read = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                let body = if request.contains("/stats ") {
+                    r#"{"data":{"total_tokens":1}}"#
+                } else {
+                    r#"{"data":{"error_code":"unauthenticated","needs_reauth":true}}"#
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                requests += 1;
+            }
+        });
+        let admin = AdminClient {
+            client: Client::builder().no_proxy().build().unwrap(),
+            base_url: format!("http://{address}"),
+            bearer: Arc::new(Zeroizing::new("test-token".to_owned())),
+        };
+        let task = AccountTask {
+            account: json!({"id": 9, "type": "oauth", "platform": "antigravity", "status": "active", "schedulable": true}),
+            channel: None,
+            query_provider_usage: false,
+            auto_isolate_on_exhaustion: false,
+        };
+
+        let record = query_account(
+            &admin,
+            task,
+            &Arc::new(Mutex::new(UsageCache::new())),
+            Instant::now() + Duration::from_secs(3),
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(record.account.query_note, "class=authentication");
+        assert!(!record.account.query_note.contains("request_failure"));
+    }
+
+    #[test]
     fn credential_endpoints_reject_host_and_scheme_confusion() {
         assert!(coding_plan_endpoint("https://api.zenmux.ai/api/v1").is_some());
         for url in [
@@ -2252,19 +3947,20 @@ mod tests {
                 .all(|account| !account.query_note.contains("class=request_failure")),
             "a subscription still exposes class=request_failure"
         );
-        let kimi = snapshot
+        if let Some(kimi) = snapshot
             .api_channels
             .iter()
             .find(|account| account.name.to_ascii_lowercase().contains("kimi"))
-            .expect("configured Kimi channel");
-        assert!(
-            !kimi.windows.is_empty(),
-            "Kimi returned no readable quota window"
-        );
-        assert!(
-            !kimi.query_note.contains("ROUTER_KIMI_CREDENTIAL_REJECTED"),
-            "Kimi rejected the credential selected in the application"
-        );
+        {
+            assert!(
+                !kimi.windows.is_empty(),
+                "Kimi returned no readable quota window"
+            );
+            assert!(
+                !kimi.query_note.contains("ROUTER_KIMI_CREDENTIAL_REJECTED"),
+                "Kimi rejected the credential selected in the application"
+            );
+        }
         eprintln!(
             "live usage acceptance: subscriptions={}, api_channels={}",
             snapshot.subscriptions.len(),

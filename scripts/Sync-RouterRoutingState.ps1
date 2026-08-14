@@ -34,6 +34,16 @@ $oauthSelectionInitialized = $null -ne $oauthSelectionProperty
 $oauthAccountIds = if ($oauthSelectionInitialized) {
     @($oauthSelectionProperty.Value | ForEach-Object { [long]$_ } | Where-Object { $_ -gt 0 } | Select-Object -Unique)
 } else { @() }
+$observationPath = Join-Path (Get-RouterDataRoot -RouterRoot $routerRoot) 'state\oauth-recovery-observations.json'
+$observations = @{}
+if (Test-Path -LiteralPath $observationPath) {
+    try {
+        $saved = Get-Content -LiteralPath $observationPath -Raw | ConvertFrom-Json
+        foreach ($entry in @($saved.entries)) {
+            if ([long]$entry.accountId -gt 0) { $observations[[long]$entry.accountId] = $entry }
+        }
+    } catch { $observations = @{} }
+}
 
 $session = New-RouterAdminSession
 $group = @(Get-RouterGroups -Session $session | Where-Object { [string]$_.name -eq 'Codex-Router' } | Select-Object -First 1)
@@ -51,7 +61,10 @@ foreach ($accountId in $oauthAccountIds) {
     try {
         $account = Get-RouterResponseData (Invoke-RouterApi -Session $session -Method GET -Path "/api/v1/admin/accounts/$accountId")
         if ([string]$account.type -ne 'oauth') { continue }
-        $state = Get-RouterOAuthRecoveryState -Account $account
+        $state = Get-RouterOAuthRecoveryState -Account $account `
+            -ObservedResetAt $(if ($observations.ContainsKey($accountId)) { $observations[$accountId].resetAt } else { $null }) `
+            -ObservedExhausted:($observations.ContainsKey($accountId) -and [bool]$observations[$accountId].exhausted) `
+            -ObservedAt $(if ($observations.ContainsKey($accountId)) { [string]$observations[$accountId].observedAt } else { $null })
         $hasModels = @($configModels | Where-Object {
             $sourceProperty = $_.PSObject.Properties['source']
             $source = if ($null -eq $sourceProperty) { 'apikey' } else { ([string]$sourceProperty.Value).Trim().ToLowerInvariant() }

@@ -224,22 +224,11 @@ try {
                     [void]$models.Add([ordered]@{
                         id = $modelId
                         displayName = if ($displayName) { $displayName } else { $modelId }
-                        suggested = $false
                     })
                 }
             } catch {
                 $models.Clear()
                 $seenModelIds = @{}
-            }
-
-            foreach ($suggestedModel in @(Get-RouterOAuthModelSuggestions -Platform $platform)) {
-                if ($seenModelIds.ContainsKey([string]$suggestedModel.id)) { continue }
-                $seenModelIds[[string]$suggestedModel.id] = $true
-                [void]$models.Add([ordered]@{
-                    id = [string]$suggestedModel.id
-                    displayName = [string]$suggestedModel.displayName
-                    suggested = $true
-                })
             }
 
             $credentials = Get-SafePropertyValue -InputObject $detail -Name 'credentials'

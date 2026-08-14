@@ -1,0 +1,366 @@
+diff --git a/backend/internal/domain/constants.go b/backend/internal/domain/constants.go
+index fe8600248800da22fd8dcde67094209cb20d9f12..461ab480bb581215703363520ddae5602ba2ed8d 100644
+--- a/backend/internal/domain/constants.go
++++ b/backend/internal/domain/constants.go
+@@ -122,8 +122,12 @@ var DefaultAntigravityModelMapping = map[string]string{
+ 	"gemini-3.6-flash-medium": "gemini-3.6-flash-medium",
+ 	"gemini-3.6-flash-low":    "gemini-3.6-flash-low",
+ 	"gemini-3.6-flash-tiered": "gemini-3.6-flash-tiered",
+-	// Gemini 3.7 Flash is a native Antigravity model released on 2026-08-13.
+-	"gemini-3.7-flash": "gemini-3.7-flash",
++	// Gemini 3.7 Flash is exposed as three live Antigravity tiers. Keep one
++	// public model name and use the balanced medium tier by default.
++	"gemini-3.7-flash":        "gemini-3.7-flash-medium",
++	"gemini-3.7-flash-high":   "gemini-3.7-flash-high",
++	"gemini-3.7-flash-medium": "gemini-3.7-flash-medium",
++	"gemini-3.7-flash-low":    "gemini-3.7-flash-low",
+ 	// Gemini 3 image 兼容映射（向 3.1 image 迁移）
+ 	"gemini-3-pro-image":         "gemini-3.1-flash-image",
+ 	"gemini-3-pro-image-preview": "gemini-3.1-flash-image",
+diff --git a/backend/internal/domain/constants_test.go b/backend/internal/domain/constants_test.go
+index 5d3ef827b1708bf5e19c3ce610a505e3ad0a296d..5eea633b1eee6b7f267953e7c22f28f1589f38fc 100644
+--- a/backend/internal/domain/constants_test.go
++++ b/backend/internal/domain/constants_test.go
+@@ -80,12 +80,21 @@ func TestDefaultAntigravityModelMapping_ContainsLiveGemini36FlashModels(t *testi
+ 	}
+ }
+ 
+-func TestDefaultAntigravityModelMapping_Gemini37FlashNativeRoute(t *testing.T) {
++func TestDefaultAntigravityModelMapping_Gemini37FlashTieredRoute(t *testing.T) {
+ 	t.Parallel()
+ 
+-	const model = "gemini-3.7-flash"
+-	if got := DefaultAntigravityModelMapping[model]; got != model {
+-		t.Fatalf("expected native model %q to pass through, got %q", model, got)
++	const publicModel = "gemini-3.7-flash"
++	if got := DefaultAntigravityModelMapping[publicModel]; got != "gemini-3.7-flash-medium" {
++		t.Fatalf("expected public model %q to use the medium upstream tier, got %q", publicModel, got)
++	}
++	for _, model := range []string{
++		"gemini-3.7-flash-high",
++		"gemini-3.7-flash-medium",
++		"gemini-3.7-flash-low",
++	} {
++		if got := DefaultAntigravityModelMapping[model]; got != model {
++			t.Fatalf("expected live model %q to pass through, got %q", model, got)
++		}
+ 	}
+ }
+ 
+diff --git a/backend/internal/pkg/antigravity/oauth.go b/backend/internal/pkg/antigravity/oauth.go
+index 4c129475f0fced93b8f733fa4b59e13e826a3f4e..5b044397d3f36ca7ae5fcccb1047dc955bee1211 100644
+--- a/backend/internal/pkg/antigravity/oauth.go
++++ b/backend/internal/pkg/antigravity/oauth.go
+@@ -34,7 +34,7 @@ const (
+ 	AntigravityUserAgentVersionEnv = "ANTIGRAVITY_USER_AGENT_VERSION"
+ 
+ 	// DefaultUserAgentVersion 是未通过环境变量或后台设置覆盖时使用的默认版本号。
+-	DefaultUserAgentVersion = "1.23.2"
++	DefaultUserAgentVersion = "2.8.1"
+ 
+ 	// 固定的 redirect_uri（用户需手动复制 code）
+ 	RedirectURI = "http://localhost:8085/callback"
+diff --git a/backend/internal/pkg/antigravity/oauth_test.go b/backend/internal/pkg/antigravity/oauth_test.go
+index 2f65d48ab7294df3bd9bb72b87ab84f8b4b2a4d1..aab307edc66e3fde651b8dda55e970d140b07d7d 100644
+--- a/backend/internal/pkg/antigravity/oauth_test.go
++++ b/backend/internal/pkg/antigravity/oauth_test.go
+@@ -681,7 +681,10 @@ func TestConstants_值正确(t *testing.T) {
+ 	if RedirectURI != "http://localhost:8085/callback" {
+ 		t.Errorf("RedirectURI 不匹配: got %s", RedirectURI)
+ 	}
+-	if GetUserAgent() != "antigravity/1.23.2 windows/amd64" {
++	if DefaultUserAgentVersion != "2.8.1" {
++		t.Errorf("DefaultUserAgentVersion 不匹配: got %s", DefaultUserAgentVersion)
++	}
++	if GetUserAgent() != "antigravity/2.8.1 windows/amd64" {
+ 		t.Errorf("UserAgent 不匹配: got %s", GetUserAgent())
+ 	}
+ 	if SessionTTL != 30*time.Minute {
+diff --git a/backend/internal/pkg/antigravity/request_transformer.go b/backend/internal/pkg/antigravity/request_transformer.go
+index 7d0a707959b80b320612aa042d25668ec84beee7..9d712e6d2fa489f57820f217d9fb9203ef49aadf 100644
+--- a/backend/internal/pkg/antigravity/request_transformer.go
++++ b/backend/internal/pkg/antigravity/request_transformer.go
+@@ -761,26 +761,21 @@ func buildTools(tools []ClaudeTool) []GeminiToolDeclaration {
+ 		})
+ 	}
+ 
+-	var declarations []GeminiToolDeclaration
+-	if len(funcDecls) > 0 {
+-		declarations = append(declarations, GeminiToolDeclaration{
+-			FunctionDeclarations: funcDecls,
+-		})
+-	}
+-	if hasWebSearch {
+-		declarations = append(declarations, GeminiToolDeclaration{
+-			GoogleSearch: &GeminiGoogleSearch{
+-				EnhancedContent: &GeminiEnhancedContent{
+-					ImageSearch: &GeminiImageSearch{
+-						MaxResultCount: 5,
+-					},
++	declaration := GeminiToolDeclaration{FunctionDeclarations: funcDecls}
++	// Antigravity's v1internal endpoint rejects googleSearch combined with
++	// functionDeclarations even when includeServerSideToolInvocations is set.
++	// Preserve executable client functions and degrade only server-side search.
++	if hasWebSearch && len(funcDecls) == 0 {
++		declaration.GoogleSearch = &GeminiGoogleSearch{
++			EnhancedContent: &GeminiEnhancedContent{
++				ImageSearch: &GeminiImageSearch{
++					MaxResultCount: 5,
+ 				},
+ 			},
+-		})
++		}
+ 	}
+-	if len(declarations) == 0 {
++	if len(funcDecls) == 0 && !hasWebSearch {
+ 		return nil
+ 	}
+-
+-	return declarations
++	return []GeminiToolDeclaration{declaration}
+ }
+diff --git a/backend/internal/pkg/antigravity/request_transformer_test.go b/backend/internal/pkg/antigravity/request_transformer_test.go
+index ea95cc7ea656e5a0925962f06d0055039ca036c1..1ef6184048c29ad325aec87b0ff28348607e9af4 100644
+--- a/backend/internal/pkg/antigravity/request_transformer_test.go
++++ b/backend/internal/pkg/antigravity/request_transformer_test.go
+@@ -263,7 +263,7 @@ func TestBuildTools_CustomTypeTools(t *testing.T) {
+ 	}
+ }
+ 
+-func TestBuildTools_PreservesWebSearchAlongsideFunctions(t *testing.T) {
++func TestBuildTools_PrefersFunctionsWhenWebSearchIsAlsoRequested(t *testing.T) {
+ 	tools := []ClaudeTool{
+ 		{
+ 			Name:        "get_weather",
+@@ -277,13 +277,10 @@ func TestBuildTools_PreservesWebSearchAlongsideFunctions(t *testing.T) {
+ 	}
+ 
+ 	result := buildTools(tools)
+-	require.Len(t, result, 2)
++	require.Len(t, result, 1)
+ 	require.Len(t, result[0].FunctionDeclarations, 1)
+ 	require.Equal(t, "get_weather", result[0].FunctionDeclarations[0].Name)
+-	require.NotNil(t, result[1].GoogleSearch)
+-	require.NotNil(t, result[1].GoogleSearch.EnhancedContent)
+-	require.NotNil(t, result[1].GoogleSearch.EnhancedContent.ImageSearch)
+-	require.Equal(t, 5, result[1].GoogleSearch.EnhancedContent.ImageSearch.MaxResultCount)
++	require.Nil(t, result[0].GoogleSearch)
+ }
+ 
+ func TestBuildGenerationConfig_ThinkingDynamicBudget(t *testing.T) {
+@@ -533,7 +530,7 @@ func TestTransformClaudeToGeminiWithOptions_MessageRoles(t *testing.T) {
+ 	})
+ }
+ 
+-func TestTransformClaudeToGeminiWithOptions_PreservesWebSearchAlongsideFunctions(t *testing.T) {
++func TestTransformClaudeToGeminiWithOptions_PrefersFunctionsWhenWebSearchIsAlsoRequested(t *testing.T) {
+ 	claudeReq := &ClaudeRequest{
+ 		Model: "claude-3-5-sonnet-latest",
+ 		Messages: []ClaudeMessage{
+@@ -560,8 +557,8 @@ func TestTransformClaudeToGeminiWithOptions_PreservesWebSearchAlongsideFunctions
+ 
+ 	var req V1InternalRequest
+ 	require.NoError(t, json.Unmarshal(body, &req))
+-	require.Len(t, req.Request.Tools, 2)
++	require.Len(t, req.Request.Tools, 1)
+ 	require.Len(t, req.Request.Tools[0].FunctionDeclarations, 1)
+ 	require.Equal(t, "get_weather", req.Request.Tools[0].FunctionDeclarations[0].Name)
+-	require.NotNil(t, req.Request.Tools[1].GoogleSearch)
++	require.Nil(t, req.Request.Tools[0].GoogleSearch)
+ }
+diff --git a/backend/internal/service/account.go b/backend/internal/service/account.go
+index 53c85d255e8ea78636d8eb3fc52a2d2b5befd64e..0b0bdf080eb4dca3f6dcca7223aa65187eff56ab 100644
+--- a/backend/internal/service/account.go
++++ b/backend/internal/service/account.go
+@@ -620,6 +620,9 @@ func (a *Account) resolveModelMapping(rawMapping map[string]any) map[string]stri
+ 				"gemini-3-flash",
+ 				"gemini-3.1-pro-high",
+ 				"gemini-3.1-pro-low",
++				"gemini-3.7-flash-high",
++				"gemini-3.7-flash-medium",
++				"gemini-3.7-flash-low",
+ 			})
+ 			applyAntigravityGemini31ProAliases(result)
+ 		}
+diff --git a/backend/internal/service/antigravity_gateway_compat.go b/backend/internal/service/antigravity_gateway_compat.go
+index af1b8ebbe42a622697cc912855e4702691b399ca..751b31360aa7423dc7d35328abe64130e2b297d6 100644
+--- a/backend/internal/service/antigravity_gateway_compat.go
++++ b/backend/internal/service/antigravity_gateway_compat.go
+@@ -263,6 +263,10 @@ func (s *AntigravityGatewayService) buildAntigravityCompatGeminiBody(
+ 		if err != nil {
+ 			return nil, err
+ 		}
++		body, err = degradeAntigravityMixedTools(body)
++		if err != nil {
++			return nil, err
++		}
+ 		body = ensureGeminiFunctionCallThoughtSignatures(body)
+ 		body, err = injectIdentityPatchToGeminiRequest(body)
+ 		if err != nil {
+@@ -279,6 +283,60 @@ func (s *AntigravityGatewayService) buildAntigravityCompatGeminiBody(
+ 	return antigravity.TransformClaudeToGeminiWithOptions(claudeRequest, projectID, mappedModel, options)
+ }
+ 
++func degradeAntigravityMixedTools(body []byte) ([]byte, error) {
++	var payload map[string]any
++	if err := json.Unmarshal(body, &payload); err != nil {
++		return nil, err
++	}
++	tools, ok := payload["tools"].([]any)
++	if !ok || len(tools) == 0 {
++		return body, nil
++	}
++	hasFunctions := false
++	for _, rawTool := range tools {
++		tool, ok := rawTool.(map[string]any)
++		if !ok {
++			continue
++		}
++		if declarations, ok := tool["functionDeclarations"].([]any); ok && len(declarations) > 0 {
++			hasFunctions = true
++			break
++		}
++	}
++	if !hasFunctions {
++		return body, nil
++	}
++
++	filtered := make([]any, 0, len(tools))
++	modified := false
++	for _, rawTool := range tools {
++		tool, ok := rawTool.(map[string]any)
++		if !ok {
++			filtered = append(filtered, rawTool)
++			continue
++		}
++		for _, key := range []string{
++			"googleSearch",
++			"google_search",
++			"googleSearchRetrieval",
++			"google_search_retrieval",
++		} {
++			if _, exists := tool[key]; exists {
++				delete(tool, key)
++				modified = true
++			}
++		}
++		if len(tool) > 0 {
++			filtered = append(filtered, tool)
++		}
++	}
++	if !modified {
++		return body, nil
++	}
++	payload["tools"] = filtered
++	return json.Marshal(payload)
++}
++
+ func antigravityCompatProxyURL(account *Account) string {
+ 	if account.ProxyID == nil || account.Proxy == nil {
+ 		return ""
+diff --git a/backend/internal/service/antigravity_gateway_compat_test.go b/backend/internal/service/antigravity_gateway_compat_test.go
+index 1f73a80a6c1cd382e71c2fe228d58188de31dbed..cc9382c06e0602577757227b966cee2603a442c7 100644
+--- a/backend/internal/service/antigravity_gateway_compat_test.go
++++ b/backend/internal/service/antigravity_gateway_compat_test.go
+@@ -265,7 +265,7 @@ func TestAntigravityCompatPreservesChatTokenLimit(t *testing.T) {
+ 	}
+ }
+ 
+-func TestAntigravityCompatResponsesEnablesMixedServerAndFunctionTools(t *testing.T) {
++func TestAntigravityCompatResponsesDegradesMixedToolsToFunctions(t *testing.T) {
+ 	gin.SetMode(gin.TestMode)
+ 	upstream := &queuedHTTPUpstreamStub{responses: []*http.Response{antigravityCompatSuccessResponse()}}
+ 	svc := newAntigravityCompatService(config.GatewayConfig{MaxLineSize: defaultMaxLineSize}, upstream)
+@@ -291,16 +291,16 @@ func TestAntigravityCompatResponsesEnablesMixedServerAndFunctionTools(t *testing
+ 	require.NotNil(t, result)
+ 	require.Len(t, upstream.requestBodies, 1)
+ 	posted := upstream.requestBodies[0]
+-	require.True(t, gjson.GetBytes(posted, "request.toolConfig.includeServerSideToolInvocations").Bool())
++	require.False(t, gjson.GetBytes(posted, "request.toolConfig.includeServerSideToolInvocations").Exists())
+ 	var wrapped map[string]any
+ 	require.NoError(t, json.Unmarshal(posted, &wrapped))
+ 	requestBody, ok := wrapped["request"].(map[string]any)
+ 	require.True(t, ok)
+ 	tools, ok := requestBody["tools"].([]any)
+ 	require.True(t, ok)
+-	require.Len(t, tools, 2)
++	require.Len(t, tools, 1)
+ 	require.Contains(t, tools[0].(map[string]any), "functionDeclarations")
+-	require.Contains(t, tools[1].(map[string]any), "googleSearch")
++	require.NotContains(t, tools[0].(map[string]any), "googleSearch")
+ 	require.Equal(t, "read_record", gjson.GetBytes(posted, "request.tools.0.functionDeclarations.0.name").String())
+ }
+ 
+diff --git a/backend/internal/service/gateway_channel_restriction_test.go b/backend/internal/service/gateway_channel_restriction_test.go
+index 03171e4bb904ba5cb50bc1947a49a4d5e8701e1a..5442c6fe108ed86b21bb1aaa6010b6ddeb8543b3 100644
+--- a/backend/internal/service/gateway_channel_restriction_test.go
++++ b/backend/internal/service/gateway_channel_restriction_test.go
+@@ -47,22 +47,23 @@ func TestResolveAccountUpstreamModel_Antigravity(t *testing.T) {
+ 	require.Equal(t, "claude-sonnet-4-6", got)
+ }
+ 
+-func TestResolveAccountUpstreamModel_AntigravityGemini37NativeRoute(t *testing.T) {
++func TestResolveAccountUpstreamModel_AntigravityGemini37TieredRoute(t *testing.T) {
+ 	t.Parallel()
+ 
+ 	defaultAccount := &Account{Platform: PlatformAntigravity}
+-	require.Equal(t, "gemini-3.7-flash", resolveAccountUpstreamModel(defaultAccount, "gemini-3.7-flash"))
++	require.Equal(t, "gemini-3.7-flash-medium", resolveAccountUpstreamModel(defaultAccount, "gemini-3.7-flash"))
+ 
+ 	configuredAccount := &Account{
+ 		Platform: PlatformAntigravity,
+ 		Credentials: map[string]any{
+ 			"model_mapping": map[string]any{
+-				"gemini-3.7-flash": "gemini-3.7-flash",
++				"gemini-3.7-flash": "gemini-3.7-flash-medium",
+ 			},
+ 		},
+ 	}
+-	require.Equal(t, "gemini-3.7-flash", resolveAccountUpstreamModel(configuredAccount, "gemini-3.7-flash"))
++	require.Equal(t, "gemini-3.7-flash-medium", resolveAccountUpstreamModel(configuredAccount, "gemini-3.7-flash"))
+ 	require.True(t, (&GatewayService{}).isModelSupportedByAccount(configuredAccount, "gemini-3.7-flash"))
++	require.True(t, (&GatewayService{}).isModelSupportedByAccount(configuredAccount, "gemini-3.7-flash-medium"))
+ }
+ 
+ func TestResolveAccountUpstreamModel_Antigravity_Unsupported(t *testing.T) {
+diff --git a/backend/internal/service/gemini_messages_compat_service.go b/backend/internal/service/gemini_messages_compat_service.go
+index f1206f919f7e6f87924c017fc24ff6a9669a8b28..e4df8982d3ba11d53be4fb9bde1aeacf37f0d8c2 100644
+--- a/backend/internal/service/gemini_messages_compat_service.go
++++ b/backend/internal/service/gemini_messages_compat_service.go
+@@ -3168,11 +3168,6 @@ func convertClaudeMessagesToGeminiGenerateContent(body []byte) ([]byte, error) {
+ 
+ 	if tools := convertClaudeToolsToGeminiTools(req["tools"]); tools != nil {
+ 		out["tools"] = tools
+-		if geminiToolsMixServerAndFunctionCalls(tools) {
+-			out["toolConfig"] = map[string]any{
+-				"includeServerSideToolInvocations": true,
+-			}
+-		}
+ 	}
+ 
+ 	generationConfig := convertClaudeGenerationConfig(req)
+@@ -3184,24 +3179,6 @@ func convertClaudeMessagesToGeminiGenerateContent(body []byte) ([]byte, error) {
+ 	return json.Marshal(out)
+ }
+ 
+-func geminiToolsMixServerAndFunctionCalls(tools []any) bool {
+-	hasServerTool := false
+-	hasFunctionTool := false
+-	for _, tool := range tools {
+-		toolMap, ok := tool.(map[string]any)
+-		if !ok {
+-			continue
+-		}
+-		if _, ok := toolMap["googleSearch"]; ok {
+-			hasServerTool = true
+-		}
+-		if declarations, ok := toolMap["functionDeclarations"].([]any); ok && len(declarations) > 0 {
+-			hasFunctionTool = true
+-		}
+-	}
+-	return hasServerTool && hasFunctionTool
+-}
+-
+ func stripGeminiFunctionIDs(req map[string]any) {
+ 	// Defensive cleanup: some upstreams reject unexpected `id` fields in functionCall/functionResponse.
+ 	contents, ok := req["contents"].([]any)

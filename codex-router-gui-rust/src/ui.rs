@@ -1,6 +1,6 @@
 use super::{
     ensure_full_ui_fonts, theme, CloseBehavior, CodexRouterApp, IsolationKind, IsolationProfile,
-    ModelConfig, OAuthAccountSummary, Page, UsageAccount, UsageWindow, APP_VERSION,
+    ModelConfig, OAuthAccountSummary, Page, RouterConfig, UsageAccount, UsageWindow, APP_VERSION,
     OFFICIAL_GITHUB_URL,
 };
 use eframe::egui;
@@ -43,7 +43,7 @@ fn shell_metrics(viewport_height: f32) -> ShellMetrics {
 }
 
 fn topbar_control_size(viewport_width: f32, viewport_height: f32) -> egui::Vec2 {
-    if viewport_width < 1060.0 || viewport_height < 700.0 {
+    if viewport_width < 1120.0 || viewport_height < 700.0 {
         egui::vec2(COMPACT_TOPBAR_CONTROL_WIDTH, COMPACT_TOPBAR_CONTROL_HEIGHT)
     } else {
         egui::vec2(TOPBAR_CONTROL_WIDTH, TOPBAR_CONTROL_HEIGHT)
@@ -150,9 +150,10 @@ mod ordering_tests {
     use super::egui;
     use super::{
         dashboard_panel_heights, dashboard_uses_wide_layout, fit_dialog_size, friendly_error,
-        move_list_item, oauth_terms_confirmation_ready, remaining_quota_percent, shell_metrics,
-        topbar_control_size, usage_column_indices, usage_monitor_uses_two_columns, APP_VERSION,
-        DIALOG_VIEWPORT_GUTTER, TERMS_EN, TERMS_ZH, TOPBAR_CONTROL_HEIGHT, TOPBAR_CONTROL_WIDTH,
+        move_list_item, oauth_account_error, oauth_terms_confirmation_ready,
+        remaining_quota_percent, shell_metrics, topbar_control_size, usage_column_indices,
+        usage_monitor_uses_two_columns, APP_VERSION, DIALOG_VIEWPORT_GUTTER, TERMS_EN, TERMS_ZH,
+        TOPBAR_CONTROL_HEIGHT, TOPBAR_CONTROL_WIDTH,
     };
 
     #[test]
@@ -181,13 +182,14 @@ mod ordering_tests {
     }
 
     #[test]
-    fn dashboard_keeps_two_and_a_half_model_rows_and_a_compact_log() {
-        for available_height in [480.0, 560.0, 720.0] {
-            let (model_panel, model_list, log) = dashboard_panel_heights(available_height);
-            assert!((312.0..=320.0).contains(&model_panel));
-            assert!((216.0..=224.0).contains(&model_list));
-            assert_eq!(log, 90.0);
-        }
+    fn dashboard_model_list_uses_height_above_the_compact_log() {
+        let compact = dashboard_panel_heights(480.0);
+        let regular = dashboard_panel_heights(560.0);
+        let tall = dashboard_panel_heights(720.0);
+
+        assert_eq!(compact, (308.0, 262.0, 116.0));
+        assert_eq!(regular, (388.0, 342.0, 116.0));
+        assert_eq!(tall, (548.0, 502.0, 116.0));
     }
 
     #[test]
@@ -197,7 +199,7 @@ mod ordering_tests {
         for available_height in [300.0_f32, 360.0, 420.0] {
             let (model_panel, model_list, log) = dashboard_panel_heights(available_height);
             assert!(
-                model_panel + log + 72.0 <= available_height + 0.5,
+                model_panel + log + 56.0 <= available_height + 0.5,
                 "panels overflow at {available_height}: {model_panel} + {log}"
             );
             assert!(model_list <= model_panel);
@@ -209,6 +211,7 @@ mod ordering_tests {
         assert_eq!(TOPBAR_CONTROL_WIDTH, 112.0);
         assert_eq!(TOPBAR_CONTROL_HEIGHT, 48.0);
         assert_eq!(topbar_control_size(1280.0, 820.0), egui::vec2(112.0, 48.0));
+        assert_eq!(topbar_control_size(1064.0, 820.0), egui::vec2(92.0, 42.0));
         assert_eq!(topbar_control_size(944.0, 452.0), egui::vec2(92.0, 42.0));
     }
 
@@ -395,6 +398,18 @@ mod ordering_tests {
     }
 
     #[test]
+    fn oauth_account_errors_are_actionable_instead_of_raw_classes() {
+        let request = oauth_account_error("class=request_failure", true);
+        assert!(request.contains("上游探测暂时失败"));
+        assert!(!request.contains("本地服务"));
+        assert!(!request.contains("class="));
+
+        let authentication = oauth_account_error("class=authentication", true);
+        assert!(authentication.contains("重新授权"));
+        assert!(!authentication.contains("管理会话"));
+    }
+
+    #[test]
     fn quota_percentages_are_presented_as_remaining_capacity() {
         assert_eq!(remaining_quota_percent(Some(0.0)), Some(100.0));
         assert_eq!(remaining_quota_percent(Some(62.0)), Some(38.0));
@@ -529,13 +544,47 @@ fn friendly_error(raw: &str, zh: bool) -> String {
     }
 }
 
-fn oauth_model_docs_url(platform: &str) -> &'static str {
-    match platform {
-        "openai" => "https://developers.openai.com/api/docs/models",
-        "anthropic" => "https://platform.claude.com/docs/en/about-claude/models/overview",
-        "gemini" | "antigravity" => "https://ai.google.dev/gemini-api/docs/models",
-        "grok" => "https://docs.x.ai/docs/models",
-        _ => "https://github.com/HernanJiang/Codex-Router",
+fn oauth_account_error(raw: &str, zh: bool) -> String {
+    let normalized = raw.to_ascii_lowercase();
+    if normalized.contains("authentication")
+        || normalized.contains("unauthenticated")
+        || normalized.contains("status=401")
+        || normalized.contains("invalid_grant")
+    {
+        t(
+            zh,
+            "OAuth 凭据已失效。请撤销此账号后重新授权。",
+            "The OAuth credential has expired. Revoke this account, then authorize it again.",
+        )
+        .to_owned()
+    } else if normalized.contains("permission")
+        || normalized.contains("forbidden")
+        || normalized.contains("status=403")
+    {
+        t(
+            zh,
+            "上游拒绝了此账号的访问。请完成账号验证或重新授权后再刷新。",
+            "The provider denied this account. Complete account verification or authorize it again, then refresh.",
+        )
+        .to_owned()
+    } else if normalized.contains("rate_limit") || normalized.contains("status=429") {
+        t(
+            zh,
+            "此账号当前受额度或频率限制。到重置时间后点击「刷新」。",
+            "This account is currently quota or rate limited. Click Refresh after its reset time.",
+        )
+        .to_owned()
+    } else if normalized.contains("class=request_failure")
+        || normalized.contains("class=unclassified_error")
+    {
+        t(
+            zh,
+            "该账号的上游探测暂时失败。自检系统会自动重试，也可点击「刷新」。",
+            "This account's upstream probe temporarily failed. Self-check will retry automatically; you can also click Refresh.",
+        )
+        .to_owned()
+    } else {
+        friendly_error(raw, zh)
     }
 }
 
@@ -565,14 +614,22 @@ fn log_excerpt(text: &str, max_lines: usize, max_chars: usize) -> String {
 }
 
 fn dashboard_panel_heights(layout_height: f32) -> (f32, f32, f32) {
-    const LOG_CONTENT_HEIGHT: f32 = 90.0;
-    // Chrome around both panels: log frame, spacing, and the footer strip.
-    const RESERVED: f32 = 72.0;
-    let available_for_models = layout_height - LOG_CONTENT_HEIGHT - RESERVED;
-    // Prefer ~2.5 model rows, but never claim more than the window can show or
-    // the activity log gets pushed under the taskbar.
-    let model_content_height = available_for_models.clamp(0.0, 320.0);
-    let model_list_height = (model_content_height - 96.0).clamp(0.0, 224.0);
+    const LOG_CONTENT_HEIGHT: f32 = 116.0;
+    const PANEL_GAP: f32 = 8.0;
+    const BOTTOM_GAP: f32 = 4.0;
+    const MODEL_FRAME_VERTICAL_MARGIN: f32 = 24.0;
+    const LOG_FRAME_VERTICAL_MARGIN: f32 = 20.0;
+    const MODEL_HEADER_HEIGHT: f32 = 46.0;
+    // `model_content_height` and `log_content_height` are inner allocations.
+    // Account for both custom frame margins here so the activity log cannot be
+    // pushed beneath the footer on scaled Windows displays.
+    let reserved = LOG_CONTENT_HEIGHT
+        + PANEL_GAP
+        + BOTTOM_GAP
+        + MODEL_FRAME_VERTICAL_MARGIN
+        + LOG_FRAME_VERTICAL_MARGIN;
+    let model_content_height = (layout_height - reserved).max(0.0);
+    let model_list_height = (model_content_height - MODEL_HEADER_HEIGHT).max(0.0);
     (model_content_height, model_list_height, LOG_CONTENT_HEIGHT)
 }
 
@@ -580,13 +637,44 @@ impl eframe::App for CodexRouterApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         super::clamp_window_to_current_monitor(ctx);
         if self.ui_audit_mode {
+            let screenshot = ctx.input(|input| {
+                input.events.iter().find_map(|event| match event {
+                    egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                    _ => None,
+                })
+            });
+            if let (Some(path), Some(image)) = (self.ui_audit_screenshot_path.as_ref(), screenshot)
+            {
+                let result = (|| -> anyhow::Result<()> {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    let rgba = image
+                        .pixels
+                        .iter()
+                        .flat_map(|pixel| pixel.to_array())
+                        .collect::<Vec<_>>();
+                    image::save_buffer(
+                        path,
+                        &rgba,
+                        image.size[0] as u32,
+                        image.size[1] as u32,
+                        image::ColorType::Rgba8,
+                    )?;
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => eprintln!("UI_AUDIT_SCREENSHOT={}", path.display()),
+                    Err(error) => eprintln!("UI_AUDIT_ERROR={error:#}"),
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
             return;
         }
         self.enforce_background_start_hidden(ctx);
         self.process_app_events(ctx);
         if !self.exit_shutdown_in_progress {
             self.process_router_health_protection(ctx);
-            self.process_codex_binding_watch(ctx);
             self.process_scheduled_usage_refresh(ctx);
             self.process_scheduled_oauth_recovery(ctx);
             self.process_scheduled_oauth_account_refresh(ctx);
@@ -602,6 +690,7 @@ impl eframe::App for CodexRouterApp {
         let needs_full_fonts = self.close_prompt_open
             || self.apply_success_dialog_open
             || self.oauth_post_login_prompt_open
+            || self.profile_delete_target.is_some()
             || self.oauth_priority_target.is_some()
             || self.oauth_revoke_target.is_some()
             || self.update_dialog_open
@@ -637,12 +726,7 @@ impl eframe::App for CodexRouterApp {
             .exact_size(shell.topbar_height)
             .frame(
                 egui::Frame::new()
-                    .fill(egui::Color32::from_rgba_unmultiplied(
-                        palette.background_light.r(),
-                        palette.background_light.g(),
-                        palette.background_light.b(),
-                        178,
-                    ))
+                    .fill(palette.background_dark)
                     .stroke(egui::Stroke::new(
                         1.0_f32,
                         egui::Color32::from_rgba_unmultiplied(255, 255, 255, 112),
@@ -744,14 +828,14 @@ impl eframe::App for CodexRouterApp {
         if self.update_dialog_open {
             self.show_update_dialog(&ctx, &palette);
         }
+        if self.profile_delete_target.is_some() {
+            self.show_profile_delete_dialog(&ctx, &palette);
+        }
         if self.oauth_revoke_target.is_some() {
             self.show_oauth_revoke_dialog(&ctx, &palette);
         }
         if self.oauth_priority_target.is_some() {
             self.show_oauth_priority_dialog(&ctx, &palette);
-        }
-        if self.oauth_manual_model_target.is_some() {
-            self.show_oauth_manual_model_dialog(&ctx, &palette);
         }
         if self.oauth_fallback_picker_target.is_some() {
             self.show_oauth_fallback_picker_dialog(&ctx, &palette);
@@ -765,11 +849,23 @@ impl eframe::App for CodexRouterApp {
         if self.grok_sso_dialog_open {
             self.show_grok_sso_dialog(&ctx, &palette);
         }
+        if self.provider_oauth_prompt.is_some() {
+            self.show_provider_oauth_prompt(&ctx, &palette);
+        }
         if self.terms_open {
             self.show_terms_modal(&ctx, &palette);
         }
         if self.log_dialog_open {
             self.show_log_dialog(&ctx, &palette);
+        }
+        if self.ui_audit_screenshot_path.is_some() && !self.ui_audit_screenshot_requested {
+            self.ui_audit_frame_count = self.ui_audit_frame_count.saturating_add(1);
+            if self.ui_audit_frame_count >= 3 {
+                self.ui_audit_screenshot_requested = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+            } else {
+                ctx.request_repaint();
+            }
         }
         if self.tray_lightweight_mode {
             // Health protection schedules its own low-frequency wakeup.
@@ -830,7 +926,7 @@ impl CodexRouterApp {
                 egui::RichText::new(label)
                     .size(14.0)
                     .strong()
-                    .color(palette.ink),
+                    .color(palette.action),
             )
             .fill(palette.paper)
             .stroke(egui::Stroke::new(1.0, palette.line))
@@ -855,31 +951,43 @@ impl CodexRouterApp {
             egui::Stroke::new(1.0, palette.line),
             egui::StrokeKind::Inside,
         );
-
-        let track = egui::Rect::from_center_size(rect.center(), egui::vec2(38.0, 22.0));
-        ui.painter()
-            .rect_filled(track, egui::CornerRadius::same(11), palette.action);
-        let position = ui.ctx().animate_bool(response.id, !zh);
-        let knob_x = egui::lerp((track.left() + 11.0)..=(track.right() - 11.0), position);
-        ui.painter().circle_filled(
-            egui::pos2(knob_x, track.center().y),
-            8.0,
-            egui::Color32::WHITE,
+        let left = egui::Rect::from_min_max(rect.min, egui::pos2(rect.center().x, rect.max.y));
+        let right = egui::Rect::from_min_max(egui::pos2(rect.center().x, rect.min.y), rect.max);
+        let active = if zh { left } else { right };
+        ui.painter().rect_filled(
+            active.shrink(3.0),
+            egui::CornerRadius::same(7),
+            palette.action,
+        );
+        ui.painter().line_segment(
+            [
+                egui::pos2(rect.center().x, rect.top() + 9.0),
+                egui::pos2(rect.center().x, rect.bottom() - 9.0),
+            ],
+            egui::Stroke::new(1.0, palette.line),
         );
         let font = egui::FontId::new(13.0, egui::FontFamily::Proportional);
         ui.painter().text(
-            egui::pos2(rect.left() + 22.0, rect.center().y),
+            left.center(),
             egui::Align2::CENTER_CENTER,
             "中",
             font.clone(),
-            if zh { palette.ink } else { palette.muted },
+            if zh {
+                egui::Color32::WHITE
+            } else {
+                palette.ink_soft
+            },
         );
         ui.painter().text(
-            egui::pos2(rect.right() - 24.0, rect.center().y),
+            right.center(),
             egui::Align2::CENTER_CENTER,
             "EN",
             font,
-            if zh { palette.muted } else { palette.ink },
+            if zh {
+                palette.ink_soft
+            } else {
+                egui::Color32::WHITE
+            },
         );
         response
     }
@@ -909,7 +1017,7 @@ impl CodexRouterApp {
                 })
                 .size(13.0)
                 .strong()
-                .color(palette.ink),
+                .color(palette.action),
             )
             .fill(palette.paper)
             .stroke(egui::Stroke::new(1.0, palette.line))
@@ -1100,8 +1208,8 @@ impl CodexRouterApp {
                         ui.label(
                             egui::RichText::new(t(
                                 zh,
-                                "请完全退出并重新启动 ChatGPT / Codex。未登录时也会写入本地 Router（第三方 API）；已登录账号会保留，模型列表来自本机路由目录。",
-                                "Fully quit and restart ChatGPT / Codex. Without a login, local Router API mode is still written; an existing login is kept, and models come from the local catalog.",
+                                "请完全退出并重新启动 ChatGPT / Codex。应用后会继续使用原有 ChatGPT 登录；若尚未登录，请先按 Codex 官方流程登录。模型列表来自本机路由目录。",
+                                "Fully quit and restart ChatGPT / Codex. Applying keeps the existing ChatGPT sign-in; if you are signed out, use the official Codex sign-in flow first. Models come from the local Router catalog.",
                             ))
                             .color(palette.ink_soft),
                         );
@@ -1447,7 +1555,8 @@ impl CodexRouterApp {
         let zh = self.ui_language == "zh";
         let viewport = ui.ctx().content_rect().size();
         let viewport_width = viewport.x;
-        let compact_chrome = viewport.y < 700.0 || viewport_width < 1060.0;
+        let compact_chrome =
+            topbar_control_size(viewport_width, viewport.y).x < TOPBAR_CONTROL_WIDTH;
         let compact_brand = viewport_width < 1000.0;
         let logo_size = if compact_chrome { 34.0 } else { 38.0 };
         ui.horizontal(|ui| {
@@ -1486,76 +1595,10 @@ impl CodexRouterApp {
                 });
 
             ui.add_space(8.0);
-            let current = step_number(self.page);
-            let full_step_navigation = viewport_width >= if zh { 1180.0 } else { 1420.0 };
-            if full_step_navigation {
-                theme::elevated_control_frame(palette, false).show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 3.0;
-                        ui.spacing_mut().button_padding.x = 10.0;
-                        let labels = if zh {
-                            ["项目", "登录", "模型", "网络", "部署"]
-                        } else {
-                            ["PROJECT", "ACCESS", "MODEL", "NETWORK", "DEPLOY"]
-                        };
-                        for (index, label) in labels.iter().enumerate() {
-                            let active = current == index + 1;
-                            let complete = current > index + 1
-                                || matches!(
-                                    self.page,
-                                    Page::Dashboard | Page::Profiles | Page::OAuth | Page::Monitor
-                                );
-                            let color = if active || complete {
-                                palette.ink
-                            } else {
-                                palette.ink_soft
-                            };
-                            let text = if complete {
-                                format!("✅ {label}")
-                            } else {
-                                (*label).to_string()
-                            };
-                            let response = ui.add(
-                                egui::Button::new(
-                                    egui::RichText::new(text).small().strong().color(color),
-                                )
-                                .fill(if active {
-                                    palette.paper
-                                } else {
-                                    egui::Color32::TRANSPARENT
-                                })
-                                .stroke(if active {
-                                    egui::Stroke::new(1.0_f32, palette.line)
-                                } else {
-                                    egui::Stroke::NONE
-                                })
-                                .corner_radius(egui::CornerRadius::same(7)),
-                            );
-                            if response.clicked() && complete {
-                                self.page = match index {
-                                    0 => Page::Project,
-                                    1 => Page::Auth,
-                                    2 => Page::Model,
-                                    3 => Page::Proxy,
-                                    _ => Page::Finish,
-                                };
-                            }
-                        }
-                    });
-                });
-            } else if viewport_width >= 1060.0 {
-                theme::elevated_control_frame(palette, true).show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{}  {} / 5",
-                            page_label(self.page, zh),
-                            current.min(5)
-                        ))
-                        .small()
-                        .strong()
-                        .color(palette.ink),
-                    );
-                });
+            if let Some(page) =
+                Self::tutorial_progress(ui, step_number(self.page), zh, viewport_width, palette)
+            {
+                self.page = page;
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1642,6 +1685,116 @@ impl CodexRouterApp {
         });
     }
 
+    fn tutorial_progress(
+        ui: &mut egui::Ui,
+        current: usize,
+        zh: bool,
+        viewport_width: f32,
+        palette: &theme::Palette,
+    ) -> Option<Page> {
+        let width = if viewport_width < 900.0 {
+            190.0
+        } else if viewport_width < 1040.0 {
+            260.0
+        } else {
+            300.0
+        };
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(width, 66.0), egui::Sense::click());
+        let painter = ui.painter_at(rect);
+        painter.rect(
+            rect,
+            egui::CornerRadius::same(10),
+            palette.paper,
+            egui::Stroke::new(1.0, palette.line),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            egui::pos2(rect.center().x, rect.top() + 6.0),
+            egui::Align2::CENTER_TOP,
+            t(zh, "新手教学配置", "QUICK START SETUP"),
+            egui::FontId::new(10.5, theme::display_family()),
+            palette.ink,
+        );
+        let stages = if zh {
+            ["项目", "登录", "首个模型", "网络代理", "完成"]
+        } else {
+            ["Project", "Access", "1st model", "Proxy", "Finish"]
+        };
+        let pages = [
+            Page::Project,
+            Page::Auth,
+            Page::Model,
+            Page::Proxy,
+            Page::Finish,
+        ];
+        let track_left = rect.left() + 18.0;
+        let track_right = rect.right() - 18.0;
+        let track_y = rect.top() + 30.0;
+        painter.line_segment(
+            [
+                egui::pos2(track_left, track_y),
+                egui::pos2(track_right, track_y),
+            ],
+            egui::Stroke::new(2.0, palette.line),
+        );
+        let complete_all = current > 5;
+        for (index, label) in stages.iter().enumerate() {
+            let progress = index as f32 / 4.0;
+            let x = egui::lerp(track_left..=track_right, progress);
+            let complete = complete_all || current > index + 1;
+            let active = current == index + 1;
+            let dot_color = if complete || active {
+                palette.action
+            } else {
+                palette.paper_alt
+            };
+            painter.circle_filled(
+                egui::pos2(x, track_y),
+                if active { 6.0 } else { 5.0 },
+                dot_color,
+            );
+            painter.circle_stroke(
+                egui::pos2(x, track_y),
+                if active { 6.0 } else { 5.0 },
+                egui::Stroke::new(
+                    1.0,
+                    if complete || active {
+                        palette.action
+                    } else {
+                        palette.line
+                    },
+                ),
+            );
+            painter.text(
+                egui::pos2(x, rect.bottom() - 6.0),
+                egui::Align2::CENTER_BOTTOM,
+                label,
+                egui::FontId::new(if zh { 9.5 } else { 8.5 }, egui::FontFamily::Proportional),
+                if complete || active {
+                    palette.ink
+                } else {
+                    palette.ink_soft
+                },
+            );
+        }
+        response.clone().on_hover_text(t(
+            zh,
+            "点击已完成的阶段返回对应设置",
+            "Open any completed setup stage",
+        ));
+        if response.clicked() {
+            let progress = ((response.interact_pointer_pos()?.x - track_left)
+                / (track_right - track_left))
+                .clamp(0.0, 1.0);
+            let index = (progress * 4.0).round() as usize;
+            if complete_all || current > index {
+                return Some(pages[index]);
+            }
+        }
+        None
+    }
+
     fn show_update_dialog(&mut self, ctx: &egui::Context, palette: &theme::Palette) {
         let zh = self.ui_language == "zh";
         let info = self.update_info.clone().unwrap_or_default();
@@ -1677,8 +1830,8 @@ impl CodexRouterApp {
                         ),
                         t(
                             zh,
-                            "是否从官方 GitHub Release 下载更新包？下载后不会自动覆盖当前程序。",
-                            "Download the package from the official GitHub Release? It will not overwrite the running app automatically.",
+                            "从官方 GitHub Release 下载并校验后，程序会安全退出、自动覆盖当前版本并重新启动。",
+                            "After the official GitHub Release is downloaded and verified, the app will exit safely, replace the current version, and restart automatically.",
                         )
                         .to_owned(),
                     ),
@@ -1716,6 +1869,15 @@ impl CodexRouterApp {
                             zh,
                             "请关闭 Codex-Router 后解压或运行更新包。现有配置和数据不会被自动删除。",
                             "Close Codex-Router before extracting or running the package. Existing configuration and data are not deleted automatically.",
+                        )
+                        .to_owned(),
+                    ),
+                    "ready_to_install" => (
+                        t(zh, "更新包校验完成", "Update verified").to_owned(),
+                        t(
+                            zh,
+                            "正在安全退出本地服务；退出后会自动完成替换并重新启动。",
+                            "Local services are shutting down safely; replacement and restart will continue automatically after exit.",
                         )
                         .to_owned(),
                     ),
@@ -1788,6 +1950,23 @@ impl CodexRouterApp {
                             .color(palette.muted),
                     );
                 }
+                if self.update_downloading {
+                    ui.add_space(10.0);
+                    let total = self.update_total_bytes.max(info.asset_size);
+                    let fraction = if total == 0 {
+                        0.0
+                    } else {
+                        (self.update_downloaded_bytes as f32 / total as f32).clamp(0.0, 1.0)
+                    };
+                    let downloaded_mib = self.update_downloaded_bytes as f64 / 1_048_576.0;
+                    let total_mib = total as f64 / 1_048_576.0;
+                    ui.add(
+                        egui::ProgressBar::new(fraction)
+                            .desired_width(ui.available_width())
+                            .show_percentage()
+                            .text(format!("{downloaded_mib:.1} / {total_mib:.1} MiB")),
+                    );
+                }
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     if info.status == "update_available" && !info.download_url.is_empty() {
@@ -1806,7 +1985,7 @@ impl CodexRouterApp {
                             )
                             .clicked()
                         {
-                            self.download_update(&info);
+                            self.download_update(&info, ctx);
                         }
                     }
                     if info.status == "downloaded"
@@ -2335,12 +2514,7 @@ impl CodexRouterApp {
                             }
                         }
                     });
-                    let valid = this
-                        .router_root
-                        .join("scripts")
-                        .join("Start-Router.ps1")
-                        .exists()
-                        && this.router_root.join("app").join("sub2api.exe").exists();
+                    let valid = RouterConfig::is_router_root(&this.router_root);
                     ui.add_space(14.0);
                     egui::Frame::new()
                         .fill(if valid {
@@ -2354,7 +2528,7 @@ impl CodexRouterApp {
                                 egui::RichText::new(if valid {
                                     t(zh, "✓ 已识别完整运行环境", "✓ Complete runtime detected")
                                 } else {
-                                    t(zh, "目录缺少 Start-Router.ps1 或 sub2api.exe", "Start-Router.ps1 or sub2api.exe is missing")
+                                    t(zh, "目录缺少完整的本机运行组件", "The native runtime is incomplete")
                                 })
                                 .strong()
                                 .color(if valid {
@@ -2677,6 +2851,7 @@ impl CodexRouterApp {
                                             || !this.temp_model.credential_name.is_empty())));
                             let mut back = false;
                             let mut next = false;
+                            let mut open_oauth_models = false;
                             ui.horizontal(|ui| {
                                 ui.vertical(|ui| {
                                     Self::panel_heading(
@@ -2712,6 +2887,21 @@ impl CodexRouterApp {
                                             )
                                         });
                                         next = response.inner.clicked();
+                                        open_oauth_models = theme::secondary_button(
+                                            ui,
+                                            t(
+                                                zh,
+                                                "添加订阅账号模型",
+                                                "Add subscription model",
+                                            ),
+                                            palette,
+                                        )
+                                        .on_hover_text(t(
+                                            zh,
+                                            "打开 OAuth 账号页，选择账号实时声明的可用模型",
+                                            "Open OAuth accounts and choose from live declared models",
+                                        ))
+                                        .clicked();
                                         back = theme::secondary_button(
                                             ui,
                                             if this.model_from_wizard {
@@ -3204,14 +3394,19 @@ impl CodexRouterApp {
                                     .color(palette.danger),
                                 );
                             }
-                            if back {
+                            if open_oauth_models {
+                                this.open_oauth_manager();
+                            } else if back {
                                 this.page = if this.model_from_wizard {
                                     Page::Auth
                                 } else {
                                     Page::Dashboard
                                 };
                             }
-                            if next {
+                            if next && !open_oauth_models {
+                                if this.temp_model.source == "oauth" {
+                                    this.temp_model.user_selected = true;
+                                }
                                 let key_update_pending =
                                     !this.temp_model.api_key.trim().is_empty();
                                 if this.model_from_wizard {
@@ -4176,6 +4371,7 @@ impl CodexRouterApp {
         let mut restore_previous = false;
         let mut create_request = None;
         let mut apply_profile: Option<IsolationProfile> = None;
+        let mut delete_profile: Option<IsolationProfile> = None;
         let restore_points =
             super::profiles::list_restore_points(&self.router_root).unwrap_or_default();
         let compact_header = ui.available_width() < 1000.0;
@@ -4289,8 +4485,8 @@ impl CodexRouterApp {
                         ui.heading(t(zh, "应用前配置与本地隔离", "Previous & local"));
                         ui.label(t(
                             zh,
-                            "首次保存前请先命名配置分组。建议：先在 Codex 登录账号 → 在此命名并应用 → 完全重启 Codex。未登录 Codex 时也会写入本地 Router（第三方 API 模式）。",
-                            "Name a profile before the first save. Recommended: sign in to Codex first → name and apply here → fully restart Codex. Without a Codex login, Router still writes local API mode.",
+                            "首次保存前请先命名配置分组。建议：先按 Codex 官方流程登录账号 → 在此命名并应用 → 完全重启 Codex。应用不会把登录切换成第三方 API 模式。",
+                            "Name a profile before the first save. Recommended: use the official Codex sign-in first → name and apply here → fully restart Codex. Applying never switches the account into third-party API sign-in.",
                         ));
                         ui.add_space(8.0);
                         let response = ui.add_enabled_ui(
@@ -4436,7 +4632,9 @@ impl CodexRouterApp {
                                 // name wrap in the remaining width. Both sides get
                                 // an explicit height so the row cannot stretch to
                                 // fill the panel.
-                                let action_width = if active { 150.0_f32 } else { 104.0_f32 };
+                                let apply_width = if active { 150.0_f32 } else { 104.0_f32 };
+                                let delete_width = 66.0_f32;
+                                let action_width = apply_width + delete_width + 8.0;
                                 let row_height = 44.0_f32;
                                 ui.horizontal(|ui| {
                                     // Text takes the left side; the action button is
@@ -4478,6 +4676,37 @@ impl CodexRouterApp {
                                         ),
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
+                                            let delete_response = ui.add_enabled(
+                                                !self.applying && !active,
+                                                egui::Button::new(
+                                                    egui::RichText::new(t(zh, "删除", "Delete"))
+                                                        .strong()
+                                                        .color(if active {
+                                                            palette.muted
+                                                        } else {
+                                                            palette.danger
+                                                        }),
+                                                )
+                                                .fill(palette.paper)
+                                                .stroke(egui::Stroke::new(1.0, palette.danger))
+                                                .corner_radius(egui::CornerRadius::same(7)),
+                                            );
+                                            let delete_response = if active {
+                                                delete_response.on_disabled_hover_text(t(
+                                                    zh,
+                                                    "当前正在使用；请先应用另一个配置或初始化 Codex",
+                                                    "Currently active; apply another profile or reset Codex first",
+                                                ))
+                                            } else {
+                                                delete_response.on_hover_text(t(
+                                                    zh,
+                                                    "删除这个已保存配置",
+                                                    "Delete this saved profile",
+                                                ))
+                                            };
+                                            if delete_response.clicked() {
+                                                delete_profile = Some(profile.clone());
+                                            }
                                             let response = ui.add_enabled_ui(
                                                 !self.applying && !active,
                                                 |ui| {
@@ -4516,6 +4745,106 @@ impl CodexRouterApp {
             self.create_isolation_profile(kind, name);
         } else if let Some(profile) = apply_profile {
             self.apply_isolation_profile(&profile);
+        }
+        if let Some(profile) = delete_profile {
+            self.profile_delete_target = Some(profile);
+        }
+    }
+
+    fn show_profile_delete_dialog(&mut self, ctx: &egui::Context, palette: &theme::Palette) {
+        let zh = self.ui_language == "zh";
+        let Some(profile) = self.profile_delete_target.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut confirm = false;
+        let mut cancel = false;
+        let dialog_size = fit_dialog_size(
+            ctx.content_rect().size(),
+            egui::vec2(560.0, 330.0),
+            egui::vec2(420.0, 280.0),
+        );
+        egui::Window::new("")
+            .id(egui::Id::new("profile-delete-confirmation"))
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .fixed_size(dialog_size)
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .frame(
+                egui::Frame::new()
+                    .fill(palette.background_dark)
+                    .stroke(egui::Stroke::new(1.0, palette.background_light))
+                    .inner_margin(egui::Margin::ZERO)
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 14],
+                        blur: 38,
+                        spread: 0,
+                        color: egui::Color32::from_rgba_unmultiplied(18, 24, 28, 82),
+                    }),
+            )
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(palette.glass_dark)
+                    .inner_margin(egui::Margin::symmetric(22, 13))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(t(zh, "删除已保存配置", "Delete saved profile"))
+                                .size(24.0)
+                                .strong()
+                                .color(palette.paper),
+                        );
+                    });
+                egui::Frame::new()
+                    .fill(palette.background)
+                    .inner_margin(egui::Margin::same(22))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(&profile.name)
+                                .size(20.0)
+                                .strong()
+                                .color(palette.ink),
+                        );
+                        ui.add_space(10.0);
+                        ui.label(
+                            egui::RichText::new(t(
+                                zh,
+                                "将永久删除这个配置快照及其隔离保存的 API 凭据。不会删除 OAuth 账号，也不会修改当前 Codex 配置。",
+                                "This permanently deletes the saved profile and its isolated API credentials. OAuth accounts and the current Codex configuration are not changed.",
+                            ))
+                            .color(palette.danger),
+                        );
+                        ui.add_space(16.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    !self.applying,
+                                    egui::Button::new(
+                                        egui::RichText::new(t(zh, "确认删除", "Delete profile"))
+                                            .strong()
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .fill(palette.danger)
+                                    .corner_radius(egui::CornerRadius::same(7)),
+                                )
+                                .clicked()
+                            {
+                                confirm = true;
+                            }
+                            if theme::secondary_button(ui, t(zh, "取消", "Cancel"), palette)
+                                .clicked()
+                            {
+                                cancel = true;
+                            }
+                        });
+                    });
+            });
+        if confirm {
+            self.profile_delete_target = None;
+            self.delete_isolation_profile(profile);
+        } else if cancel || !open {
+            self.profile_delete_target = None;
         }
     }
 
@@ -4601,13 +4930,7 @@ impl CodexRouterApp {
                     )
                     .clicked()
                     {
-                        self.run_script_hidden("Copy-Sub2ApiLogin.ps1");
-                        self.status_text = t(
-                            zh,
-                            "Sub2API 登录信息已复制",
-                            "Sub2API login copied",
-                        )
-                        .into();
+                        self.copy_sub2api_login();
                     }
                     if theme::primary_button(
                         ui,
@@ -5707,6 +6030,170 @@ impl CodexRouterApp {
         }
     }
 
+    fn show_provider_oauth_prompt(&mut self, ctx: &egui::Context, palette: &theme::Palette) {
+        let Some(prompt) = self
+            .provider_oauth_prompt
+            .as_ref()
+            .map(|state| state.prompt.clone())
+        else {
+            return;
+        };
+        let zh = self.ui_language == "zh";
+        let mut open = true;
+        let mut submit = false;
+        let mut cancel = false;
+        let dialog_size = fit_dialog_size(
+            ctx.content_rect().size(),
+            egui::vec2(620.0, 370.0),
+            egui::vec2(430.0, 300.0),
+        );
+        egui::Window::new("")
+            .id(egui::Id::new("provider-oauth-prompt"))
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .fixed_size(dialog_size)
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .vscroll(true)
+            .open(&mut open)
+            .frame(
+                egui::Frame::new()
+                    .fill(palette.paper)
+                    .stroke(egui::Stroke::new(1.0, palette.line))
+                    .corner_radius(egui::CornerRadius::same(8))
+                    .inner_margin(egui::Margin::same(24))
+                    .shadow(theme::soft_card_shadow()),
+            )
+            .show(ctx, |ui| {
+                match &prompt {
+                    crate::logic::oauth::Prompt::GeminiConfiguration {
+                        detected_project_id: _,
+                    } => {
+                        ui.label(
+                            egui::RichText::new(t(
+                                zh,
+                                "选择 Gemini 额度类型",
+                                "Choose Gemini quota type",
+                            ))
+                            .font(egui::FontId::new(25.0, theme::display_family()))
+                            .color(palette.ink),
+                        );
+                        ui.add_space(18.0);
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(
+                                &mut self.provider_oauth_gemini_code_assist,
+                                false,
+                                t(zh, "Google One / 个人", "Google One / personal"),
+                            );
+                            ui.selectable_value(
+                                &mut self.provider_oauth_gemini_code_assist,
+                                true,
+                                t(zh, "GCP Code Assist", "GCP Code Assist"),
+                            );
+                        });
+                        ui.add_space(20.0);
+                        ui.label(
+                            egui::RichText::new(t(
+                                zh,
+                                "GOOGLE CLOUD PROJECT ID（可选）",
+                                "GOOGLE CLOUD PROJECT ID (OPTIONAL)",
+                            ))
+                            .small()
+                            .strong()
+                            .color(palette.muted),
+                        );
+                        ui.add_sized(
+                            [ui.available_width(), 34.0],
+                            egui::TextEdit::singleline(&mut self.provider_oauth_project_draft),
+                        );
+                    }
+                    crate::logic::oauth::Prompt::AuthorizationCode { provider } => {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} {}",
+                                provider.as_str(),
+                                t(zh, "授权码", "authorization code")
+                            ))
+                            .font(egui::FontId::new(25.0, theme::display_family()))
+                            .color(palette.ink),
+                        );
+                        ui.add_space(18.0);
+                        ui.label(
+                            egui::RichText::new(t(zh, "一次性授权码", "ONE-TIME CODE"))
+                                .small()
+                                .strong()
+                                .color(palette.muted),
+                        );
+                        ui.add_sized(
+                            [ui.available_width(), 36.0],
+                            egui::TextEdit::singleline(&mut self.provider_oauth_code_draft)
+                                .password(true),
+                        );
+                    }
+                }
+                ui.add_space(24.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let enabled = match prompt {
+                        crate::logic::oauth::Prompt::GeminiConfiguration { .. } => true,
+                        crate::logic::oauth::Prompt::AuthorizationCode { .. } => {
+                            !self.provider_oauth_code_draft.trim().is_empty()
+                        }
+                    };
+                    let button = ui.add_enabled_ui(enabled, |ui| {
+                        theme::primary_button(
+                            ui,
+                            egui::RichText::new(t(zh, "继续", "Continue"))
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                            palette,
+                        )
+                    });
+                    if button.inner.clicked() {
+                        submit = true;
+                    }
+                    if theme::secondary_button(ui, t(zh, "取消", "Cancel"), palette).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if submit {
+            if let Some(state) = self.provider_oauth_prompt.take() {
+                let response = match state.prompt {
+                    crate::logic::oauth::Prompt::GeminiConfiguration { .. } => {
+                        crate::logic::oauth::PromptResponse::GeminiConfiguration {
+                            oauth_type: if self.provider_oauth_gemini_code_assist {
+                                "code_assist"
+                            } else {
+                                "google_one"
+                            }
+                            .to_owned(),
+                            tier_id: if self.provider_oauth_gemini_code_assist {
+                                "gcp_standard"
+                            } else {
+                                "google_one_free"
+                            }
+                            .to_owned(),
+                            project_id: self.provider_oauth_project_draft.trim().to_owned(),
+                        }
+                    }
+                    crate::logic::oauth::Prompt::AuthorizationCode { .. } => {
+                        crate::logic::oauth::PromptResponse::AuthorizationCode(
+                            zeroize::Zeroizing::new(
+                                self.provider_oauth_code_draft.trim().to_owned(),
+                            ),
+                        )
+                    }
+                };
+                let _ = state.response.send(response);
+            }
+            self.provider_oauth_code_draft.clear();
+            self.provider_oauth_project_draft.clear();
+        } else if cancel || !open {
+            self.cancel_provider_oauth();
+        }
+    }
+
     fn oauth_fallback_base_urls(&self, account_id: i64) -> Vec<String> {
         let oauth_model_ids = self
             .config
@@ -5999,6 +6486,7 @@ impl CodexRouterApp {
         let oauth_count = self.config.oauth_account_ids.as_ref().map_or(0, Vec::len);
         let compact_header = ui.available_width() < 1000.0;
         let applying = self.applying;
+        let return_to_model_editor = matches!(self.oauth_return_page, Page::Model);
         let mut back_to_console = false;
         let mut apply_current_profile = false;
         let mut refresh_accounts = false;
@@ -6025,9 +6513,16 @@ impl CodexRouterApp {
             });
         };
         let mut show_actions = |ui: &mut egui::Ui| {
-            back_to_console =
-                theme::secondary_button(ui, t(zh, "返回控制台", "Back to console"), palette)
-                    .clicked();
+            back_to_console = theme::secondary_button(
+                ui,
+                if return_to_model_editor {
+                    t(zh, "返回模型编辑", "Back to model editor")
+                } else {
+                    t(zh, "返回控制台", "Back to console")
+                },
+                palette,
+            )
+            .clicked();
             let response = ui.add_enabled_ui(!applying, |ui| {
                 theme::primary_button(
                     ui,
@@ -6066,7 +6561,7 @@ impl CodexRouterApp {
             self.apply_all();
         }
         if refresh_accounts {
-            self.refresh_oauth_accounts();
+            self.trigger_self_check();
         }
         ui.add_space(14.0);
         let accounts = self.oauth_accounts.clone();
@@ -6074,9 +6569,9 @@ impl CodexRouterApp {
         let mut selected_ids = self.config.oauth_account_ids.clone().unwrap_or_default();
         let mut selection_changed = false;
         let mut import_model = None;
+        let mut remove_model = None;
         let mut revoke_account = None;
         let mut priority_account = None;
-        let mut manual_model_account = None;
         let mut fallback_picker_account = None;
         let content_height = ui.available_height().max(320.0);
         ui.horizontal_top(|ui| {
@@ -6342,9 +6837,7 @@ impl CodexRouterApp {
                 );
                 ui.horizontal(|ui| {
                     if ui.small_button(t(zh, "复制 Key", "Copy key")).clicked() {
-                        self.run_script_hidden("Copy-LocalApiKey.ps1");
-                        self.status_text =
-                            t(zh, "本机 Router Key 已复制", "Local Router key copied").into();
+                        self.copy_local_api_key();
                     }
                 });
             });
@@ -6540,7 +7033,7 @@ impl CodexRouterApp {
                             });
                             if !account.error.is_empty() {
                                 ui.label(
-                                    egui::RichText::new(&account.error)
+                                    egui::RichText::new(oauth_account_error(&account.error, zh))
                                         .small()
                                         .color(palette.danger),
                                 );
@@ -6571,6 +7064,53 @@ impl CodexRouterApp {
                             }
                             ui.add_space(8.0);
                             ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    egui::RichText::new(t(
+                                        zh,
+                                        "账号可选 OAuth 模型",
+                                        "AVAILABLE OAUTH MODELS",
+                                    ))
+                                    .small()
+                                    .strong()
+                                    .color(palette.ink),
+                                );
+                                theme::pill(
+                                    ui,
+                                    &account.models.len().to_string(),
+                                    palette.paper_alt,
+                                    palette.ink_soft,
+                                );
+                            });
+                            if !account.models_error.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(if account.models.is_empty() {
+                                        t(
+                                            zh,
+                                            "实时模型目录暂时无法读取；请点击上方“刷新”重试。",
+                                            "The live model catalog is temporarily unavailable; click Refresh to retry.",
+                                        )
+                                    } else {
+                                        t(
+                                            zh,
+                                            "实时刷新暂时失败；当前保留上次成功发现的模型。",
+                                            "Live refresh failed temporarily; the last successful model list is retained.",
+                                        )
+                                    })
+                                    .small()
+                                    .color(palette.danger),
+                                );
+                            } else if account.models.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(t(
+                                        zh,
+                                        "此账号当前没有实时声明可用模型。",
+                                        "This account currently declares no available models.",
+                                    ))
+                                    .small()
+                                    .color(palette.muted),
+                                );
+                            }
+                            ui.horizontal_wrapped(|ui| {
                                 for model in &account.models {
                                     let already_added = self
                                         .config
@@ -6589,50 +7129,44 @@ impl CodexRouterApp {
                                             model.display_name,
                                             t(zh, "已加入", "Added")
                                         )
-                                    } else if model.suggested {
-                                        format!(
-                                            "＋ {} · {}",
-                                            model.display_name,
-                                            t(zh, "文档新增", "Docs update")
-                                        )
                                     } else {
                                         format!("＋ {}", model.display_name)
                                     };
-                                    let mut response = ui.add_enabled(
-                                        !already_added && !unsupported,
+                                    let response = ui.add_enabled(
+                                        already_added || !unsupported,
                                         egui::Button::new(label)
                                             .fill(palette.paper_alt)
                                             .corner_radius(egui::CornerRadius::same(6)),
                                     );
-                                    if model.suggested {
-                                        response = response.on_hover_text(if account.platform == "openai" {
-                                            t(
+                                    if already_added {
+                                        response
+                                            .clone()
+                                            .on_hover_text(t(
                                                 zh,
-                                                "Codex 已知模型目录包含此模型，但当前 OpenAI 账号尚未通过接口发现；能否使用取决于账号权限，失败时会按配置走备用路由。",
-                                                "The known Codex catalog includes this model, but the OpenAI account has not advertised it through discovery. Access depends on the account and failures use the configured fallback route.",
-                                            )
-                                        } else {
-                                            t(
-                                                zh,
-                                                "平台已知模型目录包含此模型，但当前账号尚未通过接口发现；能否使用取决于账号权限，失败时会按配置走备用路由。",
-                                                "The known provider catalog includes this model, but the account has not advertised it through discovery. Access depends on the account and failures use the configured fallback route.",
-                                            )
-                                        });
+                                                "已加入当前配置；右键可删除",
+                                                "Added to this profile; right-click to remove",
+                                            ))
+                                            .context_menu(|ui| {
+                                                if ui
+                                                    .button(t(
+                                                        zh,
+                                                        "从当前配置删除",
+                                                        "Remove from this profile",
+                                                    ))
+                                                    .clicked()
+                                                {
+                                                    remove_model = Some((
+                                                        account.id,
+                                                        model.id.clone(),
+                                                        model.display_name.clone(),
+                                                    ));
+                                                    ui.close();
+                                                }
+                                            });
                                     }
-                                    if response.clicked() {
+                                    if !already_added && !unsupported && response.clicked() {
                                         import_model = Some((account.clone(), model.clone()));
                                     }
-                                }
-                                if ui
-                                    .button(t(zh, "手动补填模型…", "Add model manually…"))
-                                    .on_hover_text(t(
-                                        zh,
-                                        "接口列表缺少新模型时，按平台官方文档填写准确模型 ID",
-                                        "Enter the exact model ID from the provider documentation when discovery is incomplete",
-                                    ))
-                                    .clicked()
-                                {
-                                    manual_model_account = Some(account.clone());
                                 }
                             });
                         });
@@ -6649,11 +7183,6 @@ impl CodexRouterApp {
         if let Some(account) = priority_account {
             self.open_oauth_priority_editor(account);
         }
-        if let Some(account) = manual_model_account {
-            self.oauth_manual_model_target = Some(account);
-            self.oauth_manual_model_id_draft.clear();
-            self.oauth_manual_model_alias_draft.clear();
-        }
         if let Some(account) = fallback_picker_account {
             self.open_oauth_fallback_picker(account);
         }
@@ -6668,6 +7197,18 @@ impl CodexRouterApp {
                 "OAuth account selection is stored in this profile. Save & apply to activate it.",
             )
             .into();
+        }
+        if let Some((account_id, model_id, display_name)) = remove_model {
+            if super::logic::remove_oauth_model_reference(&mut self.config, account_id, &model_id) {
+                self.schedule_usage_refresh();
+                self.status_text = if zh {
+                    format!("已从当前配置删除 {display_name}；点击“保存并应用”后生效")
+                } else {
+                    format!(
+                        "Removed {display_name} from this profile. Save & apply to activate it."
+                    )
+                };
+            }
         }
         if let Some((account, model)) = import_model {
             let imported_model_id =
@@ -6685,6 +7226,7 @@ impl CodexRouterApp {
                 source: "oauth".into(),
                 oauth_account_id: account.id,
                 oauth_platform: account.platform,
+                user_selected: true,
                 ..Default::default()
             };
             item.multimodal = "auto".into();
@@ -7048,250 +7590,6 @@ impl CodexRouterApp {
         }
     }
 
-    fn show_oauth_manual_model_dialog(&mut self, ctx: &egui::Context, palette: &theme::Palette) {
-        let zh = self.ui_language == "zh";
-        let Some(account) = self.oauth_manual_model_target.clone() else {
-            return;
-        };
-        let mut open = true;
-        let mut add = false;
-        let mut cancel = false;
-        let dialog_size = fit_dialog_size(
-            ctx.content_rect().size(),
-            egui::vec2(600.0, 430.0),
-            egui::vec2(440.0, 300.0),
-        );
-        egui::Window::new("")
-            .id(egui::Id::new("oauth-manual-model-dialog"))
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .fixed_size(dialog_size)
-            .title_bar(false)
-            .collapsible(false)
-            .resizable(false)
-            .vscroll(true)
-            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-            .open(&mut open)
-            .frame(
-                egui::Frame::new()
-                    .fill(palette.background_dark)
-                    .stroke(egui::Stroke::new(1.0, palette.background_light))
-                    .inner_margin(egui::Margin::ZERO)
-                    .shadow(egui::epaint::Shadow {
-                        offset: [0, 14],
-                        blur: 38,
-                        spread: 0,
-                        color: egui::Color32::from_rgba_unmultiplied(18, 24, 28, 82),
-                    }),
-            )
-            .show(ctx, |ui| {
-                egui::Frame::new()
-                    .fill(palette.glass_dark)
-                    .inner_margin(egui::Margin::symmetric(22, 13))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(t(
-                                    zh,
-                                    "手动补填 OAuth 模型",
-                                    "Add OAuth model manually",
-                                ))
-                                .size(24.0)
-                                .strong()
-                                .color(palette.paper),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui
-                                        .add_sized(
-                                            [34.0, 30.0],
-                                            egui::Button::new(
-                                                egui::RichText::new("×")
-                                                    .size(21.0)
-                                                    .color(palette.paper),
-                                            )
-                                            .fill(egui::Color32::TRANSPARENT)
-                                            .stroke(egui::Stroke::NONE),
-                                        )
-                                        .on_hover_text(t(zh, "关闭", "Close"))
-                                        .clicked()
-                                    {
-                                        cancel = true;
-                                    }
-                                },
-                            );
-                        });
-                    });
-
-                egui::Frame::new()
-                    .fill(palette.background)
-                    .inner_margin(egui::Margin::same(22))
-                    .show(ui, |ui| {
-                        egui::Frame::new()
-                            .fill(palette.glass)
-                            .stroke(egui::Stroke::new(1.0, palette.background_light))
-                            .corner_radius(egui::CornerRadius::same(6))
-                            .inner_margin(egui::Margin::same(16))
-                            .show(ui, |ui| {
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{} · {}",
-                                        account.name, account.platform
-                                    ))
-                                    .size(18.0)
-                                    .strong()
-                                    .color(palette.ink),
-                                );
-                                ui.add_space(6.0);
-                                ui.label(
-                                    egui::RichText::new(t(
-                                        zh,
-                                        "模型发现列表可能滞后。请从平台官方文档复制准确的接口模型 ID；手动加入不代表当前账号套餐一定拥有该模型权限。",
-                                        "Model discovery can lag behind. Copy the exact API model ID from the provider documentation; adding it does not guarantee that the account plan has access.",
-                                    ))
-                                    .small()
-                                    .color(palette.ink_soft),
-                                );
-                                ui.add(
-                                    egui::Hyperlink::from_label_and_url(
-                                        egui::RichText::new(t(
-                                            zh,
-                                            "查看该平台模型文档 ↗",
-                                            "Open provider model documentation ↗",
-                                        ))
-                                        .strong()
-                                        .color(palette.action),
-                                        oauth_model_docs_url(&account.platform),
-                                    ),
-                                );
-                                ui.add_space(14.0);
-                                theme::field_label(
-                                    ui,
-                                    t(zh, "模型 ID", "MODEL ID"),
-                                    t(
-                                        zh,
-                                        "必填，例如 gemini-3.6-flash；请求会原样发送此值",
-                                        "Required, for example gemini-3.6-flash; requests use this exact value",
-                                    ),
-                                    palette,
-                                );
-                                ui.add(
-                                    egui::TextEdit::singleline(
-                                        &mut self.oauth_manual_model_id_draft,
-                                    )
-                                    .hint_text("gemini-3.6-flash")
-                                    .desired_width(f32::INFINITY),
-                                );
-                                ui.add_space(10.0);
-                                theme::field_label(
-                                    ui,
-                                    t(zh, "模型名称（可选）", "DISPLAY NAME (OPTIONAL)"),
-                                    t(
-                                        zh,
-                                        "仅用于 Codex-Router 中显示；留空则使用模型 ID",
-                                        "Only shown in Codex-Router; leave blank to use the model ID",
-                                    ),
-                                    palette,
-                                );
-                                ui.add(
-                                    egui::TextEdit::singleline(
-                                        &mut self.oauth_manual_model_alias_draft,
-                                    )
-                                    .hint_text(t(
-                                        zh,
-                                        "例如 Gemini 3.6 Flash",
-                                        "e.g. Gemini 3.6 Flash",
-                                    ))
-                                    .desired_width(f32::INFINITY),
-                                );
-                            });
-                        ui.add_space(14.0);
-                        ui.horizontal(|ui| {
-                            let response = ui.add_enabled_ui(
-                                !self.oauth_manual_model_id_draft.trim().is_empty(),
-                                |ui| {
-                                    theme::primary_button(
-                                        ui,
-                                        egui::RichText::new(t(
-                                            zh,
-                                            "加入当前配置",
-                                            "Add to profile",
-                                        ))
-                                        .strong()
-                                        .color(egui::Color32::WHITE),
-                                        palette,
-                                    )
-                                },
-                            );
-                            if response.inner.clicked() {
-                                add = true;
-                            }
-                            if theme::secondary_button(
-                                ui,
-                                t(zh, "取消", "Cancel"),
-                                palette,
-                            )
-                            .clicked()
-                            {
-                                cancel = true;
-                            }
-                        });
-                    });
-            });
-
-        if add {
-            let mut model_id = self.oauth_manual_model_id_draft.trim().to_owned();
-            if account.platform == "openai" && model_id.eq_ignore_ascii_case("gpt-5.6") {
-                model_id = "gpt-5.6-sol".to_owned();
-            }
-            if self.config.models.iter().any(|item| {
-                item.source == "oauth"
-                    && item.oauth_account_id == account.id
-                    && item.model == model_id
-            }) {
-                self.status_text = t(
-                    zh,
-                    "这个模型 ID 已在当前配置中，无需重复加入",
-                    "That model ID is already in the current profile",
-                )
-                .into();
-            } else {
-                let alias = self.oauth_manual_model_alias_draft.trim();
-                self.config.models.push(ModelConfig {
-                    model: model_id.clone(),
-                    alias: if alias.is_empty() {
-                        super::logic::recommended_model_display_name(&model_id)
-                    } else {
-                        alias.to_owned()
-                    },
-                    alias_customized: Some(!alias.is_empty()),
-                    base_url: format!("Sub2API OAuth / {}", account.platform),
-                    priority: self.config.oauth_fallback.official_priority,
-                    source: "oauth".into(),
-                    oauth_account_id: account.id,
-                    oauth_platform: account.platform,
-                    multimodal: "auto".into(),
-                    ..Default::default()
-                });
-                let ids = self.config.oauth_account_ids.get_or_insert_with(Vec::new);
-                if !ids.contains(&account.id) {
-                    ids.push(account.id);
-                }
-                super::logic::normalize_default_model(&mut self.config);
-                self.schedule_usage_refresh();
-                self.status_text = t(
-                    zh,
-                    "手动模型已加入当前配置；点击“保存并应用”后可在 Codex 中使用",
-                    "The manual model was added. Save & apply to use it in Codex.",
-                )
-                .into();
-            }
-            self.oauth_manual_model_target = None;
-        } else if cancel || !open {
-            self.oauth_manual_model_target = None;
-        }
-    }
-
     fn compact_number(value: i64) -> String {
         let absolute = value.unsigned_abs() as f64;
         if absolute >= 1_000_000_000.0 {
@@ -7306,6 +7604,18 @@ impl CodexRouterApp {
     }
 
     fn usage_window_label(window: &UsageWindow, zh: bool) -> String {
+        if window.kind == "sharedPool" {
+            return match window.display_name.as_str() {
+                "Gemini shared quota" => t(zh, "Gemini 共享额度", "Gemini shared quota"),
+                "Claude shared quota" => t(zh, "Claude 共享额度", "Claude shared quota"),
+                "GPT shared quota" => t(zh, "GPT 共享额度", "GPT shared quota"),
+                "Claude / GPT shared quota" => {
+                    t(zh, "Claude / GPT 共享额度", "Claude / GPT shared quota")
+                }
+                _ => t(zh, "Antigravity 共享额度", "Antigravity shared quota"),
+            }
+            .to_owned();
+        }
         if !window.display_name.trim().is_empty() {
             return window.display_name.clone();
         }
@@ -7828,7 +8138,7 @@ impl CodexRouterApp {
                     )
                 });
                 if refresh.inner.clicked() {
-                    self.refresh_usage_monitor();
+                    self.trigger_self_check();
                 }
             });
         });
@@ -8127,51 +8437,37 @@ impl CodexRouterApp {
     fn show_dashboard(&mut self, ui: &mut egui::Ui, palette: &theme::Palette) {
         let zh = self.ui_language == "zh";
         let header_width = ui.available_width();
-        let compact_header = header_width < 1080.0;
         let narrow_header = header_width < 900.0;
         ui.horizontal(|ui| {
-            // English labels are noticeably wider, so the title column needs more
-            // room before the share/action controls begin.
+            ui.spacing_mut().item_spacing = egui::vec2(if narrow_header { 4.0 } else { 6.0 }, 6.0);
             ui.allocate_ui_with_layout(
                 egui::vec2(
                     if narrow_header {
-                        if zh { 180.0 } else { 200.0 }
-                    } else if zh {
-                        230.0
-                    } else if compact_header {
-                        250.0
+                        if zh {
+                            118.0
+                        } else {
+                            126.0
+                        }
                     } else {
-                        275.0
+                        if zh {
+                            158.0
+                        } else {
+                            172.0
+                        }
                     },
-                    72.0,
+                    54.0,
                 ),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
-                    theme::eyebrow(
-                        ui,
-                        if narrow_header {
-                            t(zh, "本地路由", "LOCAL ROUTER")
-                        } else {
-                            t(zh, "本地模型控制中心", "LOCAL MODEL CONTROL PLANE")
-                        },
-                        palette.paper,
-                    );
+                    theme::eyebrow(ui, t(zh, "本地模型控制", "LOCAL ROUTER"), palette.paper);
                     ui.label(
                         egui::RichText::new(if zh {
                             "路由控制台"
-                        } else if narrow_header {
-                            "CONSOLE"
                         } else {
                             "ROUTER CONSOLE"
                         })
                         .font(egui::FontId::new(
-                            if narrow_header {
-                                27.0
-                            } else if zh {
-                                34.0
-                            } else {
-                                30.0
-                            },
+                            if narrow_header { 22.0 } else { 25.0 },
                             theme::display_family(),
                         ))
                         .color(egui::Color32::WHITE),
@@ -8179,62 +8475,106 @@ impl CodexRouterApp {
                 },
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let action_width = if narrow_header {
-                    104.0
-                } else if compact_header {
-                    142.0
-                } else {
-                    180.0
-                };
-                if ui
-                    .add_sized(
-                        [action_width, 42.0],
-                        egui::Button::new(if narrow_header {
-                            t(zh, "配置分组", "Groups")
-                        } else {
-                            t(zh, "切换配置分组", "Switch groups")
-                        })
+                let button = |ui: &mut egui::Ui, width: f32, label: &str| {
+                    ui.add_sized(
+                        [width, 40.0],
+                        egui::Button::new(egui::RichText::new(label).size(13.0).strong())
                             .fill(palette.paper)
                             .stroke(egui::Stroke::new(1.0, palette.line))
-                            .corner_radius(egui::CornerRadius::same(8)),
+                            .corner_radius(egui::CornerRadius::same(7)),
                     )
-                    .clicked()
-                {
-                    self.open_profiles();
-                }
+                };
+                let oauth_count = self.config.oauth_account_ids.as_ref().map_or(0, Vec::len);
                 if ui
                     .add_sized(
-                        [action_width, 42.0],
-                        egui::Button::new(if narrow_header {
-                            t(zh, "用量", "Usage")
-                        } else {
-                            t(zh, "实时用量统计", "Live usage")
-                        })
-                            .fill(palette.paper)
-                            .stroke(egui::Stroke::new(1.0, palette.line))
-                            .corner_radius(egui::CornerRadius::same(8)),
+                        [if narrow_header { 88.0 } else { 122.0 }, 40.0],
+                        egui::Button::new(
+                            egui::RichText::new(if narrow_header {
+                                format!("OAuth ({oauth_count})")
+                            } else {
+                                format!(
+                                    "{} ({oauth_count})",
+                                    t(zh, "当前配置 OAuth", "Profile OAuth")
+                                )
+                            })
+                            .size(13.0)
+                            .strong()
+                            .color(egui::Color32::WHITE),
+                        )
+                        .fill(palette.action)
+                        .stroke(egui::Stroke::NONE)
+                        .corner_radius(egui::CornerRadius::same(7)),
                     )
                     .on_hover_text(t(
                         zh,
-                        "查看当前配置的订阅额度、重置时间与 API token 用量",
-                        "View subscription quotas, reset times, and API token usage for this profile",
+                        "管理当前配置的 OAuth 账号、模型和回退策略",
+                        "Manage OAuth accounts, models, and fallback policy for this profile",
                     ))
                     .clicked()
+                {
+                    self.open_oauth_manager();
+                }
+                if button(
+                    ui,
+                    if narrow_header { 86.0 } else { 116.0 },
+                    if narrow_header {
+                        t(zh, "配置分组", "Groups")
+                    } else {
+                        t(zh, "切换配置分组", "Switch groups")
+                    },
+                )
+                .clicked()
+                {
+                    self.open_profiles();
+                }
+                if button(
+                    ui,
+                    if narrow_header { 88.0 } else { 126.0 },
+                    if narrow_header {
+                        t(zh, "常见渠道", "Providers")
+                    } else {
+                        t(zh, "常见渠道快速配置", "Provider setup")
+                    },
+                )
+                .on_hover_text(t(
+                    zh,
+                    "快速添加常见 API 渠道",
+                    "Quickly add a common API provider",
+                ))
+                .clicked()
+                {
+                    self.channel_preset_dialog_open = true;
+                }
+                if button(
+                    ui,
+                    if narrow_header { 78.0 } else { 116.0 },
+                    if narrow_header {
+                        t(zh, "用量", "Usage")
+                    } else {
+                        t(zh, "实时用量统计", "Live usage")
+                    },
+                )
+                .on_hover_text(t(
+                    zh,
+                    "查看订阅额度、重置时间与 API token 用量",
+                    "View subscription quotas, reset times, and API token usage",
+                ))
+                .clicked()
                 {
                     self.open_usage_monitor();
                 }
             });
         });
-        ui.add_space(14.0);
+        ui.add_space(8.0);
         let panel_height = ui.available_height();
         let wide = dashboard_uses_wide_layout(ui.available_width(), panel_height);
         if wide {
             let width = ui.available_width();
             ui.horizontal_top(|ui| {
                 ui.allocate_ui_with_layout(
-                    egui::vec2(width * 0.25, (panel_height - 24.0).max(440.0)),
+                    egui::vec2(width * 0.25, panel_height.max(440.0)),
                     egui::Layout::top_down(egui::Align::Min),
-                    |ui| self.dashboard_sidebar(ui, palette, panel_height - 24.0),
+                    |ui| self.dashboard_sidebar(ui, palette, panel_height),
                 );
                 ui.add_space(16.0);
                 ui.allocate_ui_with_layout(
@@ -8414,11 +8754,11 @@ impl CodexRouterApp {
                 left: 0,
                 right: 0,
                 top: 0,
-                bottom: 16,
+                bottom: 0,
             })
             .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.set_min_height((target_height - 40.0).max(440.0));
+            ui.set_min_height(target_height.max(440.0));
             theme::eyebrow(ui, t(zh, "系统 / 概览", "SYSTEM / OVERVIEW"), palette.muted);
             let active_config_name = self.active_route_config_name(zh);
             ui.horizontal_top(|ui| {
@@ -8613,54 +8953,45 @@ impl CodexRouterApp {
         // Keep the split within both the requested allocation and the current
         // clip rect. On scaled Windows displays the parent allocation can be
         // taller than the visible region, which otherwise clips the log.
-        let dashboard_bottom_space = 24.0;
+        let dashboard_bottom_space = 4.0;
         let visible_height = (ui.clip_rect().bottom() - ui.cursor().top()).max(0.0);
         let layout_height = target_height.min(visible_height);
-        // Cap the model panel at about 2.5 rows, then reserve a compact
-        // three-line log preview and a visible footer gap.
+        // Give the model list all remaining height above the compact log and
+        // footer gap so large windows do not end with an unused blank band.
         let (model_content_height, list_height, log_content_height) =
             dashboard_panel_heights(layout_height);
-        theme::glass_frame(palette).show(ui, |ui| {
+        theme::glass_frame(palette)
+            .inner_margin(egui::Margin::symmetric(16, 12))
+            .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.set_min_height(model_content_height);
             ui.horizontal(|ui| {
-                // Reserve the action row first so the heading can never be
-                // overlapped by it. English action labels are wider than Chinese.
-                let actions_width = if zh { 430.0_f32 } else { 520.0_f32 };
-                let title_width = (ui.available_width() - actions_width).max(168.0);
-                ui.allocate_ui_with_layout(
-                    egui::vec2(title_width, 0.0),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        ui.set_max_width(title_width);
-                        theme::eyebrow(
-                            ui,
-                            t(zh, "模型渠道", "MODEL CHANNELS"),
-                            palette.background_dark,
-                        );
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(t(zh, "你的路由配置", "Router Configuration"))
-                                    .font(egui::FontId::new(
-                                        if zh { 24.0 } else { 18.0 },
-                                        theme::display_family(),
-                                    ))
-                                    .color(palette.ink),
-                            )
-                            .truncate(),
-                        );
-                    },
+                theme::eyebrow(
+                    ui,
+                    t(zh, "模型渠道", "MODEL CHANNELS"),
+                    palette.background_dark,
+                );
+                ui.label(
+                    egui::RichText::new(t(zh, "路由配置", "Router configuration"))
+                        .font(egui::FontId::new(18.0, theme::display_family()))
+                        .color(palette.ink),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::accent_button(
-                        ui,
-                        egui::RichText::new("＋")
-                            .size(22.0)
-                            .color(egui::Color32::WHITE),
-                        palette,
-                    )
-                    .on_hover_text(t(zh, "新增模型渠道", "Add model channel"))
-                    .clicked()
+                    if ui
+                        .add_sized(
+                            [if zh { 116.0 } else { 126.0 }, 36.0],
+                            egui::Button::new(
+                                egui::RichText::new(t(zh, "＋ 添加新模型", "＋ Add model"))
+                                    .size(13.0)
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                            )
+                            .fill(palette.action)
+                            .stroke(egui::Stroke::NONE)
+                            .corner_radius(egui::CornerRadius::same(7)),
+                        )
+                        .on_hover_text(t(zh, "新增模型渠道", "Add model channel"))
+                        .clicked()
                     {
                         self.temp_model = ModelConfig::default();
                         self.temp_model.priority =
@@ -8670,66 +9001,22 @@ impl CodexRouterApp {
                         self.advanced_json_open = false;
                         self.page = Page::Model;
                     }
-                    let response = ui.add_enabled_ui(!self.applying, |ui| {
-                        theme::primary_button(
-                            ui,
-                            egui::RichText::new(t(zh, "保存并应用", "Save & apply"))
-                                .strong()
-                                .color(egui::Color32::WHITE),
-                            palette,
-                        )
-                    });
-                    if response.inner.clicked() {
-                        self.apply_all();
-                    }
-                    let oauth_count = self.config.oauth_account_ids.as_ref().map_or(0, Vec::len);
-                    let oauth_response = ui
-                        .add_sized(
-                            [178.0, 44.0],
+                    let apply = ui.add_enabled_ui(!self.applying, |ui| {
+                        ui.add_sized(
+                            [if zh { 102.0 } else { 110.0 }, 36.0],
                             egui::Button::new(
-                                egui::RichText::new(format!(
-                                    "{} ({oauth_count})",
-                                    t(zh, "当前配置 OAuth", "Profile OAuth")
-                                ))
-                                .strong()
-                                .color(egui::Color32::WHITE),
+                                egui::RichText::new(t(zh, "保存并应用", "Save & apply"))
+                                    .size(13.0)
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
                             )
-                            .fill(palette.accent)
+                            .fill(palette.background_dark)
                             .stroke(egui::Stroke::NONE)
                             .corner_radius(egui::CornerRadius::same(7)),
                         )
-                        .on_hover_text(t(
-                            zh,
-                            "管理只属于当前配置的 OAuth 账号、模型和回退策略",
-                            "Manage OAuth accounts, models, and fallback policy for this profile",
-                        ));
-                    if oauth_response.clicked() {
-                        self.open_oauth_manager();
-                    }
-                    if ui
-                        .add_sized(
-                            [142.0, 44.0],
-                            egui::Button::new(
-                                egui::RichText::new(t(
-                                    zh,
-                                    "常见渠道快速配置",
-                                    "Common provider setup",
-                                ))
-                                    .strong()
-                                    .color(palette.ink),
-                            )
-                            .fill(palette.paper)
-                            .stroke(egui::Stroke::new(1.0, palette.line))
-                            .corner_radius(egui::CornerRadius::same(7)),
-                        )
-                        .on_hover_text(t(
-                            zh,
-                            "查看 OpenAI、Claude、OpenRouter、Kimi、MiMo 等常见 API 渠道；推荐平台单独展示",
-                            "Choose OpenAI, Claude, OpenRouter, Kimi, MiMo, and other common APIs; recommended platforms are listed separately",
-                        ))
-                        .clicked()
-                    {
-                        self.channel_preset_dialog_open = true;
+                    });
+                    if apply.inner.clicked() {
+                        self.apply_all();
                     }
                 });
             });
@@ -8743,7 +9030,7 @@ impl CodexRouterApp {
                 self.status_text.clear();
                 self.status_expires_at = None;
             }
-            ui.add_space(10.0);
+            ui.add_space(3.0);
             let mut edit = None;
             let mut delete = None;
             let mut set_default = None;
@@ -8751,6 +9038,7 @@ impl CodexRouterApp {
             let current_default = super::logic::resolve_default_model(&self.config)
                 .unwrap_or_default()
                 .to_owned();
+            let route_plan = super::logic::catalog::build_route_plan(&self.config);
             if !self.config.models.is_empty() {
                 egui::ScrollArea::vertical()
                     .id_salt("dashboard-model-list-scroll")
@@ -8759,34 +9047,59 @@ impl CodexRouterApp {
                     .show(ui, |ui| {
                     for (index, model) in self.config.models.iter().enumerate() {
                         let vision = super::logic::resolve_multimodal(model);
-                        let is_default = model.model == current_default;
+                        let route = route_plan.iter().find(|route| route.index == index);
+                        let route_id = route
+                            .map(|route| route.public_model_id.as_str())
+                            .unwrap_or(model.model.as_str());
+                        let is_default = route.is_some_and(|route| {
+                            route.include_in_catalog && route.public_model_id == current_default
+                        });
                         let response = egui::Frame::new()
                             .fill(palette.paper)
                             .stroke(egui::Stroke::new(1.0_f32, palette.line))
                             .shadow(theme::soft_card_shadow())
-                            .inner_margin(egui::Margin::symmetric(18, 15))
+                            .inner_margin(egui::Margin::symmetric(12, 6))
                             .show(ui, |ui| {
                                 ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 2.0;
                                     ui.horizontal(|ui| {
-                                        ui.label(
-                                            egui::RichText::new(format!("{:02}", index + 1))
-                                                .font(egui::FontId::new(
-                                                    23.0,
-                                                    theme::display_family(),
-                                                ))
-                                                .color(palette.accent),
+                                        let action_width = if zh { 286.0 } else { 336.0 };
+                                        let title_width =
+                                            (ui.available_width() - action_width - 8.0).max(120.0);
+                                        let model_label = if model.alias.is_empty() {
+                                            &model.model
+                                        } else {
+                                            &model.alias
+                                        };
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(title_width, 32.0),
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    egui::RichText::new(format!("{:02}", index + 1))
+                                                        .font(egui::FontId::new(
+                                                            21.0,
+                                                            theme::display_family(),
+                                                        ))
+                                                        .color(palette.accent),
+                                                );
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(model_label)
+                                                            .font(egui::FontId::new(
+                                                                18.0,
+                                                                theme::display_family(),
+                                                            ))
+                                                            .color(palette.ink)
+                                                            .strong(),
+                                                    )
+                                                    .truncate(),
+                                                )
+                                                .on_hover_text(model_label);
+                                            },
                                         );
-                                        ui.label(
-                                            egui::RichText::new(if model.alias.is_empty() {
-                                                &model.model
-                                            } else {
-                                                &model.alias
-                                            })
-                                            .font(egui::FontId::new(19.0, theme::display_family()))
-                                            .color(palette.ink)
-                                            .strong(),
-                                        );
-                                        ui.with_layout(
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(ui.available_width().max(action_width), 32.0),
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
                                                 let drag_handle = ui
@@ -8840,13 +9153,19 @@ impl CodexRouterApp {
                                                     ))
                                                     .clicked()
                                                 {
-                                                    set_default = Some(model.model.clone());
+                                                    let label = if model.alias.trim().is_empty() {
+                                                        model.model.clone()
+                                                    } else {
+                                                        model.alias.clone()
+                                                    };
+                                                    set_default =
+                                                        Some((route_id.to_owned(), label));
                                                 }
                                             },
                                         );
                                     });
-                                    ui.add_space(6.0);
                                     ui.horizontal_wrapped(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
                                         theme::pill(
                                             ui,
                                             &format!(
@@ -8859,16 +9178,11 @@ impl CodexRouterApp {
                                         );
                                         theme::pill(
                                             ui,
-                                            if model.source == "oauth" {
-                                                "OAUTH"
-                                            } else if super::logic::is_oauth_fallback_model(
+                                            &super::logic::model_route_badge(
                                                 &self.config,
                                                 model,
-                                            ) {
-                                                "FALLBACK"
-                                            } else {
-                                                "API KEY"
-                                            },
+                                                zh,
+                                            ),
                                             palette.paper_alt,
                                             palette.ink_soft,
                                         );
@@ -8885,33 +9199,6 @@ impl CodexRouterApp {
                                             } else {
                                                 palette.muted
                                             },
-                                        );
-                                        ui.label(
-                                            egui::RichText::new(
-                                                super::logic::model_routing_explanation(
-                                                    &self.config,
-                                                    model,
-                                                    zh,
-                                                ),
-                                            )
-                                            .small()
-                                            .color(palette.ink_soft),
-                                        );
-                                        // Endpoint belongs on the same line as the
-                                        // route description so the card stays compact.
-                                        ui.label(
-                                            egui::RichText::new(if model.source == "oauth" {
-                                                t(
-                                                    zh,
-                                                    "Sub2API 托管 OAuth",
-                                                    "Sub2API-managed OAuth",
-                                                )
-                                                .to_owned()
-                                            } else {
-                                                model.base_url.clone()
-                                            })
-                                            .small()
-                                            .color(palette.background_dark),
                                         );
                                     });
                                 });
@@ -8985,12 +9272,12 @@ impl CodexRouterApp {
                 self.config.models.remove(index);
                 super::logic::normalize_default_model(&mut self.config);
             }
-            if let Some(model) = set_default {
-                self.config.default_model = model.clone();
+            if let Some((model, label)) = set_default {
+                self.config.default_model = model;
                 self.status_text = if zh {
-                    format!("默认模型已选择：{model}；点击“保存并应用”后生效")
+                    format!("默认模型已选择：{label}；点击“保存并应用”后生效")
                 } else {
-                    format!("Default model selected: {model}. Save & apply to activate it.")
+                    format!("Default model selected: {label}. Save & apply to activate it.")
                 };
             }
             if let Some(index) = edit {
@@ -9024,89 +9311,101 @@ impl CodexRouterApp {
                     });
             }
         });
-        ui.add_space(12.0);
+        ui.add_space(8.0);
         let mut clear_log = false;
         let mut export_log = false;
-        theme::dark_glass_frame(palette).show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), log_content_height),
-                egui::Layout::top_down(egui::Align::Min),
-                |ui| {
-                    ui.horizontal(|ui| {
-                        theme::eyebrow(
-                            ui,
-                            t(zh, "活动日志", "ACTIVITY LOG"),
-                            egui::Color32::from_rgb(220, 220, 215),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .small_button("↗")
-                                .on_hover_text(t(zh, "展开运行日志", "Open runtime log"))
-                                .clicked()
-                            {
-                                self.log_dialog_open = true;
-                            }
-                            if ui
-                                .small_button("↓")
-                                .on_hover_text(t(zh, "下载脱敏日志", "Download redacted log"))
-                                .clicked()
-                            {
-                                export_log = true;
-                            }
-                            if ui
-                                .small_button("×")
-                                .on_hover_text(t(zh, "清空日志", "Clear log"))
-                                .clicked()
-                            {
-                                clear_log = true;
-                            }
-                            let previous_follow = self.log_follow_latest;
-                            ui.checkbox(&mut self.log_follow_latest, t(zh, "跟随最新", "Follow"));
-                            if self.log_follow_latest && !previous_follow {
-                                self.log_scroll_to_bottom = true;
-                            }
-                        });
-                    });
-                    let content = if self.logs.is_empty() {
-                        t(zh, "等待操作…", "Waiting for an action…").to_owned()
-                    } else {
-                        log_excerpt(&self.logs, 200, 320)
-                    };
-                    let scroll = egui::ScrollArea::vertical()
-                        .id_salt("dashboard-activity-log")
-                        .max_height(log_content_height - 34.0)
-                        .auto_shrink([false, false])
-                        .stick_to_bottom(self.log_follow_latest)
-                        .show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new(&content)
-                                    .monospace()
-                                    .small()
-                                    .color(egui::Color32::WHITE),
+        theme::dark_glass_frame(palette)
+            .inner_margin(egui::Margin::symmetric(14, 10))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), log_content_height),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.horizontal(|ui| {
+                            theme::eyebrow(
+                                ui,
+                                t(zh, "活动日志", "ACTIVITY LOG"),
+                                egui::Color32::from_rgb(220, 220, 215),
                             );
-                            if self.log_scroll_to_bottom {
-                                ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
-                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .small_button("↗")
+                                        .on_hover_text(t(zh, "展开运行日志", "Open runtime log"))
+                                        .clicked()
+                                    {
+                                        self.log_dialog_open = true;
+                                    }
+                                    if ui
+                                        .small_button("↓")
+                                        .on_hover_text(t(
+                                            zh,
+                                            "下载脱敏日志",
+                                            "Download redacted log",
+                                        ))
+                                        .clicked()
+                                    {
+                                        export_log = true;
+                                    }
+                                    if ui
+                                        .small_button("×")
+                                        .on_hover_text(t(zh, "清空日志", "Clear log"))
+                                        .clicked()
+                                    {
+                                        clear_log = true;
+                                    }
+                                    let previous_follow = self.log_follow_latest;
+                                    ui.checkbox(
+                                        &mut self.log_follow_latest,
+                                        t(zh, "跟随最新", "Follow"),
+                                    );
+                                    if self.log_follow_latest && !previous_follow {
+                                        self.log_scroll_to_bottom = true;
+                                    }
+                                },
+                            );
                         });
-                    let at_bottom = scroll.state.offset.y + scroll.inner_rect.height()
-                        >= scroll.content_size.y - 4.0;
-                    // Keep "Follow latest" on by default. Only drop it when the
-                    // user intentionally scrolls this log away from the bottom.
-                    let pointer_over_log = ui.rect_contains_pointer(scroll.inner_rect);
-                    let scrolled_up = ui.input(|input| input.smooth_scroll_delta.y > 0.5);
-                    if self.log_follow_latest
-                        && !at_bottom
-                        && pointer_over_log
-                        && scrolled_up
-                        && !self.log_scroll_to_bottom
-                    {
-                        self.log_follow_latest = false;
-                    }
-                    self.log_scroll_to_bottom = false;
-                },
-            );
-        });
+                        let content = if self.logs.is_empty() {
+                            t(zh, "等待操作…", "Waiting for an action…").to_owned()
+                        } else {
+                            log_excerpt(&self.logs, 200, 320)
+                        };
+                        let scroll = egui::ScrollArea::vertical()
+                            .id_salt("dashboard-activity-log")
+                            .max_height(log_content_height - 34.0)
+                            .auto_shrink([false, false])
+                            .stick_to_bottom(self.log_follow_latest)
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(&content)
+                                        .monospace()
+                                        .small()
+                                        .color(egui::Color32::WHITE),
+                                );
+                                if self.log_scroll_to_bottom {
+                                    ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
+                                }
+                            });
+                        let at_bottom = scroll.state.offset.y + scroll.inner_rect.height()
+                            >= scroll.content_size.y - 4.0;
+                        // Keep "Follow latest" on by default. Only drop it when the
+                        // user intentionally scrolls this log away from the bottom.
+                        let pointer_over_log = ui.rect_contains_pointer(scroll.inner_rect);
+                        let scrolled_up = ui.input(|input| input.smooth_scroll_delta.y > 0.5);
+                        if self.log_follow_latest
+                            && !at_bottom
+                            && pointer_over_log
+                            && scrolled_up
+                            && !self.log_scroll_to_bottom
+                        {
+                            self.log_follow_latest = false;
+                        }
+                        self.log_scroll_to_bottom = false;
+                    },
+                );
+            });
         if clear_log {
             self.logs.clear();
             self.log_scroll_to_bottom = false;

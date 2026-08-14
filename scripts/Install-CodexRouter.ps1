@@ -14,13 +14,13 @@ if ([string]::IsNullOrWhiteSpace($SourceRoot)) {
     $SourceRoot = $PSScriptRoot
 }
 if ([string]::IsNullOrWhiteSpace($InstallRoot)) {
-    $InstallRoot = Join-Path $env:LOCALAPPDATA 'Programs\Codex-Router\1.5.4'
+    $InstallRoot = Join-Path $env:LOCALAPPDATA 'Programs\Codex-Router\1.6.11'
 }
 $SourceRoot = [IO.Path]::GetFullPath($SourceRoot)
 $InstallRoot = [IO.Path]::GetFullPath($InstallRoot)
 
 if ([string]::IsNullOrWhiteSpace($PackageZip)) {
-    $PackageZip = @(Get-ChildItem -LiteralPath $SourceRoot -Filter 'Codex-Router-Portable-1.5.4-windows-x64.zip' -File -ErrorAction SilentlyContinue |
+    $PackageZip = @(Get-ChildItem -LiteralPath $SourceRoot -Filter 'Codex-Router-Portable-1.6.11-windows-x64.zip' -File -ErrorAction SilentlyContinue |
             Select-Object -First 1 -ExpandProperty FullName)
 }
 if (-not [string]::IsNullOrWhiteSpace([string]$PackageZip) -and -not [IO.Path]::IsPathRooted($PackageZip)) {
@@ -77,7 +77,7 @@ try {
     [ordered]@{
         installed = $true
         installRoot = $InstallRoot
-        version = '1.5.4'
+        version = '1.6.11'
         shortcut = (-not $NoShortcut)
         userData = (Join-Path $env:LOCALAPPDATA 'Codex-Router\UserData')
     } | ConvertTo-Json -Compress

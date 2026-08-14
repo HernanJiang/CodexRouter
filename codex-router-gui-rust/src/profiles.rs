@@ -42,6 +42,11 @@ pub struct RestoreOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeleteProfileOutcome {
+    pub credential_cleanup_complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CodexAccountMode {
     Official,
     ApiOnly,
@@ -512,8 +517,8 @@ fn prepare_account_mode_config(
         .and_then(|providers| providers.get_mut(&provider_id))
         .and_then(Item::as_table_like_mut)
         .context("无法更新 Codex-Router 模型提供方")?;
-    // Apply/account switching must never force API-only login. Codex keeps the
-    // user's sign-in UI while Router requests still use the local bearer.
+    // Match the v1.5.2 account contract: keep Codex in its normal signed-in
+    // account flow while Router requests continue to use the local bearer.
     provider.insert("requires_openai_auth", toml_edit::value(true));
 
     match target {
@@ -928,6 +933,13 @@ pub(crate) fn merge_codex_route_config(current: &str, target: &str) -> anyhow::R
             current_doc.insert(key, item.clone());
         }
     }
+    if current_doc
+        .get("forced_login_method")
+        .and_then(Item::as_str)
+        == Some("chatgpt")
+    {
+        current_doc.remove("forced_login_method");
+    }
     if let Some(providers) = current_doc
         .get_mut("model_providers")
         .and_then(Item::as_table_like_mut)
@@ -1042,6 +1054,64 @@ fn restore_snapshot_auth(source: &Path, cfg: &RouterConfig) -> anyhow::Result<()
     result
 }
 
+/// Recover a missing file-backed ChatGPT login from the newest validated local
+/// snapshot. Existing auth state is never replaced, including API or external
+/// auth managed outside Codex-Router.
+pub fn recover_missing_chatgpt_auth(
+    router_root: &Path,
+    cfg: &RouterConfig,
+) -> anyhow::Result<bool> {
+    if cfg.auth_mode != "chatgpt_oauth" {
+        return Ok(false);
+    }
+    let auth_target = logic::resolve_codex_home(cfg).join("auth.json");
+    if auth_target.exists() {
+        return Ok(false);
+    }
+
+    if let Ok((auth, _)) = load_official_auth_snapshot(router_root) {
+        atomic_write(&auth_target, &auth)?;
+        return Ok(read_auth_info(&auth_target).valid_chatgpt);
+    }
+
+    let mut candidates = Vec::new();
+    let original = original_root(router_root);
+    if original.join("state.json").is_file() {
+        candidates.push(original);
+    }
+    let history = history_root(router_root);
+    if history.is_dir() {
+        let mut entries = std::fs::read_dir(history)?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().join("state.json").is_file())
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| right.file_name().cmp(&left.file_name()));
+        candidates.splice(0..0, entries);
+    }
+
+    for source in candidates {
+        let Ok(manifest) = std::fs::read_to_string(source.join("state.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<StateManifest>(&text).ok())
+            .ok_or(())
+        else {
+            continue;
+        };
+        if !manifest.auth_present
+            || !read_snapshot_auth_info(&source, &manifest).is_ok_and(|info| info.valid_chatgpt)
+        {
+            continue;
+        }
+        restore_snapshot_auth(&source, cfg)?;
+        if read_auth_info(&auth_target).valid_chatgpt {
+            return Ok(true);
+        }
+        clear_optional_file(&auth_target)?;
+    }
+    Ok(false)
+}
+
 fn restore_state(
     source: &Path,
     cfg: &RouterConfig,
@@ -1114,6 +1184,7 @@ fn sanitize_router_config(text: &str) -> String {
         "service_tier",
         "openai_base_url",
         "disable_response_storage",
+        "forced_login_method",
     ] {
         document.remove(key);
     }
@@ -1250,19 +1321,11 @@ pub fn initialize_codex_defaults(
         }
     }
 
-    // Codex owns its own login. Only remove an auth file that is unusable; a
-    // valid ChatGPT session must survive so the user is not signed out.
+    // Codex owns its own login. Router may report whether a file-backed
+    // ChatGPT session is available, but must never delete another valid auth
+    // mode (or a format introduced by a newer Codex release).
     let auth_path = codex_home.join("auth.json");
-    let auth_available = if auth_path.is_file() {
-        if read_auth_info(&auth_path).valid_chatgpt {
-            true
-        } else {
-            clear_optional_file(&auth_path)?;
-            false
-        }
-    } else {
-        false
-    };
+    let auth_available = auth_path.is_file() && read_auth_info(&auth_path).valid_chatgpt;
 
     Ok(RestoreOutcome {
         auth_available,
@@ -1469,6 +1532,52 @@ pub fn load_profile_config(
     )
 }
 
+pub fn delete_profile(
+    router_root: &Path,
+    profile: &IsolationProfile,
+) -> anyhow::Result<DeleteProfileOutcome> {
+    let mut components = Path::new(&profile.id).components();
+    if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+    {
+        bail!("隔离配置标识无效，未执行删除");
+    }
+
+    let destination = profile_root(router_root).join(&profile.id);
+    let metadata_path = destination.join("profile.json");
+    let stored: IsolationProfile = serde_json::from_str(
+        &std::fs::read_to_string(&metadata_path)
+            .with_context(|| format!("隔离配置不存在: {}", profile.id))?,
+    )?;
+    if stored.id != profile.id {
+        bail!("隔离配置标识不匹配，未执行删除");
+    }
+
+    let config = RouterConfig::load(&destination.join("router-config.json"))?;
+    let credential_prefix = format!("Profile-{}-", logic::slugify(&profile.id));
+    let mut credential_names = config
+        .models
+        .iter()
+        .map(|model| model.credential_name.trim())
+        .filter(|name| name.starts_with(&credential_prefix))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let proxy_credential = config.proxy.password_credential.trim();
+    if proxy_credential.starts_with(&credential_prefix) {
+        credential_names.push(proxy_credential.to_owned());
+    }
+    credential_names.sort();
+    credential_names.dedup();
+
+    std::fs::remove_dir_all(&destination)
+        .with_context(|| format!("无法删除隔离配置“{}”", profile.name))?;
+    let credential_cleanup_complete =
+        logic::remove_isolated_profile_credentials(&credential_names).is_ok();
+    Ok(DeleteProfileOutcome {
+        credential_cleanup_complete,
+    })
+}
+
 pub fn restore_profile_codex_state(
     router_root: &Path,
     profile: &IsolationProfile,
@@ -1568,6 +1677,72 @@ mod tests {
         drop(first);
         acquire_config_apply_lock(&root, Duration::from_secs(1)).unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deleting_a_saved_profile_removes_only_that_profile() {
+        let root = temporary_test_dir("delete-profile");
+        let profiles = profile_root(&root);
+        let target = IsolationProfile {
+            id: "local-delete-me".to_owned(),
+            name: "Delete me".to_owned(),
+            kind: IsolationKind::Local,
+            created_at: "2026-08-11T00:00:00Z".to_owned(),
+            updated_at: "2026-08-11T00:00:00Z".to_owned(),
+        };
+        let keep = IsolationProfile {
+            id: "local-keep-me".to_owned(),
+            name: "Keep me".to_owned(),
+            kind: IsolationKind::Local,
+            created_at: "2026-08-11T00:00:00Z".to_owned(),
+            updated_at: "2026-08-11T00:00:00Z".to_owned(),
+        };
+        for profile in [&target, &keep] {
+            let destination = profiles.join(&profile.id);
+            std::fs::create_dir_all(&destination).unwrap();
+            write_json(&destination.join("profile.json"), profile).unwrap();
+            RouterConfig {
+                models: vec![crate::config::ModelConfig {
+                    model: "gpt-5.6-sol".to_owned(),
+                    source: "oauth".to_owned(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+            .save(&destination.join("router-config.json"))
+            .unwrap();
+        }
+
+        let outcome = delete_profile(&root, &target).unwrap();
+
+        assert!(outcome.credential_cleanup_complete);
+        assert!(!profiles.join(&target.id).exists());
+        assert!(profiles.join(&keep.id).is_dir());
+        let remaining = list_profiles(&root).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, keep.id);
+        assert_eq!(remaining[0].name, keep.name);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn official_mode_restores_the_v1_5_2_router_contract() {
+        let input = r#"model_provider = "codex_router"
+forced_login_method = "chatgpt"
+
+[model_providers.codex_router]
+name = "Codex-Router"
+base_url = "http://127.0.0.1:18080/v1"
+requires_openai_auth = false
+"#;
+        let document = input.parse::<DocumentMut>().unwrap();
+        assert_eq!(router_requires_openai_auth(&document), Some(false));
+
+        let restored =
+            prepare_account_mode_config(input, CodexAccountMode::Official, None, None).unwrap();
+        assert!(restored.contains("name = \"Codex-Router\""));
+        assert!(restored.contains("requires_openai_auth = true"));
+        assert!(!restored.contains("forced_login_method"));
     }
 
     #[test]
@@ -1774,6 +1949,7 @@ experimental_bearer_token = "local-router-secret"
 model = "gpt-5.6-sol"
 model_catalog_json = "C:\\catalog.json"
 model_reasoning_effort = "high"
+forced_login_method = "chatgpt"
 approval_policy = "never"
 
 [windows]
@@ -1805,6 +1981,7 @@ experimental_bearer_token = "sk-local-test"
         assert!(!cleaned.contains("model_catalog_json"));
         assert!(!cleaned.contains("codex_router"));
         assert!(!cleaned.contains("experimental_bearer_token"));
+        assert!(!cleaned.contains("forced_login_method"));
         // The user's own Codex settings survive untouched.
         assert!(cleaned.contains("approval_policy = \"never\""));
         assert!(cleaned.contains("sandbox = \"elevated\""));
@@ -1820,6 +1997,23 @@ experimental_bearer_token = "sk-local-test"
             std::fs::read_to_string(sessions.join("chat.jsonl")).unwrap(),
             "chat"
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn initialize_codex_defaults_preserves_non_chatgpt_auth_owned_by_codex() {
+        let root = temporary_test_dir("codex-defaults-external-auth");
+        let codex_home = root.join("codex-home");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let auth = br#"{"auth_mode":"apikey","provider":"external"}"#;
+        std::fs::write(codex_home.join("auth.json"), auth).unwrap();
+
+        let mut cfg = RouterConfig::default();
+        cfg.deploy.codex_home = codex_home.display().to_string();
+        let outcome = initialize_codex_defaults(&root, &cfg).unwrap();
+
+        assert!(!outcome.auth_available);
+        assert_eq!(std::fs::read(codex_home.join("auth.json")).unwrap(), auth);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1974,7 +2168,7 @@ experimental_bearer_token = "local-router-key"
 
     #[cfg(windows)]
     #[test]
-    fn official_mode_keeps_requires_openai_auth_true() {
+    fn signed_in_account_restores_the_v1_5_2_login_contract() {
         let root = temporary_test_dir("account-mode-official-true");
         let codex_home = root.join("codex-home");
         std::fs::create_dir_all(&codex_home).unwrap();
@@ -2317,8 +2511,8 @@ command = "user-mcp.exe"
     }
 
     #[test]
-    fn oauth_auto_enrollment_updates_only_the_target_profiles_oauth_fields() {
-        let root = temporary_test_dir("profile-oauth-auto-enrollment");
+    fn oauth_selection_update_changes_only_the_target_profiles_oauth_fields() {
+        let root = temporary_test_dir("profile-oauth-selection-update");
         let mut config = RouterConfig {
             oauth_account_ids: Some(vec![3]),
             oauth_seen_account_ids: vec![3],
@@ -2335,6 +2529,26 @@ command = "user-mcp.exe"
         assert_eq!(saved.oauth_account_ids, Some(vec![3, 9]));
         assert_eq!(saved.oauth_seen_account_ids, vec![3, 9]);
         assert_eq!(saved.default_model, "before-save");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn apply_recovery_restores_missing_chatgpt_auth_from_latest_snapshot() {
+        let root = temporary_test_dir("recover-missing-chatgpt-auth");
+        let codex_home = root.join("codex-home");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let mut cfg = RouterConfig::default();
+        cfg.deploy.codex_home = codex_home.display().to_string();
+        let auth = r#"{"auth_mode":"chatgpt","tokens":{"account_id":"account-a","access_token":"not-real"}}"#;
+        std::fs::write(codex_home.join("auth.json"), auth).unwrap();
+        capture_restore_point(&root, &cfg, "valid ChatGPT login").unwrap();
+        std::fs::remove_file(codex_home.join("auth.json")).unwrap();
+
+        assert!(recover_missing_chatgpt_auth(&root, &cfg).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(codex_home.join("auth.json")).unwrap(),
+            auth
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }

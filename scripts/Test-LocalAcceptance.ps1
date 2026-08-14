@@ -30,6 +30,18 @@ Initialize-StandardPowerShellModulePath
 $routerRoot = Split-Path -Parent $PSScriptRoot
 $releaseBuilder = Join-Path $PSScriptRoot 'Build-PortableRelease.ps1'
 $acceptanceRoot = Join-Path ([IO.Path]::GetTempPath()) ('codex-router-acceptance-' + [Guid]::NewGuid().ToString('N'))
+$acceptanceCodexHome = Join-Path $acceptanceRoot 'codex-home'
+$acceptanceUserDataRoot = Join-Path $acceptanceRoot 'router-user-data'
+$defaultCodexHome = Join-Path $env:USERPROFILE '.codex'
+$defaultCodexConfig = Join-Path $defaultCodexHome 'config.toml'
+$defaultCodexAuth = Join-Path $defaultCodexHome 'auth.json'
+$hadCodexHome = Test-Path Env:CODEX_HOME
+$previousCodexHome = $env:CODEX_HOME
+$hadRouterUserDataRoot = Test-Path Env:CODEX_ROUTER_USER_DATA_ROOT
+$previousRouterUserDataRoot = $env:CODEX_ROUTER_USER_DATA_ROOT
+$hadPortableState = Test-Path Env:CODEX_ROUTER_PORTABLE_STATE
+$previousPortableState = $env:CODEX_ROUTER_PORTABLE_STATE
+$testEnvironmentIsolated = $false
 $utf8NoBom = [Text.UTF8Encoding]::new($false)
 $results = [Collections.Generic.List[object]]::new()
 $hadFailure = $false
@@ -71,6 +83,31 @@ function Add-AcceptanceResult {
 function Set-AcceptanceDetail {
     param([string]$Detail)
     $script:currentDetail = $Detail
+}
+
+function Get-FileMetadataFingerprint {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return 'missing' }
+    $item = Get-Item -LiteralPath $Path -Force
+    return '{0}|{1}|{2}' -f $item.Length, $item.LastWriteTimeUtc.Ticks, $item.Attributes
+}
+
+$defaultCodexConfigBefore = Get-FileMetadataFingerprint -Path $defaultCodexConfig
+$defaultCodexAuthBefore = Get-FileMetadataFingerprint -Path $defaultCodexAuth
+
+function Assert-IsolatedTestState {
+    $expectedCodexHome = [IO.Path]::GetFullPath($acceptanceCodexHome)
+    $expectedUserDataRoot = [IO.Path]::GetFullPath($acceptanceUserDataRoot)
+    if ([IO.Path]::GetFullPath([string]$env:CODEX_HOME) -ne $expectedCodexHome -or
+        [IO.Path]::GetFullPath([string]$env:CODEX_ROUTER_USER_DATA_ROOT) -ne $expectedUserDataRoot -or
+        $env:CODEX_ROUTER_PORTABLE_STATE -ne '1') {
+        throw 'The acceptance suite lost its isolated Codex or Router user-data root.'
+    }
+    if ((Get-FileMetadataFingerprint -Path $defaultCodexConfig) -ne $defaultCodexConfigBefore -or
+        (Get-FileMetadataFingerprint -Path $defaultCodexAuth) -ne $defaultCodexAuthBefore) {
+        throw 'The default Codex config/auth file metadata changed during isolated acceptance.'
+    }
+    Set-AcceptanceDetail -Detail 'Isolated CODEX_HOME and per-test portable Router state; default config/auth metadata unchanged'
 }
 
 function Invoke-AcceptanceCheck {
@@ -361,6 +398,16 @@ function Resolve-OptionalStage {
 
 [IO.Directory]::CreateDirectory($acceptanceRoot) | Out-Null
 try {
+    [IO.Directory]::CreateDirectory($acceptanceCodexHome) | Out-Null
+    [IO.Directory]::CreateDirectory($acceptanceUserDataRoot) | Out-Null
+    $env:CODEX_HOME = $acceptanceCodexHome
+    $env:CODEX_ROUTER_USER_DATA_ROOT = $acceptanceUserDataRoot
+    # The override is a fallback for paths that do not receive an explicit test
+    # root. Portable state keeps Rust and PowerShell fixtures on their own
+    # temporary roots instead of merging parallel tests into one directory.
+    $env:CODEX_ROUTER_PORTABLE_STATE = '1'
+    $testEnvironmentIsolated = $true
+
     if (-not (Test-Path -LiteralPath $releaseBuilder -PathType Leaf)) {
         throw 'Build-PortableRelease.ps1 is required for local acceptance.'
     }
@@ -465,6 +512,8 @@ try {
         Add-AcceptanceResult -Name 'concurrent-stage-validation' -Status skipped -Milliseconds 0 -Detail 'Enable with -Stress.'
     }
 
+    Invoke-AcceptanceCheck -Name 'test-state-isolation' -Action { Assert-IsolatedTestState }
+
     $suiteWatch.Stop()
     $passed = @($results | Where-Object status -eq 'passed').Count
     $failed = @($results | Where-Object status -eq 'failed').Count
@@ -483,6 +532,23 @@ try {
 
     if ($hadFailure) { throw 'Local acceptance failed; see the redacted result summary above.' }
 } finally {
+    if ($testEnvironmentIsolated) {
+        if ($hadCodexHome) {
+            $env:CODEX_HOME = $previousCodexHome
+        } else {
+            [Environment]::SetEnvironmentVariable('CODEX_HOME', $null, 'Process')
+        }
+        if ($hadRouterUserDataRoot) {
+            $env:CODEX_ROUTER_USER_DATA_ROOT = $previousRouterUserDataRoot
+        } else {
+            [Environment]::SetEnvironmentVariable('CODEX_ROUTER_USER_DATA_ROOT', $null, 'Process')
+        }
+        if ($hadPortableState) {
+            $env:CODEX_ROUTER_PORTABLE_STATE = $previousPortableState
+        } else {
+            [Environment]::SetEnvironmentVariable('CODEX_ROUTER_PORTABLE_STATE', $null, 'Process')
+        }
+    }
     if (Test-Path -LiteralPath $acceptanceRoot) {
         $resolvedAcceptanceRoot = [IO.Path]::GetFullPath($acceptanceRoot)
         $resolvedTempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())

@@ -25,16 +25,38 @@ $previousLifecycleLockMarker = [Environment]::GetEnvironmentVariable(
     'Process')
 $session = $null
 $localKey = $null
+$nativeLifecycle = $env:CODEX_ROUTER_NATIVE_LIFECYCLE -eq '1'
+$routerExe = Join-Path $routerRoot 'Codex-Router.exe'
 try {
-$lifecycleLock = Enter-RouterLifecycleLock `
-    -RouterRoot $routerRoot `
-    -TimeoutMilliseconds 10000 `
-    -Operation 'Apply Router configuration'
-[Environment]::SetEnvironmentVariable('CODEX_ROUTER_LIFECYCLE_LOCK_HELD', [string]$PID, 'Process')
+if (-not $nativeLifecycle) {
+    $lifecycleLock = Enter-RouterLifecycleLock `
+        -RouterRoot $routerRoot `
+        -TimeoutMilliseconds 10000 `
+        -Operation 'Apply Router configuration'
+    [Environment]::SetEnvironmentVariable('CODEX_ROUTER_LIFECYCLE_LOCK_HELD', [string]$PID, 'Process')
+}
 $config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
 $proxyProperty = $config.PSObject.Properties['proxy']
 $proxyConfig = if ($null -eq $proxyProperty) { $null } else { $proxyProperty.Value }
-$proxySettings = Resolve-RouterProxySettings -ProxyConfig $proxyConfig -ProxyPassword $null
+$proxySettings = if ($env:CODEX_ROUTER_NATIVE_PROXY -eq '1') {
+    [pscustomobject][ordered]@{
+        Mode = [string]$env:CODEX_ROUTER_PROXY_MODE
+        Source = [string]$env:CODEX_ROUTER_PROXY_SOURCE
+        ProxyUrl = if ([string]::IsNullOrWhiteSpace($env:CODEX_ROUTER_PROXY_URL)) { $null } else { [string]$env:CODEX_ROUTER_PROXY_URL }
+        NoProxy = [string]$env:CODEX_ROUTER_NO_PROXY
+        HasCredentials = $env:CODEX_ROUTER_PROXY_HAS_CREDENTIALS -eq '1'
+        SupportsAccountBinding = $env:CODEX_ROUTER_PROXY_SUPPORTS_ACCOUNT_BINDING -eq '1'
+        Diagnostic = ''
+    }
+} else {
+    Resolve-RouterProxySettings -ProxyConfig $proxyConfig -ProxyPassword $null
+}
+$nativeProxyTargetPolicies = if ($env:CODEX_ROUTER_NATIVE_PROXY -eq '1' -and
+    -not [string]::IsNullOrWhiteSpace($env:CODEX_ROUTER_PROXY_TARGET_POLICIES)) {
+    $env:CODEX_ROUTER_PROXY_TARGET_POLICIES | ConvertFrom-Json
+} else {
+    $null
+}
 if ($proxySettings.Mode -eq 'unsupported') {
     throw "ROUTER_PROXY_UNSUPPORTED: $($proxySettings.Diagnostic)"
 }
@@ -106,7 +128,52 @@ Write-Output '[1/7] Initializing local credentials and database...'
 & (Join-Path $PSScriptRoot 'Initialize-Router.ps1')
 Write-RouterFlag 'STAGE-01-INIT-OK'
 Write-Output '[2/7] Starting PostgreSQL, Redis, and Sub2API...'
-& (Join-Path $PSScriptRoot 'Start-Router.ps1') -RepairUnhealthy
+if ($nativeLifecycle) {
+    if (-not (Test-Path -LiteralPath $routerExe -PathType Leaf)) {
+        throw "Codex-Router.exe not found: $routerExe"
+    }
+    $nativeLifecycleOutput = Join-Path `
+        (Get-RouterUserDataRoot -RouterRoot $routerRoot) `
+        "data\pids\native-lifecycle-$PID.json"
+    $previousNativeCliOutput = [Environment]::GetEnvironmentVariable(
+        'CODEX_ROUTER_CLI_OUTPUT',
+        'Process')
+    try {
+        [Environment]::SetEnvironmentVariable(
+            'CODEX_ROUTER_CLI_OUTPUT',
+            $nativeLifecycleOutput,
+            'Process')
+        if ($routerRoot.Contains('"')) {
+            throw 'Router root contains an invalid quote character.'
+        }
+        $nativeLifecycleStartInfo = [Diagnostics.ProcessStartInfo]::new()
+        $nativeLifecycleStartInfo.FileName = $routerExe
+        $nativeLifecycleStartInfo.Arguments = (
+            '--ensure-router-services ' +
+            '--repair-unhealthy ' +
+            '--lifecycle-lock-inherited ' +
+            "--router-root=`"$routerRoot`"")
+        $nativeLifecycleStartInfo.UseShellExecute = $false
+        $nativeLifecycleStartInfo.CreateNoWindow = $true
+        $nativeLifecycleProcess = [Diagnostics.Process]::Start($nativeLifecycleStartInfo)
+        if (-not $nativeLifecycleProcess.WaitForExit(240000)) {
+            $nativeLifecycleProcess.Kill()
+            throw 'Codex-Router.exe exceeded the four-minute local service startup budget.'
+        }
+        $nativeLifecycleExitCode = $nativeLifecycleProcess.ExitCode
+        if ($nativeLifecycleExitCode -ne 0) {
+            throw "Codex-Router.exe failed to start local services (exit $nativeLifecycleExitCode)."
+        }
+    } finally {
+        [Environment]::SetEnvironmentVariable(
+            'CODEX_ROUTER_CLI_OUTPUT',
+            $previousNativeCliOutput,
+            'Process')
+        Remove-Item -LiteralPath $nativeLifecycleOutput -Force -ErrorAction SilentlyContinue
+    }
+} else {
+    & (Join-Path $PSScriptRoot 'Start-Router.ps1') -RepairUnhealthy
+}
 Write-RouterFlag 'STAGE-02-SERVICES-OK'
 Write-Output '[3/7] Local services are ready; signing in to the admin API...'
 $session = New-RouterAdminSession
@@ -339,7 +406,12 @@ for ($modelIndex = 0; $modelIndex -lt $models.Count; $modelIndex++) {
         $extra.codex_router_oauth_fallback = [bool]$isOAuthFallback
         $targetBaseUrl = ([string]$model.baseURL).TrimEnd('/')
         $directFallbackEligible = $false
-        if ([string]$proxySettings.Mode -eq 'proxy') {
+        $nativeTargetPolicy = if ($null -ne $nativeProxyTargetPolicies) {
+            $nativeProxyTargetPolicies.PSObject.Properties[$targetBaseUrl]
+        } else { $null }
+        if ($null -ne $nativeTargetPolicy) {
+            $directFallbackEligible = [bool]$nativeTargetPolicy.Value.directFallback
+        } elseif ([string]$proxySettings.Mode -eq 'proxy') {
             if (-not $directReachabilityByTarget.ContainsKey($targetBaseUrl)) {
                 $directReachabilityByTarget[$targetBaseUrl] = Test-RouterDirectTargetReachability `
                     -TargetUri $targetBaseUrl
@@ -367,6 +439,11 @@ for ($modelIndex = 0; $modelIndex -lt $models.Count; $modelIndex++) {
         }
         if ($existing) {
             [void](Invoke-RouterApi -Session $session -Method PUT -Path "/api/v1/admin/accounts/$($existing.id)" -Body $body)
+            if ([string]$existing.status -eq 'error' -or -not [bool]$existing.schedulable) {
+                [void](Invoke-RouterApi -Session $session -Method POST -Path "/api/v1/admin/accounts/$($existing.id)/clear-error")
+                [void](Invoke-RouterApi -Session $session -Method POST -Path "/api/v1/admin/accounts/$($existing.id)/schedulable" -Body @{ schedulable = $true })
+                Write-Output "Recovered managed channel state: $accountName"
+            }
             Write-Output "Updated channel: $accountName"
         Write-RouterFlag $(if ($isOAuthFallback) { 'API-FALLBACK-CHANNEL' } else { 'API-CHANNEL' }) @{ model = [string]$route.PublicModelId; priority = $effectivePriority; joined = $(if ($shouldJoinRouter) { 'yes' } else { 'no' }) }
         } else {
@@ -544,8 +621,16 @@ foreach ($accountSummary in $existingAccounts) {
     $shouldUseManagedProxy = $isRouterMember -and $isManagedChannel
     if ($shouldUseManagedProxy -and [long]$managedProxyState.DesiredProxyId -gt 0) {
         $target = [string]$managedAccountTargets[[string]$account.name]
-        if (-not [string]::IsNullOrWhiteSpace($target) -and
-            (Test-RouterProxyBypass -TargetUri $target -NoProxy ([string]$proxySettings.NoProxy))) {
+        $nativeTargetPolicy = if ($null -ne $nativeProxyTargetPolicies -and
+            -not [string]::IsNullOrWhiteSpace($target)) {
+            $nativeProxyTargetPolicies.PSObject.Properties[$target.TrimEnd('/')]
+        } else { $null }
+        $targetBypassesProxy = if ($null -ne $nativeTargetPolicy) {
+            [bool]$nativeTargetPolicy.Value.bypass
+        } elseif (-not [string]::IsNullOrWhiteSpace($target)) {
+            Test-RouterProxyBypass -TargetUri $target -NoProxy ([string]$proxySettings.NoProxy)
+        } else { $false }
+        if ($targetBypassesProxy) {
             $shouldUseManagedProxy = $false
             $proxyBypassed++
         }
@@ -747,31 +832,11 @@ $modelDefaults = Get-CodexRouterModelDefaults `
     -RouterConfig $config `
     -CatalogPath $catalogPath `
     -Model $defaultModel
-$text = if (Test-Path -LiteralPath $codexConfig) { [IO.File]::ReadAllText($codexConfig) } else { '' }
-$permissionSource = Get-CodexPermissionSourceContent -CodexConfigPath $codexConfig -Content $text
 $sub2apiHost = if ($config.deploy.sub2apiHost) { [string]$config.deploy.sub2apiHost } else { 'http://127.0.0.1:18080' }
-# Always keep Codex account/sign-in mode. Never force API-only login, never
-# rewrite auth.json. Local Router auth stays on experimental_bearer_token.
-$text = New-CodexRouterConfig `
-    -Content $text `
-    -Model $defaultModel `
-    -CatalogPath $catalogPath `
-    -LocalApiKey $localKey `
-    -BaseUrl $sub2apiHost `
-    -ReasoningEffort $modelDefaults.ReasoningEffort `
-    -FastMode $modelDefaults.FastMode `
-    -RequireOpenAiAuth $true `
-    -PermissionSourceContent $permissionSource `
-    -CodexHome $codexHome
-if (Test-Path -LiteralPath $codexConfig) {
-    $backup = "$codexConfig.codex-router-$(Get-Date -Format 'yyyyMMdd-HHmmss-fff').bak"
-    [IO.File]::Copy($codexConfig, $backup, $false)
-    Limit-CodexRouterBackups `
-        -Directory (Split-Path -Parent $codexConfig) `
-        -Filter 'config.toml.codex-router-*.bak' `
-        -Keep 3
+& $routerExe --write-codex-config --codex-home="$codexHome" --model="$defaultModel" --catalog="$catalogPath" --base-url="$sub2apiHost" --reasoning-effort="$($modelDefaults.ReasoningEffort)" $(if ($modelDefaults.FastMode) { '--fast-mode' } else { '--no-fast-mode' }) --require-openai-auth --display-router-provider
+if ($LASTEXITCODE -ne 0) {
+    throw "Codex-Router.exe failed to write Codex configuration (exit $LASTEXITCODE)."
 }
-Write-RouterTextFileAtomic -Path $codexConfig -Text $text
 
 # OpenCode is outside product scope: never rewrite the user's OpenCode config.
 
@@ -780,10 +845,12 @@ $autostartProperty = $config.deploy.PSObject.Properties['startWithWindows']
 if ($null -ne $autostartProperty) {
     $startWithWindows = [bool]$autostartProperty.Value
 }
-if ($startWithWindows) {
-    & (Join-Path $PSScriptRoot 'Register-Autostart.ps1') | Write-Output
-} else {
-    & (Join-Path $PSScriptRoot 'Unregister-Autostart.ps1') | Write-Output
+if ($env:CODEX_ROUTER_NATIVE_AUTOSTART -ne '1') {
+    if ($startWithWindows) {
+        & (Join-Path $PSScriptRoot 'Register-Autostart.ps1') | Write-Output
+    } else {
+        & (Join-Path $PSScriptRoot 'Unregister-Autostart.ps1') | Write-Output
+    }
 }
 
 Write-Output "Configured $($models.Count) model channel(s)."
