@@ -237,7 +237,7 @@ The current release supports Windows 10/11 x64. ARM64 and macOS are not included
 - Release packages exclude user configuration, logs, databases, OAuth state, backups, and developer paths.
 - Runtime services bind to `127.0.0.1` by default. The management endpoint is not intended for remote exposure.
 - The complete terms are available in [English](TERMS.en.md) and [中文](TERMS.zh-CN.md).
-- Codex-Router original work is licensed for personal, non-commercial use under the included terms. Sub2API and other third-party components remain subject to their upstream licenses and notices.
+- Codex-Router original work is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0). Sub2API and other third-party components remain subject to their upstream licenses and notices.
 
 For the full directory layout and upgrade behavior, see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and the release package README.
 
