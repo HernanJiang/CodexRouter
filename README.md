@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.6.11-0969da" alt="Version 1.6.11">
+  <img src="https://img.shields.io/badge/version-1.7.0-0969da" alt="Version 1.7.0">
   <img src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078d4" alt="Windows 10/11">
   <img src="https://img.shields.io/badge/architecture-x64-555555" alt="x64">
   <img src="https://img.shields.io/badge/runtime-portable-2ea44f" alt="Portable runtime">
@@ -103,13 +103,19 @@ The view keeps OAuth quota cards and API usage cards visible together, packs car
 
 Codex-Router can start with Windows in a lightweight tray mode without launching an additional daemon. Tray mode pauses log following, UI refresh, and high-frequency usage updates. It retains one native health check every 60 seconds, local-service recovery after consecutive failures, and the unified self-check every 10 minutes.
 
-The 1.6.11 runtime retains the memory and background-work optimizations. Idle tray CPU, disk, and network activity are designed to be effectively negligible; the screenshot below shows the router process at 0% CPU and 0 Mbps network activity in the tested idle state.
+The 1.7.0 runtime retains the memory and background-work optimizations. Idle tray CPU, disk, and network activity are designed to be effectively negligible; the screenshot below shows the router process at 0% CPU and 0 Mbps network activity in the tested idle state.
 
 <p align="center">
   <img src="assets/release/usage-performance.png" alt="Codex-Router idle resource usage" width="900">
 </p>
 
-### What is new in 1.6.11
+### What is new in 1.7.0
+
+- The generated Codex model catalog now uses each non-empty configured model alias as its display name while preserving the route slug and upstream Model ID. Models such as grok-4.6 therefore appear with their configured display name instead of falling back to the raw ID.
+- Generated Codex provider settings use five request retries and five stream reconnect attempts by default. Both values come from one Router constant so an older fallback cannot silently override them.
+- Real TTFT acceptance now correlates client response headers, first SSE data, first semantic output, first text, and Sub2API first-token timing, making upstream latency distinguishable from local streaming overhead.
+
+### What changed in 1.6.11
 
 - The OAuth account page now reads accounts and live model catalogs through the native Rust Sub2API admin client. The PowerShell-free release no longer depends on the removed `Get-OAuthAccounts.ps1`, so working Grok, Antigravity, and ChatGPT accounts are no longer shown as having no declared models or an unreadable catalog.
 - Both live Sub2API response shapes are supported: account catalogs returned as `data` model objects and upstream synchronization returned as `data.models` identifiers. ChatGPT falls back to its stable catalog when synchronization is unsupported; Grok and Antigravity refresh upstream and then use the current account catalog.
@@ -199,15 +205,15 @@ The 1.6.11 runtime retains the memory and background-work optimizations. Idle tr
 - The updater validates the official GitHub URL, SHA-256 digest, and release manifest while reporting live download progress. A detached Rust helper performs atomic replacement, rollback on failure, and automatic restart.
 - A hidden local Router Key is recognized idempotently by its managed name and group, so repeated apply operations do not create duplicate Key records.
 - The portable root includes `Start-Codex-Router.cmd`, a launcher shell that does not depend on PowerShell. EXE publisher metadata is consistently `Hernan_JIANG`; a trusted certificate issued to that publisher is still required for SmartScreen trust.
-- The 1.6.11 portable package and installer payload contain no `.ps1`, `.psm1`, or `.psd1` files. PowerShell remains only in the GitHub source repository for Windows build, release, compatibility, and development tests.
+- The 1.7.0 portable package and installer payload contain no `.ps1`, `.psm1`, or `.psd1` files. PowerShell remains only in the GitHub source repository for Windows build, release, compatibility, and development tests.
 
 ## Download And First Run
 
-Download the Windows x64 package from [GitHub Releases](https://github.com/HernanJiang/Codex-Router/releases/tag/v1.6.11):
+Download the Windows x64 package from [GitHub Releases](https://github.com/HernanJiang/Codex-Router/releases/tag/v1.7.0):
 
-`Codex-Router-Portable-1.6.11-windows-x64.zip`
+`Codex-Router-Portable-1.7.0-windows-x64.zip`
 
-An optional per-user installer is also provided as `Codex-Router-Installer-1.6.11-windows-x64.exe`. It uses the native Rust installer path to place the same verified runtime under `%LOCALAPPDATA%\Programs\Codex-Router\1.6.11` without administrator access.
+An optional per-user installer is also provided as `Codex-Router-Installer-1.7.0-windows-x64.exe`. It uses the native Rust installer path to place the same verified runtime under `%LOCALAPPDATA%\Programs\Codex-Router\1.7.0` without administrator access.
 
 For transient pre-output stream failures such as `Upstream request failed`, the router now allows up to five same-account retries by default with a longer 1.5-second interval. The request is never replayed after visible model output has started.
 

@@ -3861,6 +3861,7 @@ mod tests {
                     }
                     Err(error) => panic!("mock server accept failed: {error}"),
                 };
+                stream.set_nonblocking(false).unwrap();
                 let mut request = [0_u8; 4096];
                 let read = stream.read(&mut request).unwrap();
                 let request = String::from_utf8_lossy(&request[..read]);

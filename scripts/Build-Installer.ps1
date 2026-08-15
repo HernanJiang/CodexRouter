@@ -12,6 +12,19 @@ $stage = [IO.Path]::GetFullPath($StagePath)
 $archive = [IO.Path]::GetFullPath($ArchivePath)
 $output = [IO.Path]::GetFullPath($OutputPath)
 $iexpress = (Get-Command iexpress.exe -ErrorAction Stop).Source
+$dependencyManifestPath = Join-Path $stage 'dependency-manifest.json'
+if (-not (Test-Path -LiteralPath $dependencyManifestPath -PathType Leaf)) {
+    throw "Release dependency manifest is missing: $dependencyManifestPath"
+}
+$dependencyManifest = Get-Content -LiteralPath $dependencyManifestPath -Raw | ConvertFrom-Json
+$routerComponents = @($dependencyManifest.components | Where-Object { [string]$_.name -eq 'Codex-Router' })
+if ($routerComponents.Count -ne 1) {
+    throw 'Release dependency manifest must contain exactly one Codex-Router component.'
+}
+$version = [string]$routerComponents[0].version
+if ($version -notmatch '^\d+\.\d+\.\d+$') {
+    throw "Release dependency manifest has an invalid Codex-Router version: $version"
+}
 
 function Copy-VersionResource {
     param(
@@ -205,7 +218,7 @@ if ([IO.Path]::GetExtension($output) -ne '.exe') { throw 'Installer output must 
 
 $work = Join-Path ([IO.Path]::GetTempPath()) ('codex-router-iexpress-' + [Guid]::NewGuid().ToString('N'))
 $payload = Join-Path $work 'payload'
-$sedPath = Join-Path $work 'Codex-Router-1.6.11.sed'
+$sedPath = Join-Path $work "Codex-Router-$version.sed"
 try {
     [IO.Directory]::CreateDirectory($payload) | Out-Null
     Copy-Item -LiteralPath $archive -Destination (Join-Path $payload (Split-Path -Leaf $archive)) -Force
@@ -220,6 +233,17 @@ try {
     }
 
     $archiveName = Split-Path -Leaf $archive
+    $launcherName = 'Install-Codex-Router.cmd'
+    $launcher = @"
+@echo off
+start "" /wait "%~dp0Codex-Router-Setup.exe" --install-portable "--install-package=%~dp0$archiveName" --install-version=$version
+exit /b %errorlevel%
+"@
+    [IO.File]::WriteAllText(
+        (Join-Path $payload $launcherName),
+        $launcher,
+        [Text.Encoding]::ASCII
+    )
     $sed = @"
 [Version]
 Class=IEXPRESS
@@ -240,8 +264,8 @@ TargetName=$output
 FriendlyName=%FriendlyName%
 AppLaunched=%AppLaunched%
 PostInstallCmd=%PostInstallCmd%
-AdminQuietInstCmd=
-UserQuietInstCmd=
+AdminQuietInstCmd=%AppLaunched%
+UserQuietInstCmd=%AppLaunched%
 SourceFiles=SourceFiles
 [SourceFiles]
 SourceFiles0=$payload\
@@ -251,18 +275,20 @@ SourceFiles0=$payload\
 %FILE2%=
 %FILE3%=
 %FILE4%=
+%FILE5%=
 [Strings]
-InstallPrompt="Install Codex-Router 1.6.11 for the current Windows user. Publisher: Hernan_JIANG."
+InstallPrompt="Install Codex-Router $version for the current Windows user. Publisher: Hernan_JIANG."
 DisplayLicense=""
-FinishMessage="Codex-Router 1.6.11 was installed. Your existing user data was preserved."
-FriendlyName="Codex-Router 1.6.11 by Hernan_JIANG"
-AppLaunched="Codex-Router-Setup.exe --install-portable --install-package=$archiveName --install-version=1.6.11"
+FinishMessage="Codex-Router $version was installed. Your existing user data was preserved."
+FriendlyName="Codex-Router $version by Hernan_JIANG"
+AppLaunched="$launcherName"
 PostInstallCmd="<None>"
 FILE0="$archiveName"
 FILE1="Codex-Router-Setup.exe"
 FILE2="VCRUNTIME140.dll"
 FILE3="VCRUNTIME140_1.dll"
 FILE4="MSVCP140.dll"
+FILE5="$launcherName"
 "@
     [IO.File]::WriteAllText($sedPath, $sed, [Text.Encoding]::ASCII)
 
@@ -272,16 +298,16 @@ FILE4="MSVCP140.dll"
 
     Copy-VersionResource -SourcePath (Join-Path $stage 'Codex-Router.exe') -DestinationPath $output
     $versionInfo = (Get-Item -LiteralPath $output).VersionInfo
-    if ([string]$versionInfo.ProductVersion -ne '1.6.11' -or
-        [string]$versionInfo.FileVersion -ne '1.6.11' -or
+    if ([string]$versionInfo.ProductVersion -ne $version -or
+        [string]$versionInfo.FileVersion -ne $version -or
         [string]$versionInfo.CompanyName -ne 'Hernan_JIANG' -or
         [string]$versionInfo.ProductName -ne 'Codex-Router') {
-        throw 'Installer version resource does not match Codex-Router 1.6.11 metadata.'
+        throw "Installer version resource does not match Codex-Router $version metadata."
     }
 
     [ordered]@{
         installer = $output
-        version = '1.6.11'
+        version = $version
         publisher = 'Hernan_JIANG'
         payloadArchive = $archiveName
         sha256 = (Get-FileHash -LiteralPath $output -Algorithm SHA256).Hash.ToLowerInvariant()

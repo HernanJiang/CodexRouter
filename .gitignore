@@ -53,8 +53,3 @@ build/
 # Go build artifacts
 source/backend/sub2api
 source/backend/*.exe
-
-# PyInstaller build artifacts
-codex-router-gui/build/
-codex-router-gui/dist/
-codex-router-gui/*.spec

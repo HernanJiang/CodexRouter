@@ -9,6 +9,26 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $routerRoot = Split-Path -Parent $PSScriptRoot
+$cargoToml = Get-Content -LiteralPath (Join-Path $routerRoot 'codex-router-gui-rust\Cargo.toml') -Raw
+$versionMatch = [regex]::Match($cargoToml, '(?m)^version\s*=\s*"([^"]+)"\s*$')
+if (-not $versionMatch.Success) { throw 'Could not read the Codex-Router version from Cargo.toml.' }
+$version = $versionMatch.Groups[1].Value
+$installerBuilder = Get-Content -LiteralPath (Join-Path $routerRoot 'scripts\Build-Installer.ps1') -Raw
+foreach ($quietCommand in @(
+    'AdminQuietInstCmd=%AppLaunched%',
+    'UserQuietInstCmd=%AppLaunched%'
+)) {
+    $matches = [regex]::Matches(
+        $installerBuilder,
+        "(?m)^$([regex]::Escape($quietCommand))\r?$"
+    )
+    if ($matches.Count -ne 1) {
+        throw "Installer builder must define exactly one silent command: $quietCommand"
+    }
+}
+if (-not $installerBuilder.Contains('start "" /wait "%~dp0Codex-Router-Setup.exe"')) {
+    throw 'Installer builder must synchronously wait for the extracted native setup process.'
+}
 if ([string]::IsNullOrWhiteSpace($RouterExePath)) {
     $RouterExePath = Join-Path $routerRoot 'codex-router-gui-rust\target\release\codex-router.exe'
 }
@@ -38,7 +58,7 @@ function Invoke-NativeInstaller {
 }
 
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('codex-router-installer-test-' + [Guid]::NewGuid().ToString('N'))
-$payload = Join-Path $testRoot 'Codex-Router-Portable-1.6.11-windows-x64'
+$payload = Join-Path $testRoot "Codex-Router-Portable-$version-windows-x64"
 $archive = "$payload.zip"
 $installRoot = Join-Path $testRoot 'installed'
 
@@ -67,11 +87,11 @@ try {
         '--install-portable',
         "--install-package=$archive",
         "--install-root=$installRoot",
-        '--install-version=1.6.11',
+        "--install-version=$version",
         '--no-shortcut'
     )
     $result = Get-Content -LiteralPath $cliOutput -Raw | ConvertFrom-Json
-    if (-not [bool]$result.installed -or [string]$result.version -ne '1.6.11') {
+    if (-not [bool]$result.installed -or [string]$result.version -ne $version) {
         throw 'Installer returned invalid completion metadata.'
     }
     foreach ($relativePath in @('Codex-Router.exe', 'app\sub2api.exe')) {
@@ -108,13 +128,13 @@ if (-not [string]::IsNullOrWhiteSpace($ArchivePath)) {
             '--install-portable',
             "--install-package=$archivePath",
             "--install-root=$realInstallRoot",
-            '--install-version=1.6.11',
+            "--install-version=$version",
             '--no-shortcut'
         )
         $result = Get-Content -LiteralPath $cliOutput -Raw | ConvertFrom-Json
         $exe = Get-Item -LiteralPath (Join-Path $realInstallRoot 'Codex-Router.exe')
-        if (-not [bool]$result.installed -or [string]$result.version -ne '1.6.11' -or
-            [string]$exe.VersionInfo.ProductVersion -ne '1.6.11' -or
+        if (-not [bool]$result.installed -or [string]$result.version -ne $version -or
+            [string]$exe.VersionInfo.ProductVersion -ne $version -or
             [string]$exe.VersionInfo.CompanyName -ne 'Hernan_JIANG') {
             throw 'Real installer returned invalid version or publisher metadata.'
         }
@@ -143,8 +163,8 @@ if (-not [string]::IsNullOrWhiteSpace($InstallerPath)) {
         throw "Installer package is missing: $installerPath"
     }
     $versionInfo = (Get-Item -LiteralPath $installerPath).VersionInfo
-    if ([string]$versionInfo.ProductVersion -ne '1.6.11' -or
-        [string]$versionInfo.FileVersion -ne '1.6.11' -or
+    if ([string]$versionInfo.ProductVersion -ne $version -or
+        [string]$versionInfo.FileVersion -ne $version -or
         [string]$versionInfo.CompanyName -ne 'Hernan_JIANG' -or
         [string]$versionInfo.ProductName -ne 'Codex-Router') {
         throw 'Installer package exposes incorrect Windows version or publisher metadata.'
@@ -169,8 +189,9 @@ if (-not [string]::IsNullOrWhiteSpace($InstallerPath)) {
             throw "Installer package extraction failed with exit code $($process.ExitCode)."
         }
         foreach ($name in @(
-            'Codex-Router-Portable-1.6.11-windows-x64.zip',
+            "Codex-Router-Portable-$version-windows-x64.zip",
             'Codex-Router-Setup.exe',
+            'Install-Codex-Router.cmd',
             'VCRUNTIME140.dll',
             'VCRUNTIME140_1.dll',
             'MSVCP140.dll'

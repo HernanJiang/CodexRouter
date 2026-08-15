@@ -10,13 +10,13 @@
 
 最终发布包：
 
-`D:\Work\Tools\Codex-Router-Releases\Codex-Router-Portable-1.2.17-windows-x64-20260805-164000-879.zip`
+`Codex-Router-Portable-1.2.17-windows-x64-20260805-164000-879.zip`
 
 SHA-256：`26A72164D9D37B6F1A903A6DE56EB718FBA2D23090991A853D48CAD213CD3714`
 
 旧包存档：
 
-`D:\Work\Tools\Codex-Router-Releases\Archived-Model-Packages\Codex-Router-Portable-1.2.16-windows-x64-20260805-013749-068.zip`
+`Archived-Model-Packages/Codex-Router-Portable-1.2.16-windows-x64-20260805-013749-068.zip`
 
 ## 功能矩阵
 

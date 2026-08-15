@@ -370,7 +370,6 @@ fn create_start_menu_shortcut(install_root: &Path, enabled: bool) -> anyhow::Res
 
 #[cfg(windows)]
 fn create_windows_shortcut(install_root: &Path, shortcut_path: &Path) -> anyhow::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
     use windows::core::{Interface, PCWSTR};
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER,
@@ -383,9 +382,8 @@ fn create_windows_shortcut(install_root: &Path, shortcut_path: &Path) -> anyhow:
     }
     let target = install_root.join("Codex-Router.exe");
     let wide = |value: &Path| {
-        value
-            .as_os_str()
-            .encode_wide()
+        display_path(value)
+            .encode_utf16()
             .chain(std::iter::once(0))
             .collect::<Vec<_>>()
     };
@@ -1471,6 +1469,7 @@ mod tests {
         let shortcut = root.join("shortcuts/Codex-Router.lnk");
         fs::create_dir_all(&install_root).unwrap();
         fs::write(install_root.join("Codex-Router.exe"), b"test").unwrap();
+        let install_root = install_root.canonicalize().unwrap();
 
         create_windows_shortcut(&install_root, &shortcut).unwrap();
 

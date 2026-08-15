@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.6.11-0969da" alt="版本 1.6.11">
+  <img src="https://img.shields.io/badge/version-1.7.0-0969da" alt="版本 1.7.0">
   <img src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078d4" alt="Windows 10/11">
   <img src="https://img.shields.io/badge/architecture-x64-555555" alt="x64">
   <img src="https://img.shields.io/badge/runtime-portable-2ea44f" alt="便携运行">
@@ -103,13 +103,19 @@ Codex-Router 可以将 OAuth 和 API 渠道合并为 Codex 可见的模型目录
 
 Codex-Router 可以在 Windows 登录后直接进入轻量托盘模式，不启动额外守护进程。托盘模式暂停日志跟随、界面刷新和高频用量更新，保留每 60 秒一次的原生健康检查、连续失败后的无窗口恢复，以及每 10 分钟一次的统一自检。
 
-1.6.11 同时保留了内存和后台任务优化。空闲托盘状态下的 CPU、磁盘和网络活动设计为几乎可以忽略；下图展示了测试环境中 Codex-Router 进程处于 0% CPU、0 Mbps 网络占用的空闲状态。
+1.7.0 同时保留了内存和后台任务优化。空闲托盘状态下的 CPU、磁盘和网络活动设计为几乎可以忽略；下图展示了测试环境中 Codex-Router 进程处于 0% CPU、0 Mbps 网络占用的空闲状态。
 
 <p align="center">
   <img src="assets/release/usage-performance.png" alt="Codex-Router 空闲资源占用" width="900">
 </p>
 
-### 1.6.11 更新重点
+### 1.7.0 更新重点
+
+- Codex 模型目录现在使用 Router 配置中非空的模型别名作为显示名称，同时保持路由标识和上游 Model ID 不变；grok-4.6 等模型会显示配置名称，不再回退为原始 ID。
+- 生成的 Codex provider 默认使用 5 次请求重试和 5 次 Streaming 重连；两个值由同一 Router 常量写入，旧 fallback 不会再静默覆盖。
+- 真实 TTFT 验收会关联客户端响应头、首个 SSE、首个语义输出、首段文本与 Sub2API 首 Token 计时，可以区分上游等待和本地 Streaming 开销。
+
+### 1.6.11 变更回顾
 
 - OAuth 账号页现在通过 Rust 原生 Sub2API 管理客户端读取账号和实时模型目录。无 PowerShell 的最终发布包不再依赖已移除的 `Get-OAuthAccounts.ps1`，实际可用的 Grok、Antigravity 与 ChatGPT 账号不会再被误显示为没有声明模型或目录无法读取。
 - 同时支持 Sub2API 的两种真实响应：稳定账号目录返回的 `data` 模型对象数组，以及上游同步返回的 `data.models` 模型 ID 数组。ChatGPT 不支持同步时使用稳定目录；Grok 与 Antigravity 会先同步上游再读取当前账号目录。
@@ -199,15 +205,15 @@ Codex-Router 可以在 Windows 登录后直接进入轻量托盘模式，不启�
 - 更新器会校验官方 GitHub 地址、SHA-256 和发布清单，显示实时下载进度；下载完成后由独立 Rust 助手执行原子替换、失败回滚和自动重启。
 - 本机 Router Key 在管理接口隐藏完整值时仍按受管名称和分组幂等识别，重复应用不会生成重复 Key 记录。
 - 便携包根目录保留不依赖 PowerShell 的 `Start-Codex-Router.cmd` 启动壳；EXE 发布者元数据统一为 `Hernan_JIANG`。Windows SmartScreen 的受信任发布者仍需要同名代码签名证书。
-- 1.6.11 便携包和安装载荷不包含 `.ps1`、`.psm1` 或 `.psd1`。PowerShell 仅保留在 GitHub 源码仓库中用于 Windows 构建、发布、兼容和开发测试。
+- 1.7.0 便携包和安装载荷不包含 `.ps1`、`.psm1` 或 `.psd1`。PowerShell 仅保留在 GitHub 源码仓库中用于 Windows 构建、发布、兼容和开发测试。
 
 ## 下载与首次启动
 
-前往 [GitHub Releases](https://github.com/HernanJiang/Codex-Router/releases/tag/v1.6.11) 下载 Windows x64 版本：
+前往 [GitHub Releases](https://github.com/HernanJiang/Codex-Router/releases/tag/v1.7.0) 下载 Windows x64 版本：
 
-`Codex-Router-Portable-1.6.11-windows-x64.zip`
+`Codex-Router-Portable-1.7.0-windows-x64.zip`
 
-同时提供可选的用户级安装器：`Codex-Router-Installer-1.6.11-windows-x64.exe`。它使用 Rust 原生安装逻辑，把同一份已验收运行时安装到 `%LOCALAPPDATA%\Programs\Codex-Router\1.6.11`，不需要管理员权限。
+同时提供可选的用户级安装器：`Codex-Router-Installer-1.7.0-windows-x64.exe`。它使用 Rust 原生安装逻辑，把同一份已验收运行时安装到 `%LOCALAPPDATA%\Programs\Codex-Router\1.7.0`，不需要管理员权限。
 
 对于 `Upstream request failed` 这类尚未向客户端输出内容的瞬时流错误，Router 默认允许同一账号最多重试 5 次，每次间隔 1.5 秒。已经开始输出模型内容后不会重复回放请求。
 
