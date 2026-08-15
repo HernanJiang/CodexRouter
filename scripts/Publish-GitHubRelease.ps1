@@ -16,7 +16,7 @@ $stage = [IO.Path]::GetFullPath($StagePath)
 $archive = [IO.Path]::GetFullPath($ArchivePath)
 $installer = if ([string]::IsNullOrWhiteSpace($InstallerPath)) { $null } else { [IO.Path]::GetFullPath($InstallerPath) }
 $notes = if ([string]::IsNullOrWhiteSpace($NotesPath)) { $null } else { [IO.Path]::GetFullPath($NotesPath) }
-$repository = 'HernanJiang/Codex-Router'
+$repository = 'HernanJiang/CodexRouter'
 if (-not (Test-Path -LiteralPath $stage -PathType Container)) { throw 'Release stage does not exist.' }
 if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) { throw 'Release archive does not exist.' }
 if ($null -ne $installer -and -not (Test-Path -LiteralPath $installer -PathType Leaf)) {
@@ -90,7 +90,7 @@ if ($releaseViewExitCode -eq 0) {
     if ([string]$release.tagName -ne $tag) { throw 'GitHub returned an unexpected release tag.' }
     gh release upload $tag @assetPaths --repo $repository --clobber
     if ($LASTEXITCODE -eq 0 -and $null -ne $notes) {
-        gh release edit $tag --repo $repository --title "Codex-Router $tag" --notes-file $notes
+        gh release edit $tag --repo $repository --title "CodexRouter $tag" --notes-file $notes
     }
 } else {
     $createArguments = @(
@@ -98,7 +98,7 @@ if ($releaseViewExitCode -eq 0) {
     ) + $assetPaths + @(
         '--repo', $repository,
         '--target', $head,
-        '--title', "Codex-Router $tag"
+        '--title', "CodexRouter $tag"
     )
     if ($null -ne $notes) {
         $createArguments += @('--notes-file', $notes)

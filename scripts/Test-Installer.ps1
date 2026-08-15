@@ -29,6 +29,23 @@ foreach ($quietCommand in @(
 if (-not $installerBuilder.Contains('start "" /wait "%~dp0Codex-Router-Setup.exe"')) {
     throw 'Installer builder must synchronously wait for the extracted native setup process.'
 }
+if (-not $installerBuilder.Contains('--installer-wizard')) {
+    throw 'Installer builder must launch the interactive installer wizard instead of installing immediately.'
+}
+$nativeMain = @(
+    (Join-Path $routerRoot 'codex-router-gui-rust\src\main.rs'),
+    (Join-Path $routerRoot 'codex-router-gui-rust\src\windows_main.rs')
+) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | ForEach-Object {
+    Get-Content -LiteralPath $_ -Raw
+}
+$nativeMain = $nativeMain -join "`n"
+if (-not $nativeMain.Contains('installer_wizard')) {
+    throw 'Native installer must expose the interactive installer wizard entry point.'
+}
+$nativeUpdater = Get-Content -LiteralPath (Join-Path $routerRoot 'codex-router-gui-rust\src\updater.rs') -Raw
+if (-not $nativeUpdater.Contains('create_desktop_shortcut')) {
+    throw 'Installer must create a desktop shortcut when the user selects that option.'
+}
 if ([string]::IsNullOrWhiteSpace($RouterExePath)) {
     $RouterExePath = Join-Path $routerRoot 'codex-router-gui-rust\target\release\codex-router.exe'
 }
@@ -166,7 +183,7 @@ if (-not [string]::IsNullOrWhiteSpace($InstallerPath)) {
     if ([string]$versionInfo.ProductVersion -ne $version -or
         [string]$versionInfo.FileVersion -ne $version -or
         [string]$versionInfo.CompanyName -ne 'Hernan_JIANG' -or
-        [string]$versionInfo.ProductName -ne 'Codex-Router') {
+        [string]$versionInfo.ProductName -ne 'CodexRouter') {
         throw 'Installer package exposes incorrect Windows version or publisher metadata.'
     }
     $extractRoot = Join-Path ([IO.Path]::GetTempPath()) (
@@ -191,7 +208,7 @@ if (-not [string]::IsNullOrWhiteSpace($InstallerPath)) {
         foreach ($name in @(
             "Codex-Router-Portable-$version-windows-x64.zip",
             'Codex-Router-Setup.exe',
-            'Install-Codex-Router.cmd',
+            'Install-CodexRouter.cmd',
             'VCRUNTIME140.dll',
             'VCRUNTIME140_1.dll',
             'MSVCP140.dll'

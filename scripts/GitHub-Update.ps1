@@ -15,9 +15,9 @@ $OutputEncoding = [Console]::OutputEncoding = New-Object Text.UTF8Encoding($fals
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $routerRoot = Split-Path -Parent $PSScriptRoot
-$repositoryUrl = 'https://github.com/HernanJiang/Codex-Router'
-$releaseApiUrl = 'https://api.github.com/repos/HernanJiang/Codex-Router/releases/latest'
-$repositoryName = 'HernanJiang/Codex-Router'
+$repositoryUrl = 'https://github.com/HernanJiang/CodexRouter'
+$releaseApiUrl = 'https://api.github.com/repos/HernanJiang/CodexRouter/releases/latest'
+$repositoryName = 'HernanJiang/CodexRouter'
 
 function Get-GitHubCliPath {
     $command = Get-Command gh -ErrorAction SilentlyContinue
@@ -30,7 +30,7 @@ function Get-GitHubCliPath {
 function Get-LatestGitHubRelease {
     try {
         return Invoke-RestMethod -Headers @{
-            'User-Agent' = 'Codex-Router-Updater'
+            'User-Agent' = 'CodexRouter-Updater'
             'Accept' = 'application/vnd.github+json'
             'X-GitHub-Api-Version' = '2022-11-28'
         } -Uri $releaseApiUrl -TimeoutSec 30
@@ -59,7 +59,7 @@ function Receive-PrivateReleaseAsset {
     )
     $match = [regex]::Match(
         $Uri.AbsolutePath,
-        '^/HernanJiang/Codex-Router/releases/download/([^/]+)/([^/]+)$',
+        '^/HernanJiang/Codex(?:-)?Router/releases/download/([^/]+)/([^/]+)$',
         [Text.RegularExpressions.RegexOptions]::IgnoreCase)
     if (-not $match.Success -or
         [Uri]::UnescapeDataString($match.Groups[2].Value) -ne $AssetName) {
@@ -124,7 +124,7 @@ if ($Action -eq 'Download') {
         if (
             $uri.Scheme -ne 'https' -or
             $uri.Host -ne 'github.com' -or
-            -not $uri.AbsolutePath.StartsWith('/HernanJiang/Codex-Router/releases/download/', [StringComparison]::OrdinalIgnoreCase)
+            -not ($uri.AbsolutePath.StartsWith('/HernanJiang/CodexRouter/releases/download/', [StringComparison]::OrdinalIgnoreCase) -or $uri.AbsolutePath.StartsWith('/HernanJiang/Codex-Router/releases/download/', [StringComparison]::OrdinalIgnoreCase))
         ) {
             throw 'The update download URL is not an official GitHub release URL.'
         }
@@ -139,7 +139,7 @@ if ($Action -eq 'Download') {
         $temporary = "$destination.download"
         try {
             Invoke-WebRequest -UseBasicParsing -Headers @{
-                'User-Agent' = 'Codex-Router-Updater'
+                'User-Agent' = 'CodexRouter-Updater'
                 'Accept' = 'application/octet-stream'
             } -Uri $uri.AbsoluteUri -OutFile $temporary -TimeoutSec 600
         } catch {

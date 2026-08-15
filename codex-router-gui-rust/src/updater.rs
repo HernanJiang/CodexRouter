@@ -14,10 +14,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::os::windows::process::CommandExt;
 
 const RELEASE_API_URL: &str =
-    "https://api.github.com/repos/HernanJiang/Codex-Router/releases/latest";
-const REPOSITORY_URL: &str = "https://github.com/HernanJiang/Codex-Router";
-const RELEASE_DOWNLOAD_PREFIX: &str = "/HernanJiang/Codex-Router/releases/download/";
-const USER_AGENT_VALUE: &str = "Codex-Router-Updater";
+    "https://api.github.com/repos/HernanJiang/CodexRouter/releases/latest";
+const REPOSITORY_URL: &str = "https://github.com/HernanJiang/CodexRouter";
+const RELEASE_DOWNLOAD_PREFIXES: &[&str] = &[
+    "/HernanJiang/CodexRouter/releases/download/",
+    "/HernanJiang/Codex-Router/releases/download/",
+];
+const USER_AGENT_VALUE: &str = "CodexRouter-Updater";
 const MAX_ARCHIVE_ENTRIES: usize = 50_000;
 const MAX_UNCOMPRESSED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const APPLY_PARENT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -68,6 +71,21 @@ pub(crate) struct InstallResult {
     pub(crate) version: String,
     pub(crate) shortcut: bool,
     pub(crate) user_data: String,
+}
+
+/// Return the per-user installation directory used by a fresh install.
+/// Keeping this in the updater prevents the interactive wizard and the
+/// command-line installer from drifting to different defaults.
+pub(crate) fn default_install_root(version: &str) -> anyhow::Result<PathBuf> {
+    let version = sanitize_version(version.trim());
+    if version.is_empty() {
+        bail!("the installer version is empty");
+    }
+    Ok(dirs::data_local_dir()
+        .context("the current user has no local application-data directory")?
+        .join("Programs")
+        .join("CodexRouter")
+        .join(version))
 }
 
 #[derive(Debug, Deserialize)]
@@ -269,11 +287,7 @@ pub(crate) fn install_portable_archive(
     if version.is_empty() {
         bail!("the installer version is empty");
     }
-    let default_root = dirs::data_local_dir()
-        .context("the current user has no local application-data directory")?
-        .join("Programs")
-        .join("Codex-Router")
-        .join(&version);
+    let default_root = default_install_root(&version)?;
     let requested_root = install_root.unwrap_or(&default_root);
     let parent = requested_root
         .parent()
@@ -297,7 +311,7 @@ pub(crate) fn install_portable_archive(
         if install_root.exists() {
             let transaction = begin_update_transaction(&install_root, &staged_root)
                 .context("could not replace the existing verified installation")?;
-            match create_start_menu_shortcut(&install_root, shortcut_requested) {
+            match create_shortcuts(&install_root, shortcut_requested) {
                 Ok(()) => transaction.commit(),
                 Err(error) => match transaction.rollback() {
                     Ok(()) => Err(error).context(
@@ -311,7 +325,7 @@ pub(crate) fn install_portable_archive(
         } else {
             fs::rename(&staged_root, &install_root)
                 .context("could not activate the verified installation")?;
-            if let Err(error) = create_start_menu_shortcut(&install_root, shortcut_requested) {
+            if let Err(error) = create_shortcuts(&install_root, shortcut_requested) {
                 let _ = fs::rename(&install_root, &staged_root);
                 Err(error).context("could not create the Start menu shortcut")
             } else {
@@ -352,20 +366,41 @@ fn display_path(path: &Path) -> String {
 }
 
 #[cfg(windows)]
-fn create_start_menu_shortcut(install_root: &Path, enabled: bool) -> anyhow::Result<()> {
-    if !enabled {
-        return Ok(());
-    }
+fn create_desktop_shortcut(install_root: &Path) -> anyhow::Result<PathBuf> {
+    let desktop = dirs::desktop_dir().context("the current user has no desktop directory")?;
+    let shortcut_path = desktop.join("CodexRouter.lnk");
+    create_windows_shortcut(install_root, &shortcut_path)
+        .context("could not create the desktop shortcut")?;
+    Ok(shortcut_path)
+}
+
+#[cfg(windows)]
+fn create_start_menu_shortcut(install_root: &Path) -> anyhow::Result<PathBuf> {
     let start_menu = dirs::config_dir()
         .context("the current user has no roaming application-data directory")?
         .join("Microsoft")
         .join("Windows")
         .join("Start Menu")
         .join("Programs")
-        .join("Codex-Router");
+        .join("CodexRouter");
     fs::create_dir_all(&start_menu).context("could not create the Start menu directory")?;
-    let shortcut_path = start_menu.join("Codex-Router.lnk");
+    let shortcut_path = start_menu.join("CodexRouter.lnk");
     create_windows_shortcut(install_root, &shortcut_path)
+        .context("could not create the Start menu shortcut")?;
+    Ok(shortcut_path)
+}
+
+#[cfg(windows)]
+fn create_shortcuts(install_root: &Path, enabled: bool) -> anyhow::Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+    let desktop_shortcut = create_desktop_shortcut(install_root)?;
+    if let Err(error) = create_start_menu_shortcut(install_root) {
+        let _ = fs::remove_file(&desktop_shortcut);
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -390,7 +425,7 @@ fn create_windows_shortcut(install_root: &Path, shortcut_path: &Path) -> anyhow:
     let target_wide = wide(&target);
     let working_wide = wide(install_root);
     let shortcut_wide = wide(shortcut_path);
-    let description = "Codex-Router\0".encode_utf16().collect::<Vec<_>>();
+    let description = "CodexRouter\0".encode_utf16().collect::<Vec<_>>();
 
     unsafe {
         let initialized = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
@@ -419,7 +454,7 @@ fn create_windows_shortcut(install_root: &Path, shortcut_path: &Path) -> anyhow:
 }
 
 #[cfg(not(windows))]
-fn create_start_menu_shortcut(_install_root: &Path, enabled: bool) -> anyhow::Result<()> {
+fn create_shortcuts(_install_root: &Path, enabled: bool) -> anyhow::Result<()> {
     if enabled {
         bail!("Start menu shortcut creation is only available on Windows")
     }
@@ -512,7 +547,7 @@ fn asset_score(asset: &GitHubAsset) -> Option<i32> {
     {
         return None;
     }
-    Some(100 + i32::from(name.contains("codex-router")) * 20)
+    Some(100 + i32::from(name.contains("codex-router") || name.contains("codexrouter")) * 20)
 }
 
 fn compare_versions(left: &str, right: &str) -> anyhow::Result<std::cmp::Ordering> {
@@ -556,9 +591,11 @@ fn validate_official_download_url(value: &str, expected_name: &str) -> anyhow::R
         || !url
             .host_str()
             .is_some_and(|host| host.eq_ignore_ascii_case("github.com"))
-        || !url.path().starts_with(RELEASE_DOWNLOAD_PREFIX)
+        || !RELEASE_DOWNLOAD_PREFIXES
+            .iter()
+            .any(|prefix| url.path().starts_with(prefix))
     {
-        bail!("the update download URL is not an official Codex-Router GitHub release URL");
+        bail!("the update download URL is not an official CodexRouter GitHub release URL");
     }
     let safe_name = Path::new(expected_name)
         .file_name()

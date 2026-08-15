@@ -233,10 +233,10 @@ try {
     }
 
     $archiveName = Split-Path -Leaf $archive
-    $launcherName = 'Install-Codex-Router.cmd'
+    $launcherName = 'Install-CodexRouter.cmd'
     $launcher = @"
 @echo off
-start "" /wait "%~dp0Codex-Router-Setup.exe" --install-portable "--install-package=%~dp0$archiveName" --install-version=$version
+start "" /wait "%~dp0Codex-Router-Setup.exe" --installer-wizard "--install-package=%~dp0$archiveName" --install-version=$version
 exit /b %errorlevel%
 "@
     [IO.File]::WriteAllText(
@@ -251,7 +251,7 @@ SEDVersion=3
 [Options]
 PackagePurpose=InstallApp
 ShowInstallProgramWindow=0
-HideExtractAnimation=1
+HideExtractAnimation=0
 UseLongFileName=1
 InsideCompressed=1
 CAB_FixedSize=0
@@ -277,10 +277,10 @@ SourceFiles0=$payload\
 %FILE4%=
 %FILE5%=
 [Strings]
-InstallPrompt="Install Codex-Router $version for the current Windows user. Publisher: Hernan_JIANG."
+InstallPrompt=""
 DisplayLicense=""
-FinishMessage="Codex-Router $version was installed. Your existing user data was preserved."
-FriendlyName="Codex-Router $version by Hernan_JIANG"
+FinishMessage=""
+FriendlyName="CodexRouter $version by Hernan_JIANG"
 AppLaunched="$launcherName"
 PostInstallCmd="<None>"
 FILE0="$archiveName"
@@ -301,8 +301,8 @@ FILE5="$launcherName"
     if ([string]$versionInfo.ProductVersion -ne $version -or
         [string]$versionInfo.FileVersion -ne $version -or
         [string]$versionInfo.CompanyName -ne 'Hernan_JIANG' -or
-        [string]$versionInfo.ProductName -ne 'Codex-Router') {
-        throw "Installer version resource does not match Codex-Router $version metadata."
+        [string]$versionInfo.ProductName -ne 'CodexRouter') {
+        throw "Installer version resource does not match CodexRouter $version metadata."
     }
 
     [ordered]@{
@@ -317,3 +317,4 @@ FILE5="$launcherName"
 } finally {
     if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
 }
+

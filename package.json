@@ -1,6 +1,6 @@
 {
-  "name": "Codex-Router",
-  "version": "1.7.0",
+  "name": "CodexRouter",
+  "version": "1.7.1",
   "description": "Codex + Sub2API router configuration UI and deployment helpers",
   "private": true,
   "scripts": {
@@ -11,7 +11,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/HernanJiang/Codex-Router.git"
+    "url": "https://github.com/HernanJiang/CodexRouter.git"
   },
   "keywords": [
     "codex",

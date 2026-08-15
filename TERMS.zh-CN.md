@@ -1,10 +1,10 @@
-# Codex-Router 条款与合规说明
+# CodexRouter 条款与合规说明
 
-软件版本：v1.7.0
+软件版本：v1.7.1
 发布日期：2026-08-15
 承诺修订：v1.1（2026-08-01）
 版权所有：Hernan_Jiang
-官方发布地址：https://github.com/HernanJiang/Codex-Router
+官方发布地址：https://github.com/HernanJiang/CodexRouter
 
 请完整阅读后再确认。点击“我已阅读并同意”即表示你本人理解并承诺遵守以下条款。
 
@@ -28,7 +28,7 @@ https://www.gnu.org/licenses/agpl-3.0.html
 
 ## 四、允许分发与官方发布地址
 
-1. `https://github.com/HernanJiang/Codex-Router` 是 Codex-Router 的官方发布、来源核验和更新地址。允许免费分发源码、EXE、便携包、安装器、镜像、附件、修改版或重新包装版本。
+1. `https://github.com/HernanJiang/CodexRouter` 是 CodexRouter 的官方发布、来源核验和更新地址。允许免费分发源码、EXE、便携包、安装器、镜像、附件、修改版或重新包装版本。
 2. 每个分发页面以及分发副本内的 README、关于页面或同等显著位置，都必须醒目标注作者 `Hernan_Jiang` 和上述官方 GitHub 发布地址，并完整保留本许可证、版权声明及第三方声明。
 3. 修改版、翻译版、精简版、增强版、整合包或重新编译版本必须明确标注“非官方修改版”，说明主要改动，不得暗示其由 Hernan_Jiang 发布、审核、支持或背书。
 4. 分发必须免费，不得通过下载费、会员、广告捆绑、赞助门槛、流量导入、付费教程套餐、硬件预装或其他方式直接或间接获利。

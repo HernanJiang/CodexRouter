@@ -114,7 +114,7 @@ class Client:
                 "Content-Type": "application/json",
                 "Accept": "text/event-stream" if stream else "application/json",
                 "User-Agent": "Codex-Router-Protocol-Probe/1.2.3",
-                "HTTP-Referer": "https://github.com/HernanJiang/Codex-Router",
+                "HTTP-Referer": "https://github.com/HernanJiang/CodexRouter",
                 "X-Title": "Codex-Router protocol probe",
             },
         )

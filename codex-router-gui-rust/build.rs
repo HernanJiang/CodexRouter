@@ -9,7 +9,7 @@ fn windows_manifest(assembly_version: &str) -> String {
       processorArchitecture="*"
       type="win32"
       version="{assembly_version}" />
-  <description>Codex-Router</description>
+  <description>CodexRouter</description>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
@@ -86,11 +86,11 @@ BEGIN
         BEGIN
             VALUE "LegalCopyright", "Copyright (c) 2026 Hernan_JIANG. All rights reserved.\0"
             VALUE "CompanyName", "Hernan_JIANG\0"
-            VALUE "FileDescription", "Codex-Router\0"
+            VALUE "FileDescription", "CodexRouter\0"
             VALUE "FileVersion", "{package_version}\0"
-            VALUE "InternalName", "Codex-Router\0"
+            VALUE "InternalName", "CodexRouter\0"
             VALUE "OriginalFilename", "Codex-Router.exe\0"
-            VALUE "ProductName", "Codex-Router\0"
+            VALUE "ProductName", "CodexRouter\0"
             VALUE "ProductVersion", "{package_version}\0"
         END
     END

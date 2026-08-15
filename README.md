@@ -3,19 +3,19 @@
 </p>
 
 <p align="center">
-  <img src="assets/release/codex-router-logo.png" alt="Codex-Router logo" width="128">
+  <img src="assets/release/codex-router-logo.png" alt="CodexRouter logo" width="128">
 </p>
 
-<h1 align="center">Codex-Router</h1>
+<h1 align="center">CodexRouter</h1>
 
 <p align="center"><strong>One router for every model, subscription, and API channel.</strong></p>
 
 <p align="center">
-  <img src="assets/release/codex-router-banner.png" alt="Codex-Router banner" width="100%">
+  <img src="assets/release/codex-router-banner.png" alt="CodexRouter banner" width="100%">
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.7.0-0969da" alt="Version 1.7.0">
+  <img src="https://img.shields.io/badge/version-1.7.1-0969da" alt="Version 1.7.1">
   <img src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078d4" alt="Windows 10/11">
   <img src="https://img.shields.io/badge/architecture-x64-555555" alt="x64">
   <img src="https://img.shields.io/badge/runtime-portable%20%2B%20installer-2ea44f" alt="Portable and installer runtime">
@@ -29,15 +29,15 @@
   <a href="#security-and-terms">Security</a>
 </p>
 
-Codex-Router keeps the original Codex workflow while adding a unified model menu for multiple providers, OAuth subscription accounts, and third-party API channels. With automatic continuity enabled, matching OAuth and API channels share one public model and subscription quota is preferred. With it disabled, the API and OAuth routes remain separate choices while keeping the same model display name, so the user can choose the quota source directly.
+CodexRouter keeps the original Codex workflow while adding a unified model menu for multiple providers, OAuth subscription accounts, and third-party API channels. With automatic continuity enabled, matching OAuth and API channels share one public model and subscription quota is preferred. With it disabled, the API and OAuth routes remain separate choices while keeping the same model display name, so the user can choose the quota source directly.
 
 ## Overview
 
 <p align="center">
-  <img src="assets/release/promotion.png" alt="Codex-Router overview" width="100%">
+  <img src="assets/release/promotion.png" alt="CodexRouter overview" width="100%">
 </p>
 
-Codex-Router is a Windows desktop router built around Sub2API and a Rust desktop console. The Windows x64 release provides both a self-contained portable package and a per-user installer; both include PostgreSQL, Redis, Sub2API, the router runtime, and the required app-local VC++ runtime. Services listen on the local loopback interface.
+CodexRouter is a Windows desktop router built around Sub2API and a Rust desktop console. The Windows x64 release provides both a self-contained portable package and a per-user installer; both include PostgreSQL, Redis, Sub2API, the router runtime, and the required app-local VC++ runtime. Services listen on the local loopback interface.
 
 ### Why it is useful
 
@@ -51,7 +51,7 @@ Codex-Router is a Windows desktop router built around Sub2API and a Rust desktop
 
 ### One menu, many channels
 
-Codex-Router can merge configured OAuth and API channels into the model list that Codex sees. With automatic continuity enabled, the same public model ID appears once while backend routing priorities remain independent. With it disabled, the API and OAuth routes expose stable distinct IDs but the same display name, allowing explicit quota selection from the model menu without adding an `(OAuth)` suffix.
+CodexRouter can merge configured OAuth and API channels into the model list that Codex sees. With automatic continuity enabled, the same public model ID appears once while backend routing priorities remain independent. With it disabled, the API and OAuth routes expose stable distinct IDs but the same display name, allowing explicit quota selection from the model menu without adding an `(OAuth)` suffix.
 
 <p align="center">
   <img src="assets/release/screenshot-codex.png" alt="Switching models from the Codex model menu" width="900">
@@ -70,7 +70,7 @@ Switch models directly from the Codex model menu and continue in the same contex
 - Stores OAuth account selection independently for each routing profile. Only models the user added and enabled participate in that profile.
 - With automatic continuity enabled, prefers subscription capacity for a matching model and falls back to a lower-priority API channel when the subscription is exhausted or unhealthy. With it disabled, no automatic handoff occurs and the selected model entry determines the quota source.
 - Uses the upstream reset time when available. When no reset time is exposed, Router performs a low-frequency recovery probe and automatically returns to the subscription after recovery.
-- Keeps OAuth tokens under Sub2API management. Tokens are not written to the Codex-Router configuration file and are not offered as plaintext exports.
+- Keeps OAuth tokens under Sub2API management. Tokens are not written to the CodexRouter configuration file and are not offered as plaintext exports.
 
 ### Model-aware controls
 
@@ -86,7 +86,7 @@ The model catalog also deduplicates public IDs while preserving backend channel 
 
 ### A dedicated aggregated monitoring view
 
-Usage monitoring is a first-class part of Codex-Router, not a small detail of OAuth login. It aggregates the real-time state of multiple OAuth accounts, API channels, and coding plans in one dashboard, including:
+Usage monitoring is a first-class part of CodexRouter, not a small detail of OAuth login. It aggregates the real-time state of multiple OAuth accounts, API channels, and coding plans in one dashboard, including:
 
 - subscription windows and reset countdowns;
 - five-hour, daily, weekly, and monthly coding-plan limits;
@@ -101,13 +101,19 @@ The view keeps OAuth quota cards and API usage cards visible together, packs car
 
 ## Tray Performance
 
-Codex-Router can start with Windows in a lightweight tray mode without launching an additional daemon. Tray mode pauses log following, UI refresh, and high-frequency usage updates. It retains one native health check every 60 seconds, local-service recovery after consecutive failures, and the unified self-check every 10 minutes.
+CodexRouter can start with Windows in a lightweight tray mode without launching an additional daemon. Tray mode pauses log following, UI refresh, and high-frequency usage updates. It retains one native health check every 60 seconds, local-service recovery after consecutive failures, and the unified self-check every 10 minutes.
 
-The 1.7.0 runtime retains the memory and background-work optimizations. Idle tray CPU, disk, and network activity are designed to be effectively negligible; the screenshot below shows the router process at 0% CPU and 0 Mbps network activity in the tested idle state.
+The 1.7.1 runtime retains the memory and background-work optimizations. Idle tray CPU, disk, and network activity are designed to be effectively negligible; the screenshot below shows the router process at 0% CPU and 0 Mbps network activity in the tested idle state.
 
 <p align="center">
-  <img src="assets/release/usage-performance.png" alt="Codex-Router idle resource usage" width="900">
+  <img src="assets/release/usage-performance.png" alt="CodexRouter idle resource usage" width="900">
 </p>
+
+### What is new in 1.7.1
+
+- The Windows installer now opens a setup wizard. Choose the install location, keep the desktop shortcut by default, and confirm before files are installed.
+- The public project name and official repository are now `CodexRouter`.
+- This release also publishes theoretical macOS and Linux packages. They have not been tested on real macOS or Linux machines; contributions that help build and verify them are welcome.
 
 ### What is new in 1.7.0
 
@@ -186,7 +192,7 @@ The 1.7.0 runtime retains the memory and background-work optimizations. Idle tra
 - `chatgpt_oauth` mode keeps the stable `codex_router` provider ID and `Codex-Router` label. Compatibility apply and install scripts now write the same v1.5.2 account contract instead of overwriting it with a third-party API identity.
 - Applying a new configuration first asks Codex Desktop to close gracefully. Only verified processes that remain after the timeout are terminated, children before parents; Electron children that already exited no longer make the restart report a false failure.
 - Microsoft Store/MSIX installations are relaunched through the official AUMID with `shell:AppsFolder`, rather than by executing a protected EXE inside `WindowsApps`, so a cold start loads the new model catalog.
-- `chatgpt_oauth` mode explicitly keeps the ChatGPT login method. If file-backed login state is unexpectedly missing, Codex-Router restores only a recent snapshot that the current Windows user can decrypt and validate, and never overwrites existing auth. Router requests continue to use the local Router Key instead of treating a ChatGPT token as that Key.
+- `chatgpt_oauth` mode explicitly keeps the ChatGPT login method. If file-backed login state is unexpectedly missing, CodexRouter restores only a recent snapshot that the current Windows user can decrypt and validate, and never overwrites existing auth. Router requests continue to use the local Router Key instead of treating a ChatGPT token as that Key.
 
 - Usage querying, local Sub2API reads, provider-response normalization, bounded concurrency, and last-good quota caching now run in Rust. Refreshing usage no longer starts a PowerShell process.
 - Kimi, Grok, Z.ai/GLM, MiniMax, ZenMux, Volcengine Ark, MiMo, OpenRouter, and DeepSeek continue to refresh independently, so one provider failure does not fail the dashboard.
@@ -200,20 +206,28 @@ The 1.7.0 runtime retains the memory and background-work optimizations. Idle tra
 - Kimi `k3-256k` context-limit responses no longer disable a valid Coding Plan account as though its Key were invalid.
 - Every manual or background usage refresh now checks selected disabled accounts for recovery. An account is re-enabled only after a fresh live quota response confirms usable capacity and no credential rejection; cached data never re-enables an invalid account.
 - The self-check runs every 10 minutes by default, including in lightweight tray mode. It checks OAuth health, configuration binding, live token and coding-plan usage, and fallback eligibility. A live exhausted OAuth quota is made unschedulable immediately when a matching API fallback exists, and is re-enabled only after a fresh quota check confirms recovery; an unknown state is isolated for at most five hours before a recovery attempt. Binding drift is reported without automatic file replacement.
-- OAuth-to-API fallback, recovery, and background discovery of new OAuth accounts are live backend route changes. Codex / ChatGPT is not closed or restarted, so the active task and conversation continue. Codex-Router shows a quota/fallback notification; only an explicit full Save & apply or profile switch may require a Codex restart. OAuth and API routes share one display name by default and do not add an `(OAuth)` suffix.
+- OAuth-to-API fallback, recovery, and background discovery of new OAuth accounts are live backend route changes. Codex / ChatGPT is not closed or restarted, so the active task and conversation continue. CodexRouter shows a quota/fallback notification; only an explicit full Save & apply or profile switch may require a Codex restart. OAuth and API routes share one display name by default and do not add an `(OAuth)` suffix.
 - OAuth account priorities, account recovery, OAuth login, configuration application, and the PostgreSQL, Redis, and Sub2API lifecycle now run natively in Rust. Redis readiness requires an authenticated `PONG`.
 - The updater validates the official GitHub URL, SHA-256 digest, and release manifest while reporting live download progress. A detached Rust helper performs atomic replacement, rollback on failure, and automatic restart.
 - A hidden local Router Key is recognized idempotently by its managed name and group, so repeated apply operations do not create duplicate Key records.
 - The portable root includes `Start-Codex-Router.cmd`, a launcher shell that does not depend on PowerShell. EXE publisher metadata is consistently `Hernan_JIANG`; a trusted certificate issued to that publisher is still required for SmartScreen trust.
-- The 1.7.0 portable package and installer payload contain no `.ps1`, `.psm1`, or `.psd1` files. PowerShell remains only in the GitHub source repository for Windows build, release, compatibility, and development tests.
+- The 1.7.1 portable package and installer payload contain no `.ps1`, `.psm1`, or `.psd1` files. PowerShell remains only in the GitHub source repository for Windows build, release, compatibility, and development tests.
 
 ## Download And First Run
 
-Download the Windows x64 package from [GitHub Releases](https://github.com/HernanJiang/Codex-Router/releases/tag/v1.7.0):
+Download the Windows x64 package from [GitHub Releases](https://github.com/HernanJiang/CodexRouter/releases/tag/v1.7.1):
 
-`Codex-Router-Portable-1.7.0-windows-x64.zip`
+`Codex-Router-Portable-1.7.1-windows-x64.zip`
 
-An optional per-user installer is also provided as `Codex-Router-Installer-1.7.0-windows-x64.exe`. It uses the native Rust installer path to place the same verified runtime under `%LOCALAPPDATA%\Programs\Codex-Router\1.7.0` without administrator access.
+An optional per-user installer is also provided as `Codex-Router-Installer-1.7.1-windows-x64.exe`. It opens a setup wizard so you can choose the install location, keep a desktop shortcut by default, and confirm before installation starts. The default location is `%LOCALAPPDATA%\Programs\CodexRouter\1.7.1`. No administrator access is required.
+
+This release also includes theoretical Unix packages:
+
+- `CodexRouter-1.7.1-linux-x64-theoretical.tar.gz`
+- `CodexRouter-1.7.1-macos-arm64-theoretical.tar.gz`
+- `CodexRouter-1.7.1-macos-x64-theoretical.tar.gz`
+
+These Unix builds are theoretical and have not been tested on real macOS or Linux machines. The current supported runtime remains Windows 10/11 x64.
 
 For transient pre-output stream failures such as `Upstream request failed`, the router now allows up to five same-account retries by default with a longer 1.5-second interval. The request is never replayed after visible model output has started.
 
@@ -222,7 +236,7 @@ The package is portable and does not require Python, Node.js, Rust, PostgreSQL, 
 The first launch opens on page one of the end-to-end guide. It walks through the project, login, model, network, and deployment steps, so a new installation has no separate setup manual or high learning cost.
 
 <p align="center">
-  <img src="assets/release/first-run-guide.png" alt="Codex-Router first-run setup guide" width="100%">
+  <img src="assets/release/first-run-guide.png" alt="CodexRouter first-run setup guide" width="100%">
 </p>
 
 ### Quick start
@@ -234,7 +248,7 @@ The first launch opens on page one of the end-to-end guide. It walks through the
 5. Apply the configuration. Router initializes its local services and updates the Codex provider configuration.
 6. Use the Codex model menu to switch models in the same context window.
 
-The current release supports Windows 10/11 x64. ARM64 and macOS are not included in this Windows release.
+The current supported runtime is Windows 10/11 x64. ARM64 Windows is not included. macOS and Linux packages in this release are theoretical builds and have not been tested on real machines.
 
 ## Security And Terms
 
@@ -243,7 +257,7 @@ The current release supports Windows 10/11 x64. ARM64 and macOS are not included
 - Release packages exclude user configuration, logs, databases, OAuth state, backups, and developer paths.
 - Runtime services bind to `127.0.0.1` by default. The management endpoint is not intended for remote exposure.
 - The complete terms are available in [English](TERMS.en.md) and [中文](TERMS.zh-CN.md).
-- Codex-Router original work is licensed for personal, non-commercial use under the included terms. Sub2API and other third-party components remain subject to their upstream licenses and notices.
+- CodexRouter original work is licensed for personal, non-commercial use under the included terms. Sub2API and other third-party components remain subject to their upstream licenses and notices.
 
 For the full directory layout and upgrade behavior, see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and the release package README.
 
@@ -251,4 +265,6 @@ For the full directory layout and upgrade behavior, see [THIRD_PARTY_NOTICES.md]
 
 The desktop UI and usage-monitoring runtime are in `codex-router-gui-rust`. Routing and packaging helpers are in `scripts` and `source/backend`. The repository guide documents the supported validation commands. Do not package a live runtime directory containing user data or credentials.
 
-Official repository: <https://github.com/HernanJiang/Codex-Router>
+Official repository: <https://github.com/HernanJiang/CodexRouter>
+
+macOS and Linux packages in this release are theoretical builds. They have not been tested on real macOS or Linux machines. Contributions that help build and verify those versions are welcome.

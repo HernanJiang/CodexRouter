@@ -1,0 +1,94 @@
+name: Theoretical Unix builds
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: read
+
+jobs:
+  theoretical-unix:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux-x64
+            archive: tar.gz
+          - os: macos-latest
+            label: macos-arm64
+            archive: tar.gz
+          - os: macos-13
+            label: macos-x64
+            archive: tar.gz
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify source version
+        shell: bash
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' codex-router-gui-rust/Cargo.toml | head -n 1)"
+          if [[ -z "$version" ]]; then
+            echo "Cargo package version is missing." >&2
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            tag_version="${GITHUB_REF_NAME#v}"
+            if [[ "$tag_version" != "$version" ]]; then
+              echo "Tag version $tag_version does not match Cargo version $version." >&2
+              exit 1
+            fi
+          fi
+
+      - name: Build theoretical binary
+        run: cargo build --release --locked --manifest-path codex-router-gui-rust/Cargo.toml
+
+      - name: Package theoretical archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="CodexRouter-${VERSION}-${{ matrix.label }}-theoretical"
+          staging="${RUNNER_TEMP}/${package}"
+          mkdir -p "$staging"
+          cp "codex-router-gui-rust/target/release/codex-router" "$staging/CodexRouter"
+          chmod +x "$staging/CodexRouter"
+          cp docs/THEORETICAL-UNIX.md "$staging/README.md"
+          {
+            echo "CodexRouter ${VERSION}"
+            echo "Target: ${{ matrix.label }}"
+            echo "This is a theoretical build. It has not been tested on a real machine."
+            echo "Repository: https://github.com/HernanJiang/CodexRouter"
+          } > "$staging/NOTICE.txt"
+          mkdir -p artifacts
+          tar -C "$(dirname "$staging")" -czf "artifacts/${package}.tar.gz" "$(basename "$staging")"
+          echo "ASSET=artifacts/${package}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Smoke the theoretical binary
+        shell: bash
+        run: |
+          set +e
+          output="$("./codex-router-gui-rust/target/release/codex-router" 2>&1)"
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          if [[ "$status" -ne 2 ]]; then
+            echo "Theoretical binary must exit with status 2, got $status." >&2
+            exit 1
+          fi
+          printf '%s\n' "$output" | grep -Fq "theoretical"
+          printf '%s\n' "$output" | grep -Fq "not been tested"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: theoretical-${{ matrix.label }}
+          path: artifacts/*.tar.gz
+          if-no-files-found: error

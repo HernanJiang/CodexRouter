@@ -1,10 +1,10 @@
-# Codex-Router Terms and Compliance
+# CodexRouter Terms and Compliance
 
-Software version: v1.7.0
+Software version: v1.7.1
 Release date: 2026-08-15
 Terms revision: v1.1 (2026-08-01)
 Copyright holder: Hernan_Jiang
-Official release location: https://github.com/HernanJiang/Codex-Router
+Official release location: https://github.com/HernanJiang/CodexRouter
 
 Read this document completely before confirming. By selecting "I have read and agree," you personally understand and agree to the following terms.
 
@@ -22,7 +22,7 @@ Copyright notices, the AGPL-3.0 license text, and third-party notices must be pr
 
 ## 4. Permitted redistribution and official release location
 
-`https://github.com/HernanJiang/Codex-Router` is the official release, provenance-verification, and update location. Free redistribution of source code, executables, portable packages, installers, mirrors, attachments, modified builds, and repackaged editions is allowed only if every distribution page and every distributed copy prominently identifies `Hernan_Jiang` and that official GitHub URL, and preserves this license, copyright notices, and third-party notices. Modified, translated, lite, enhanced, bundled, or rebuilt editions must be clearly labeled “unofficial modified version,” describe their material changes, and must not imply release, review, support, or endorsement by Hernan_Jiang. Redistribution must be free and may not create direct or indirect commercial benefit. Third-party copies are not official releases; non-compliant copies receive no redistribution permission under these terms.
+`https://github.com/HernanJiang/CodexRouter` is the official release, provenance-verification, and update location. Free redistribution of source code, executables, portable packages, installers, mirrors, attachments, modified builds, and repackaged editions is allowed only if every distribution page and every distributed copy prominently identifies `Hernan_Jiang` and that official GitHub URL, and preserves this license, copyright notices, and third-party notices. Modified, translated, lite, enhanced, bundled, or rebuilt editions must be clearly labeled “unofficial modified version,” describe their material changes, and must not imply release, review, support, or endorsement by Hernan_Jiang. Redistribution must be free and may not create direct or indirect commercial benefit. Third-party copies are not official releases; non-compliant copies receive no redistribution permission under these terms.
 
 ## 4. Code and security boundaries
 

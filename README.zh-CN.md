@@ -3,19 +3,19 @@
 </p>
 
 <p align="center">
-  <img src="assets/release/codex-router-logo.png" alt="Codex-Router Logo" width="128">
+  <img src="assets/release/codex-router-logo.png" alt="CodexRouter Logo" width="128">
 </p>
 
-<h1 align="center">Codex-Router</h1>
+<h1 align="center">CodexRouter</h1>
 
 <p align="center"><strong>一个入口，连接你的全部模型、订阅账号与 API 渠道。</strong></p>
 
 <p align="center">
-  <img src="assets/release/codex-router-banner.png" alt="Codex-Router 项目横幅" width="100%">
+  <img src="assets/release/codex-router-banner.png" alt="CodexRouter 项目横幅" width="100%">
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.7.0-0969da" alt="版本 1.7.0">
+  <img src="https://img.shields.io/badge/version-1.7.1-0969da" alt="版本 1.7.1">
   <img src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078d4" alt="Windows 10/11">
   <img src="https://img.shields.io/badge/architecture-x64-555555" alt="x64">
   <img src="https://img.shields.io/badge/runtime-portable%20%2B%20installer-2ea44f" alt="便携版与安装版运行时">
@@ -29,15 +29,15 @@
   <a href="#安全与条款">安全</a>
 </p>
 
-Codex-Router 保留 Codex 原有工作方式，同时通过一个模型菜单接入不同服务商、OAuth 订阅账号与第三方 API 渠道。启用自动接续时，同名 OAuth 与 API 渠道合并为一个公开模型并优先使用订阅额度；关闭后则显示稳定分开的 API 与 OAuth 路由，使用相同的模型展示名称，由用户手动选择额度来源。
+CodexRouter 保留 Codex 原有工作方式，同时通过一个模型菜单接入不同服务商、OAuth 订阅账号与第三方 API 渠道。启用自动接续时，同名 OAuth 与 API 渠道合并为一个公开模型并优先使用订阅额度；关闭后则显示稳定分开的 API 与 OAuth 路由，使用相同的模型展示名称，由用户手动选择额度来源。
 
 ## 总体概览
 
 <p align="center">
-  <img src="assets/release/promotion.png" alt="Codex-Router 总体功能图" width="100%">
+  <img src="assets/release/promotion.png" alt="CodexRouter 总体功能图" width="100%">
 </p>
 
-Codex-Router 是基于 Sub2API 和 Rust 桌面控制台的 Windows 本地路由器。Windows x64 发布版同时提供自包含便携包和用户级安装器；两者都内置 PostgreSQL、Redis、Sub2API、Router 运行时以及 app-local VC++ Runtime，服务默认只监听本机回环地址。
+CodexRouter 是基于 Sub2API 和 Rust 桌面控制台的 Windows 本地路由器。Windows x64 发布版同时提供自包含便携包和用户级安装器；两者都内置 PostgreSQL、Redis、Sub2API、Router 运行时以及 app-local VC++ Runtime，服务默认只监听本机回环地址。
 
 ### 适合解决的问题
 
@@ -51,7 +51,7 @@ Codex-Router 是基于 Sub2API 和 Rust 桌面控制台的 Windows 本地路由�
 
 ### 一个菜单，多个后端渠道
 
-Codex-Router 可以将 OAuth 和 API 渠道合并为 Codex 可见的模型目录。启用自动接续时，同名模型只公开一次，后端优先级和容错链仍然独立保存；关闭自动接续时，API 与 OAuth 路由使用稳定的不同 ID 同时出现，但保持相同的模型展示名称，不再添加 `(OAuth)` 后缀，可直接通过模型选择控制额度来源。
+CodexRouter 可以将 OAuth 和 API 渠道合并为 Codex 可见的模型目录。启用自动接续时，同名模型只公开一次，后端优先级和容错链仍然独立保存；关闭自动接续时，API 与 OAuth 路由使用稳定的不同 ID 同时出现，但保持相同的模型展示名称，不再添加 `(OAuth)` 后缀，可直接通过模型选择控制额度来源。
 
 <p align="center">
   <img src="assets/release/screenshot-codex.png" alt="Codex 模型菜单中的多模型切换" width="900">
@@ -70,7 +70,7 @@ Codex-Router 可以将 OAuth 和 API 渠道合并为 Codex 可见的模型目录
 - 每套路由配置独立保存 OAuth 账号选择，只有用户已手动加入并启用的模型才参与当前路由。
 - 开启自动接续时，同名模型优先使用订阅额度，限额或故障时转入较低优先级的 API Key 渠道；关闭时不自动转接，由模型列表中的独立条目决定额度来源。
 - 上游提供重置时间时按实际时间恢复；无法取得重置时间时执行低频保底探测，成功后自动回切。
-- OAuth 令牌由 Sub2API 管理，不写入 Codex-Router 配置文件，也不提供明文导出。
+- OAuth 令牌由 Sub2API 管理，不写入 CodexRouter 配置文件，也不提供明文导出。
 
 ### 按模型适配的控制项
 
@@ -86,7 +86,7 @@ Codex-Router 可以将 OAuth 和 API 渠道合并为 Codex 可见的模型目录
 
 ### 独立的多账号聚合监控平台
 
-用量监控是 Codex-Router 的独立核心能力，不只是 OAuth 登录页面附带展示的一行状态。它专门聚合多个 OAuth 账号、API 渠道和 Coding Plan 的实时状态，集中展示：
+用量监控是 CodexRouter 的独立核心能力，不只是 OAuth 登录页面附带展示的一行状态。它专门聚合多个 OAuth 账号、API 渠道和 Coding Plan 的实时状态，集中展示：
 
 - 订阅额度窗口和重置倒计时；
 - 5 小时、每日、每周、每月 Coding Plan 额度；
@@ -101,13 +101,19 @@ Codex-Router 可以将 OAuth 和 API 渠道合并为 Codex 可见的模型目录
 
 ## 托盘与性能优化
 
-Codex-Router 可以在 Windows 登录后直接进入轻量托盘模式，不启动额外守护进程。托盘模式暂停日志跟随、界面刷新和高频用量更新，保留每 60 秒一次的原生健康检查、连续失败后的无窗口恢复，以及每 10 分钟一次的统一自检。
+CodexRouter 可以在 Windows 登录后直接进入轻量托盘模式，不启动额外守护进程。托盘模式暂停日志跟随、界面刷新和高频用量更新，保留每 60 秒一次的原生健康检查、连续失败后的无窗口恢复，以及每 10 分钟一次的统一自检。
 
-1.7.0 同时保留了内存和后台任务优化。空闲托盘状态下的 CPU、磁盘和网络活动设计为几乎可以忽略；下图展示了测试环境中 Codex-Router 进程处于 0% CPU、0 Mbps 网络占用的空闲状态。
+1.7.1 同时保留了内存和后台任务优化。空闲托盘状态下的 CPU、磁盘和网络活动设计为几乎可以忽略；下图展示了测试环境中 CodexRouter 进程处于 0% CPU、0 Mbps 网络占用的空闲状态。
 
 <p align="center">
-  <img src="assets/release/usage-performance.png" alt="Codex-Router 空闲资源占用" width="900">
+  <img src="assets/release/usage-performance.png" alt="CodexRouter 空闲资源占用" width="900">
 </p>
+
+### 1.7.1 更新重点
+
+- Windows 安装器改为安装向导：先选择安装位置，默认创建桌面快捷方式，再确认安装，不再一点就装完。
+- 公开项目名称和官方仓库地址统一为 `CodexRouter`。
+- 额外提供 macOS / Linux 理论构建包。这些包尚未在真实 macOS 或 Linux 机器上测试，欢迎更多用户参与共同构建。
 
 ### 1.7.0 更新重点
 
@@ -200,20 +206,28 @@ Codex-Router 可以在 Windows 登录后直接进入轻量托盘模式，不启�
 - Kimi `k3-256k` 的上下文限制响应不再被误判为 Key 失效，也不会永久禁用有效的 Coding Plan 账号。
 - 每次手动或后台用量查询都会顺带检查已选账号的恢复状态；只有实时额度查询成功、额度尚未耗尽且凭据未被拒绝时才重新启用，避免误禁用长期残留，也不会用缓存额度误恢复失效账号。
 - 默认每 10 分钟在后台运行统一自检，并执行 OAuth 健康检查、用量查询、账号恢复和备用路由维护，轻量托盘模式也不会停用。实时查询确认 OAuth 额度已耗尽且存在同模型 API 备用渠道时，会立即把该 OAuth 账号设为不可调度；只有后续实时额度确认恢复后才会重新启用；未知状态最长隔离 5 小时。后台发现 Codex 配置被外部覆盖时只提醒，不自动写文件。
-- OAuth 到 API fallback、恢复以及后台发现新 OAuth 账号后的同步都是本机 Router 的实时后端路由变更，不会关闭或重启 Codex / ChatGPT，因此当前任务和对话不会中断。Codex-Router 只弹窗提醒额度变化；只有用户明确点击完整“保存并应用”或切换配置时才可能需要重启 Codex。OAuth 与 API 默认共用同一个模型展示名称，不追加 `(OAuth)` 后缀。
+- OAuth 到 API fallback、恢复以及后台发现新 OAuth 账号后的同步都是本机 Router 的实时后端路由变更，不会关闭或重启 Codex / ChatGPT，因此当前任务和对话不会中断。CodexRouter 只弹窗提醒额度变化；只有用户明确点击完整“保存并应用”或切换配置时才可能需要重启 Codex。OAuth 与 API 默认共用同一个模型展示名称，不追加 `(OAuth)` 后缀。
 - OAuth 账号优先级更新、账号恢复、OAuth 登录、配置应用以及 PostgreSQL、Redis、Sub2API 生命周期均由 Rust 原生执行；Redis 就绪必须通过带密码的 `PONG`。
 - 更新器会校验官方 GitHub 地址、SHA-256 和发布清单，显示实时下载进度；下载完成后由独立 Rust 助手执行原子替换、失败回滚和自动重启。
 - 本机 Router Key 在管理接口隐藏完整值时仍按受管名称和分组幂等识别，重复应用不会生成重复 Key 记录。
 - 便携包根目录保留不依赖 PowerShell 的 `Start-Codex-Router.cmd` 启动壳；EXE 发布者元数据统一为 `Hernan_JIANG`。Windows SmartScreen 的受信任发布者仍需要同名代码签名证书。
-- 1.7.0 便携包和安装载荷不包含 `.ps1`、`.psm1` 或 `.psd1`。PowerShell 仅保留在 GitHub 源码仓库中用于 Windows 构建、发布、兼容和开发测试。
+- 1.7.1 便携包和安装载荷不包含 `.ps1`、`.psm1` 或 `.psd1`。PowerShell 仅保留在 GitHub 源码仓库中用于 Windows 构建、发布、兼容和开发测试。
 
 ## 下载与首次启动
 
-前往 [GitHub Releases](https://github.com/HernanJiang/Codex-Router/releases/tag/v1.7.0) 下载 Windows x64 版本：
+前往 [GitHub Releases](https://github.com/HernanJiang/CodexRouter/releases/tag/v1.7.1) 下载 Windows x64 版本：
 
-`Codex-Router-Portable-1.7.0-windows-x64.zip`
+`Codex-Router-Portable-1.7.1-windows-x64.zip`
 
-同时提供可选的用户级安装器：`Codex-Router-Installer-1.7.0-windows-x64.exe`。它使用 Rust 原生安装逻辑，把同一份已验收运行时安装到 `%LOCALAPPDATA%\Programs\Codex-Router\1.7.0`，不需要管理员权限。
+同时提供可选的用户级安装器：`Codex-Router-Installer-1.7.1-windows-x64.exe`。安装时会打开向导，由你选择安装位置、默认创建桌面快捷方式，并在确认后再开始安装。默认路径为 `%LOCALAPPDATA%\Programs\CodexRouter\1.7.1`，不需要管理员权限。
+
+本版本同时提供理论 Unix 构建包：
+
+- `CodexRouter-1.7.1-linux-x64-theoretical.tar.gz`
+- `CodexRouter-1.7.1-macos-arm64-theoretical.tar.gz`
+- `CodexRouter-1.7.1-macos-x64-theoretical.tar.gz`
+
+这些 Unix 构建为理论构建版本，未经过实际测试。当前受支持的运行时仍是 Windows 10/11 x64。
 
 对于 `Upstream request failed` 这类尚未向客户端输出内容的瞬时流错误，Router 默认允许同一账号最多重试 5 次，每次间隔 1.5 秒。已经开始输出模型内容后不会重复回放请求。
 
@@ -222,7 +236,7 @@ Codex-Router 可以在 Windows 登录后直接进入轻量托盘模式，不启�
 第一次打开会直接进入全流程引导的第一页，按项目、登录、模型、网络和部署步骤带你完成配置，减少第一次使用的学习成本，不需要另找一份安装手册。
 
 <p align="center">
-  <img src="assets/release/first-run-guide.png" alt="Codex-Router 首次启动全流程引导" width="100%">
+  <img src="assets/release/first-run-guide.png" alt="CodexRouter 首次启动全流程引导" width="100%">
 </p>
 
 ### 快速开始
@@ -234,7 +248,7 @@ Codex-Router 可以在 Windows 登录后直接进入轻量托盘模式，不启�
 5. 应用配置，Router 会初始化本地服务并更新 Codex Provider 配置。
 6. 回到 Codex，在同一上下文窗口内从模型菜单切换模型。
 
-当前版本支持 Windows 10/11 x64，不支持 ARM64；本 Windows 版本不包含 macOS 构建产物。
+当前受支持的运行时是 Windows 10/11 x64，不支持 Windows ARM64。本版本中的 macOS 和 Linux 包为理论构建，尚未在真实机器上测试。
 
 ## 安全与条款
 
@@ -243,6 +257,8 @@ Codex-Router 可以在 Windows 登录后直接进入轻量托盘模式，不启�
 - 发布包排除用户配置、日志、数据库、OAuth 状态、备份和开发机路径。
 - 本地运行服务默认绑定 `127.0.0.1`，不建议将管理接口暴露到远程网络。
 - 完整条款请查看 [中文条款](TERMS.zh-CN.md) 和 [English Terms](TERMS.en.md)。
-- Codex-Router 原创部分仅授权个人、非商业使用；Sub2API 和其他第三方组件继续遵循各自的上游许可证和声明。
+- CodexRouter 原创部分仅授权个人、非商业使用；Sub2API 和其他第三方组件继续遵循各自的上游许可证和声明。
 
-官方仓库：<https://github.com/HernanJiang/Codex-Router>
+官方仓库：<https://github.com/HernanJiang/CodexRouter>
+
+macOS 和 Linux 为理论构建版本，未经过实际测试，欢迎更多用户参与共同构建。

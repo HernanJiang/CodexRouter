@@ -1,9 +1,9 @@
 [package]
 name = "codex-router"
-version = "1.7.0"
+version = "1.7.1"
 edition = "2021"
 
-[dependencies]
+[target.'cfg(windows)'.dependencies]
 eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow", "persistence"] }
 egui = "0.35"
 image = { version = "0.25", default-features = false, features = ["ico", "png"] }
@@ -23,10 +23,8 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 toml_edit = "0.22"
 zeroize = "1.8"
 zip = { version = "4.6", default-features = false, features = ["deflate"] }
-
-[target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinHttp", "Win32_Networking_WinSock", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
 windows = { version = "0.61", features = ["Win32_System_Com", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
-[build-dependencies]
+[target.'cfg(windows)'.build-dependencies]
 windres = "0.2"
