@@ -10,6 +10,7 @@
 - 公开项目名称和官方仓库地址统一为 `CodexRouter`。
 - 额外提供 macOS / Linux 理论构建包。这些包尚未在真实 macOS 或 Linux 机器上测试，欢迎更多用户参与共同构建。
 - 修复 Unix 理论构建时 `build.rs` 仍引用 Windows-only `windres` 导致无法编译的问题。
+- macOS Intel 理论构建改为在 Apple Silicon runner 上交叉编译，避免 macos-13 队列长时间卡住。
 
 ## 1.7.0 - 2026-08-14
 
