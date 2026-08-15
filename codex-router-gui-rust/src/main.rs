@@ -47,7 +47,7 @@ const TRAY_TOOLTIP_EN: &str = concat!(
     " - lightweight tray mode (forwarding protection only)"
 );
 const CURRENT_CONFIG_VERSION: &str = APP_VERSION;
-const CURRENT_TERMS_VERSION: &str = "codex-router-terms-v2.0.0-2026-08-14";
+const CURRENT_TERMS_VERSION: &str = "codex-router-terms-v1.2.2-2026-08-04";
 const OFFICIAL_GITHUB_URL: &str = "https://github.com/HernanJiang/Codex-Router";
 const MAX_LOG_BYTES: usize = 256 * 1024;
 const RETAIN_LOG_BYTES: usize = 192 * 1024;
@@ -3334,7 +3334,7 @@ impl CodexRouterApp {
         if !self.config.accept_compliance
             || self.config.accepted_terms_version != CURRENT_TERMS_VERSION
         {
-            self.report_error("请先阅读并同意当前条款与合规说明，再创建可应用的隔离配置");
+            self.report_error("请先阅读并同意当前使用与分发承诺，再创建可应用的隔离配置");
             return;
         }
         if self.config.models.is_empty() {
@@ -5733,7 +5733,7 @@ impl CodexRouterApp {
             || self.config.accepted_terms_version != CURRENT_TERMS_VERSION
         {
             let message = if zh {
-                "请先完整阅读并同意当前版本的 Codex-Router 条款与合规说明"
+                "请先完整阅读并同意当前版本的 Codex-Router 使用与分发承诺"
             } else {
                 "Read and accept the current Codex-Router terms before deployment"
             };

@@ -4018,8 +4018,8 @@ impl CodexRouterApp {
                             ui.label(
                                 egui::RichText::new(t(
                                     zh,
-                                    "采用 AGPL-3.0 开源许可，允许商业使用；分发或提供网络服务时须公开对应源码，并遵守 Sub2API 专项合规条款。",
-                                    "Licensed under AGPL-3.0 with source disclosure for distribution and network use, plus Sub2API compliance requirements.",
+                                    "包含禁止商用、允许保留署名与官方 GitHub 发布地址的分发，以及 Sub2API 专项合规条款。",
+                                    "Includes non-commercial use, redistribution with attribution and the official GitHub release URL, and Sub2API requirements.",
                                 ))
                                 .small()
                                 .color(palette.muted),

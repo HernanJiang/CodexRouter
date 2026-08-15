@@ -9,18 +9,19 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+$version = '1.7.0'
 
 if ([string]::IsNullOrWhiteSpace($SourceRoot)) {
     $SourceRoot = $PSScriptRoot
 }
 if ([string]::IsNullOrWhiteSpace($InstallRoot)) {
-    $InstallRoot = Join-Path $env:LOCALAPPDATA 'Programs\Codex-Router\1.6.11'
+    $InstallRoot = Join-Path $env:LOCALAPPDATA "Programs\Codex-Router\$version"
 }
 $SourceRoot = [IO.Path]::GetFullPath($SourceRoot)
 $InstallRoot = [IO.Path]::GetFullPath($InstallRoot)
 
 if ([string]::IsNullOrWhiteSpace($PackageZip)) {
-    $PackageZip = @(Get-ChildItem -LiteralPath $SourceRoot -Filter 'Codex-Router-Portable-1.6.11-windows-x64.zip' -File -ErrorAction SilentlyContinue |
+    $PackageZip = @(Get-ChildItem -LiteralPath $SourceRoot -Filter "Codex-Router-Portable-$version-windows-x64.zip" -File -ErrorAction SilentlyContinue |
             Select-Object -First 1 -ExpandProperty FullName)
 }
 if (-not [string]::IsNullOrWhiteSpace([string]$PackageZip) -and -not [IO.Path]::IsPathRooted($PackageZip)) {
@@ -77,7 +78,7 @@ try {
     [ordered]@{
         installed = $true
         installRoot = $InstallRoot
-        version = '1.6.11'
+        version = $version
         shortcut = (-not $NoShortcut)
         userData = (Join-Path $env:LOCALAPPDATA 'Codex-Router\UserData')
     } | ConvertTo-Json -Compress

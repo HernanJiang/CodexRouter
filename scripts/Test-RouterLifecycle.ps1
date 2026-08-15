@@ -515,8 +515,7 @@ Export-ModuleMember -Function Get-RouterModelRoutePlan, Get-RouterDefaultPublicM
             $mainSource.Contains('codex_router_mode_configured') -and
             $mainSource.Contains('acquire_config_apply_lock') -and
             $mainSource.Contains('repaint.request_repaint()') -and
-            $mainSource.Contains('.arg("-Force")') -and
-            $mainSource.Contains('.arg("-AdoptActivePortableOwner")')) `
+            $mainSource.Contains('lifecycle::stop_services(router_root, true, false)')) `
         -Message 'full GUI exit is not wired to a verified forced portable-backend shutdown'
     Assert-Test `
         -Condition (-not $stopSource.Contains('health-monitor.paused') -and

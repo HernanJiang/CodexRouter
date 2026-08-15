@@ -1,8 +1,8 @@
 use crate::config::{ModelConfig, RouterConfig};
 use crate::logic::{
-    canonical_route_model_id, is_fallback_channel_selected, is_model_alias_customized,
-    model_identity, recommended_model_display_name, resolve_context_window, resolve_multimodal,
-    resolve_reasoning, same_model_identity, slugify,
+    canonical_route_model_id, is_fallback_channel_selected, model_identity,
+    recommended_model_display_name, resolve_context_window, resolve_multimodal, resolve_reasoning,
+    same_model_identity, slugify,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -245,8 +245,8 @@ pub fn build_route_plan(cfg: &RouterConfig) -> Vec<ModelRoute> {
         .collect()
 }
 
-fn route_display_name(_cfg: &RouterConfig, route: &ModelRoute) -> String {
-    if is_model_alias_customized(&route.model) && !route.model.alias.trim().is_empty() {
+fn route_display_name(route: &ModelRoute) -> String {
+    if !route.model.alias.trim().is_empty() {
         return route.model.alias.trim().to_owned();
     }
     recommended_model_display_name(&route.model.model)
@@ -312,7 +312,7 @@ pub fn build_model_catalog_with_root(cfg: &RouterConfig, router_root: &Path) -> 
         let context_window = resolve_context_window(model);
         let compact_percent = model.auto_compact_percent.clamp(60, 90);
         let auto_compact_token_limit = context_window * compact_percent as i64 / 100;
-        let display_name = route_display_name(cfg, route);
+        let display_name = route_display_name(route);
 
         let mut entry = template.clone();
         entry["slug"] = Value::String(route.public_model_id.clone());
@@ -510,5 +510,23 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(split_public_model_id(&model), split_public_model_id(&model));
+    }
+
+    #[test]
+    fn configured_display_name_is_emitted_without_changing_model_id() {
+        let cfg = crate::config::RouterConfig {
+            models: vec![ModelConfig {
+                model: "vendor/model-id".to_owned(),
+                alias: "Configured Display Name".to_owned(),
+                alias_customized: Some(false),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let catalog = build_model_catalog(&cfg);
+
+        assert_eq!(catalog[0]["slug"], "vendor/model-id");
+        assert_eq!(catalog[0]["display_name"], "Configured Display Name");
     }
 }

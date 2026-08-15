@@ -39,8 +39,8 @@
 
 ## 最终发布包
 
-- Stage：`D:\Work\Tools\Codex-Router-Releases\Codex-Router-Portable-1.2.18-windows-x64-20260805-175354-038`
-- ZIP：`D:\Work\Tools\Codex-Router-Releases\Codex-Router-Portable-1.2.18-windows-x64-20260805-175354-038.zip`
+- Stage：`Codex-Router-Portable-1.2.18-windows-x64-20260805-175354-038`
+- ZIP：`Codex-Router-Portable-1.2.18-windows-x64-20260805-175354-038.zip`
 - ZIP SHA-256：`571A062FBDFC6E723C1BA4866AFAEB26E644B9D138683C7C5E679ED9E2260B8F`
 - 文件数：1130。
 - Sub2API SHA-256：`F5D8B0A8E54CCB408ACF77CE0F0A937C9AA7BD9E2A2E90D56D0FDA4FF61B4AD7`。

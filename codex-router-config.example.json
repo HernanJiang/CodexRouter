@@ -1,5 +1,5 @@
 {
-  "version": "1.6.11",
+  "version": "1.7.0",
   "authMode": "chatgpt_oauth",
   "deploy": {
     "codexHome": "",

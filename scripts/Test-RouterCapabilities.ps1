@@ -3,7 +3,9 @@ param(
     [switch]$LiveModels,
     [string[]]$OnlyModel = @(),
     [switch]$SseOnly,
-    [ValidateRange(15, 900)][int]$RequestTimeoutSeconds = 300
+    [ValidateRange(15, 900)][int]$RequestTimeoutSeconds = 300,
+    [ValidateRange(1, 65535)][int]$PostgresPort = 15432,
+    [ValidateRange(1, 65535)][int]$RedisPort = 16379
 )
 
 Set-StrictMode -Version Latest
@@ -238,8 +240,8 @@ try {
     Invoke-CriticalCheck -Name 'processes-and-listeners' -Action {
         $expected = @(
             @{ Name = 'Sub2API'; Port = $baseUri.Port; Path = (Join-Path $RouterRoot 'app\sub2api.exe') },
-            @{ Name = 'PostgreSQL'; Port = 15432; Path = (Join-Path $RouterRoot 'postgres\pgsql\bin\postgres.exe') },
-            @{ Name = 'Redis'; Port = 16379; Path = (Join-Path $RouterRoot 'redis\Redis-8.10.0-Windows-x64-msys2\redis-server.exe') }
+            @{ Name = 'PostgreSQL'; Port = $PostgresPort; Path = (Join-Path $RouterRoot 'postgres\pgsql\bin\postgres.exe') },
+            @{ Name = 'Redis'; Port = $RedisPort; Path = (Join-Path $RouterRoot 'redis\Redis-8.10.0-Windows-x64-msys2\redis-server.exe') }
         )
         foreach ($service in $expected) {
             $listener = @(Get-NetTCPConnection -LocalPort $service.Port -State Listen -ErrorAction Stop)
