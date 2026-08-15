@@ -1,5 +1,7 @@
+#[cfg(windows)]
 use std::{env, fs, path::PathBuf};
 
+#[cfg(windows)]
 fn windows_manifest(assembly_version: &str) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -29,10 +31,15 @@ fn windows_manifest(assembly_version: &str) -> String {
 }
 
 fn main() {
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
-        return;
-    }
+    // Build scripts are compiled for the host. `windres` is a Windows-only
+    // build-dependency, so the Windows resource path must not even be referenced
+    // when compiling this file on macOS or Linux.
+    #[cfg(windows)]
+    compile_windows_resources();
+}
 
+#[cfg(windows)]
+fn compile_windows_resources() {
     let package_version = env::var("CARGO_PKG_VERSION").expect("Cargo package version is missing");
     let mut version_parts = package_version
         .split('-')
