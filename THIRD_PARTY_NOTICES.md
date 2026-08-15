@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-Codex-Router combines original project material with independent third-party software. The Codex-Router proprietary license does not replace, narrow, or claim ownership of third-party rights.
+Codex-Router combines original project material with independent third-party software. Codex-Router is licensed under AGPL-3.0; this does not replace, narrow, or claim ownership of third-party rights.
 
 ## Sub2API
 

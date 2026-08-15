@@ -1,0 +1,12 @@
+# GitHub language statistics: Codex-Router is a Rust desktop application.
+# The Windows bootstrap/build/release tooling below is not part of the product
+# language, so it is excluded from the repository language bar. Files are kept
+# in the repository and remain part of the build and release pipeline.
+*.ps1  linguist-detectable=false
+*.psm1 linguist-detectable=false
+*.psd1 linguist-detectable=false
+*.cmd  linguist-detectable=false
+*.bat  linguist-detectable=false
+
+# Vendored third-party copy (cc-switch 0.4.3) kept for reference only.
+archive/** linguist-vendored

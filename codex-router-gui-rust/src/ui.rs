@@ -3981,7 +3981,7 @@ impl CodexRouterApp {
                                     ui.label(
                                         egui::RichText::new(t(
                                             zh,
-                                            "✓ 已同意《Codex-Router 使用与分发承诺》",
+                                            "✓ 已同意《Codex-Router 条款与合规说明》",
                                             "✓ Codex-Router terms accepted",
                                         ))
                                         .strong()
@@ -3991,7 +3991,7 @@ impl CodexRouterApp {
                                     ui.label(
                                         egui::RichText::new(t(
                                             zh,
-                                            "尚未同意《Codex-Router 使用与分发承诺》",
+                                            "尚未同意《Codex-Router 条款与合规说明》",
                                             "Codex-Router terms have not been accepted",
                                         ))
                                         .strong()
@@ -4111,8 +4111,8 @@ impl CodexRouterApp {
                 ui.label(
                     egui::RichText::new(t(
                         zh,
-                        "Codex-Router 使用与分发承诺",
-                        "Codex-Router Use and Distribution Commitment",
+                        "Codex-Router 条款与合规说明",
+                        "Codex-Router Terms and Compliance",
                     ))
                     .font(egui::FontId::new(24.0, theme::display_family()))
                     .color(palette.ink),

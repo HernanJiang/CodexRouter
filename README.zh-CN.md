@@ -18,7 +18,7 @@
   <img src="https://img.shields.io/badge/version-1.7.0-0969da" alt="版本 1.7.0">
   <img src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078d4" alt="Windows 10/11">
   <img src="https://img.shields.io/badge/architecture-x64-555555" alt="x64">
-  <img src="https://img.shields.io/badge/runtime-portable-2ea44f" alt="便携运行">
+  <img src="https://img.shields.io/badge/runtime-portable%20%2B%20installer-2ea44f" alt="便携版与安装版运行时">
 </p>
 
 <p align="center">
@@ -37,7 +37,7 @@ Codex-Router 保留 Codex 原有工作方式，同时通过一个模型菜单接
   <img src="assets/release/promotion.png" alt="Codex-Router 总体功能图" width="100%">
 </p>
 
-Codex-Router 是基于 Sub2API 和 Rust 桌面控制台的 Windows 本地路由器。便携包内置 PostgreSQL、Redis、Sub2API、Router 运行时以及 app-local VC++ Runtime，服务默认只监听本机回环地址。
+Codex-Router 是基于 Sub2API 和 Rust 桌面控制台的 Windows 本地路由器。Windows x64 发布版同时提供自包含便携包和用户级安装器；两者都内置 PostgreSQL、Redis、Sub2API、Router 运行时以及 app-local VC++ Runtime，服务默认只监听本机回环地址。
 
 ### 适合解决的问题
 

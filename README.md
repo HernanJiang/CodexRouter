@@ -18,7 +18,7 @@
   <img src="https://img.shields.io/badge/version-1.7.0-0969da" alt="Version 1.7.0">
   <img src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078d4" alt="Windows 10/11">
   <img src="https://img.shields.io/badge/architecture-x64-555555" alt="x64">
-  <img src="https://img.shields.io/badge/runtime-portable-2ea44f" alt="Portable runtime">
+  <img src="https://img.shields.io/badge/runtime-portable%20%2B%20installer-2ea44f" alt="Portable and installer runtime">
 </p>
 
 <p align="center">
@@ -37,7 +37,7 @@ Codex-Router keeps the original Codex workflow while adding a unified model menu
   <img src="assets/release/promotion.png" alt="Codex-Router overview" width="100%">
 </p>
 
-Codex-Router is a Windows desktop router built around Sub2API and a Rust desktop console. PostgreSQL, Redis, Sub2API, the router runtime, and the required app-local VC++ runtime are included in the portable package. Services listen on the local loopback interface.
+Codex-Router is a Windows desktop router built around Sub2API and a Rust desktop console. The Windows x64 release provides both a self-contained portable package and a per-user installer; both include PostgreSQL, Redis, Sub2API, the router runtime, and the required app-local VC++ runtime. Services listen on the local loopback interface.
 
 ### Why it is useful
 
