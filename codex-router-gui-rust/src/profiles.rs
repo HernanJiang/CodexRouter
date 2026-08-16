@@ -511,15 +511,23 @@ fn prepare_account_mode_config(
         bail!("账号模式只能用于本机 Codex-Router 提供方");
     }
 
+    let current_model = document
+        .get("model")
+        .and_then(Item::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let require_openai_auth = current_model.trim().is_empty()
+        || crate::logic::responses_compat::is_openai_family_model(&current_model);
     let provider = document
         .get_mut("model_providers")
         .and_then(Item::as_table_like_mut)
         .and_then(|providers| providers.get_mut(&provider_id))
         .and_then(Item::as_table_like_mut)
         .context("无法更新 Codex-Router 模型提供方")?;
-    // Match the v1.5.2 account contract: keep Codex in its normal signed-in
-    // account flow while Router requests continue to use the local bearer.
-    provider.insert("requires_openai_auth", toml_edit::value(true));
+    provider.insert(
+        "requires_openai_auth",
+        toml_edit::value(require_openai_auth),
+    );
 
     match target {
         CodexAccountMode::ApiOnly => {

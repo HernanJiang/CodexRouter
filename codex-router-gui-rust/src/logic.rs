@@ -35,6 +35,8 @@ pub mod catalog;
 pub mod codex_toml;
 pub mod deployment;
 pub mod oauth;
+pub mod responses_compat;
+pub mod responses_gateway;
 mod usage;
 pub use catalog::*;
 
@@ -1100,7 +1102,7 @@ pub fn detect_context_defaults(model_name: &str) -> ContextDefaults {
             source_en: "official Kimi Code documentation",
         };
     }
-    if name.contains("grok-4.5") {
+    if name.contains("grok-4") {
         return ContextDefaults {
             window: 500_000,
             source_zh: "模型文档预设",
@@ -1173,6 +1175,35 @@ pub fn build_channel_manifest(cfg: &RouterConfig) -> Vec<serde_json::Value> {
         .collect()
 }
 
+fn model_catalog_path(router_root: &Path) -> PathBuf {
+    let stable = crate::user_data::state_root(router_root).join("model-catalog.json");
+    if stable != router_root.join("model-catalog.json") {
+        stable
+    } else {
+        router_root.join("config").join("model-catalog.json")
+    }
+}
+
+fn catalog_document(cfg: &RouterConfig, router_root: &Path) -> Value {
+    json!({
+        "fetched_at": chrono::Utc::now().to_rfc3339(),
+        "etag": "codex-router-local-v2",
+        "client_version": env!("CARGO_PKG_VERSION"),
+        "models": build_model_catalog_with_root(cfg, router_root),
+    })
+}
+
+pub fn write_model_catalog(cfg: &RouterConfig, router_root: &Path) -> anyhow::Result<()> {
+    let catalog_path = model_catalog_path(router_root);
+    if let Some(parent) = catalog_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    atomic_write(
+        &catalog_path,
+        &serde_json::to_vec_pretty(&catalog_document(cfg, router_root))?,
+    )
+}
+
 pub fn write_all_files(cfg: &RouterConfig, router_root: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(router_root.join("config"))?;
     // The deployment scripts resolve the Router config through
@@ -1182,24 +1213,12 @@ pub fn write_all_files(cfg: &RouterConfig, router_root: &Path) -> anyhow::Result
     let config_path = crate::user_data::config_path(router_root);
     // The catalog and channel manifest stay beside the executable because the
     // scripts read them from `$routerRoot\config`.
-    let catalog_path = {
-        let stable = crate::user_data::state_root(router_root).join("model-catalog.json");
-        if stable != router_root.join("model-catalog.json") {
-            stable
-        } else {
-            router_root.join("config").join("model-catalog.json")
-        }
-    };
+    let catalog_path = model_catalog_path(router_root);
     let channels_path = router_root.join("config").join("sub2api-channels.json");
     let writes = vec![
         (
             catalog_path,
-            serde_json::to_vec_pretty(&json!({
-            "fetched_at": chrono::Utc::now().to_rfc3339(),
-            "etag": "codex-router-local-v2",
-            "client_version": env!("CARGO_PKG_VERSION"),
-            "models": build_model_catalog_with_root(cfg, router_root),
-            }))?,
+            serde_json::to_vec_pretty(&catalog_document(cfg, router_root))?,
         ),
         (
             channels_path,
@@ -1986,7 +2005,10 @@ pub(crate) fn codex_config_uses_router(config_text: &str, router_base_url: &str)
     if !base_matches {
         return false;
     }
-    if provider.get("requires_openai_auth").and_then(Item::as_bool) != Some(true)
+    let openai_auth = provider
+        .get("requires_openai_auth")
+        .and_then(Item::as_bool);
+    if openai_auth.is_none()
         || provider
             .get("wire_api")
             .and_then(Item::as_str)
@@ -2061,7 +2083,10 @@ pub fn codex_router_mode_configured(cfg: &RouterConfig) -> bool {
         return false;
     };
     let router_base_url = cfg.deploy.sub2api_host.trim();
-    codex_config_uses_router(&config_text, router_base_url)
+    let gateway = responses_gateway::responses_gateway_url(router_base_url)
+        .unwrap_or_else(|_| router_base_url.to_owned());
+    codex_config_uses_router(&config_text, &gateway)
+        || codex_config_uses_router(&config_text, router_base_url)
 }
 
 pub fn codex_router_mode_active(cfg: &RouterConfig) -> bool {
@@ -2967,19 +2992,19 @@ model_catalog_json = "C:/Users/test/.codex-router/model-catalog.json"
 
 [model_providers.codex_router]
 name = "Codex-Router"
-base_url = "http://127.0.0.1:18080/v1"
+base_url = "http://127.0.0.1:18082/v1"
 wire_api = "responses"
 requires_openai_auth = true
 experimental_bearer_token = "local-router-test-key"
 "#;
-        assert!(codex_config_uses_router(config, "http://127.0.0.1:18080"));
+        assert!(codex_config_uses_router(config, "http://127.0.0.1:18082"));
         assert!(!codex_config_uses_router(config, "http://127.0.0.1:19090"));
         assert!(!codex_config_uses_router(
             &config.replace(
                 "model_provider = \"codex_router\"",
                 "model_provider = \"openai\""
             ),
-            "http://127.0.0.1:18080"
+            "http://127.0.0.1:18082"
         ));
 
         let legacy_custom = r#"model_provider = "custom"
@@ -2987,10 +3012,10 @@ model = "gpt-5.6-sol"
 
 [model_providers.custom]
 name = "Codex-Router"
-base_url = "http://127.0.0.1:18080/v1"
+base_url = "http://127.0.0.1:18082/v1"
 "#;
         assert!(
-            !codex_config_uses_router(legacy_custom, "http://127.0.0.1:18080"),
+            !codex_config_uses_router(legacy_custom, "http://127.0.0.1:18082"),
             "an incomplete legacy provider must be migrated before it is considered healthy"
         );
 
@@ -3001,15 +3026,15 @@ model = "grok-4.5"
 name = "micu"
 base_url = "https://api.430123.xyz/v1"
 "#;
-        assert!(!codex_config_uses_router(chiral, "http://127.0.0.1:18080"));
+        assert!(!codex_config_uses_router(chiral, "http://127.0.0.1:18082"));
 
         let third_party = config.replace(
             "requires_openai_auth = true",
             "requires_openai_auth = false",
         );
         assert!(
-            !codex_config_uses_router(&third_party, "http://127.0.0.1:18080"),
-            "a Router provider switched into third-party API mode must be repaired"
+            codex_config_uses_router(&third_party, "http://127.0.0.1:18082"),
+            "third-party catalog models must keep a valid Router binding without ChatGPT allowlist"
         );
 
         let legacy = config
@@ -3018,7 +3043,7 @@ base_url = "https://api.430123.xyz/v1"
                 "model_provider = \"sub2api\"",
             )
             .replace("model_providers.codex_router", "model_providers.sub2api");
-        assert!(codex_config_uses_router(&legacy, "http://127.0.0.1:18080"));
+        assert!(codex_config_uses_router(&legacy, "http://127.0.0.1:18082"));
     }
 
     fn temporary_test_dir(label: &str) -> PathBuf {
@@ -4041,6 +4066,10 @@ base_url = "https://api.430123.xyz/v1"
         assert_eq!(resolve_context_window(&kimi), 272_000);
         assert_eq!(resolve_auto_compact_token_limit(&kimi), 217_600);
 
+        kimi.model = "grok-4.6".into();
+        assert_eq!(resolve_context_window(&kimi), 500_000);
+        assert_eq!(resolve_auto_compact_token_limit(&kimi), 400_000);
+
         for model in ["gemini-3.6-flash", "mimo-v2.5-pro", "deepseek-v4-pro"] {
             kimi.model = model.into();
             assert_eq!(resolve_context_window(&kimi), 1_048_576, "{model}");
@@ -4286,5 +4315,44 @@ Write-Output '[7/7] Deployment complete.'
         // Restore must never invent a [windows] table.
         assert!(!output.contains("[windows]"));
         assert_eq!(output, input);
+    }
+
+    #[test]
+    #[ignore = "writes the live 1.7.3 catalog; requires CODEX_ROUTER_LIVE_APPLY=1"]
+    fn live_apply_173_catalog_and_binding() {
+        assert_eq!(
+            std::env::var("CODEX_ROUTER_LIVE_APPLY").as_deref(),
+            Ok("1")
+        );
+        let router_root = std::env::var("CODEX_ROUTER_LIVE_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .expect("source root")
+                    .to_path_buf()
+            });
+        let config = RouterConfig::load(&crate::user_data::config_path(&router_root))
+            .expect("load live Router config");
+        write_model_catalog(&config, &router_root).expect("write 1.7.3 catalog");
+        super::codex_toml::write_codex_config_from_router_config(&config, &router_root)
+            .expect("repair Codex binding");
+        let catalog_path = crate::user_data::state_root(&router_root).join("model-catalog.json");
+        let catalog: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(catalog_path).unwrap()).unwrap();
+        assert_eq!(catalog["client_version"], env!("CARGO_PKG_VERSION"));
+        assert!(
+            catalog["models"][0]["base_instructions"]
+                .as_str()
+                .unwrap()
+                .contains("默认使用简体中文")
+        );
+        assert!(catalog["models"][0]["priority"].as_i64().unwrap() >= 1);
+        assert!(
+            catalog["models"][0]["truncation_policy"]["limit"]
+                .as_i64()
+                .unwrap()
+                >= 32_000
+        );
     }
 }

@@ -1670,11 +1670,25 @@ fn usage_error_for_display(zh: bool, text: &str) -> String {
             "The upstream quota service is temporarily unavailable; the last successful data is retained."
                 .to_owned()
         }
-        (true, "authentication" | "permission") => {
-            "额度服务拒绝了当前授权，请在授权页面重新登录或检查凭据。".to_owned()
+        (true, "admin_session") => {
+            "本地额度查询的管理会话已失效，请稍后刷新。不必前往授权页重新登录。".to_owned()
         }
-        (false, "authentication" | "permission") => {
-            "The quota service rejected the current authorization. Sign in again or check the credential."
+        (false, "admin_session") => {
+            "The local usage admin session expired. Refresh shortly; you do not need to sign in again on the authorization page."
+                .to_owned()
+        }
+        (true, "quota_denied" | "permission") => {
+            "上游额度接口拒绝了此次查询（可能是套餐权限或额度策略），已保留上次成功数据。".to_owned()
+        }
+        (false, "quota_denied" | "permission") => {
+            "The upstream quota endpoint denied this query. The last successful data is retained."
+                .to_owned()
+        }
+        (true, "authentication") => {
+            "该账号的额度凭据已失效，请在授权页面重新登录或检查 API Key。".to_owned()
+        }
+        (false, "authentication") => {
+            "This account's quota credential is no longer valid. Sign in again or check the API key."
                 .to_owned()
         }
         (true, _) => "用量查询暂时失败，已保留上次成功数据，请稍后重试。".to_owned(),
@@ -2612,6 +2626,11 @@ impl CodexRouterApp {
         if router_mode_enabled && !ui_preferences.prefer_router_mode {
             // Migrate older installs that already bind Codex to Router.
             let _ = app.persist_ui_preferences();
+        }
+        if router_mode_enabled {
+            let _ = logic::responses_gateway::ensure_responses_gateway(
+                &app.config.deploy.sub2api_host,
+            );
         }
         app
     }
@@ -5209,6 +5228,8 @@ impl CodexRouterApp {
         self.observe_codex_binding_state();
         if self.router_mode_enabled && !self.health_probe_running && !self.health_recovery_running {
             self.health_probe_due = Some(std::time::Instant::now());
+            let host = self.config.deploy.sub2api_host.clone();
+            let _ = logic::responses_gateway::ensure_responses_gateway(&host);
         }
         self.refresh_usage_monitor();
     }
@@ -6004,7 +6025,7 @@ impl CodexRouterApp {
     }
 
     fn local_sub2api_base_url(&self) -> String {
-        let fallback = "http://127.0.0.1:18080";
+        let fallback = "http://127.0.0.1:18082";
         let candidate = self.config.deploy.sub2api_host.trim().trim_end_matches('/');
         let Ok(mut url) = url::Url::parse(candidate) else {
             return fallback.to_owned();
@@ -7158,7 +7179,7 @@ fn try_cli_mode() -> Option<anyhow::Result<()>> {
         let mut codex_home = None;
         let mut model = None;
         let mut catalog = None;
-        let mut base_url = "http://127.0.0.1:18080".to_owned();
+        let mut base_url = "http://127.0.0.1:18082".to_owned();
         let mut reasoning_effort = "medium".to_owned();
         let mut fast_mode = false;
         let mut require_openai_auth = DEFAULT_ROUTER_REQUIRES_OPENAI_AUTH;
@@ -7937,7 +7958,7 @@ mod main_tests {
         std::fs::write(
             codex_home.join("config.toml"),
             "model_provider = \"sub2api\"\nmodel = \"router-model\"\n\
-             [model_providers.sub2api]\nname = \"Codex-Router\"\nbase_url = \"http://127.0.0.1:18080/v1\"\n",
+             [model_providers.sub2api]\nname = \"Codex-Router\"\nbase_url = \"http://127.0.0.1:18082/v1\"\n",
         )
         .unwrap();
 
@@ -7963,7 +7984,7 @@ mod main_tests {
         std::fs::create_dir_all(&codex_home).unwrap();
         let mut config = RouterConfig::default();
         config.deploy.codex_home = codex_home.to_string_lossy().into_owned();
-        config.deploy.sub2api_host = "http://127.0.0.1:18080".into();
+        config.deploy.sub2api_host = "http://127.0.0.1:18082".into();
         config.save(&root.join("codex-router-config.json")).unwrap();
         std::fs::write(
             codex_home.join("config.toml"),
@@ -7984,7 +8005,7 @@ mod main_tests {
             "model_provider = \"codex_router\"\nmodel = \"router-model\"\n\
              model_catalog_json = \"C:/Users/test/.codex-router/model-catalog.json\"\n\
              [model_providers.codex_router]\nname = \"Codex-Router\"\n\
-             base_url = \"http://127.0.0.1:18080/v1\"\nwire_api = \"responses\"\n\
+             base_url = \"http://127.0.0.1:18082/v1\"\nwire_api = \"responses\"\n\
              requires_openai_auth = true\n\
              experimental_bearer_token = \"local-router-test-key\"\n",
         )
@@ -8058,7 +8079,7 @@ mod main_tests {
             "Configured 8 model channel(s).",
             "Codex configuration written to: C:\\Users\\x\\.codex\\config.toml",
             "Local access key is stored in Windows Credential Manager and the current user environment.",
-            "Codex Router is running at http://127.0.0.1:18080",
+            "Codex Router is running at http://127.0.0.1:18082",
             "Codex Router secrets and PostgreSQL data directory are initialized.",
         ] {
             for zh in [true, false] {

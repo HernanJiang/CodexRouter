@@ -166,17 +166,23 @@ pub fn generate_codex_router_config(
         }
     }
 
-    // desktop.enabled-reasoning-efforts
+    // Merge [desktop]: only own enabled-reasoning-efforts. Layout, window,
+    // plugin and other far-side keys stay so cloud sync cannot wipe local
+    // typesetting with an older remote document, and Router apply cannot
+    // wipe a newer Desktop layout.
     let mut desktop = doc
         .remove("desktop")
         .and_then(|item| item.into_table().ok())
         .unwrap_or_default();
-    let levels = ["low", "medium", "high", "xhigh", "ultra", "max"];
-    let mut arr = toml_edit::Array::new();
-    for level in levels {
-        arr.push(level);
+    if !desktop.contains_key("enabled-reasoning-efforts") {
+        let levels = ["low", "medium", "high", "xhigh", "ultra", "max"];
+        let mut arr = toml_edit::Array::new();
+        for level in levels {
+            arr.push(level);
+        }
+        desktop.insert("enabled-reasoning-efforts", toml_edit::value(arr));
     }
-    desktop.insert("enabled-reasoning-efforts", toml_edit::value(arr));
+    merge_desktop_overlay(&mut desktop, existing);
 
     // Assemble tables into the document.
     {
@@ -363,6 +369,15 @@ fn limit_backups(codex_home: &Path, filter: &str, keep: usize) -> anyhow::Result
     Ok(())
 }
 
+fn codex_public_base_url(cfg: &RouterConfig) -> String {
+    super::responses_gateway::responses_gateway_url(&cfg.deploy.sub2api_host).unwrap_or_else(|_| {
+        cfg.deploy
+            .sub2api_host
+            .trim()
+            .trim_end_matches('/')
+            .to_owned()
+    })
+}
 /// Write the Codex `config.toml` to `codex_home`, preserving a timestamped backup and
 /// keeping only the most recent backups.
 pub fn write_codex_router_config(
@@ -395,7 +410,9 @@ pub fn write_codex_router_config(
         read_permission_source(codex_home, &existing)?
     };
     let catalog_path_str = catalog_path.to_string_lossy().into_owned();
-    let generated = generate_codex_router_config(
+    let overlay_path = codex_home.join("codex-router-desktop-overlay.toml");
+    persist_desktop_overlay_file(&overlay_path, &existing);
+    let mut generated = generate_codex_router_config(
         &existing,
         model,
         &catalog_path_str,
@@ -407,6 +424,7 @@ pub fn write_codex_router_config(
         display_openai_provider,
         permission_source.as_deref(),
     )?;
+    generated = apply_desktop_overlay_file(&generated, &overlay_path);
 
     if !existing.is_empty() && existing.trim() != generated.trim() {
         let id = chrono::Local::now().format("%Y%m%d%H%M%S%3f").to_string();
@@ -421,6 +439,75 @@ pub fn write_codex_router_config(
     crate::config::atomic_write(&config_path, generated.as_bytes())
         .context("failed to write Codex config.toml")?;
     Ok(())
+}
+
+fn desktop_overlay_path(router_root: &Path) -> PathBuf {
+    crate::user_data::state_root(router_root).join("codex-desktop-overlay.toml")
+}
+
+fn extract_desktop_overlay(existing: &str) -> Option<toml_edit::Table> {
+    let document: DocumentMut = existing.parse().ok()?;
+    let desktop = document.get("desktop")?.as_table()?;
+    let mut overlay = toml_edit::Table::new();
+    for (key, item) in desktop.iter() {
+        if key != "enabled-reasoning-efforts" {
+            overlay.insert(key, item.clone());
+        }
+    }
+    (!overlay.is_empty()).then_some(overlay)
+}
+
+fn merge_desktop_overlay(desktop: &mut toml_edit::Table, existing: &str) {
+    let Some(overlay) = extract_desktop_overlay(existing) else {
+        return;
+    };
+    for (key, item) in overlay.iter() {
+        if key != "enabled-reasoning-efforts" && !desktop.contains_key(key) {
+            desktop.insert(key, item.clone());
+        }
+    }
+}
+
+fn persist_desktop_overlay_file(path: &Path, existing: &str) {
+    let mut overlay = extract_desktop_overlay(existing).unwrap_or_default();
+    if let Ok(previous) = std::fs::read_to_string(path) {
+        if let Some(previous_overlay) = extract_desktop_overlay(&previous) {
+            for (key, item) in previous_overlay.iter() {
+                if key != "enabled-reasoning-efforts" && !overlay.contains_key(key) {
+                    overlay.insert(key, item.clone());
+                }
+            }
+        }
+    }
+    if overlay.is_empty() {
+        return;
+    }
+    let mut document = DocumentMut::new();
+    document["desktop"] = toml_edit::Item::Table(overlay);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = crate::config::atomic_write(path, document.to_string().as_bytes());
+}
+
+fn apply_desktop_overlay_file(generated: &str, path: &Path) -> String {
+    let Ok(overlay) = std::fs::read_to_string(path) else {
+        return generated.to_owned();
+    };
+    let Ok(mut document) = generated.parse::<DocumentMut>() else {
+        return generated.to_owned();
+    };
+    let mut desktop = document
+        .remove("desktop")
+        .and_then(|item| item.into_table().ok())
+        .unwrap_or_default();
+    merge_desktop_overlay(&mut desktop, &overlay);
+    document["desktop"] = toml_edit::Item::Table(desktop);
+    let mut text = document.to_string();
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text
 }
 
 fn resolve_codex_home(cfg: &RouterConfig) -> PathBuf {
@@ -440,15 +527,24 @@ pub fn write_codex_config_from_router_config(
     router_root: &Path,
 ) -> anyhow::Result<()> {
     let codex_home = resolve_codex_home(cfg);
-    let settings = codex_router_settings(cfg);
+    let existing = std::fs::read_to_string(codex_home.join("config.toml")).unwrap_or_default();
+    let settings = if existing.trim().is_empty() {
+        codex_router_settings(cfg)
+    } else {
+        // Keep the model and reasoning already shown in Desktop. Saving Router
+        // settings must refresh the local binding, not yank the user back to
+        // Router's default_model.
+        codex_router_repair_settings(cfg, &existing)
+    };
     let catalog_path = crate::user_data::state_root(router_root).join("model-catalog.json");
     let local_api_key = super::ensure_local_api_key()?;
+    persist_desktop_overlay_file(&desktop_overlay_path(router_root), &existing);
     write_codex_router_config(
         &codex_home,
         &settings.model,
         &catalog_path,
         &local_api_key,
-        &cfg.deploy.sub2api_host,
+        &super::responses_gateway::responses_gateway_url(&cfg.deploy.sub2api_host)?,
         &settings.reasoning_effort,
         settings.fast_mode,
         settings.require_openai_auth,
@@ -486,10 +582,8 @@ fn codex_router_settings(cfg: &RouterConfig) -> CodexRouterSettings {
         model,
         reasoning_effort,
         fast_mode,
-        // Match the proven v1.5.2 contract: Codex keeps its normal ChatGPT
-        // account session while the local bearer authenticates requests sent
-        // to Router. Marking this provider as third-party makes Desktop drop
-        // the Router catalog and show only its built-in model list.
+        // Keep the ChatGPT account in the Desktop corner. Custom models still
+        // go through the local Router bearer + catalog.
         require_openai_auth: true,
         display_openai_provider: false,
     }
@@ -547,7 +641,7 @@ fn codex_router_binding_matches(
     local_api_key: &str,
 ) -> bool {
     if local_api_key.is_empty()
-        || !super::codex_config_uses_router(existing, cfg.deploy.sub2api_host.trim())
+        || !super::codex_config_uses_router(existing, &codex_public_base_url(cfg))
     {
         return false;
     }
@@ -630,7 +724,7 @@ pub(crate) fn repair_codex_router_binding_with_key(
         &settings.model,
         &catalog_path,
         local_api_key,
-        &cfg.deploy.sub2api_host,
+        &codex_public_base_url(cfg),
         &settings.reasoning_effort,
         settings.fast_mode,
         settings.require_openai_auth,
@@ -640,7 +734,7 @@ pub(crate) fn repair_codex_router_binding_with_key(
 
     let repaired = std::fs::read_to_string(&config_path)
         .context("failed to verify the repaired Codex Router binding")?;
-    if !super::codex_config_uses_router(&repaired, cfg.deploy.sub2api_host.trim()) {
+    if !super::codex_config_uses_router(&repaired, &codex_public_base_url(cfg)) {
         bail!("CODEX_ROUTER_BINDING_REPAIR_INCOMPLETE");
     }
     Ok(true)
@@ -684,7 +778,7 @@ mod tests {
             &settings.model,
             "C:/isolated/model-catalog.json",
             "fixture-local-key",
-            "http://127.0.0.1:18080",
+            "http://127.0.0.1:18082",
             &settings.reasoning_effort,
             settings.fast_mode,
             settings.require_openai_auth,
@@ -782,7 +876,7 @@ mod tests {
             "gpt-5.6-sol",
             "C:/catalog.json",
             "sk-local-key",
-            "http://127.0.0.1:18080",
+            "http://127.0.0.1:18082",
             "medium",
             false,
             false,
@@ -803,7 +897,7 @@ mod tests {
             "gpt-5.6-sol",
             "C:/users/test/.codex-router/model-catalog.json",
             "sk-local-abc123",
-            "http://127.0.0.1:18080",
+            "http://127.0.0.1:18082",
             "medium",
             false,
             false,
@@ -817,7 +911,7 @@ mod tests {
             .contains("model_catalog_json = \"C:/users/test/.codex-router/model-catalog.json\""));
         assert!(text.contains("[features]") && text.contains("apps = false"));
         assert!(text.contains("[model_providers.codex_router]"));
-        assert!(text.contains("base_url = \"http://127.0.0.1:18080/v1\""));
+        assert!(text.contains("base_url = \"http://127.0.0.1:18082/v1\""));
         assert!(text.contains("experimental_bearer_token = \"sk-local-abc123\""));
         assert!(text.contains("requires_openai_auth = false"));
         assert!(text.contains("name = \"Codex-Router\""));
@@ -828,13 +922,39 @@ mod tests {
     }
 
     #[test]
+    fn desktop_layout_keys_survive_router_rewrite() {
+        let existing = r#"
+[desktop]
+enabled-reasoning-efforts = ["low"]
+window-layout = "sidebar-wide"
+theme = "dark"
+"#;
+        let text = generate_codex_router_config(
+            existing,
+            "gpt-5.6-sol",
+            "C:/catalog.json",
+            "sk-local-key",
+            "http://127.0.0.1:18082",
+            "medium",
+            false,
+            true,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(text.contains("window-layout = \"sidebar-wide\""));
+        assert!(text.contains("theme = \"dark\""));
+        assert!(text.contains("enabled-reasoning-efforts"));
+    }
+
+    #[test]
     fn fast_mode_sets_fast_tier() {
         let text = generate_codex_router_config(
             "",
             "gpt-5.6-sol",
             "C:/catalog.json",
             "sk-local-key",
-            "http://127.0.0.1:18080",
+            "http://127.0.0.1:18082",
             "medium",
             true,
             true,
@@ -863,7 +983,7 @@ experimental_bearer_token = "PROXY_MANAGED"
             "gpt-5.6-sol",
             "C:/catalog.json",
             "sk-local-key",
-            "http://127.0.0.1:18080",
+            "http://127.0.0.1:18082",
             "medium",
             false,
             true,
@@ -885,7 +1005,7 @@ experimental_bearer_token = "keep-this-provider"
             "gpt-5.6-sol",
             "C:/catalog.json",
             "sk-local-key",
-            "http://127.0.0.1:18080",
+            "http://127.0.0.1:18082",
             "medium",
             false,
             true,
@@ -911,7 +1031,7 @@ sandbox = "unelevated"
             "gpt-5.6-sol",
             "C:/catalog.json",
             "sk-local-key",
-            "http://127.0.0.1:18080",
+            "http://127.0.0.1:18082",
             "medium",
             false,
             false,
@@ -939,7 +1059,7 @@ sandbox = "unelevated"
             "gpt-5.6-sol",
             "C:/catalog.json",
             "sk-local-key",
-            "http://127.0.0.1:18080",
+            "http://127.0.0.1:18082",
             "medium",
             false,
             false,
@@ -972,7 +1092,7 @@ sandbox = "unelevated"
             "gpt-5.6-sol",
             &catalog,
             "sk-local-key",
-            "http://127.0.0.1:18080",
+            "http://127.0.0.1:18082",
             "medium",
             false,
             false,
@@ -1022,7 +1142,7 @@ sandbox = "unelevated"
             "gpt-5.6-sol",
             &catalog,
             "sk-local-key",
-            "http://127.0.0.1:18080",
+            "http://127.0.0.1:18082",
             "medium",
             false,
             false,
@@ -1071,7 +1191,7 @@ sandbox = "unelevated"
             ],
             deploy: crate::config::DeployConfig {
                 codex_home: codex_home.to_string_lossy().into_owned(),
-                sub2api_host: "http://127.0.0.1:18080".to_owned(),
+                sub2api_host: "http://127.0.0.1:18082".to_owned(),
                 ..Default::default()
             },
             ..Default::default()
@@ -1115,6 +1235,53 @@ sandbox = "unelevated"
             !repair_codex_router_binding_with_key(&cfg, &tmp, "fixture-local-router-key").unwrap()
         );
         assert_eq!(std::fs::read(codex_home.join("auth.json")).unwrap(), auth);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn write_codex_config_preserves_desktop_selected_model_and_reasoning() {
+        let tmp = std::env::temp_dir().join(format!(
+            "codex-router-write-preserve-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let router_root = tmp.join("router-root");
+        let codex_home = tmp.join("codex-home");
+        std::fs::create_dir_all(&router_root).unwrap();
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "model = \"deepseek-v4-flash\"\nmodel_provider = \"codex_router\"\nmodel_reasoning_effort = \"high\"\n",
+        )
+        .unwrap();
+
+        let cfg = RouterConfig {
+            default_model: "gpt-5.6-sol".to_owned(),
+            models: vec![
+                ModelConfig {
+                    source: "apikey".to_owned(),
+                    model: "gpt-5.6-sol".to_owned(),
+                    ..Default::default()
+                },
+                ModelConfig {
+                    source: "apikey".to_owned(),
+                    model: "deepseek-v4-flash".to_owned(),
+                    ..Default::default()
+                },
+            ],
+            deploy: crate::config::DeployConfig {
+                codex_home: codex_home.to_string_lossy().into_owned(),
+                sub2api_host: "http://127.0.0.1:18082".to_owned(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        write_codex_config_from_router_config(&cfg, &router_root).unwrap();
+        let written = std::fs::read_to_string(codex_home.join("config.toml")).unwrap();
+        assert!(written.contains("model = \"deepseek-v4-flash\""));
+        assert!(written.contains("model_reasoning_effort = \"high\""));
+        assert!(!written.contains("model = \"gpt-5.6-sol\""));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

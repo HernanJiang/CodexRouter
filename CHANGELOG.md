@@ -2,6 +2,49 @@
 
 本文件记录面向用户的重要变化。完整技术细节以对应版本的源码和 GitHub Release 为准。
 
+## 1.7.4 - 2026-08-16
+
+### 修复
+
+- 普通生成不再因历史条数自动本地压缩，避免 Gemini 中途出现“上下文已完成本地压缩与恢复”后停住；仅 Codex 明确调用 `/compact` 时才做摘要压缩。
+- 启动和自检时重新拉起 Responses 兼容网关（18082），避免热替换后网关消失。
+- 目录截断上限再提高；catalog 增加 `display_order` 与 `priority` 同步为列表序号。
+- 延续 1.7.3：中文默认、DeepSeek 白名单绕过、会话隔离、Kimi 文本函数转写、授权误报拆分。
+
+升级后请完全重启 Codex-Router 和 Codex。
+
+## 1.7.3 - 2026-08-15
+
+### 界面
+
+- 实时用量页提高信息密度，并把同一 coding plan（例如多个 Grok 账号）合并到一张卡片内分区展示。
+- 路由配置区块右下方新增渠道用量：套餐显示最小周期进度条，按量渠道显示输入/输出 Token 与缓存命中率。
+- 路由列表顺序与写入 Codex 的目录顺序对齐；拖动后立即同步 `model-catalog.json`。
+
+### 修复
+
+- 修复额度页把本地管理会话失效或 403 套餐策略误报成“请前往授权页重新登录”。
+- 第三方模型本地压缩改为摘要保留，并提高触发阈值；不再仅因指令里出现 summarize 就压缩。
+- Grok 4.6 使用 50 万上下文窗口；目录截断上限从 1 万 token 提高到按窗口计算，缓解 Gemini 中途截断。
+- 网关转译 Kimi 等模型泄漏到正文的 `functions__exec` 为标准 `exec_command` 工具调用。
+- ChatGPT 登录下可调用 `deepseek-v4-flash` 等第三方模型，不再被官方白名单拦截。
+- 近端/远端同步时保留 Codex `[desktop]` 排版键，避免旧远端布局覆盖近端修改。
+- Agent 默认稳定使用简体中文，并禁止把 CodexRouter 目录误读进其他会话。
+
+升级后请完全重启 Codex-Router，并完全重启 Codex。
+
+## 1.7.2 - 2026-08-15
+
+### 修复
+
+- 修复第三方模型（如 Grok）自动压缩上下文时一直失败、界面一直显示“正在自动压缩上下文”的问题。Router 现在会在请求到达 Sub2API 之前清掉这些模型无法解析的加密推理、compaction 和 MCP/计算机用途条目，必要时改为本地截断历史。
+- 修复子 Agent 使用 ChatGPT 以外模型，或主对话在第三方模型与 ChatGPT 之间切换后，出现 `Encrypted function output content could not be decrypted or decoded` 并断开流的问题。明文被误标成加密内容时会改回普通 tool output；真正的 OpenAI 加密块仍原样保留。
+- 修复上述失败被 Sub2API 包装成 `502 Bad Gateway: Upstream request failed` 后，主对话卡住、新对话也全部 502 的问题。协议不兼容错误不再以 502 回传，避免 Codex 把整个本机 Router 当成上游宕机并无限重试。
+- 同时存在第三方模型时，ChatGPT 目录改为 multi-agent v1，避免父 Agent 继续使用加密的子 Agent 回传协议。
+- Grok / Antigravity OAuth 账号默认关闭 `openai_compact_supported`，不再把官方 compact 协议转发给这些上游。
+
+升级后请完全重启 Codex-Router，并完全重启 Codex，让本机网关和模型目录生效。
+
 ## 1.7.1 - 2026-08-15
 
 ### 安装与发布

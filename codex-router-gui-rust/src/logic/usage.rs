@@ -252,6 +252,7 @@ impl AdminClient {
             {
                 return Ok(candidate);
             }
+            let _ = clear_cached_admin_token(router_root);
         }
 
         let mut candidates = Vec::new();
@@ -299,7 +300,7 @@ impl AdminClient {
         if rate_limited {
             bail!("class=rate_limit")
         }
-        bail!("class=authentication")
+        bail!("class=admin_session")
     }
 
     pub(super) fn get(&self, path: &str, timeout: Duration) -> anyhow::Result<Value> {
@@ -2669,6 +2670,14 @@ fn write_cached_admin_token(router_root: &Path, token: &str) -> anyhow::Result<(
     atomic_write(&admin_cache_path(router_root), &serde_json::to_vec(&body)?)
 }
 
+fn clear_cached_admin_token(router_root: &Path) -> std::io::Result<()> {
+    let path = admin_cache_path(router_root);
+    match std::fs::remove_file(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
 fn credential_string(name: &str) -> Option<Zeroizing<String>> {
     if name.trim().is_empty() {
         return None;
@@ -2736,7 +2745,7 @@ fn classify_request_error(error: reqwest::Error) -> anyhow::Error {
 fn classify_status(status: u16) -> &'static str {
     match status {
         401 => "class=authentication",
-        403 => "class=permission",
+        403 => "class=quota_denied",
         429 => "class=rate_limit",
         500..=599 => "class=upstream",
         _ => "class=request_failure",

@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.7.1-0969da" alt="Version 1.7.1">
+  <img src="https://img.shields.io/badge/version-1.7.4-0969da" alt="Version 1.7.4">
   <img src="https://img.shields.io/badge/platform-Windows%20%2F%20macOS%20%2F%20Linux-0078d4" alt="Windows / macOS / Linux">
   <img src="https://img.shields.io/badge/architecture-x64-555555" alt="x64">
   <img src="https://img.shields.io/badge/runtime-portable%20%2B%20installer-2ea44f" alt="Portable and installer runtime">
@@ -113,19 +113,13 @@ The current runtime retains the memory and background-work optimizations. Idle t
 
 ## Download And First Run
 
-Download the Windows x64 package from [GitHub Releases](https://github.com/HernanJiang/CodexRouter/releases/tag/v1.7.1):
+Download the Windows x64 package from [GitHub Releases](https://github.com/HernanJiang/CodexRouter/releases/tag/v1.7.4):
 
-`Codex-Router-Portable-1.7.1-windows-x64.zip`
+`Codex-Router-Portable-1.7.4-windows-x64.zip`
 
-An optional per-user installer is also provided as `Codex-Router-Installer-1.7.1-windows-x64.exe`. It opens a setup wizard so you can choose the install location, keep a desktop shortcut by default, and confirm before installation starts. The default location is `%LOCALAPPDATA%\Programs\CodexRouter\1.7.1`. No administrator access is required.
+An optional per-user installer is also provided as `Codex-Router-Installer-1.7.4-windows-x64.exe`. It opens a setup wizard so you can choose the install location, keep a desktop shortcut by default, and confirm before installation starts. The default location is `%LOCALAPPDATA%\Programs\CodexRouter\1.7.4`. No administrator access is required.
 
-This release also includes theoretical Unix packages:
-
-- `CodexRouter-1.7.1-linux-x64-theoretical.tar.gz`
-- `CodexRouter-1.7.1-macos-arm64-theoretical.tar.gz`
-- `CodexRouter-1.7.1-macos-x64-theoretical.tar.gz`
-
-These Unix builds are theoretical and have not been tested on real macOS or Linux machines. The current supported runtime remains Windows 10/11 x64.
+This GitHub Release publishes the verified Windows installer and portable package. Theoretical macOS / Linux binaries can still be produced from source via the repository workflow; they have not been tested on real machines. The current supported runtime remains Windows 10/11 x64.
 
 For transient pre-output stream failures such as `Upstream request failed`, the router now allows up to five same-account retries by default with a longer 1.5-second interval. The request is never replayed after visible model output has started.
 
@@ -146,7 +140,7 @@ The first launch opens on page one of the end-to-end guide. It walks through the
 5. Apply the configuration. Router initializes its local services and updates the Codex provider configuration.
 6. Use the Codex model menu to switch models in the same context window.
 
-The current supported runtime is Windows 10/11 x64. ARM64 Windows is not included. macOS and Linux packages in this release are theoretical builds and have not been tested on real machines.
+The current supported runtime is Windows 10/11 x64. ARM64 Windows is not included. macOS and Linux remain theoretical targets in this release and are not included in the published Windows packages.
 
 ## Security And Terms
 
@@ -165,4 +159,4 @@ The desktop UI and usage-monitoring runtime are in `codex-router-gui-rust`. Rout
 
 Official repository: <https://github.com/HernanJiang/CodexRouter>
 
-macOS and Linux packages in this release are theoretical builds. They have not been tested on real macOS or Linux machines. Contributions that help build and verify those versions are welcome.
+macOS and Linux remain theoretical targets. They have not been tested on real machines. Contributions that help build and verify those versions are welcome.

@@ -1,6 +1,7 @@
 use super::{
     ensure_full_ui_fonts, theme, CloseBehavior, CodexRouterApp, IsolationKind, IsolationProfile,
-    ModelConfig, OAuthAccountSummary, Page, RouterConfig, UsageAccount, UsageWindow, APP_VERSION,
+    ModelConfig, OAuthAccountSummary, Page, RouterConfig, UsageAccount, UsageSnapshot,
+    UsageWindow, APP_VERSION,
     OFFICIAL_GITHUB_URL,
 };
 use eframe::egui;
@@ -338,6 +339,88 @@ mod ordering_tests {
         assert!(!super::CodexRouterApp::usage_account_is_quota_plan(
             &model_window_only
         ));
+    }
+
+    #[test]
+    fn same_coding_plan_accounts_share_one_group_key() {
+        let grok_a = super::UsageAccount {
+            id: 1,
+            kind: "oauth".into(),
+            platform: "grok".into(),
+            name: "Grok One".into(),
+            ..Default::default()
+        };
+        let grok_b = super::UsageAccount {
+            id: 2,
+            kind: "oauth".into(),
+            platform: "grok".into(),
+            name: "Grok Two".into(),
+            ..Default::default()
+        };
+        let kimi = super::UsageAccount {
+            id: 3,
+            kind: "apikey".into(),
+            platform: "kimi".into(),
+            windows: vec![super::UsageWindow {
+                kind: "weekly".into(),
+                used_percent: Some(10.0),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            super::CodexRouterApp::usage_plan_group_key(&grok_a),
+            super::CodexRouterApp::usage_plan_group_key(&grok_b)
+        );
+        let groups = super::CodexRouterApp::group_usage_accounts(&[&grok_a, &kimi, &grok_b]);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].len(), 2);
+        assert_eq!(groups[0][0].id, 1);
+        assert_eq!(groups[0][1].id, 2);
+    }
+
+    #[test]
+    fn model_row_usage_matches_oauth_account_id_then_provider() {
+        let snapshot = super::UsageSnapshot {
+            subscriptions: vec![super::UsageAccount {
+                id: 24,
+                kind: "oauth".into(),
+                platform: "grok".into(),
+                name: "Grok A".into(),
+                ..Default::default()
+            }],
+            api_channels: vec![super::UsageAccount {
+                id: 90,
+                kind: "apikey".into(),
+                platform: "kimi".into(),
+                name: "Codex-Router / Kimi".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let grok = super::ModelConfig {
+            source: "oauth".into(),
+            model: "grok-4.6".into(),
+            oauth_account_id: 24,
+            oauth_platform: "grok".into(),
+            ..Default::default()
+        };
+        let kimi = super::ModelConfig {
+            source: "apikey".into(),
+            model: "kimi-for-coding".into(),
+            base_url: "https://api.kimi.com/coding/v1".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::CodexRouterApp::usage_account_for_model(&snapshot, &grok)
+                .map(|account| account.id),
+            Some(24)
+        );
+        assert_eq!(
+            super::CodexRouterApp::usage_account_for_model(&snapshot, &kimi)
+                .map(|account| account.id),
+            Some(90)
+        );
     }
 
     #[test]
@@ -7738,7 +7821,7 @@ impl CodexRouterApp {
             if let Some(used_percent) = window.used_percent {
                 let progress = (100.0 - used_percent.clamp(0.0, 100.0)) / 100.0;
                 let (bar_rect, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), 10.0),
+                    egui::vec2(ui.available_width(), 7.0),
                     egui::Sense::hover(),
                 );
                 ui.painter()
@@ -7782,51 +7865,46 @@ impl CodexRouterApp {
         let reset = Self::usage_reset_label(window, zh);
         let remaining = remaining_quota_percent(window.used_percent);
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(label).strong().color(palette.ink));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    egui::RichText::new(match remaining {
-                        Some(value) if zh => format!("剩余 {value:.0}%"),
-                        Some(value) => format!("{value:.0}% remaining"),
-                        None => t(zh, "额度不可用", "Quota unavailable").to_owned(),
-                    })
-                    .small()
-                    .strong()
-                    .color(palette.ink_soft),
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.label(egui::RichText::new(label).small().strong().color(palette.ink));
+            ui.label(
+                egui::RichText::new(match remaining {
+                    Some(value) if zh => format!("{value:.0}%"),
+                    Some(value) => format!("{value:.0}%"),
+                    None => "—".to_owned(),
+                })
+                .small()
+                .strong()
+                .color(palette.ink_soft),
+            );
+            let bar_width = (ui.available_width() - 132.0).clamp(56.0, 220.0);
+            let progress = remaining.unwrap_or(0.0) / 100.0;
+            let (bar_rect, _) =
+                ui.allocate_exact_size(egui::vec2(bar_width, 6.0), egui::Sense::hover());
+            ui.painter()
+                .rect_filled(bar_rect, egui::CornerRadius::same(3), palette.paper_alt);
+            if progress > 0.0 {
+                let fill_rect = egui::Rect::from_min_size(
+                    bar_rect.min,
+                    egui::vec2(bar_rect.width() * progress, bar_rect.height()),
                 );
-            });
-        });
-        let progress = remaining.unwrap_or(0.0) / 100.0;
-        let (bar_rect, _) =
-            ui.allocate_exact_size(egui::vec2(ui.available_width(), 10.0), egui::Sense::hover());
-        ui.painter()
-            .rect_filled(bar_rect, egui::CornerRadius::same(5), palette.paper_alt);
-        if progress > 0.0 {
-            let fill_rect = egui::Rect::from_min_size(
-                bar_rect.min,
-                egui::vec2(bar_rect.width() * progress, bar_rect.height()),
-            );
-            ui.painter().rect_filled(
-                fill_rect,
-                egui::CornerRadius::same(5),
-                if remaining.unwrap_or(0.0) <= 5.0 {
-                    palette.danger
-                } else {
-                    palette.action
-                },
-            );
-        }
-        ui.horizontal_wrapped(|ui| {
+                ui.painter().rect_filled(
+                    fill_rect,
+                    egui::CornerRadius::same(3),
+                    if remaining.unwrap_or(0.0) <= 5.0 {
+                        palette.danger
+                    } else {
+                        palette.action
+                    },
+                );
+            }
             ui.label(egui::RichText::new(reset).small().color(palette.muted));
             if window.tokens > 0 || window.requests > 0 {
                 ui.label(
                     egui::RichText::new(format!(
-                        "{} · {} {} · {} {}",
-                        "•",
+                        "{}·{}",
                         Self::compact_number(window.tokens),
-                        t(zh, "tokens", "tokens"),
-                        window.requests,
-                        t(zh, "次请求", "requests")
+                        window.requests
                     ))
                     .small()
                     .color(palette.muted),
@@ -7846,9 +7924,10 @@ impl CodexRouterApp {
             .fill(palette.paper)
             .stroke(egui::Stroke::new(1.0, palette.line))
             .corner_radius(egui::CornerRadius::same(7))
-            .inner_margin(egui::Margin::symmetric(20, 17))
+            .inner_margin(egui::Margin::symmetric(8, 5))
             .shadow(theme::soft_card_shadow())
             .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
                 ui.set_min_width(ui.available_width());
                 ui.set_max_width(ui.available_width());
                 let drag_handle = ui
@@ -7858,7 +7937,7 @@ impl CodexRouterApp {
                             ui.add(
                                 egui::Label::new(
                                     egui::RichText::new(&account.name)
-                                        .font(egui::FontId::new(17.0, theme::display_family()))
+                                        .font(egui::FontId::new(14.0, theme::display_family()))
                                         .color(palette.ink),
                                 )
                                 .wrap(),
@@ -7898,33 +7977,19 @@ impl CodexRouterApp {
                         .inner
                     })
                     .inner;
-                ui.add_space(10.0);
-
-                ui.columns(3, |columns| {
-                    let values = [
-                        (
-                            t(zh, "31 天 TOKENS", "31-DAY TOKENS"),
-                            Self::compact_number(account.totals.total_tokens),
-                        ),
-                        (
-                            t(zh, "请求", "REQUESTS"),
-                            account.totals.requests.to_string(),
-                        ),
-                        (
-                            t(zh, "估算费用", "EST. COST"),
-                            format!("${:.4}", account.totals.cost),
-                        ),
-                    ];
-                    for (column, (label, value)) in columns.iter_mut().zip(values) {
-                        column.label(egui::RichText::new(label).small().color(palette.muted));
-                        column.label(egui::RichText::new(value).strong().color(palette.ink));
-                    }
-                });
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} tok · {} {} · ${:.2}",
+                        Self::compact_number(account.totals.total_tokens),
+                        account.totals.requests,
+                        t(zh, "次", "req"),
+                        account.totals.cost
+                    ))
+                    .small()
+                    .color(palette.ink_soft),
+                );
 
                 if subscription || !account.windows.is_empty() {
-                    ui.add_space(12.0);
-                    ui.separator();
-                    ui.add_space(8.0);
                     let readable_windows = account
                         .windows
                         .iter()
@@ -7943,15 +8008,12 @@ impl CodexRouterApp {
                     } else {
                         for (index, window) in readable_windows.into_iter().enumerate() {
                             if index > 0 {
-                                ui.add_space(10.0);
+                                ui.add_space(4.0);
                             }
                             Self::show_usage_window(ui, window, palette, zh);
                         }
                     }
                 } else if !account.totals.models.is_empty() {
-                    ui.add_space(12.0);
-                    ui.separator();
-                    ui.add_space(8.0);
                     for model in &account.totals.models {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(
@@ -7979,7 +8041,6 @@ impl CodexRouterApp {
                 }
 
                 if !account.status_detail.trim().is_empty() {
-                    ui.add_space(10.0);
                     ui.label(
                         egui::RichText::new(&account.status_detail)
                             .small()
@@ -7987,7 +8048,6 @@ impl CodexRouterApp {
                     );
                 }
                 if !account.query_note.trim().is_empty() {
-                    ui.add_space(6.0);
                     ui.label(
                         egui::RichText::new(&account.query_note)
                             .small()
@@ -8000,7 +8060,6 @@ impl CodexRouterApp {
                     &account.updated_at
                 };
                 if !source_time.is_empty() {
-                    ui.add_space(5.0);
                     ui.label(
                         egui::RichText::new(format!(
                             "{}: {}",
@@ -8029,6 +8088,61 @@ impl CodexRouterApp {
             })
     }
 
+    fn usage_plan_group_key(account: &UsageAccount) -> String {
+        let platform = if account.platform.trim().is_empty() {
+            account
+                .name
+                .split(['/', '·', '-'])
+                .next()
+                .unwrap_or("plan")
+                .trim()
+                .to_ascii_lowercase()
+        } else {
+            account.platform.trim().to_ascii_lowercase()
+        };
+        if account.kind == "oauth" {
+            format!("oauth:{platform}")
+        } else if Self::usage_account_is_quota_plan(account) {
+            format!("plan:{platform}")
+        } else {
+            format!("id:{}", account.id)
+        }
+    }
+
+    fn group_usage_accounts<'a>(accounts: &[&'a UsageAccount]) -> Vec<Vec<&'a UsageAccount>> {
+        let mut groups: Vec<(String, Vec<&'a UsageAccount>)> = Vec::new();
+        for account in accounts {
+            let key = Self::usage_plan_group_key(account);
+            if let Some((_, group)) = groups.iter_mut().find(|(existing, _)| existing == &key) {
+                group.push(*account);
+            } else {
+                groups.push((key, vec![*account]));
+            }
+        }
+        groups.into_iter().map(|(_, accounts)| accounts).collect()
+    }
+
+    fn usage_token_breakdown(account: &UsageAccount) -> (i64, i64, i64) {
+        let mut input = 0;
+        let mut output = 0;
+        let mut cache_read = 0;
+        for model in &account.totals.models {
+            input += model.input_tokens;
+            output += model.output_tokens;
+            cache_read += model.cache_read_tokens;
+        }
+        (input, output, cache_read)
+    }
+
+    fn usage_cache_hit_rate(input: i64, cache_read: i64) -> f32 {
+        let denom = input + cache_read;
+        if denom <= 0 {
+            0.0
+        } else {
+            cache_read as f32 / denom as f32 * 100.0
+        }
+    }
+
     fn show_usage_account_grid(
         ui: &mut egui::Ui,
         accounts: &[&UsageAccount],
@@ -8038,7 +8152,8 @@ impl CodexRouterApp {
         two_columns: bool,
     ) -> Option<(UsageOrderSection, i64, i64)> {
         let mut usage_reorder = None;
-        let gap = 10.0;
+        let gap = 6.0;
+        let grouped = Self::group_usage_accounts(accounts);
         // Edge gutter keeps the right column off the scrollbar; never force a
         // floor width that would overflow and wrap into a blank second row.
         let edge_gutter = 8.0;
@@ -8048,7 +8163,7 @@ impl CodexRouterApp {
         } else {
             1usize
         };
-        let assignments = usage_column_indices(accounts.len(), columns);
+        let assignments = usage_column_indices(grouped.len(), columns);
         ui.allocate_ui_with_layout(
             egui::vec2(usable_width, 0.0),
             egui::Layout::top_down(egui::Align::Min),
@@ -8060,19 +8175,30 @@ impl CodexRouterApp {
                             if position > 0 {
                                 column.add_space(gap);
                             }
-                            let account = accounts[index];
+                            let group = &grouped[index];
+                            let account = group[0];
                             let account_section = if account.kind == "oauth" {
                                 UsageOrderSection::Subscription
                             } else {
                                 UsageOrderSection::Api
                             };
-                            let (card, handle) = Self::show_usage_account(
-                                column,
-                                account,
-                                palette,
-                                zh,
-                                subscription || account.kind == "oauth",
-                            );
+                            let (card, handle) = if group.len() == 1 {
+                                Self::show_usage_account(
+                                    column,
+                                    account,
+                                    palette,
+                                    zh,
+                                    subscription || account.kind == "oauth",
+                                )
+                            } else {
+                                Self::show_usage_plan_group(
+                                    column,
+                                    group,
+                                    palette,
+                                    zh,
+                                    subscription,
+                                )
+                            };
                             handle.dnd_set_drag_payload(UsageOrderDrag {
                                 section: account_section,
                                 account_id: account.id,
@@ -8103,6 +8229,260 @@ impl CodexRouterApp {
         usage_reorder
     }
 
+    fn show_usage_plan_group(
+        ui: &mut egui::Ui,
+        accounts: &[&UsageAccount],
+        palette: &theme::Palette,
+        zh: bool,
+        subscription: bool,
+    ) -> (egui::Response, egui::Response) {
+        let title = accounts
+            .first()
+            .map(|account| {
+                if account.platform.trim().is_empty() {
+                    account.name.clone()
+                } else {
+                    account.platform.clone()
+                }
+            })
+            .unwrap_or_else(|| t(zh, "套餐", "Plan").to_owned());
+        let card = egui::Frame::new()
+            .fill(palette.paper)
+            .stroke(egui::Stroke::new(1.0, palette.line))
+            .corner_radius(egui::CornerRadius::same(7))
+            .inner_margin(egui::Margin::symmetric(8, 5))
+            .shadow(theme::soft_card_shadow())
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.set_min_width(ui.available_width());
+                let drag_handle = ui
+                    .horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} · {} {}",
+                                title,
+                                accounts.len(),
+                                t(zh, "个账号", "accounts")
+                            ))
+                            .font(egui::FontId::new(14.0, theme::display_family()))
+                            .color(palette.ink),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add(
+                                egui::Button::new(
+                                    egui::RichText::new("≡").size(16.0).color(palette.ink_soft),
+                                )
+                                .fill(palette.paper_alt)
+                                .stroke(egui::Stroke::new(1.0, palette.line))
+                                .corner_radius(egui::CornerRadius::same(5))
+                                .sense(egui::Sense::drag()),
+                            )
+                        })
+                        .inner
+                    })
+                    .inner;
+                for (index, account) in accounts.iter().enumerate() {
+                    if index > 0 {
+                        ui.separator();
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.label(
+                            egui::RichText::new(&account.name)
+                                .small()
+                                .strong()
+                                .color(palette.ink),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("#{} · {}", account.id, account.status))
+                                .small()
+                                .color(palette.muted),
+                        );
+                        let (health, health_color) = Self::usage_health(account, palette, zh);
+                        theme::pill(ui, health, palette.paper_alt, health_color);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} tok · {} {} · ${:.2}",
+                                Self::compact_number(account.totals.total_tokens),
+                                account.totals.requests,
+                                t(zh, "次", "req"),
+                                account.totals.cost
+                            ))
+                            .small()
+                            .color(palette.ink_soft),
+                        );
+                    });
+                    if subscription || !account.windows.is_empty() {
+                        for window in account
+                            .windows
+                            .iter()
+                            .filter(|window| Self::usage_window_is_readable(window))
+                            .take(3)
+                        {
+                            Self::show_usage_window(ui, window, palette, zh);
+                        }
+                    }
+                }
+                drag_handle
+            });
+        (card.response, card.inner)
+    }
+
+    fn usage_account_for_model<'a>(
+        snapshot: &'a UsageSnapshot,
+        model: &ModelConfig,
+    ) -> Option<&'a UsageAccount> {
+        if model.source.eq_ignore_ascii_case("oauth") && model.oauth_account_id > 0 {
+            if let Some(account) = snapshot
+                .subscriptions
+                .iter()
+                .find(|account| account.id == model.oauth_account_id)
+            {
+                return Some(account);
+            }
+        }
+        let hay = format!(
+            "{} {} {} {}",
+            model.model, model.alias, model.base_url, model.oauth_platform
+        )
+        .to_ascii_lowercase();
+        snapshot
+            .api_channels
+            .iter()
+            .chain(snapshot.subscriptions.iter())
+            .find(|account| {
+                let platform = account.platform.trim().to_ascii_lowercase();
+                if !platform.is_empty()
+                    && platform.len() >= 3
+                    && (hay.contains(&platform) || platform.contains("openai") && hay.contains("gpt"))
+                {
+                    return true;
+                }
+                ["kimi", "deepseek", "glm", "zhipu", "ark", "volcengine", "openrouter", "mimo", "moonshot", "grok", "gemini", "claude"]
+                    .iter()
+                    .any(|keyword| {
+                        hay.contains(keyword)
+                            && (account.name.to_ascii_lowercase().contains(keyword)
+                                || account.platform.to_ascii_lowercase().contains(keyword))
+                    })
+            })
+    }
+
+    fn usage_window_short_label(window: &UsageWindow, zh: bool) -> String {
+        match window.kind.as_str() {
+            "fiveHour" => t(zh, "5h", "5h").to_owned(),
+            "daily" => t(zh, "日", "day").to_owned(),
+            "weekly" => t(zh, "周", "wk").to_owned(),
+            "monthly" => t(zh, "月", "mo").to_owned(),
+            "balance" => t(zh, "余额", "bal").to_owned(),
+            _ => Self::usage_window_label(window, zh),
+        }
+    }
+
+    fn show_model_row_usage(
+        ui: &mut egui::Ui,
+        account: Option<&UsageAccount>,
+        palette: &theme::Palette,
+        zh: bool,
+    ) {
+        let Some(account) = account else {
+            ui.label(
+                egui::RichText::new(t(zh, "暂无用量", "No usage"))
+                    .small()
+                    .color(palette.muted),
+            );
+            return;
+        };
+        ui.spacing_mut().item_spacing.x = 8.0;
+        if Self::usage_account_is_quota_plan(account) {
+            let mut shown = 0;
+            for window in account
+                .windows
+                .iter()
+                .filter(|window| Self::usage_window_is_readable(window))
+            {
+                if shown >= 2 {
+                    break;
+                }
+                shown += 1;
+                if window.kind == "balance" {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} {}",
+                            t(zh, "余额", "bal"),
+                            Self::usage_amount(window.remaining_amount.unwrap_or_default(), &window.currency)
+                        ))
+                        .small()
+                        .color(palette.ink_soft),
+                    );
+                    continue;
+                }
+                let remaining = remaining_quota_percent(window.used_percent);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} {}",
+                        Self::usage_window_short_label(window, zh),
+                        match remaining {
+                            Some(value) => format!("{value:.0}%"),
+                            None => "—".to_owned(),
+                        }
+                    ))
+                    .small()
+                    .color(palette.ink_soft),
+                );
+                let progress = remaining.unwrap_or(0.0) / 100.0;
+                let (bar_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(42.0, 6.0), egui::Sense::hover());
+                ui.painter()
+                    .rect_filled(bar_rect, egui::CornerRadius::same(3), palette.paper_alt);
+                if progress > 0.0 {
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_size(
+                            bar_rect.min,
+                            egui::vec2(bar_rect.width() * progress, bar_rect.height()),
+                        ),
+                        egui::CornerRadius::same(3),
+                        if remaining.unwrap_or(0.0) <= 5.0 {
+                            palette.danger
+                        } else {
+                            palette.action
+                        },
+                    );
+                }
+            }
+            if shown == 0 {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} tok",
+                        Self::compact_number(account.totals.total_tokens)
+                    ))
+                    .small()
+                    .color(palette.muted),
+                );
+            }
+        } else {
+            let (input, output, cache_read) = Self::usage_token_breakdown(account);
+            let hit = Self::usage_cache_hit_rate(input, cache_read);
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} {} · {} {} · {} {:.0}%",
+                    t(zh, "入", "in"),
+                    Self::compact_number(if input > 0 {
+                        input
+                    } else {
+                        account.totals.total_tokens
+                    }),
+                    t(zh, "出", "out"),
+                    Self::compact_number(output),
+                    t(zh, "缓存", "cache"),
+                    hit
+                ))
+                .small()
+                .color(palette.ink_soft),
+            );
+        }
+    }
+
     fn show_usage_monitor(&mut self, ui: &mut egui::Ui, palette: &theme::Palette) {
         let zh = self.ui_language == "zh";
         ui.horizontal(|ui| {
@@ -8118,7 +8498,7 @@ impl CodexRouterApp {
                 );
                 ui.label(
                     egui::RichText::new(t(zh, "实时用量统计", "LIVE USAGE"))
-                        .font(egui::FontId::new(36.0, theme::display_family()))
+                        .font(egui::FontId::new(24.0, theme::display_family()))
                         .color(egui::Color32::WHITE),
                 );
             });
@@ -8142,7 +8522,7 @@ impl CodexRouterApp {
                 }
             });
         });
-        ui.add_space(10.0);
+        ui.add_space(6.0);
 
         if self.usage_loading {
             ui.horizontal(|ui| {
@@ -9039,6 +9419,7 @@ impl CodexRouterApp {
                 .unwrap_or_default()
                 .to_owned();
             let route_plan = super::logic::catalog::build_route_plan(&self.config);
+            let usage_snapshot = self.usage_snapshot.clone();
             if !self.config.models.is_empty() {
                 egui::ScrollArea::vertical()
                     .id_salt("dashboard-model-list-scroll")
@@ -9164,7 +9545,7 @@ impl CodexRouterApp {
                                             },
                                         );
                                     });
-                                    ui.horizontal_wrapped(|ui| {
+                                    ui.horizontal(|ui| {
                                         ui.spacing_mut().item_spacing.x = 6.0;
                                         theme::pill(
                                             ui,
@@ -9198,6 +9579,21 @@ impl CodexRouterApp {
                                                 palette.success
                                             } else {
                                                 palette.muted
+                                            },
+                                        );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                let account = usage_snapshot.as_ref().and_then(
+                                                    |snapshot| {
+                                                        Self::usage_account_for_model(
+                                                            snapshot, model,
+                                                        )
+                                                    },
+                                                );
+                                                Self::show_model_row_usage(
+                                                    ui, account, palette, zh,
+                                                );
                                             },
                                         );
                                     });
@@ -9249,12 +9645,21 @@ impl CodexRouterApp {
                             .save(&crate::user_data::config_path(&self.router_root))
                         {
                             Ok(()) => {
-                                self.status_text = t(
-                                    zh,
-                                    "路由模型顺序已保存；转发优先级保持不变",
-                                    "Model display order saved; routing priorities are unchanged",
-                                )
-                                .to_owned();
+                                let catalog_note =
+                                    match super::logic::write_model_catalog(&self.config, &self.router_root)
+                                    {
+                                        Ok(()) => t(
+                                            zh,
+                                            "路由模型顺序已保存，并已同步写入 Codex 目录",
+                                            "Model order saved and written to the Codex catalog",
+                                        ),
+                                        Err(_) => t(
+                                            zh,
+                                            "路由模型顺序已保存；Codex 目录将在下次保存并应用时更新",
+                                            "Model order saved; the Codex catalog updates on Save & apply",
+                                        ),
+                                    };
+                                self.status_text = catalog_note.to_owned();
                             }
                             Err(error) => {
                                 let message = if zh {

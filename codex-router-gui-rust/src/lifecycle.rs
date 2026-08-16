@@ -1408,6 +1408,8 @@ pub fn ensure_services(
         &user_data::data_root(router_root).join(r"pids\sub2api-network.hmac"),
         fingerprint.as_bytes(),
     )?;
+    logic::responses_gateway::ensure_responses_gateway(base_uri.as_str())
+        .context("failed to start the responses compatibility gateway")?;
     status_services_with_config(router_root, &config)
 }
 
@@ -1430,6 +1432,7 @@ pub fn stop_services(
         )?
     };
     let config = load_config(router_root).unwrap_or_default();
+    logic::responses_gateway::stop_responses_gateway();
     let ports = LifecyclePorts::from_config(&config)?;
     let data_root = user_data::data_root(router_root);
     let sub2api_path = router_root.join(r"app\sub2api.exe");

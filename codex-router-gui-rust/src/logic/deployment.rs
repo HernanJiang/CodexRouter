@@ -261,7 +261,7 @@ where
         .iter()
         .filter(|route| route.include_in_catalog)
         .map(|route| route.public_model_id.clone())
-        .collect::<HashSet<_>>();
+        .collect::<Vec<_>>();
     if visible_models.is_empty() {
         bail!("ROUTER_DEPLOY_NO_SERVABLE_MODEL: no model can currently be served")
     }
@@ -296,13 +296,12 @@ fn list_accounts(admin: &impl AdminApi) -> anyhow::Result<Vec<Value>> {
     Ok(usage::array(usage::get(&body, "items").unwrap_or(&body)).to_vec())
 }
 
-fn ensure_group(admin: &impl AdminApi, models: &HashSet<String>) -> anyhow::Result<i64> {
+fn ensure_group(admin: &impl AdminApi, models: &[String]) -> anyhow::Result<i64> {
     let body = usage::data(admin.get("/api/v1/admin/groups/all?include_inactive=true")?);
     let existing = usage::array(&body)
         .iter()
         .find(|group| usage::string(group, "name") == MANAGED_GROUP_NAME);
-    let mut models = models.iter().cloned().collect::<Vec<_>>();
-    models.sort();
+    let models = models.to_vec();
     let group_body = json!({
         "name": MANAGED_GROUP_NAME,
         "description": "Single-user local Codex multi-model router managed by Codex-Router.",
@@ -560,6 +559,21 @@ fn sync_oauth_and_stale_accounts(
                     credentials.insert("model_mapping".to_owned(), json!(mapping));
                     body["credentials"] = Value::Object(credentials);
                 }
+                let platform = usage::string(&detail, "platform").to_ascii_lowercase();
+                if matches!(
+                    platform.as_str(),
+                    "grok" | "xai" | "x-ai" | "antigravity" | "gemini" | "claude" | "anthropic"
+                ) {
+                    let mut extra = usage::get(&detail, "extra")
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .unwrap_or_default();
+                    extra.insert(
+                        "openai_compact_supported".to_owned(),
+                        Value::Bool(false),
+                    );
+                    body["extra"] = Value::Object(extra);
+                }
             }
             if let Some(proxy_id) = desired_proxy {
                 body["proxy_id"] = proxy_id.into();
@@ -730,12 +744,15 @@ fn visible_public_models(
     routes: &[ModelRoute],
     isolated: &HashSet<i64>,
     cfg: &RouterConfig,
-) -> HashSet<String> {
-    servable_routes(routes, isolated, cfg)
-        .into_iter()
-        .filter(|route| route.include_in_catalog)
-        .map(|route| route.public_model_id)
-        .collect()
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut ordered = Vec::new();
+    for route in servable_routes(routes, isolated, cfg) {
+        if route.include_in_catalog && seen.insert(route.public_model_id.clone()) {
+            ordered.push(route.public_model_id);
+        }
+    }
+    ordered
 }
 
 fn account_platforms(accounts: &[Value]) -> HashMap<i64, String> {
@@ -1039,6 +1056,7 @@ fn apply_openai_channel_policy(base_url: &str, model_id: &str, extra: &mut Map<S
                 "api.kimi.com"
                     | "api.moonshot.ai"
                     | "api.moonshot.cn"
+                    | "api.deepseek.com"
                     | "ark.cn-beijing.volces.com"
             )
         {
@@ -1060,6 +1078,7 @@ fn apply_openai_channel_policy(base_url: &str, model_id: &str, extra: &mut Map<S
             | "api.kimi.com"
             | "api.moonshot.ai"
             | "api.moonshot.cn"
+            | "api.deepseek.com"
             | "ark.cn-beijing.volces.com" => {
                 extra.insert("openai_compact_supported".to_owned(), Value::Bool(false));
             }

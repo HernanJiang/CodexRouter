@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.7.1-0969da" alt="版本 1.7.1">
+  <img src="https://img.shields.io/badge/version-1.7.4-0969da" alt="版本 1.7.4">
   <img src="https://img.shields.io/badge/platform-Windows%20%2F%20macOS%20%2F%20Linux-0078d4" alt="Windows / macOS / Linux">
   <img src="https://img.shields.io/badge/architecture-x64-555555" alt="x64">
   <img src="https://img.shields.io/badge/runtime-portable%20%2B%20installer-2ea44f" alt="便携版与安装版运行时">
@@ -113,19 +113,13 @@ CodexRouter 可以在 Windows 登录后直接进入轻量托盘模式，不启�
 
 ## 下载与首次启动
 
-前往 [GitHub Releases](https://github.com/HernanJiang/CodexRouter/releases/tag/v1.7.1) 下载 Windows x64 版本：
+前往 [GitHub Releases](https://github.com/HernanJiang/CodexRouter/releases/tag/v1.7.4) 下载 Windows x64 版本：
 
-`Codex-Router-Portable-1.7.1-windows-x64.zip`
+`Codex-Router-Portable-1.7.4-windows-x64.zip`
 
-同时提供可选的用户级安装器：`Codex-Router-Installer-1.7.1-windows-x64.exe`。安装时会打开向导，由你选择安装位置、默认创建桌面快捷方式，并在确认后再开始安装。默认路径为 `%LOCALAPPDATA%\Programs\CodexRouter\1.7.1`，不需要管理员权限。
+同时提供可选的用户级安装器：`Codex-Router-Installer-1.7.4-windows-x64.exe`。安装时会打开向导，由你选择安装位置、默认创建桌面快捷方式，并在确认后再开始安装。默认路径为 `%LOCALAPPDATA%\Programs\CodexRouter\1.7.4`，不需要管理员权限。
 
-本版本同时提供理论 Unix 构建包：
-
-- `CodexRouter-1.7.1-linux-x64-theoretical.tar.gz`
-- `CodexRouter-1.7.1-macos-arm64-theoretical.tar.gz`
-- `CodexRouter-1.7.1-macos-x64-theoretical.tar.gz`
-
-这些 Unix 构建为理论构建版本，未经过实际测试。当前受支持的运行时仍是 Windows 10/11 x64。
+本 GitHub Release 发布已验证的 Windows 安装包和便携版。macOS / Linux 理论构建仍可通过仓库 workflow 从源码生成，但未在真实机器上测试。当前受支持的运行时仍是 Windows 10/11 x64。
 
 对于 `Upstream request failed` 这类尚未向客户端输出内容的瞬时流错误，Router 默认允许同一账号最多重试 5 次，每次间隔 1.5 秒。已经开始输出模型内容后不会重复回放请求。
 
@@ -146,7 +140,7 @@ CodexRouter 可以在 Windows 登录后直接进入轻量托盘模式，不启�
 5. 应用配置，Router 会初始化本地服务并更新 Codex Provider 配置。
 6. 回到 Codex，在同一上下文窗口内从模型菜单切换模型。
 
-当前受支持的运行时是 Windows 10/11 x64，不支持 Windows ARM64。本版本中的 macOS 和 Linux 包为理论构建，尚未在真实机器上测试。
+当前受支持的运行时是 Windows 10/11 x64，不支持 Windows ARM64。本版本中的 macOS 和 Linux 仍为理论目标，不包含在已发布的 Windows 包中。
 
 ## 安全与条款
 
@@ -159,4 +153,4 @@ CodexRouter 可以在 Windows 登录后直接进入轻量托盘模式，不启�
 
 官方仓库：<https://github.com/HernanJiang/CodexRouter>
 
-macOS 和 Linux 为理论构建版本，未经过实际测试，欢迎更多用户参与共同构建。
+macOS 和 Linux 仍为理论目标，未经过实际测试，欢迎更多用户参与共同构建。
