@@ -158,18 +158,21 @@ impl CallbackListeners {
     }
 }
 
-pub fn prepare(router_root: &Path, provider: &str, cancel: &AtomicBool) -> anyhow::Result<()> {
+pub fn prepare(
+    router_root: &Path,
+    config: &RouterConfig,
+    provider: &str,
+    cancel: &AtomicBool,
+) -> anyhow::Result<()> {
     Provider::parse(provider)?;
     let _lock = crate::lifecycle::acquire_lifecycle_lock(
         router_root,
         Duration::from_secs(10),
         "Prepare provider OAuth",
     )?;
-    crate::lifecycle::ensure_services(router_root, true, cancel, true)
+    crate::lifecycle::ensure_services_with_config(router_root, config, true, cancel, true)
         .context("ROUTER_OAUTH_PREPARE_ROUTER_START")?;
-    let config = RouterConfig::load(&crate::user_data::config_path(router_root))
-        .context("ROUTER_OAUTH_PREPARE_COMPONENTS: class=configuration")?;
-    let admin = usage::retry_admin_read(|| usage::AdminClient::connect(router_root, &config))
+    let admin = usage::retry_admin_read(|| usage::AdminClient::connect(router_root, config))
         .context("ROUTER_OAUTH_PREPARE_ADMIN_LOGIN")?;
     usage::retry_account_read(|| admin.get("/api/v1/admin/compliance", Duration::from_secs(10)))
         .context("ROUTER_OAUTH_PREPARE_COMPLIANCE")?;
@@ -178,6 +181,7 @@ pub fn prepare(router_root: &Path, provider: &str, cancel: &AtomicBool) -> anyho
 
 pub fn run<F>(
     router_root: &Path,
+    config: &RouterConfig,
     provider: &str,
     compliance_accepted: bool,
     cancel: &AtomicBool,
@@ -192,15 +196,13 @@ where
         Duration::from_secs(10),
         "Start provider OAuth",
     )?;
-    crate::lifecycle::ensure_services(router_root, true, cancel, true)
+    crate::lifecycle::ensure_services_with_config(router_root, config, true, cancel, true)
         .context("ROUTER_OAUTH_PREPARE_ROUTER_START")?;
-    let config = RouterConfig::load(&crate::user_data::config_path(router_root))
-        .context("class=configuration")?;
-    let admin = usage::retry_admin_read(|| usage::AdminClient::connect(router_root, &config))?;
+    let admin = usage::retry_admin_read(|| usage::AdminClient::connect(router_root, config))?;
     accept_compliance_if_required(&admin, compliance_accepted)?;
     let group_id = ensure_router_group(&admin)?;
     let existing = load_existing_accounts(&admin, provider)?;
-    let priority = next_priority(&existing, &config);
+    let priority = next_priority(&existing, config);
     let mut gemini = GeminiOptions::default();
     if provider == Provider::Gemini {
         let detected_project_id = detect_google_project(&admin)?;

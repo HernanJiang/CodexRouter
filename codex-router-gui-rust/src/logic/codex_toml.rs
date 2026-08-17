@@ -8,7 +8,8 @@ use anyhow::{bail, Context};
 use std::path::{Path, PathBuf};
 use toml_edit::{DocumentMut, Item};
 
-const CODEX_ROUTER_MAX_RETRIES: i64 = 3;
+const CODEX_ROUTER_REQUEST_MAX_RETRIES: i64 = 1;
+const CODEX_ROUTER_STREAM_MAX_RETRIES: i64 = 3;
 
 const REASONING_LEVELS: &[&str] = &[
     "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
@@ -251,11 +252,11 @@ fn build_codex_router_provider(
     provider.insert("experimental_bearer_token", toml_edit::value(local_api_key));
     provider.insert(
         "request_max_retries",
-        toml_edit::value(CODEX_ROUTER_MAX_RETRIES),
+        toml_edit::value(CODEX_ROUTER_REQUEST_MAX_RETRIES),
     );
     provider.insert(
         "stream_max_retries",
-        toml_edit::value(CODEX_ROUTER_MAX_RETRIES),
+        toml_edit::value(CODEX_ROUTER_STREAM_MAX_RETRIES),
     );
     provider.insert("stream_idle_timeout_ms", toml_edit::value(300_000_i64));
     provider.insert("supports_websockets", toml_edit::value(false));
@@ -804,7 +805,7 @@ mod tests {
         // Preserve Codex's upstream ChatGPT login contract for OAuth profiles.
         assert!(generated.contains("name = \"Codex-Router\""));
         assert!(generated.contains("requires_openai_auth = true"));
-        assert!(generated.contains("request_max_retries = 3"));
+        assert!(generated.contains("request_max_retries = 1"));
         assert!(generated.contains("stream_max_retries = 3"));
         assert!(!generated.contains("forced_login_method"));
         assert!(generated.contains("model_catalog_json = \"C:/isolated/model-catalog.json\""));

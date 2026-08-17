@@ -6238,6 +6238,7 @@ impl CodexRouterApp {
         let cancel = Arc::new(AtomicBool::new(false));
         self.provider_oauth_prepare_cancel = cancel.clone();
         let cwd = self.router_root.clone();
+        let config = self.config.clone();
         let provider = provider.to_owned();
         let event_provider = provider.clone();
         let tx = self.event_tx.clone();
@@ -6248,7 +6249,7 @@ impl CodexRouterApp {
         std::thread::spawn(move || {
             let mut final_error = "ROUTER_OAUTH_PREPARE_PROCESS stage=unknown".to_owned();
             for attempt in 0..3 {
-                match logic::oauth::prepare(&cwd, &provider, &cancel) {
+                match logic::oauth::prepare(&cwd, &config, &provider, &cancel) {
                     Ok(()) => {
                         tx.send(AppEvent::ProviderOAuthPrepared {
                             provider: event_provider,
@@ -6313,6 +6314,7 @@ impl CodexRouterApp {
 
     fn launch_provider_oauth(&mut self, provider: &str) {
         let cwd = self.router_root.clone();
+        let config = self.config.clone();
         let provider = provider.to_owned();
         let tx = self.event_tx.clone();
         let cancel = self.provider_oauth_cancel.clone();
@@ -6326,7 +6328,7 @@ impl CodexRouterApp {
         std::thread::spawn(move || {
             let prompt_tx = tx.clone();
             let prompt_cancel = cancel.clone();
-            let result = logic::oauth::run(&cwd, &provider, true, &cancel, move |prompt| {
+            let result = logic::oauth::run(&cwd, &config, &provider, true, &cancel, move |prompt| {
                 let (response_tx, response_rx) = channel();
                 prompt_tx
                     .send(AppEvent::ProviderOAuthPrompt {
@@ -7159,6 +7161,9 @@ fn try_cli_mode() -> Option<anyhow::Result<()>> {
     let refresh_codex_binding = args
         .iter()
         .any(|argument| argument == "--refresh-codex-binding");
+    let prepare_provider_oauth = args
+        .iter()
+        .any(|argument| argument == "--prepare-provider-oauth");
     let apply_staged_update = args
         .iter()
         .any(|argument| argument == "--apply-staged-update");
@@ -7170,6 +7175,7 @@ fn try_cli_mode() -> Option<anyhow::Result<()>> {
         && !stop_router_services
         && !router_status
         && !refresh_codex_binding
+        && !prepare_provider_oauth
         && !apply_staged_update
         && !install_portable
     {
@@ -7242,6 +7248,21 @@ fn try_cli_mode() -> Option<anyhow::Result<()>> {
             return Ok(());
         }
 
+        if prepare_provider_oauth {
+            let router_root = argument_value("--router-root=")
+                .map(PathBuf::from)
+                .unwrap_or_else(RouterConfig::find_router_root);
+            let provider = argument_value("--provider=").unwrap_or_else(|| "openai".to_owned());
+            let mut config = RouterConfig::default();
+            if let Some(host) = argument_value("--sub2api-host=") {
+                config.deploy.sub2api_host = host;
+            }
+            let cancel = AtomicBool::new(false);
+            logic::oauth::prepare(&router_root, &config, &provider, &cancel)?;
+            write_cli_result(&serde_json::json!({"status": "ready", "code": "ok"}).to_string())?;
+            return Ok(());
+        }
+
         if ensure_router_services || stop_router_services || router_status {
             let router_root = argument_value("--router-root=")
                 .map(PathBuf::from)
@@ -7258,11 +7279,19 @@ fn try_cli_mode() -> Option<anyhow::Result<()>> {
                     lock_inherited,
                 )?
             } else if stop_router_services {
-                lifecycle::stop_services(
-                    &router_root,
-                    args.iter().any(|argument| argument == "--force"),
-                    lock_inherited,
-                )?
+                let force = args.iter().any(|argument| argument == "--force");
+                if let Some(host) = argument_value("--sub2api-host=") {
+                    let mut config = RouterConfig::default();
+                    config.deploy.sub2api_host = host;
+                    lifecycle::stop_services_with_config(
+                        &router_root,
+                        &config,
+                        force,
+                        lock_inherited,
+                    )?
+                } else {
+                    lifecycle::stop_services(&router_root, force, lock_inherited)?
+                }
             } else {
                 lifecycle::status_services(&router_root)?
             };

@@ -93,20 +93,41 @@ jobs:
           $roots = @(Get-ChildItem -LiteralPath $expanded -Directory)
           if ($roots.Count -ne 1) { throw 'The published stage root is unavailable.' }
           $root = $roots[0].FullName
-          Copy-Item -LiteralPath ./scripts -Destination (Join-Path $root 'scripts') -Recurse
+          $userData = Join-Path $env:RUNNER_TEMP 'fresh-oauth-user-data'
+          New-Item -ItemType Directory -Path $userData -Force | Out-Null
+          $env:CODEX_ROUTER_USER_DATA_ROOT = $userData
+          $pgListener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+          $redisListener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+          $sub2apiListener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+          $pgListener.Start(); $redisListener.Start(); $sub2apiListener.Start()
+          $pgPort = ([Net.IPEndPoint]$pgListener.LocalEndpoint).Port
+          $redisPort = ([Net.IPEndPoint]$redisListener.LocalEndpoint).Port
+          $sub2apiPort = ([Net.IPEndPoint]$sub2apiListener.LocalEndpoint).Port
+          $pgListener.Stop(); $redisListener.Stop(); $sub2apiListener.Stop()
+          $env:CODEX_ROUTER_POSTGRES_PORT = [string]$pgPort
+          $env:CODEX_ROUTER_REDIS_PORT = [string]$redisPort
           try {
-            $output = & (Join-Path $root 'scripts/Start-ProviderOAuth.ps1') `
-              -Provider openai `
-              -PrepareOnly `
-              -TimeoutSeconds 360
+            if (Test-Path -LiteralPath (Join-Path $userData 'codex-router-config.json')) {
+              throw 'Fresh OAuth smoke must start without a persisted Router config.'
+            }
+            $output = & (Join-Path $root 'Codex-Router.exe') `
+              --prepare-provider-oauth `
+              --provider=openai `
+              --sub2api-host="http://127.0.0.1:$sub2apiPort" `
+              --router-root=$root
             if ($LASTEXITCODE -ne 0) { throw 'First OAuth preparation exited unsuccessfully.' }
             $result = $output | Select-Object -Last 1 | ConvertFrom-Json
             if ([string]$result.status -ne 'ready' -or [string]$result.code -ne 'ok') {
               throw "First OAuth preparation was not ready (stage=$($result.stage), code=$($result.code))."
             }
           } finally {
+            Start-Sleep -Milliseconds 750
             & (Join-Path $root 'Codex-Router.exe') `
               --stop-router-services `
+              --sub2api-host="http://127.0.0.1:$sub2apiPort" `
               --router-root=$root `
               --force
+            Remove-Item Env:CODEX_ROUTER_USER_DATA_ROOT -ErrorAction SilentlyContinue
+            Remove-Item Env:CODEX_ROUTER_POSTGRES_PORT -ErrorAction SilentlyContinue
+            Remove-Item Env:CODEX_ROUTER_REDIS_PORT -ErrorAction SilentlyContinue
           }

@@ -461,13 +461,14 @@ where
                 && !target_policy.is_some_and(|policy| policy.bypass)
                 && !official_direct_api_host(&model.base_url),
         );
+        let concurrency = api_account_concurrency(model);
         let mut body = json!({
             "name": account_name,
             "platform": "openai",
             "type": "apikey",
             "credentials": credentials,
             "extra": extra,
-            "concurrency": 8,
+            "concurrency": concurrency,
             "priority": priority,
             "rate_multiplier": 1.0,
             "group_ids": group_ids,
@@ -503,6 +504,14 @@ where
     }
     let _ = router_root;
     Ok(managed_names)
+}
+
+fn api_account_concurrency(model: &ModelConfig) -> i64 {
+    if super::is_volcengine_plan_url(&model.base_url) {
+        2
+    } else {
+        8
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1932,5 +1941,19 @@ mod tests {
         })();
         let _ = crate::logic::remove_isolated_profile_credentials(&[credential_name]);
         result.unwrap();
+    }
+
+    #[test]
+    fn volcengine_coding_plan_uses_conservative_concurrency() {
+        let volcengine = ModelConfig {
+            base_url: "https://ark.cn-beijing.volces.com/api/coding/v3".to_owned(),
+            ..Default::default()
+        };
+        let generic = ModelConfig {
+            base_url: "https://api.example.test/v1".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(api_account_concurrency(&volcengine), 2);
+        assert_eq!(api_account_concurrency(&generic), 8);
     }
 }

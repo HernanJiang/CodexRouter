@@ -7,9 +7,9 @@
 
 use super::responses_compat::{
     is_compact_path, is_openai_family_model, is_responses_path, rewrite_poisoned_upstream_status,
-    rewrite_provider_json, rewrite_sse_text, sanitize_responses_request,
+    is_unsupported_image_error, rewrite_provider_json, rewrite_sse_text, sanitize_responses_request,
     sanitize_responses_request_aggressive, should_retry_after_upstream_error,
-    synthetic_compact_response,
+    sanitize_responses_request_without_images, synthetic_compact_response,
 };
 use anyhow::{bail, Context};
 use serde_json::Value;
@@ -27,6 +27,7 @@ const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RATE_LIMIT_RETRIES: usize = 3;
+const MAX_RATE_LIMIT_DELAY: Duration = Duration::from_secs(10);
 
 struct GatewayState {
     stop: std::sync::Arc<AtomicBool>,
@@ -295,10 +296,14 @@ fn handle_client(mut client: TcpStream, upstream: &str) -> anyhow::Result<()> {
                     .and_then(Value::as_str)
                     .unwrap_or_default(),
             ) {
-                sanitize_responses_request_aggressive(&path, &mut json_body);
+                if is_unsupported_image_error(&body_text) {
+                    sanitize_responses_request_without_images(&path, &mut json_body);
+                } else {
+                    sanitize_responses_request_aggressive(&path, &mut json_body);
+                }
                 let retry_body = serde_json::to_vec(&json_body)?;
                 if let Ok((retry_status, retry_headers, retry_body)) =
-                    forward_error_exchange(upstream, &path, &retry_body)
+                    forward_error_exchange(upstream, &path, &headers, &retry_body)
                 {
                     if retry_status < 400 {
                         client.write_all(&retry_headers)?;
@@ -361,7 +366,10 @@ fn open_upstream_with_rate_limit_retry(
         let response_header_text = String::from_utf8_lossy(&response_headers);
         let status = parse_status(&response_header_text).unwrap_or(200);
         let response_headers_map = parse_headers(&response_header_text);
-        if status != 429 || attempt == RATE_LIMIT_RETRIES {
+        let retry_delay = (status == 429 && attempt < RATE_LIMIT_RETRIES)
+            .then(|| rate_limit_retry_delay(&response_headers_map, attempt))
+            .flatten();
+        if retry_delay.is_none() {
             return Ok(UpstreamResponse {
                 stream,
                 headers: response_headers,
@@ -370,9 +378,23 @@ fn open_upstream_with_rate_limit_retry(
                 header_map: response_headers_map,
             });
         }
-        thread::sleep(Duration::from_millis(250 * (attempt as u64 + 1)));
+        thread::sleep(retry_delay.unwrap());
     }
     unreachable!()
+}
+
+fn rate_limit_retry_delay(
+    headers: &HashMap<String, String>,
+    attempt: usize,
+) -> Option<Duration> {
+    if let Some(seconds) = headers
+        .get("retry-after")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        let delay = Duration::from_secs(seconds.max(1));
+        return (delay <= MAX_RATE_LIMIT_DELAY).then_some(delay);
+    }
+    Some(Duration::from_secs(2_u64.pow(attempt as u32 + 1)))
 }
 
 fn write_upstream_request(
@@ -408,10 +430,11 @@ fn write_upstream_request(
 fn forward_error_exchange(
     upstream: &str,
     path: &str,
+    original_headers: &HashMap<String, String>,
     body: &[u8],
 ) -> anyhow::Result<(u16, Vec<u8>, Vec<u8>)> {
     let mut stream = connect_upstream(upstream)?;
-    let mut headers = HashMap::new();
+    let mut headers = original_headers.clone();
     headers.insert("content-type".to_owned(), "application/json".to_owned());
     write_upstream_request(&mut stream, "POST", path, &mut headers, body, upstream)?;
     let (response_headers, leftover) = read_headers(&mut stream)?;
@@ -952,7 +975,7 @@ mod tests {
                 read_exact_more(&mut socket, &mut body, length).unwrap();
                 attempts_clone.fetch_add(1, Ordering::Relaxed);
                 let response = if index < 2 {
-                    b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                         .as_slice()
                 } else {
                     b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
@@ -972,5 +995,18 @@ mod tests {
         .unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(attempts.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn long_rate_limit_delay_is_returned_without_retry_storm() {
+        assert_eq!(
+            rate_limit_retry_delay(
+                &HashMap::from([("retry-after".to_owned(), "120".to_owned())]),
+                0,
+            ),
+            None
+        );
+        assert_eq!(rate_limit_retry_delay(&HashMap::new(), 0), Some(Duration::from_secs(2)));
+        assert_eq!(rate_limit_retry_delay(&HashMap::new(), 2), Some(Duration::from_secs(8)));
     }
 }

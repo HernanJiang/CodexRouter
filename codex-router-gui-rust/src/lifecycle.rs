@@ -1374,15 +1374,25 @@ pub fn ensure_services(
     cancel: &AtomicBool,
     lock_inherited: bool,
 ) -> anyhow::Result<LifecycleStatus> {
+    let config = load_config(router_root)?;
+    ensure_services_with_config(router_root, &config, repair, cancel, lock_inherited)
+}
+
+pub fn ensure_services_with_config(
+    router_root: &Path,
+    config: &RouterConfig,
+    repair: bool,
+    cancel: &AtomicBool,
+    lock_inherited: bool,
+) -> anyhow::Result<LifecycleStatus> {
     let _lock = if lock_inherited {
         LifecycleLock::inherited()
     } else {
         acquire_lifecycle_lock(router_root, Duration::from_secs(10), "Start Router")?
     };
-    let config = load_config(router_root)?;
-    let ports = LifecyclePorts::from_config(&config)?;
+    let ports = LifecyclePorts::from_config(config)?;
     let base_uri = loopback_base_uri(&config.deploy.sub2api_host)?;
-    let proxy_runtime = logic::resolve_proxy_runtime(&config)?;
+    let proxy_runtime = logic::resolve_proxy_runtime(config)?;
     if proxy_runtime.settings.has_credentials {
         bail!("ROUTER_PROXY_CREDENTIAL_STORAGE_UNSUPPORTED: authenticated proxy settings cannot be copied into Sub2API");
     }
@@ -1410,11 +1420,21 @@ pub fn ensure_services(
     )?;
     logic::responses_gateway::ensure_responses_gateway(base_uri.as_str())
         .context("failed to start the responses compatibility gateway")?;
-    status_services_with_config(router_root, &config)
+    status_services_with_config(router_root, config)
 }
 
 pub fn stop_services(
     router_root: &Path,
+    force: bool,
+    lock_inherited: bool,
+) -> anyhow::Result<LifecycleStatus> {
+    let config = load_config(router_root).unwrap_or_default();
+    stop_services_with_config(router_root, &config, force, lock_inherited)
+}
+
+pub fn stop_services_with_config(
+    router_root: &Path,
+    config: &RouterConfig,
     force: bool,
     lock_inherited: bool,
 ) -> anyhow::Result<LifecycleStatus> {
@@ -1431,9 +1451,8 @@ pub fn stop_services(
             "Stop Router",
         )?
     };
-    let config = load_config(router_root).unwrap_or_default();
     logic::responses_gateway::stop_responses_gateway();
-    let ports = LifecyclePorts::from_config(&config)?;
+    let ports = LifecyclePorts::from_config(config)?;
     let data_root = user_data::data_root(router_root);
     let sub2api_path = router_root.join(r"app\sub2api.exe");
     let sub2api = listener_process_id(ports.sub2api, &sub2api_path, ServiceKind::Sub2Api)?;
@@ -1469,7 +1488,7 @@ pub fn stop_services(
         }
     }
     stop_postgres(router_root, ports, force)?;
-    status_services_with_config(router_root, &config)
+    status_services_with_config(router_root, config)
 }
 
 pub fn status_services(router_root: &Path) -> anyhow::Result<LifecycleStatus> {

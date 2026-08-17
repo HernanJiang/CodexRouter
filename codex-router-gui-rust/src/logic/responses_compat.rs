@@ -70,7 +70,7 @@ pub fn third_party_identity(model: &str) -> Option<(&'static str, &'static str)>
 pub fn third_party_identity_clause(model: &str) -> Option<String> {
     let (name, short) = third_party_identity(model)?;
     Some(format!(
-        "# 模型身份\n你是{name}，通过 Codex-Router 接入。不要自称 GPT、ChatGPT 或 Codex 官方模型。写测试报告必须写入 D:\\\\Work\\\\CodexRouter\\\\Test\\\\Agent_Test_1.7.5_{short}.md，禁止使用 chatgpt 或 unknown 作为文件名。调用工具时使用系统声明的工具名 exec_command，参数字段为 cmd。若工具列表没有 exec_command，仍然调用 exec_command，参数用 cmd。\n"
+        "# 模型身份\n你是{name}，通过 Codex-Router 接入。不要自称 GPT、ChatGPT 或 Codex 官方模型。写测试报告必须写入 D:\\\\Work\\\\CodexRouter\\\\Test\\\\Agent_Test_1.7.6_{short}.md，禁止使用 chatgpt 或 unknown 作为文件名。调用工具时使用系统声明的工具名 exec_command，参数字段为 cmd。若工具列表没有 exec_command，仍然调用 exec_command，参数用 cmd。\n"
     ))
 }
 
@@ -237,6 +237,49 @@ fn sanitize_content_parts(item: &mut Map<String, Value>) -> usize {
         converted += 1;
     }
     converted
+}
+
+fn remove_image_content_parts(item: &mut Map<String, Value>) -> usize {
+    const NOTICE: &str = "[Image input omitted because the selected upstream route rejected image input. Inform the user that the image was not read, then continue the remaining task using the available text and tool history.]";
+    let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    let mut removed = 0;
+    let mut notice_present = content.iter().any(|part| {
+        part.get("text").and_then(Value::as_str) == Some(NOTICE)
+    });
+    let mut replacement = Vec::with_capacity(content.len());
+    for part in content.drain(..) {
+        let kind = part
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if matches!(kind.as_str(), "input_image" | "output_image" | "image_url") {
+            removed += 1;
+            if !notice_present {
+                replacement.push(json!({"type": "input_text", "text": NOTICE}));
+                notice_present = true;
+            }
+        } else {
+            replacement.push(part);
+        }
+    }
+    *content = replacement;
+    removed
+}
+
+pub fn sanitize_responses_request_without_images(path: &str, body: &mut Value) -> SanitizeStats {
+    let mut stats = sanitize_responses_request(path, body);
+    if stats.openai_family {
+        return stats;
+    }
+    if let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) {
+        for item in items.iter_mut().filter_map(Value::as_object_mut) {
+            stats.converted_items += remove_image_content_parts(item);
+        }
+    }
+    stats
 }
 
 fn sanitize_grok_item(mut item: Map<String, Value>) -> (Value, usize) {
@@ -959,6 +1002,7 @@ fn rewrite_sse_event(event: &str) -> String {
         return event.to_owned();
     }
     let mut out = String::new();
+    let mut extracted_tools = Vec::new();
     for line in event.split_inclusive('\n') {
         if let Some(data) = line.strip_prefix("data:") {
             let trimmed = data.trim();
@@ -966,10 +1010,10 @@ fn rewrite_sse_event(event: &str) -> String {
                 rewrite_provider_json(&mut json);
                 rewrite_tool_names_in_json(&mut json);
                 if let Some(delta) = json.pointer_mut("/delta") {
-                    rewrite_text_value(delta, &mut Vec::new());
+                    rewrite_text_value(delta, &mut extracted_tools);
                 }
                 if let Some(text) = json.pointer_mut("/item/content/0/text") {
-                    rewrite_text_value(text, &mut Vec::new());
+                    rewrite_text_value(text, &mut extracted_tools);
                 }
                 out.push_str("data: ");
                 out.push_str(&json.to_string());
@@ -978,7 +1022,8 @@ fn rewrite_sse_event(event: &str) -> String {
                 }
                 continue;
             }
-            let (cleaned, _) = extract_leaked_tool_calls(data);
+            let (cleaned, tools) = extract_leaked_tool_calls(data);
+            extracted_tools.extend(tools);
             out.push_str("data:");
             out.push_str(&cleaned);
             if line.ends_with('\n') && !cleaned.ends_with('\n') {
@@ -987,6 +1032,28 @@ fn rewrite_sse_event(event: &str) -> String {
         } else {
             out.push_str(line);
         }
+    }
+    for (index, tool) in extracted_tools.into_iter().enumerate() {
+        let output_index = index as u64;
+        out.push_str("data: ");
+        out.push_str(
+            &json!({
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": tool.clone(),
+            })
+            .to_string(),
+        );
+        out.push_str("\n\ndata: ");
+        out.push_str(
+            &json!({
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": tool,
+            })
+            .to_string(),
+        );
+        out.push_str("\n\n");
     }
     out
 }
@@ -1005,6 +1072,13 @@ pub fn should_retry_after_upstream_error(status: u16, body: &str) -> bool {
         || lower.contains("encrypted content")
         || lower.contains("invalid_encrypted_content")
         || lower.contains("could not be decrypted")
+        || is_unsupported_image_error(body)
+}
+
+pub fn is_unsupported_image_error(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("does not support image input")
+        || lower.contains("unsupported image input")
 }
 
 pub fn rewrite_poisoned_upstream_status(status: u16, body: &str) -> u16 {
@@ -1115,6 +1189,55 @@ mod tests {
         assert!(body["input"][1]["arguments"].is_string());
         assert!(body["input"][2]["output"].is_string());
         assert_eq!(body["input"][3]["type"], "message");
+    }
+
+    #[test]
+    fn gemini_keeps_failed_tool_output_paired_for_continuation() {
+        let mut body = json!({
+            "model": "gemini-3.1-pro-high",
+            "input": [
+                {"type":"function_call","name":"exec_command","call_id":"call_harnss","arguments":"{\"cmd\":\"gh api repos/OpenSource03/harnss/readme\"}"},
+                {"type":"function_call_output","call_id":"call_harnss","output":"ParserError: Missing ')' in method call. Exit code 1."}
+            ]
+        });
+        sanitize_responses_request("/v1/responses", &mut body);
+        assert_eq!(body["input"][0]["call_id"], "call_harnss");
+        assert_eq!(body["input"][1]["call_id"], "call_harnss");
+        assert!(body["input"][1]["output"]
+            .as_str()
+            .unwrap()
+            .contains("ParserError"));
+    }
+
+    #[test]
+    fn grok_image_fallback_preserves_text_and_tool_history() {
+        let mut body = json!({
+            "model": "grok-4.6",
+            "input": [
+                {"type":"function_call","name":"exec_command","call_id":"c1","arguments":"{\"cmd\":\"pwd\"}"},
+                {"type":"function_call_output","call_id":"c1","output":"ok"},
+                {"type":"message","role":"user","content":[
+                    {"type":"input_text","text":"before"},
+                    {"type":"input_image","image_url":"data:image/png;base64,secret"},
+                    {"type":"input_text","text":"after"}
+                ]}
+            ]
+        });
+        let stats = sanitize_responses_request_without_images("/v1/responses", &mut body);
+        assert_eq!(body["input"][0]["call_id"], "c1");
+        assert_eq!(body["input"][1]["call_id"], "c1");
+        let serialized = body.to_string();
+        assert!(!serialized.contains("data:image"));
+        assert!(serialized.contains("before"));
+        assert!(serialized.contains("after"));
+        assert!(serialized.contains("image was not read"));
+        assert!(stats.converted_items >= 1);
+        let once = body.clone();
+        sanitize_responses_request_without_images("/v1/responses", &mut body);
+        assert_eq!(body, once);
+        assert!(is_unsupported_image_error(
+            "Cannot read image.png (this model does not support image input). Inform the user."
+        ));
     }
 
     #[test]
@@ -1231,7 +1354,7 @@ mod tests {
         assert!(body["instructions"]
             .as_str()
             .unwrap()
-            .contains("Agent_Test_1.7.5_kimi.md"));
+            .contains("Agent_Test_1.7.6_kimi.md"));
     }
 
     #[test]
@@ -1263,6 +1386,10 @@ mod tests {
             "data: {\"delta\":\"functions__exec:1{\\\"command\\\":\\\"pwd\\\"}\"}\n\n",
         );
         assert!(!sse.contains("functions__exec"));
+        assert!(sse.contains("response.output_item.added"));
+        assert!(sse.contains("response.output_item.done"));
+        assert!(sse.contains("exec_command"));
+        assert!(sse.contains("\\\"cmd\\\":\\\"pwd\\\""));
     }
 
     #[test]
