@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing GitHub Release tag to validate
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -12,6 +18,8 @@ jobs:
   windows-release:
     runs-on: windows-latest
     timeout-minutes: 60
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
 
@@ -23,7 +31,7 @@ jobs:
       - name: Verify tag and source version
         shell: pwsh
         run: |
-          $tagVersion = '${{ github.ref_name }}'.TrimStart('v')
+          $tagVersion = $env:RELEASE_TAG.TrimStart('v')
           $manifest = Get-Content codex-router-gui-rust/Cargo.toml -Raw
           if ($manifest -notmatch '(?m)^version\s*=\s*"([^"]+)"') {
             throw 'Cargo package version is missing.'
@@ -47,7 +55,7 @@ jobs:
         run: |
           $asset = $null
           for ($attempt = 0; $attempt -lt 60 -and $null -eq $asset; $attempt++) {
-            $releaseJson = gh release view '${{ github.ref_name }}' --repo '${{ github.repository }}' --json assets 2>$null
+            $releaseJson = gh release view $env:RELEASE_TAG --repo '${{ github.repository }}' --json assets 2>$null
             if ($LASTEXITCODE -eq 0) {
               $release = $releaseJson | ConvertFrom-Json
               $asset = @($release.assets | Where-Object {
@@ -69,7 +77,7 @@ jobs:
           $download = Join-Path $env:RUNNER_TEMP 'published-release'
           $expanded = Join-Path $env:RUNNER_TEMP 'published-stage'
           New-Item -ItemType Directory -Path $download,$expanded -Force | Out-Null
-          gh release download '${{ github.ref_name }}' --repo '${{ github.repository }}' --pattern '${{ steps.package.outputs.asset }}' --dir $download
+          gh release download $env:RELEASE_TAG --repo '${{ github.repository }}' --pattern '${{ steps.package.outputs.asset }}' --dir $download
           if ($LASTEXITCODE -ne 0) { throw 'Could not download the published asset.' }
           $archive = Join-Path $download '${{ steps.package.outputs.asset }}'
           Expand-Archive -LiteralPath $archive -DestinationPath $expanded
@@ -96,5 +104,8 @@ jobs:
               throw "First OAuth preparation was not ready (stage=$($result.stage), code=$($result.code))."
             }
           } finally {
-            & (Join-Path $root 'scripts/Stop-Router.ps1') -NoRestoreCodexConfig
+            & (Join-Path $root 'Codex-Router.exe') `
+              --stop-router-services `
+              --router-root=$root `
+              --force
           }
