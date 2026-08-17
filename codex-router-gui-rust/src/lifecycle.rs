@@ -1339,28 +1339,40 @@ fn wait_sub2api_ready(
 ) -> anyhow::Result<()> {
     let expected = router_root.join(r"app\sub2api.exe");
     let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(120) {
+    // Cold machines (fresh initdb, Defender scans, slow disks) need a generous
+    // budget. Probes run cheapest-first so the polling cadence stays tight
+    // while Sub2API is still booting: an unanswered /health fails fast and
+    // skips the expensive authenticated PostgreSQL checks entirely.
+    while started.elapsed() < Duration::from_secs(180) {
         if cancel.load(Ordering::Acquire) {
             bail!("Router startup was cancelled");
         }
         if !process_exists(process_id) {
             bail!("Sub2API exited during startup");
         }
-        if sub2api_health(base_uri, Duration::from_secs(3))
-            && postgres_ready(router_root, ports, &secrets.postgres)
-            && sub2api_database_ready(router_root, ports, &secrets.postgres)
-            && redis_ping(ports.redis, Some(&secrets.redis))
+        if !sub2api_health(base_uri, Duration::from_secs(3))
+            || !redis_ping(ports.redis, Some(&secrets.redis))
+            || !postgres_ready(router_root, ports, &secrets.postgres)
+            || !sub2api_database_ready(router_root, ports, &secrets.postgres)
         {
-            let listener = listener_process_id(ports.sub2api, &expected, ServiceKind::Sub2Api)?
-                .context("Sub2API health succeeded without the expected loopback listener")?;
-            if listener != process_id {
-                bail!("Sub2API PID file and listener do not refer to the same process");
-            }
-            return Ok(());
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
         }
-        std::thread::sleep(Duration::from_secs(1));
+        // A healthy answer can briefly win the race against the Windows TCP
+        // owner table on a busy machine; treat a missing listener as "not
+        // ready yet" instead of failing the whole startup. A listener owned
+        // by a different process is a real conflict and stays a hard error.
+        let Some(listener) = listener_process_id(ports.sub2api, &expected, ServiceKind::Sub2Api)?
+        else {
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        };
+        if listener != process_id {
+            bail!("Sub2API PID file and listener do not refer to the same process");
+        }
+        return Ok(());
     }
-    bail!("Sub2API or an authenticated dependency did not become ready within 120 seconds")
+    bail!("Sub2API or an authenticated dependency did not become ready within 180 seconds")
 }
 
 fn load_config(router_root: &Path) -> anyhow::Result<RouterConfig> {
@@ -1418,8 +1430,11 @@ pub fn ensure_services_with_config(
         &user_data::data_root(router_root).join(r"pids\sub2api-network.hmac"),
         fingerprint.as_bytes(),
     )?;
-    logic::responses_gateway::ensure_responses_gateway(base_uri.as_str())
-        .context("failed to start the responses compatibility gateway")?;
+    logic::responses_gateway::ensure_responses_gateway(
+        base_uri.as_str(),
+        config.rate_limit_max_retries,
+    )
+    .context("failed to start the responses compatibility gateway")?;
     status_services_with_config(router_root, config)
 }
 

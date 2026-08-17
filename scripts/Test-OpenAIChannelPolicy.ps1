@@ -84,15 +84,22 @@ foreach ($arkBaseUrl in @(
 )) {
     $ark = Get-RouterOpenAIChannelPolicy -BaseUrl $arkBaseUrl -Extra @{}
     Assert-True (
-        [string]$ark.ResponsesMode -eq 'force_chat_completions'
-    ) "Ark endpoint was not routed through the reliable Chat Completions bridge: $arkBaseUrl"
+        [string]$ark.ResponsesMode -eq 'force_responses'
+    ) "Ark Coding/Agent Plan endpoint was not kept on Responses: $arkBaseUrl"
     Assert-True (
-        @($ark.OpenAICapabilities) -contains 'chat_completions'
-    ) "Ark endpoint did not advertise Chat Completions capability: $arkBaseUrl"
+        @($ark.OpenAICapabilities).Count -eq 0
+    ) "Ark Coding/Agent Plan endpoint was incorrectly restricted to Chat Completions: $arkBaseUrl"
     Assert-True (
         $ark.Extra.openai_compact_supported -eq $false
     ) "Ark endpoint incorrectly advertised Responses compact support: $arkBaseUrl"
 }
+
+$arkPayg = Get-RouterOpenAIChannelPolicy `
+    -BaseUrl 'https://ark.cn-beijing.volces.com/api/v3' `
+    -Extra @{}
+Assert-True (
+    [string]$arkPayg.ResponsesMode -eq 'force_chat_completions'
+) 'Ark PAYG /api/v3 should stay on Chat Completions.'
 
 $kimiExplicitResponses = Get-RouterOpenAIChannelPolicy `
     -BaseUrl 'https://api.kimi.com/coding/v1' `

@@ -149,7 +149,7 @@ fn oauth_accounts_with_api_fallback(cfg: &RouterConfig) -> HashSet<i64> {
             cfg.models.iter().any(|candidate| {
                 candidate.source != "oauth"
                     && super::same_model_identity(&oauth.model, &candidate.model)
-                    && super::is_fallback_channel_selected(cfg, candidate)
+                    && super::is_eligible_oauth_api_fallback(cfg, oauth, candidate)
             })
         })
         .map(|model| model.oauth_account_id)

@@ -923,6 +923,9 @@ impl eframe::App for CodexRouterApp {
         if self.oauth_post_login_prompt_open {
             self.show_oauth_post_login_prompt(&ctx, &palette);
         }
+        if self.codex_overwrite_prompt_open {
+            self.show_codex_overwrite_dialog(&ctx, &palette);
+        }
         if self.sub2api_intro_open {
             self.show_sub2api_intro(&ctx, &palette);
         }
@@ -994,6 +997,54 @@ impl eframe::App for CodexRouterApp {
         storage.set_string("codex-router-ui-language-v1", self.ui_language.clone());
     }
 }
+
+fn overwrite_choice_card(
+    ui: &mut egui::Ui,
+    palette: &theme::Palette,
+    enabled: bool,
+    primary: bool,
+    title: &str,
+    detail: &str,
+    width: f32,
+) -> bool {
+    let fill = if primary { palette.action } else { egui::Color32::WHITE };
+    let title_color = if primary { egui::Color32::WHITE } else { palette.ink };
+    let detail_color = if primary {
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 220)
+    } else {
+        palette.ink_soft
+    };
+    let stroke = if primary {
+        egui::Stroke::NONE
+    } else {
+        egui::Stroke::new(1.0_f32, palette.line)
+    };
+    let mut clicked = false;
+    ui.add_enabled_ui(enabled, |ui| {
+        let response = egui::Frame::NONE
+            .fill(fill)
+            .stroke(stroke)
+            .corner_radius(egui::CornerRadius::same(10))
+            .inner_margin(egui::Margin::symmetric(16, 12))
+            .show(ui, |ui| {
+                ui.set_width(width);
+                ui.label(
+                    egui::RichText::new(title)
+                        .size(16.0)
+                        .strong()
+                        .color(title_color),
+                );
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(detail).size(13.0).color(detail_color));
+            })
+            .response
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .interact(egui::Sense::click());
+        clicked = response.clicked();
+    });
+    clicked
+}
+
 
 impl CodexRouterApp {
     fn show_current_page(&mut self, ui: &mut egui::Ui, palette: &theme::Palette) {
@@ -1232,6 +1283,118 @@ impl CodexRouterApp {
             if open_oauth {
                 self.open_oauth_manager();
             }
+        }
+    }
+
+    fn show_codex_overwrite_dialog(&mut self, ctx: &egui::Context, palette: &theme::Palette) {
+        let zh = self.ui_language == "zh";
+        let running = self.codex_overwrite_action_running || self.applying;
+        let mut apply_router = false;
+        let mut keep_current = false;
+        let mut restore_factory = false;
+        let dialog_size = fit_dialog_size(
+            ctx.content_rect().size(),
+            egui::vec2(640.0, 520.0),
+            egui::vec2(460.0, 430.0),
+        );
+        egui::Window::new(t(zh, "Codex 配置被外部覆写", "Codex config overwritten"))
+            .id(egui::Id::new("codex-overwrite-dialog"))
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .default_size(dialog_size)
+            .min_size(dialog_size)
+            .max_size(dialog_size)
+            .show(ctx, |ui| {
+                ui.set_min_size(dialog_size);
+                ui.set_max_size(dialog_size);
+                egui::Frame::NONE
+                    .fill(palette.paper_alt)
+                    .inner_margin(egui::Margin::same(20))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(t(
+                                zh,
+                                "自检发现 Codex 的 config.toml 已被其他程序覆写。",
+                                "Self-check found Codex's config.toml was overwritten.",
+                            ))
+                            .size(16.0)
+                            .strong()
+                            .color(palette.ink),
+                        );
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(t(
+                                zh,
+                                "请选择一项。写入或恢复出厂后会保存对应配置并自动重启 Codex。",
+                                "Choose one option. Writing Router settings or restoring factory defaults will save the matching config and restart Codex.",
+                            ))
+                            .color(palette.ink_soft),
+                        );
+                        if running {
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new(t(
+                                    zh,
+                                    "正在处理，请稍候…",
+                                    "Working, please wait…",
+                                ))
+                                .color(palette.muted),
+                            );
+                        }
+                        ui.add_space(14.0);
+                        let card_width = (ui.available_width() - 4.0).max(360.0);
+                        apply_router |= overwrite_choice_card(
+                            ui,
+                            palette,
+                            !running,
+                            true,
+                            t(zh, "应用当前设置", "Apply current settings"),
+                            t(
+                                zh,
+                                "保存并写入当前已有的 CodexRouter 配置，然后自动重启 Codex。",
+                                "Save and write the current CodexRouter configuration, then restart Codex.",
+                            ),
+                            card_width,
+                        );
+                        ui.add_space(8.0);
+                        keep_current |= overwrite_choice_card(
+                            ui,
+                            palette,
+                            !running,
+                            false,
+                            t(zh, "保持当前覆写结果", "Keep the overwritten file"),
+                            t(
+                                zh,
+                                "不修改当前已被覆写的 Codex 配置，也不重启 Codex。",
+                                "Leave the overwritten Codex config unchanged and do not restart Codex.",
+                            ),
+                            card_width,
+                        );
+                        ui.add_space(8.0);
+                        restore_factory |= overwrite_choice_card(
+                            ui,
+                            palette,
+                            !running,
+                            false,
+                            t(zh, "恢复 Codex 默认设置", "Restore Codex defaults"),
+                            t(
+                                zh,
+                                "把 Codex 重置为官方默认配置，移除 Router 绑定，然后自动重启 Codex。",
+                                "Reset Codex to official defaults, remove the Router binding, then restart Codex.",
+                            ),
+                            card_width,
+                        );
+                    });
+            });
+        if apply_router {
+            self.codex_overwrite_apply_router_config();
+        }
+        if keep_current {
+            self.codex_overwrite_keep_current();
+        }
+        if restore_factory {
+            self.codex_overwrite_restore_factory();
         }
     }
 
@@ -6903,6 +7066,33 @@ impl CodexRouterApp {
                     .color(palette.ink_soft),
                 );
             }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let retries_response = ui.add(
+                    egui::DragValue::new(&mut self.config.rate_limit_max_retries).range(0..=32),
+                );
+                theme::ascii_response(ui, &retries_response);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(t(
+                            zh,
+                            "上游 429 / 断网自动重试次数（2s / 10s / 30s / 1min / 3min / 5min）",
+                            "Automatic retries on 429 or network errors (2s / 10s / 30s / 1min / 3min / 5min)",
+                        ))
+                        .small()
+                        .color(palette.ink_soft),
+                    )
+                    .wrap(),
+                );
+                if retries_response.changed() {
+                    self.status_text = t(
+                        zh,
+                        "429 限流重试次数已修改；保存并应用后生效",
+                        "The 429 retry count changed. Save & apply to activate it.",
+                    )
+                    .into();
+                }
+            });
             ui.add_space(6.0);
             let router_base_url = format!(
                 "{}/v1",
@@ -8348,13 +8538,10 @@ impl CodexRouterApp {
         model: &ModelConfig,
     ) -> Option<&'a UsageAccount> {
         if model.source.eq_ignore_ascii_case("oauth") && model.oauth_account_id > 0 {
-            if let Some(account) = snapshot
+            return snapshot
                 .subscriptions
                 .iter()
-                .find(|account| account.id == model.oauth_account_id)
-            {
-                return Some(account);
-            }
+                .find(|account| account.id == model.oauth_account_id);
         }
         let hay = format!(
             "{} {} {} {}",
@@ -9441,7 +9628,15 @@ impl CodexRouterApp {
                     .max_height(list_height)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                    for (index, model) in self.config.models.iter().enumerate() {
+                    for (display_index, row) in super::logic::dashboard_model_rows(&self.config.models)
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let index = row.index;
+                        let account_count = row.account_count;
+                        let Some(model) = self.config.models.get(index) else {
+                            continue;
+                        };
                         let vision = super::logic::resolve_multimodal(model);
                         let route = route_plan.iter().find(|route| route.index == index);
                         let route_id = route
@@ -9472,7 +9667,7 @@ impl CodexRouterApp {
                                             egui::Layout::left_to_right(egui::Align::Center),
                                             |ui| {
                                                 ui.label(
-                                                    egui::RichText::new(format!("{:02}", index + 1))
+                                                    egui::RichText::new(format!("{:02}", display_index + 1))
                                                         .font(egui::FontId::new(
                                                             21.0,
                                                             theme::display_family(),
@@ -9492,6 +9687,26 @@ impl CodexRouterApp {
                                                     .truncate(),
                                                 )
                                                 .on_hover_text(model_label);
+                                                if account_count > 1 {
+                                                    ui.add_space(6.0);
+                                                    ui.add(
+                                                        egui::Button::new(
+                                                            egui::RichText::new(account_count.to_string())
+                                                                .small()
+                                                                .strong()
+                                                                .color(palette.ink),
+                                                        )
+                                                        .fill(palette.paper_alt)
+                                                        .stroke(egui::Stroke::new(1.0, palette.line))
+                                                        .corner_radius(egui::CornerRadius::same(4))
+                                                        .min_size(egui::vec2(22.0, 20.0)),
+                                                    )
+                                                    .on_hover_text(t(
+                                                        zh,
+                                                        "该数字代表有多少个账号正在提供这个模型",
+                                                        "This number is how many accounts currently provide this model",
+                                                    ));
+                                                }
                                             },
                                         );
                                         ui.allocate_ui_with_layout(

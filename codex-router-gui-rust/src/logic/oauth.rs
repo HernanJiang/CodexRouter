@@ -165,9 +165,13 @@ pub fn prepare(
     cancel: &AtomicBool,
 ) -> anyhow::Result<()> {
     Provider::parse(provider)?;
+    // A first run on a new machine serializes behind a concurrent Apply that
+    // may still be running initdb / pg_ctl / the Sub2API boot. Waiting minutes
+    // here is what keeps the first-run wizard from failing with
+    // ROUTER_OAUTH_PREPARE_LIFECYCLE_BUSY on every attempt.
     let _lock = crate::lifecycle::acquire_lifecycle_lock(
         router_root,
-        Duration::from_secs(10),
+        Duration::from_secs(120),
         "Prepare provider OAuth",
     )?;
     crate::lifecycle::ensure_services_with_config(router_root, config, true, cancel, true)
@@ -193,7 +197,7 @@ where
     let provider = Provider::parse(provider)?;
     let _lock = crate::lifecycle::acquire_lifecycle_lock(
         router_root,
-        Duration::from_secs(10),
+        Duration::from_secs(120),
         "Start provider OAuth",
     )?;
     crate::lifecycle::ensure_services_with_config(router_root, config, true, cancel, true)

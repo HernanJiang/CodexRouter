@@ -44,7 +44,7 @@ pub fn is_openai_family_model(model: &str) -> bool {
 
 pub fn is_chat_completions_agent_model(model: &str) -> bool {
     let slug = model.trim().to_ascii_lowercase();
-    slug.contains("kimi") || slug.contains("k3") || slug.contains("deepseek")
+    slug.contains("kimi") || slug.contains("k3")
 }
 
 pub fn third_party_identity(model: &str) -> Option<(&'static str, &'static str)> {
@@ -70,7 +70,7 @@ pub fn third_party_identity(model: &str) -> Option<(&'static str, &'static str)>
 pub fn third_party_identity_clause(model: &str) -> Option<String> {
     let (name, short) = third_party_identity(model)?;
     Some(format!(
-        "# 模型身份\n你是{name}，通过 Codex-Router 接入。不要自称 GPT、ChatGPT 或 Codex 官方模型。写测试报告必须写入 D:\\\\Work\\\\CodexRouter\\\\Test\\\\Agent_Test_1.7.6_{short}.md，禁止使用 chatgpt 或 unknown 作为文件名。调用工具时使用系统声明的工具名 exec_command，参数字段为 cmd。若工具列表没有 exec_command，仍然调用 exec_command，参数用 cmd。\n"
+        "# 模型身份\n你是{name}，通过 Codex-Router 接入。不要自称 GPT、ChatGPT 或 Codex 官方模型。写测试报告必须写入 D:\\\\Work\\\\CodexRouter\\\\Test\\\\Agent_Test_1.7.10_{short}.md，禁止使用 chatgpt 或 unknown 作为文件名。调用工具时使用系统声明的工具名 exec_command，参数字段为 cmd。若工具列表没有 exec_command，仍然调用 exec_command，参数用 cmd。\n"
     ))
 }
 
@@ -1090,20 +1090,26 @@ pub fn rewrite_poisoned_upstream_status(status: u16, body: &str) -> u16 {
 }
 
 pub fn rewrite_exhausted_account_status(status: u16, body: &str) -> u16 {
-    if status != 503 {
-        return status;
-    }
-    let lower = body.to_ascii_lowercase();
-    if lower.contains("no available accounts")
-        || lower.contains("too many requests")
-        || lower.contains("rate_limit")
-        || lower.contains("rate limit")
-        || lower.contains("service temporarily unavailable")
-    {
+    if is_exhausted_account_status(status, body) {
         429
     } else {
         status
     }
+}
+
+/// Sub2API reports an account pool drained by upstream rate limiting as 503.
+/// Detecting it here lets the gateway retry it like a literal 429 instead of
+/// passing it straight through and ending the conversation.
+pub fn is_exhausted_account_status(status: u16, body: &str) -> bool {
+    if status != 503 {
+        return false;
+    }
+    let lower = body.to_ascii_lowercase();
+    lower.contains("no available accounts")
+        || lower.contains("too many requests")
+        || lower.contains("rate_limit")
+        || lower.contains("rate limit")
+        || lower.contains("service temporarily unavailable")
 }
 
 #[cfg(test)]
@@ -1354,7 +1360,7 @@ mod tests {
         assert!(body["instructions"]
             .as_str()
             .unwrap()
-            .contains("Agent_Test_1.7.6_kimi.md"));
+            .contains("Agent_Test_1.7.10_kimi.md"));
     }
 
     #[test]

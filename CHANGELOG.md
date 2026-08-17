@@ -2,6 +2,57 @@
 
 本文件记录面向用户的重要变化。完整技术细节以对应版本的源码和 GitHub Release 为准。
 
+## 1.7.10 - 2026-08-17
+
+### 新增
+
+- 路由配置列表将多个 OAuth 账号的同名模型合并为一项；名称后显示可提供该模型的账号数，悬浮提示该数字含义。
+- 模型卡片底部额度只展示当前正在使用的账号 / API。
+
+### 修复
+
+- 干净 new 版本首次启动强制进入引导首页，不再因为读到本机已有 UserData 而直接进入控制台。
+
+升级后请完全重启 CodexRouter 和 Codex。
+
+## 1.7.9 - 2026-08-17
+
+### 修复
+
+- 修复别人机器上首次引导第一次 OAuth 无法配置：未完成设置时不再把缺失的 Router 配置文件误报成 `class=configuration`；账号刷新改用当前内存配置，并在后台用这份配置启动本地 Router。
+- 条款页“安全登录环境准备失败”继续显示具体阶段，并在冷启动 initdb / Redis / Sub2API 未就绪时自动重试准备。
+
+升级后请完全重启 CodexRouter 和 Codex。
+
+## 1.7.8 - 2026-08-17
+
+### 修复
+
+- 严格区分额度来源与接口协议：`subscription | coding_plan | official_api | relay` 与 `responses | chat_completions | anthropic` 分开保存；不再因厂商名自动切官方协议。
+- 订阅与 Coding Plan 默认 `allow_fallback = false`，禁止因 401/429/5xx/断流静默切到同厂商 PAYG。ChatGPT 订阅不会静默切 OpenAI PAYG；Grok 订阅经 sub2api 不会静默切 xAI PAYG；火山 Coding Plan 固定 `https://ark.cn-beijing.volces.com/api/coding/v3` Responses，禁止切 `/api/v3`。
+- Kimi Coding Plan 仍按实际 Chat 协议处理，由 Router 做 Responses ↔ Chat 转换；DXH / CIRL 优先直接 Responses。
+- Gemini 按实际线路（官方 API / sub2api / DXH / CIRL）决定协议，不再仅凭 `gemini-*` 模型名判断。
+- 上游 429 / 无网络最大尝试从 3 次改为 6 次，阶梯等待 `2s → 10s → 30s → 1min → 3min → 5min`；短 `Retry-After` 不能缩短等待，避免 RequestBurstTooFast 瞬间耗尽重试。
+- 自检覆写弹窗三个选项改为卡片式说明，并接到真实功能：应用当前设置会保存并写入现有 CodexRouter 配置后自动重启 Codex；保持当前覆写结果不改任何文件；恢复 Codex 默认设置会移除 Router 绑定并自动重启 Codex。
+
+升级后请完全重启 CodexRouter 和 Codex。
+
+## 1.7.7 - 2026-08-17
+
+### 修复
+
+- 修复模型降级兜底仅对 ChatGPT-5.6-Sol 生效的问题：`chatgpt-*` 品牌命名的渠道统一归一到对应 `gpt-*` 模型族，OAuth 与同名 API 渠道的身份配对、手动备用选择和自动隔离接管对所有接入模型生效，切换 Luna 等变体后兜底不再失效。
+- 修复 Grok、Gemini 长会话中途被擅自中断：网关改为 30 秒轮询上游流并注入 SSE 保活注释，长时间推理静默不再触发 Codex 空闲超时；上游完全静默的上限放宽到 30 分钟；上游分块帧损坏时以显式终止事件收尾，不再静默断开。
+- 修复全新设备首次引导高频弹出“本地 Router 未能稳定启动”：OAuth 准备/登录的生命周期锁等待从 10 秒放宽到 120 秒以容纳冷机 initdb 与并发 Apply；预热重试扩为 4 次（2/5/10 秒阶梯）；Sub2API 就绪检测改为低成本探针优先（health → Redis → PostgreSQL），总预算放宽到 180 秒；健康检查先通过但 Windows TCP 属主表尚未刷新时继续等待而不是直接判失败。
+- 修复火山方舟 CodingPlan（DeepSeek V4 Flash）429 限流直接终止对话：网关对 429 与 Sub2API 额度耗尽型 503 做阶梯退避自动重试（2/4/8/16/30 秒，封顶 60 秒），长 `Retry-After` 不再放弃重试而是按封顶值等待；最大重试次数可在 OAuth 设置中配置（默认 8 次），耗尽后才向 Codex 正常抛出限流提示。
+
+### 新增
+
+- 自检识别到 Codex 原生 `config.toml` 被外部程序覆写时，不再静默自动修复，改为弹出交互选择窗口：① 写入 CodexRouter 标准配置；② 保留当前已被覆写的配置（按内容指纹记忆，文件再次变化时重新提示）；③ 恢复 Codex 官方出厂默认配置。
+- 应用配置与修复绑定时，自动把 Router 绑定（模型提供方、模型目录、Fast 开关、推理档位菜单）同步写入 Codex 的系统层配置 `%ProgramData%\OpenAI\Codex\config.toml`：Codex Desktop 周期性重写用户 `config.toml` 并丢弃 Router 键时（此前会导致 Grok/Kimi 等非 ChatGPT 模型被直接发往 ChatGPT 后端，报 “model is not supported when using Codex with a ChatGPT account”），新会话仍自动走本地路由，全部已注册模型不受影响。恢复出厂设置、初始化默认配置与关闭 Router 路由时会自动移除该绑定。
+
+升级后请完全重启 CodexRouter 和 Codex。
+
 ## 1.7.6 - 2026-08-17
 
 ### 修复

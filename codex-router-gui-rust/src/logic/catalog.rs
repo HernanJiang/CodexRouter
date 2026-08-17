@@ -1,6 +1,6 @@
 use crate::config::{ModelConfig, RouterConfig};
 use crate::logic::{
-    canonical_route_model_id, is_fallback_channel_selected, model_identity,
+    canonical_route_model_id, is_eligible_oauth_api_fallback, model_identity,
     recommended_model_display_name, resolve_context_window, resolve_multimodal, resolve_reasoning,
     same_model_identity, slugify,
 };
@@ -187,7 +187,7 @@ pub fn build_route_plan(cfg: &RouterConfig) -> Vec<ModelRoute> {
                     .filter(|x| {
                         x.source != "oauth"
                             && same_model_identity(&x.model_id, &d.model_id)
-                            && is_fallback_channel_selected(cfg, &x.model)
+                            && is_eligible_oauth_api_fallback(cfg, &d.model, &x.model)
                     })
                     .cloned()
                     .collect()
@@ -205,7 +205,9 @@ pub fn build_route_plan(cfg: &RouterConfig) -> Vec<ModelRoute> {
             if is_oauth {
                 include_in_catalog = d.selected && catalog_ids.insert(public_model_id.clone());
             } else if fallback_enabled && !matching_oauth.is_empty() {
-                is_fallback = is_fallback_channel_selected(cfg, &d.model);
+                is_fallback = matching_oauth
+                    .iter()
+                    .any(|oauth| is_eligible_oauth_api_fallback(cfg, &oauth.model, &d.model));
                 join_router = is_fallback;
                 public_model_id = matching_oauth[0].model_id.clone();
                 let has_explicit_matching_oauth = matching_oauth.iter().any(|o| !o.discovered);

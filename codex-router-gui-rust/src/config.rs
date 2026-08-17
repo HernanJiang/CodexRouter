@@ -104,6 +104,15 @@ pub struct UiPreferences {
     /// shown once and then suppressed.
     #[serde(default)]
     pub oauth_model_hint_seen: bool,
+    /// The user's choice on the "Codex config was overwritten externally"
+    /// prompt: "" (undecided), "keep" (leave the overwritten file untouched),
+    /// or "factory" (Codex factory defaults were restored).
+    #[serde(default)]
+    pub codex_overwrite_decision: String,
+    /// Fingerprint of the overwritten config.toml the decision refers to. A
+    /// new external overwrite produces a different fingerprint and re-prompts.
+    #[serde(default)]
+    pub codex_overwrite_fingerprint: String,
     #[serde(default)]
     pub window_width: f32,
     #[serde(default)]
@@ -121,6 +130,8 @@ impl Default for UiPreferences {
             share_codex_state: true,
             prefer_router_mode: false,
             oauth_model_hint_seen: false,
+            codex_overwrite_decision: String::new(),
+            codex_overwrite_fingerprint: String::new(),
             window_width: 0.0,
             window_height: 0.0,
         }
@@ -440,6 +451,12 @@ pub struct RouterConfig {
     pub fallback_channel_selections: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub reasoning: ReasoningConfig,
+    /// Maximum automatic retries when an upstream answers 429, a transient
+    /// network error, or Sub2API reports the account pool drained as 503.
+    /// Each retry waits on a staged backoff (2s, 10s, 30s, 1min, 3min, 5min)
+    /// so a burst-limited conversation keeps waiting instead of ending.
+    #[serde(default = "default_rate_limit_max_retries")]
+    pub rate_limit_max_retries: u32,
     #[serde(default)]
     pub proxy: ProxyConfig,
     #[serde(default)]
@@ -462,6 +479,10 @@ fn default_ui_theme() -> String {
     "sky".to_string()
 }
 
+fn default_rate_limit_max_retries() -> u32 {
+    crate::logic::responses_gateway::DEFAULT_RATE_LIMIT_RETRIES
+}
+
 impl Default for RouterConfig {
     fn default() -> Self {
         Self {
@@ -477,6 +498,7 @@ impl Default for RouterConfig {
             oauth_seen_account_ids: Vec::new(),
             fallback_channel_selections: BTreeMap::new(),
             reasoning: ReasoningConfig::default(),
+            rate_limit_max_retries: default_rate_limit_max_retries(),
             proxy: ProxyConfig::default(),
             models: vec![],
             default_model: String::new(),
@@ -853,6 +875,8 @@ mod tests {
             share_codex_state: false,
             prefer_router_mode: true,
             oauth_model_hint_seen: true,
+            codex_overwrite_decision: "keep".into(),
+            codex_overwrite_fingerprint: "abc123".into(),
             window_width: 1064.0,
             window_height: 820.0,
         };
@@ -866,11 +890,15 @@ mod tests {
         assert_eq!(restored.monitor_api_order, vec![4, 1]);
         assert!(!restored.share_codex_state);
         assert!(restored.prefer_router_mode);
+        assert_eq!(restored.codex_overwrite_decision, "keep");
+        assert_eq!(restored.codex_overwrite_fingerprint, "abc123");
         assert_eq!(restored.window_width, 1064.0);
         assert_eq!(restored.window_height, 820.0);
         let legacy_no_prefer: UiPreferences =
             serde_json::from_str(r#"{"shareCodexState":true}"#).unwrap();
         assert!(!legacy_no_prefer.prefer_router_mode);
+        assert!(legacy_no_prefer.codex_overwrite_decision.is_empty());
+        assert!(legacy_no_prefer.codex_overwrite_fingerprint.is_empty());
     }
 
     #[test]

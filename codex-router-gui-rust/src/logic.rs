@@ -651,6 +651,13 @@ pub fn canonical_route_model_id(model_id: &str) -> String {
     if value == "gpt-5.6" {
         value = "gpt-5.6-sol".to_owned();
     }
+    // ChatGPT-branded channel ids (chatgpt-5.6-sol, chatgpt-5.6-luna, ...)
+    // name the same OpenAI models as their gpt-* twins. Canonicalizing them
+    // onto the gpt-* family keeps fallback pairing, manual channel selections,
+    // and display naming global instead of limited to preset gpt-* ids.
+    if let Some(suffix) = value.strip_prefix("chatgpt-") {
+        value = format!("gpt-{suffix}");
+    }
     value
 }
 
@@ -663,9 +670,12 @@ pub struct ModelIdentity {
 
 pub fn model_identity(model_id: &str) -> ModelIdentity {
     let raw = model_id.trim().to_ascii_lowercase();
+    // canonical_route_model_id already normalizes chatgpt-* branded ids onto
+    // the gpt-* family, so the provider cascade below covers them via gpt-.
     let mut real_id = canonical_route_model_id(&raw);
     let provider = if raw.starts_with("openai/")
         || raw.starts_with("chatgpt/")
+        || raw.starts_with("chatgpt-")
         || real_id.starts_with("gpt-")
         || real_id.starts_with("codex-")
     {
@@ -748,38 +758,367 @@ pub fn same_model_identity(left: &str, right: &str) -> bool {
         && left.real_id == right.real_id
 }
 
-pub fn api_channel_tier(model: &ModelConfig) -> i32 {
-    if model.source == "oauth" {
-        return 0;
-    }
-    let explicit_coding_plan = serde_json::from_str::<serde_json::Value>(&model.extra)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("codex_router_channel_kind")
-                .and_then(|kind| kind.as_str())
-                .map(str::to_owned)
-        })
-        .is_some_and(|kind| kind.eq_ignore_ascii_case("coding_plan"));
-    let coding_endpoint = url::Url::parse(model.base_url.trim())
-        .ok()
-        .is_some_and(|url| {
-            url.scheme() == "https"
-                && ((url.host_str() == Some("api.kimi.com") && url.path().starts_with("/coding"))
-                    || (url.host_str() == Some("api.moonshot.ai")
-                        && url.path().starts_with("/coding"))
-                    // ByteDance Volcengine Ark subscription plans: /api/coding/v3
-                    // (Coding Plan) and /api/plan/v3 (Agent Plan).
-                    || (url
-                        .host_str()
-                        .is_some_and(|host| host.ends_with(".volces.com"))
-                        && (url.path().starts_with("/api/coding")
-                            || url.path().starts_with("/api/plan"))))
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DashboardModelRow {
+    pub index: usize,
+    pub account_count: usize,
+}
+
+pub fn dashboard_model_rows(models: &[ModelConfig]) -> Vec<DashboardModelRow> {
+    let mut rows = Vec::new();
+    let mut seen_oauth = HashSet::new();
+    for (index, model) in models.iter().enumerate() {
+        if model.source == "oauth" {
+            let key = format!(
+                "{}|{}",
+                model_identity(&model.model).provider,
+                model_identity(&model.model).real_id
+            );
+            if !seen_oauth.insert(key) {
+                continue;
+            }
+            let account_count = models
+                .iter()
+                .filter(|candidate| {
+                    candidate.source == "oauth"
+                        && same_model_identity(&candidate.model, &model.model)
+                })
+                .count()
+                .max(1);
+            rows.push(DashboardModelRow {
+                index,
+                account_count,
+            });
+            continue;
+        }
+        rows.push(DashboardModelRow {
+            index,
+            account_count: 1,
         });
-    if explicit_coding_plan || coding_endpoint {
-        1
+    }
+    rows
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChannelSourceType {
+    Subscription,
+    CodingPlan,
+    OfficialApi,
+    Relay,
+}
+
+impl ChannelSourceType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Subscription => "subscription",
+            Self::CodingPlan => "coding_plan",
+            Self::OfficialApi => "official_api",
+            Self::Relay => "relay",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "subscription" => Some(Self::Subscription),
+            "coding_plan" => Some(Self::CodingPlan),
+            "official_api" => Some(Self::OfficialApi),
+            "relay" => Some(Self::Relay),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChannelGateway {
+    Sub2Api,
+    Direct,
+}
+
+impl ChannelGateway {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sub2Api => "sub2api",
+            Self::Direct => "direct",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpstreamProtocol {
+    Responses,
+    ChatCompletions,
+    Anthropic,
+}
+
+impl UpstreamProtocol {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Responses => "responses",
+            Self::ChatCompletions => "chat_completions",
+            Self::Anthropic => "anthropic",
+        }
+    }
+
+    pub fn responses_mode(self) -> &'static str {
+        match self {
+            Self::Responses => "force_responses",
+            Self::ChatCompletions | Self::Anthropic => "force_chat_completions",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChannelRouteProfile {
+    pub vendor: String,
+    pub source_type: ChannelSourceType,
+    pub gateway: ChannelGateway,
+    pub base_url: String,
+    pub upstream_protocol: UpstreamProtocol,
+    pub billing_mode: String,
+    pub allow_fallback: bool,
+}
+
+fn extra_object(raw: &str) -> serde_json::Map<String, Value> {
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default()
+}
+
+fn endpoint_host_path(base_url: &str) -> (String, String) {
+    url::Url::parse(base_url.trim())
+        .ok()
+        .map(|url| {
+            (
+                url.host_str().unwrap_or_default().to_ascii_lowercase(),
+                url.path().to_ascii_lowercase(),
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn looks_like_sub2api_endpoint(base_url: &str) -> bool {
+    let lower = base_url.trim().to_ascii_lowercase();
+    lower.starts_with("sub2api")
+        || lower.contains("127.0.0.1")
+        || lower.contains("localhost")
+}
+
+fn is_coding_plan_endpoint(host: &str, path: &str) -> bool {
+    (host == "api.kimi.com" && path.starts_with("/coding"))
+        || (host == "api.moonshot.ai" && path.starts_with("/coding"))
+        || (host.ends_with(".volces.com")
+            && (path.starts_with("/api/coding") || path.starts_with("/api/plan")))
+}
+
+fn is_official_api_host(host: &str) -> bool {
+    matches!(
+        host,
+        "api.openai.com"
+            | "api.anthropic.com"
+            | "api.deepseek.com"
+            | "api.kimi.com"
+            | "api.moonshot.ai"
+            | "api.moonshot.cn"
+            | "generativelanguage.googleapis.com"
+            | "api.x.ai"
+    ) || (host.ends_with(".volces.com") && !host.is_empty())
+}
+
+fn channel_vendor(
+    model_id: &str,
+    host: &str,
+    oauth_platform: &str,
+    source_type: ChannelSourceType,
+) -> String {
+    let platform = oauth_platform.trim().to_ascii_lowercase();
+    if !platform.is_empty() {
+        return match platform.as_str() {
+            "openai" | "chatgpt" => "openai".to_owned(),
+            "grok" | "xai" | "x-ai" => "x-ai".to_owned(),
+            "gemini" | "antigravity" | "google" => "google".to_owned(),
+            "anthropic" | "claude" => "anthropic".to_owned(),
+            other => other.to_owned(),
+        };
+    }
+    if host == "api.430123.xyz" || host.ends_with(".430123.xyz") {
+        return "chiral".to_owned();
+    }
+    if host == "openrouter.ai" || host.ends_with(".openrouter.ai") {
+        return "openrouter".to_owned();
+    }
+    if host.ends_with(".volces.com") {
+        return "volcengine".to_owned();
+    }
+    if host == "api.kimi.com" || host == "api.moonshot.ai" || host == "api.moonshot.cn" {
+        return "moonshot".to_owned();
+    }
+    if host == "api.deepseek.com" {
+        return "deepseek".to_owned();
+    }
+    if host == "api.anthropic.com" {
+        return "anthropic".to_owned();
+    }
+    if host == "api.openai.com" {
+        return "openai".to_owned();
+    }
+    if host == "generativelanguage.googleapis.com" {
+        return "google".to_owned();
+    }
+    if host == "api.x.ai" {
+        return "x-ai".to_owned();
+    }
+    let identity = model_identity(model_id);
+    if !identity.provider.starts_with("unknown") {
+        return identity.provider;
+    }
+    match source_type {
+        ChannelSourceType::Relay => "relay".to_owned(),
+        _ => identity.provider,
+    }
+}
+
+fn endpoint_protocol(
+    host: &str,
+    path: &str,
+    model_id: &str,
+    gateway: ChannelGateway,
+) -> UpstreamProtocol {
+    if host == "api.anthropic.com" {
+        return UpstreamProtocol::Anthropic;
+    }
+    if host == "api.430123.xyz" || host.ends_with(".430123.xyz") {
+        return UpstreamProtocol::Responses;
+    }
+    if host.ends_with(".volces.com") {
+        return if path.starts_with("/api/coding") || path.starts_with("/api/plan") {
+            UpstreamProtocol::Responses
+        } else {
+            UpstreamProtocol::ChatCompletions
+        };
+    }
+    if host == "api.kimi.com"
+        || host == "api.moonshot.ai"
+        || host == "api.moonshot.cn"
+        || host == "api.deepseek.com"
+        || host == "generativelanguage.googleapis.com"
+        || host == "api.x.ai"
+    {
+        return UpstreamProtocol::ChatCompletions;
+    }
+    if host == "openrouter.ai" || host.ends_with(".openrouter.ai") {
+        let model = model_id.trim().trim_start_matches('~');
+        return if model.to_ascii_lowercase().starts_with("deepseek/") {
+            UpstreamProtocol::Responses
+        } else {
+            UpstreamProtocol::ChatCompletions
+        };
+    }
+    if gateway == ChannelGateway::Sub2Api || host == "api.openai.com" || host.is_empty() {
+        return UpstreamProtocol::Responses;
+    }
+    UpstreamProtocol::Responses
+}
+
+pub fn classify_channel_route(model: &ModelConfig) -> ChannelRouteProfile {
+    let extra = extra_object(&model.extra);
+    let (host, path) = endpoint_host_path(&model.base_url);
+    let gateway = if model.source == "oauth" || looks_like_sub2api_endpoint(&model.base_url) {
+        ChannelGateway::Sub2Api
     } else {
-        2
+        ChannelGateway::Direct
+    };
+    let explicit_source = extra
+        .get("codex_router_channel_kind")
+        .and_then(Value::as_str)
+        .and_then(ChannelSourceType::parse);
+    let source_type = if model.source == "oauth" {
+        ChannelSourceType::Subscription
+    } else if let Some(kind) = explicit_source {
+        kind
+    } else if is_coding_plan_endpoint(&host, &path) {
+        ChannelSourceType::CodingPlan
+    } else if (is_official_api_host(&host) && !host.ends_with(".volces.com"))
+        || (host.ends_with(".volces.com") && path.starts_with("/api/v3"))
+    {
+        ChannelSourceType::OfficialApi
+    } else if host.is_empty() && gateway == ChannelGateway::Sub2Api {
+        ChannelSourceType::Subscription
+    } else {
+        ChannelSourceType::Relay
+    };
+    let explicit_protocol = extra
+        .get("openai_responses_mode")
+        .and_then(Value::as_str)
+        .map(|mode| mode.trim().to_ascii_lowercase());
+    let upstream_protocol = match explicit_protocol.as_deref() {
+        Some("force_responses") => UpstreamProtocol::Responses,
+        Some("force_chat_completions") => UpstreamProtocol::ChatCompletions,
+        _ => endpoint_protocol(&host, &path, &model.model, gateway),
+    };
+    let allow_fallback = extra
+        .get("allow_fallback")
+        .and_then(Value::as_bool)
+        .unwrap_or(!matches!(
+            source_type,
+            ChannelSourceType::Subscription | ChannelSourceType::CodingPlan
+        ));
+    let vendor = extra
+        .get("codex_router_vendor")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            channel_vendor(&model.model, &host, &model.oauth_platform, source_type)
+        });
+    let billing_mode = match source_type {
+        ChannelSourceType::Subscription => "subscription",
+        ChannelSourceType::CodingPlan => "coding_plan",
+        ChannelSourceType::OfficialApi => "payg",
+        ChannelSourceType::Relay => "relay",
+    }
+    .to_owned();
+    ChannelRouteProfile {
+        vendor,
+        source_type,
+        gateway,
+        base_url: model.base_url.trim().trim_end_matches('/').to_owned(),
+        upstream_protocol,
+        billing_mode,
+        allow_fallback,
+    }
+}
+
+pub fn is_same_vendor_payg_fallback(source: &ModelConfig, candidate: &ModelConfig) -> bool {
+    let source_profile = classify_channel_route(source);
+    let candidate_profile = classify_channel_route(candidate);
+    !source_profile.allow_fallback
+        && candidate_profile.source_type == ChannelSourceType::OfficialApi
+        && source_profile.vendor == candidate_profile.vendor
+}
+
+pub fn is_eligible_oauth_api_fallback(
+    cfg: &RouterConfig,
+    source: &ModelConfig,
+    candidate: &ModelConfig,
+) -> bool {
+    if candidate.source == "oauth" || !is_fallback_channel_selected(cfg, candidate) {
+        return false;
+    }
+    let canonical = canonical_route_model_id(&candidate.model);
+    let explicitly_listed = cfg.fallback_channel_selections.contains_key(&canonical);
+    if explicitly_listed {
+        return true;
+    }
+    !is_same_vendor_payg_fallback(source, candidate)
+}
+
+pub fn api_channel_tier(model: &ModelConfig) -> i32 {
+    match classify_channel_route(model).source_type {
+        ChannelSourceType::Subscription => 0,
+        ChannelSourceType::CodingPlan => 1,
+        ChannelSourceType::OfficialApi | ChannelSourceType::Relay => 2,
     }
 }
 
@@ -971,10 +1310,7 @@ pub fn next_api_channel_priority(cfg: &RouterConfig) -> i32 {
 }
 
 pub fn is_oauth_fallback_model(cfg: &RouterConfig, candidate: &ModelConfig) -> bool {
-    if !cfg.oauth_fallback.enabled
-        || candidate.source == "oauth"
-        || !is_fallback_channel_selected(cfg, candidate)
-    {
+    if !cfg.oauth_fallback.enabled || candidate.source == "oauth" {
         return false;
     }
     cfg.models.iter().any(|model| {
@@ -984,6 +1320,7 @@ pub fn is_oauth_fallback_model(cfg: &RouterConfig, candidate: &ModelConfig) -> b
                 .as_ref()
                 .is_none_or(|ids| ids.contains(&model.oauth_account_id))
             && same_model_identity(&model.model, &candidate.model)
+            && is_eligible_oauth_api_fallback(cfg, model, candidate)
     })
 }
 
@@ -1204,7 +1541,52 @@ pub fn write_model_catalog(cfg: &RouterConfig, router_root: &Path) -> anyhow::Re
     )
 }
 
-pub fn write_all_files(cfg: &RouterConfig, router_root: &Path) -> anyhow::Result<()> {
+pub fn stamp_channel_route_metadata(model: &mut ModelConfig) {
+    let profile = classify_channel_route(model);
+    let mut extra = extra_object(&model.extra);
+    extra.insert(
+        "codex_router_vendor".to_owned(),
+        Value::String(profile.vendor),
+    );
+    extra.insert(
+        "codex_router_source_type".to_owned(),
+        Value::String(profile.source_type.as_str().to_owned()),
+    );
+    extra.insert(
+        "codex_router_gateway".to_owned(),
+        Value::String(profile.gateway.as_str().to_owned()),
+    );
+    extra.insert(
+        "codex_router_upstream_protocol".to_owned(),
+        Value::String(profile.upstream_protocol.as_str().to_owned()),
+    );
+    extra.insert(
+        "codex_router_billing_mode".to_owned(),
+        Value::String(profile.billing_mode),
+    );
+    extra.insert("allow_fallback".to_owned(), Value::Bool(profile.allow_fallback));
+    extra.insert(
+        "codex_router_channel_kind".to_owned(),
+        Value::String(profile.source_type.as_str().to_owned()),
+    );
+    extra
+        .entry("openai_responses_mode".to_owned())
+        .or_insert_with(|| Value::String(profile.upstream_protocol.responses_mode().to_owned()));
+    if profile.base_url.to_ascii_lowercase().contains("api.openai.com")
+        && extra
+            .get("openai_responses_mode")
+            .and_then(Value::as_str)
+            .is_some_and(|mode| mode == "force_responses")
+    {
+        extra.remove("openai_responses_mode");
+    }
+    model.extra = serde_json::to_string(&Value::Object(extra)).unwrap_or_else(|_| "{}".to_owned());
+}
+
+pub fn write_all_files(cfg: &mut RouterConfig, router_root: &Path) -> anyhow::Result<()> {
+    for model in &mut cfg.models {
+        stamp_channel_route_metadata(model);
+    }
     std::fs::create_dir_all(router_root.join("config"))?;
     // The deployment scripts resolve the Router config through
     // `Get-RouterConfigPath`, which points at the persistent user-data root for
@@ -2098,12 +2480,24 @@ pub fn codex_router_mode_active(cfg: &RouterConfig) -> bool {
 
 pub fn load_oauth_accounts(router_root: &Path) -> anyhow::Result<Vec<crate::OAuthAccountSummary>> {
     let config = RouterConfig::load(&crate::user_data::config_path(router_root))
-        .context("ROUTER_OAUTH_ACCOUNTS_CONFIGURATION: class=configuration")?;
+        .unwrap_or_default();
+    load_oauth_accounts_with_config(router_root, &config)
+}
+
+pub fn load_oauth_accounts_with_config(
+    router_root: &Path,
+    config: &RouterConfig,
+) -> anyhow::Result<Vec<crate::OAuthAccountSummary>> {
     let mut last_failure = "ROUTER_OAUTH_ACCOUNTS_UNAVAILABLE: class=request_failure".to_owned();
     let mut attempted_repair = false;
     for attempt in 0..5 {
         if attempt == 0 {
-            for _ in 0..6 {
+            let wait_rounds = if crate::user_data::config_looks_configured(config) {
+                8
+            } else {
+                2
+            };
+            for _ in 0..wait_rounds {
                 if local_router_health_available(&config.deploy.sub2api_host) {
                     break;
                 }
@@ -2115,10 +2509,10 @@ pub fn load_oauth_accounts(router_root: &Path) -> anyhow::Result<Vec<crate::OAut
             && oauth_accounts_failure_needs_router_repair(&last_failure)
         {
             attempted_repair = true;
-            let _ = ensure_router_healthy(router_root);
+            let _ = ensure_router_healthy_with_config(router_root, config);
             std::thread::sleep(Duration::from_millis(800));
         }
-        match load_oauth_accounts_native(router_root, &config) {
+        match load_oauth_accounts_native(router_root, config) {
             Ok(accounts) => return Ok(accounts),
             Err(error) => {
                 last_failure = format!(
@@ -2412,9 +2806,9 @@ fn oauth_accounts_failure_needs_router_repair(summary: &str) -> bool {
         || lower.contains("connection_refused")
 }
 
-fn ensure_router_healthy(router_root: &Path) -> bool {
+fn ensure_router_healthy_with_config(router_root: &Path, config: &RouterConfig) -> bool {
     let cancel = AtomicBool::new(false);
-    crate::lifecycle::ensure_services(router_root, true, &cancel, false).is_ok()
+    crate::lifecycle::ensure_services_with_config(router_root, config, true, &cancel, false).is_ok()
 }
 
 fn native_admin_error(error: &anyhow::Error) -> String {
@@ -2979,6 +3373,84 @@ mod tests {
     }
 
     #[test]
+    fn channel_route_profiles_keep_source_and_protocol_separate() {
+        let grok = ModelConfig {
+            model: "grok-4.6".into(),
+            source: "oauth".into(),
+            oauth_platform: "grok".into(),
+            base_url: "Sub2API OAuth / grok".into(),
+            ..Default::default()
+        };
+        let grok_profile = classify_channel_route(&grok);
+        assert_eq!(grok_profile.vendor, "x-ai");
+        assert_eq!(grok_profile.source_type, ChannelSourceType::Subscription);
+        assert_eq!(grok_profile.gateway, ChannelGateway::Sub2Api);
+        assert_eq!(grok_profile.upstream_protocol, UpstreamProtocol::Responses);
+        assert!(!grok_profile.allow_fallback);
+
+        let ark = ModelConfig {
+            model: "deepseek-v4-flash".into(),
+            base_url: "https://ark.cn-beijing.volces.com/api/coding/v3".into(),
+            ..Default::default()
+        };
+        let ark_profile = classify_channel_route(&ark);
+        assert_eq!(ark_profile.vendor, "volcengine");
+        assert_eq!(ark_profile.source_type, ChannelSourceType::CodingPlan);
+        assert_eq!(ark_profile.upstream_protocol, UpstreamProtocol::Responses);
+        assert!(!ark_profile.allow_fallback);
+
+        let ark_payg = ModelConfig {
+            model: "deepseek-v4-flash".into(),
+            base_url: "https://ark.cn-beijing.volces.com/api/v3".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_channel_route(&ark_payg).source_type,
+            ChannelSourceType::OfficialApi
+        );
+        assert!(is_same_vendor_payg_fallback(&ark, &ark_payg));
+
+        let kimi = ModelConfig {
+            model: "kimi-for-coding".into(),
+            base_url: "https://api.kimi.com/coding/v1".into(),
+            ..Default::default()
+        };
+        let kimi_profile = classify_channel_route(&kimi);
+        assert_eq!(kimi_profile.source_type, ChannelSourceType::CodingPlan);
+        assert_eq!(
+            kimi_profile.upstream_protocol,
+            UpstreamProtocol::ChatCompletions
+        );
+        assert!(!kimi_profile.allow_fallback);
+
+        let chiral = ModelConfig {
+            model: "gpt-5.6-sol".into(),
+            base_url: "https://api.430123.xyz/v1".into(),
+            ..Default::default()
+        };
+        let chiral_profile = classify_channel_route(&chiral);
+        assert_eq!(chiral_profile.vendor, "chiral");
+        assert_eq!(chiral_profile.source_type, ChannelSourceType::Relay);
+        assert_eq!(chiral_profile.upstream_protocol, UpstreamProtocol::Responses);
+        assert!(chiral_profile.allow_fallback);
+
+        let chatgpt = ModelConfig {
+            model: "gpt-5.6-sol".into(),
+            source: "oauth".into(),
+            oauth_platform: "openai".into(),
+            base_url: "Sub2API OAuth / openai".into(),
+            ..Default::default()
+        };
+        let openai_payg = ModelConfig {
+            model: "gpt-5.6-sol".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            ..Default::default()
+        };
+        assert!(is_same_vendor_payg_fallback(&chatgpt, &openai_payg));
+        assert!(!is_same_vendor_payg_fallback(&chatgpt, &chiral));
+    }
+
+    #[test]
     fn effective_api_priority_preserves_configured_channel_order() {
         assert_eq!(effective_api_priority(10, 10, 100, 1, true), 100);
         assert_eq!(effective_api_priority(20, 10, 100, 1, true), 110);
@@ -3371,6 +3843,22 @@ base_url = "https://api.430123.xyz/v1"
         let failure = "ROUTER_OAUTH_ACCOUNTS_UNAVAILABLE: class=request_failure";
         assert!(oauth_accounts_failure_is_retryable(failure));
         assert!(oauth_accounts_failure_needs_router_repair(failure));
+    }
+
+    #[test]
+    fn first_run_without_saved_config_does_not_fail_as_configuration() {
+        let root = temporary_test_dir("oauth-first-run-no-config");
+        let config_path = crate::user_data::config_path(&root);
+        assert!(!config_path.is_file());
+        let loaded = RouterConfig::load(&config_path);
+        assert!(loaded.is_err());
+        let fallback = loaded.unwrap_or_default();
+        assert_eq!(fallback.deploy.sub2api_host, "http://127.0.0.1:18080");
+        assert!(!crate::user_data::config_looks_configured(&fallback));
+        let _loader: fn(&Path) -> anyhow::Result<Vec<crate::OAuthAccountSummary>> =
+            load_oauth_accounts;
+        let _ = _loader;
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3834,6 +4322,13 @@ base_url = "https://api.430123.xyz/v1"
             "gpt-5.6-sol"
         );
         assert_eq!(canonical_route_model_id("gpt-5.6"), "gpt-5.6-sol");
+        // ChatGPT-branded ids canonicalize onto their gpt-* twins globally.
+        assert_eq!(canonical_route_model_id("chatgpt-5.6-sol"), "gpt-5.6-sol");
+        assert_eq!(canonical_route_model_id("chatgpt-5.6-luna"), "gpt-5.6-luna");
+        assert_eq!(
+            canonical_route_model_id("OpenAI/ChatGPT-5.6-Luna"),
+            "gpt-5.6-luna"
+        );
     }
 
     #[test]
@@ -3845,6 +4340,11 @@ base_url = "https://api.430123.xyz/v1"
             ("grok-4.5", "x-ai/grok-4.5"),
             ("deepseek-v4-flash", "deepseek/deepseek-v4-flash"),
             ("claude-opus-4-6", "anthropic/claude-opus-4.6"),
+            // ChatGPT-branded ids are the same OpenAI family as gpt-* twins,
+            // so every ChatGPT model variant pairs for fallback, not only sol.
+            ("chatgpt-5.6-sol", "gpt-5.6-sol"),
+            ("chatgpt-5.6-luna", "gpt-5.6-luna"),
+            ("chatgpt-5.6-luna", "openai/gpt-5.6-luna"),
         ] {
             assert!(
                 same_model_identity(left, right),
@@ -3858,12 +4358,78 @@ base_url = "https://api.430123.xyz/v1"
             ("kimi-for-coding", "kimi-for-coding-highspeed"),
             ("kimi-k3", "k3-256k"),
             ("vendor-a/model-x", "vendor-b/model-x"),
+            ("chatgpt-5.6-luna", "gpt-5.6-sol"),
+            ("chatgpt-5.6-luna", "chatgpt-5.6-terra"),
         ] {
             assert!(
                 !same_model_identity(left, right),
                 "{left} must not match {right}"
             );
         }
+    }
+
+    #[test]
+    fn dashboard_merges_duplicate_oauth_models_and_keeps_distinct_api_rows() {
+        let models = vec![
+            ModelConfig {
+                model: "gemini-3.7-flash".into(),
+                source: "oauth".into(),
+                oauth_account_id: 4,
+                ..Default::default()
+            },
+            ModelConfig {
+                model: "gemini-3.7-flash".into(),
+                source: "oauth".into(),
+                oauth_account_id: 26,
+                ..Default::default()
+            },
+            ModelConfig {
+                model: "gpt-5.6-sol".into(),
+                source: "apikey".into(),
+                ..Default::default()
+            },
+        ];
+        let rows = dashboard_model_rows(&models);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].index, 0);
+        assert_eq!(rows[0].account_count, 2);
+        assert_eq!(rows[1].index, 2);
+        assert_eq!(rows[1].account_count, 1);
+    }
+
+    #[test]
+    fn chatgpt_branded_api_channel_becomes_oauth_fallback_for_every_variant() {
+        let mut config = RouterConfig {
+            oauth_account_ids: Some(vec![7]),
+            ..Default::default()
+        };
+        let luna_api = ModelConfig {
+            model: "chatgpt-5.6-luna".into(),
+            ..Default::default()
+        };
+        config.models = vec![luna_api.clone()];
+        assert!(!is_oauth_fallback_model(&config, &luna_api));
+
+        config.models.push(ModelConfig {
+            model: "gpt-5.6-luna".into(),
+            source: "oauth".into(),
+            oauth_account_id: 7,
+            ..Default::default()
+        });
+        assert!(is_oauth_fallback_model(&config, &luna_api));
+
+        let plan = catalog::build_route_plan(&config);
+        let api_route = plan
+            .iter()
+            .find(|route| route.model.model == "chatgpt-5.6-luna")
+            .expect("API route exists");
+        assert!(api_route.is_oauth_fallback);
+        assert!(api_route.join_router);
+        assert_eq!(api_route.public_model_id, "gpt-5.6-luna");
+        assert_eq!(
+            api_route.request_model_ids,
+            vec!["gpt-5.6-luna".to_owned()]
+        );
     }
 
     #[test]
@@ -4116,7 +4682,7 @@ base_url = "https://api.430123.xyz/v1"
             ..Default::default()
         });
 
-        write_all_files(&config, &root).unwrap();
+        write_all_files(&mut config, &root).unwrap();
 
         let raw = std::fs::read_to_string(root.join("config/model-catalog.json")).unwrap();
         let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();

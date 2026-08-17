@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use toml_edit::{DocumentMut, Item};
 
 const CODEX_ROUTER_REQUEST_MAX_RETRIES: i64 = 1;
-const CODEX_ROUTER_STREAM_MAX_RETRIES: i64 = 3;
+const CODEX_ROUTER_STREAM_MAX_RETRIES: i64 = 6;
 
 const REASONING_LEVELS: &[&str] = &[
     "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
@@ -527,6 +527,14 @@ pub fn write_codex_config_from_router_config(
     cfg: &RouterConfig,
     router_root: &Path,
 ) -> anyhow::Result<()> {
+    write_codex_config_from_router_config_impl(cfg, router_root, &codex_system_config_path())
+}
+
+pub(crate) fn write_codex_config_from_router_config_impl(
+    cfg: &RouterConfig,
+    router_root: &Path,
+    system_config_path: &Path,
+) -> anyhow::Result<()> {
     let codex_home = resolve_codex_home(cfg);
     let existing = std::fs::read_to_string(codex_home.join("config.toml")).unwrap_or_default();
     let settings = if existing.trim().is_empty() {
@@ -551,7 +559,18 @@ pub fn write_codex_config_from_router_config(
         settings.require_openai_auth,
         settings.display_openai_provider,
         None,
-    )
+    )?;
+    // Mirror the binding into the system layer so a Codex Desktop rewrite of
+    // the user config.toml can no longer sever non-ChatGPT model routing.
+    write_codex_system_binding_to(
+        system_config_path,
+        &catalog_path,
+        &local_api_key,
+        &codex_public_base_url(cfg),
+        settings.require_openai_auth,
+        settings.display_openai_provider,
+    )?;
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -708,6 +727,15 @@ pub(crate) fn repair_codex_router_binding_with_key(
     router_root: &Path,
     local_api_key: &str,
 ) -> anyhow::Result<bool> {
+    repair_codex_router_binding_impl(cfg, router_root, local_api_key, &codex_system_config_path())
+}
+
+pub(crate) fn repair_codex_router_binding_impl(
+    cfg: &RouterConfig,
+    router_root: &Path,
+    local_api_key: &str,
+    system_config_path: &Path,
+) -> anyhow::Result<bool> {
     let codex_home = resolve_codex_home(cfg);
     let config_path = codex_home.join("config.toml");
     let existing = match std::fs::read_to_string(&config_path) {
@@ -715,12 +743,22 @@ pub(crate) fn repair_codex_router_binding_with_key(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(error).context("failed to read Codex config for Router repair"),
     };
+    let catalog_path = crate::user_data::state_root(router_root).join("model-catalog.json");
     if codex_router_binding_matches(cfg, router_root, &existing, local_api_key) {
+        // The user-layer binding is intact; make sure the system-layer safety
+        // net exists as well so later external rewrites cannot sever routing.
+        write_codex_system_binding_to(
+            system_config_path,
+            &catalog_path,
+            local_api_key,
+            &codex_public_base_url(cfg),
+            true,
+            false,
+        )?;
         return Ok(false);
     }
 
     let settings = codex_router_repair_settings(cfg, &existing);
-    let catalog_path = crate::user_data::state_root(router_root).join("model-catalog.json");
     write_codex_router_config(
         &codex_home,
         &settings.model,
@@ -739,12 +777,293 @@ pub(crate) fn repair_codex_router_binding_with_key(
     if !super::codex_config_uses_router(&repaired, &codex_public_base_url(cfg)) {
         bail!("CODEX_ROUTER_BINDING_REPAIR_INCOMPLETE");
     }
+    write_codex_system_binding_to(
+        system_config_path,
+        &catalog_path,
+        local_api_key,
+        &codex_public_base_url(cfg),
+        settings.require_openai_auth,
+        settings.display_openai_provider,
+    )?;
     Ok(true)
 }
 
 pub fn repair_codex_router_binding(cfg: &RouterConfig, router_root: &Path) -> anyhow::Result<bool> {
     let local_api_key = super::ensure_local_api_key()?;
     repair_codex_router_binding_with_key(cfg, router_root, &local_api_key)
+}
+
+/// Detection-only counterpart of [`repair_codex_router_binding`]: reports
+/// whether an external program overwrote Codex's native `config.toml` so the
+/// local Router binding no longer matches. Returns the fingerprint of the
+/// overwritten content so the app can remember a user's "keep it" decision
+/// until the file changes again. `Ok(None)` means the binding is intact.
+pub fn probe_codex_router_binding_overwrite(
+    cfg: &RouterConfig,
+    router_root: &Path,
+) -> anyhow::Result<Option<String>> {
+    let local_api_key = super::ensure_local_api_key()?;
+    probe_codex_router_binding_overwrite_with_key(cfg, router_root, &local_api_key)
+}
+
+pub(crate) fn probe_codex_router_binding_overwrite_with_key(
+    cfg: &RouterConfig,
+    router_root: &Path,
+    local_api_key: &str,
+) -> anyhow::Result<Option<String>> {
+    let codex_home = resolve_codex_home(cfg);
+    let config_path = codex_home.join("config.toml");
+    let existing = match std::fs::read_to_string(&config_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error).context("failed to read Codex config for overwrite detection")
+        }
+    };
+    if codex_router_binding_matches(cfg, router_root, &existing, local_api_key) {
+        return Ok(None);
+    }
+    Ok(Some(codex_config_fingerprint(&existing)))
+}
+
+/// Stable fingerprint of the current Codex config content. A missing file is
+/// hashed as empty content so its "deleted" state is equally trackable.
+pub fn codex_config_fingerprint(content: &str) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(content.as_bytes());
+    digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
+/// Marker comment identifying a system-layer Codex config owned by
+/// Codex-Router. Kept line-oriented so rewrites stay idempotent.
+const SYSTEM_BINDING_MARKER: &str = "# codex-router-managed: binding layer";
+
+/// Codex merges `%ProgramData%\OpenAI\Codex\config.toml` as a system default
+/// layer beneath the user `config.toml`. Codex Desktop periodically rewrites
+/// the user file and drops the Router keys (`model_provider`,
+/// `model_catalog_json`, the provider block, `features.fast_mode`), which
+/// sends non-ChatGPT models straight to the ChatGPT backend where they are
+/// rejected. Mirroring the binding into the system layer keeps every
+/// registered model routed through the local gateway even while the user file
+/// is stripped.
+///
+/// NOTE: the system layer is machine-wide. Codex-Router targets single-user
+/// machines; on shared machines every local Windows user inherits this
+/// binding.
+pub fn codex_system_config_path() -> PathBuf {
+    let program_data = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+    program_data.join("OpenAI").join("Codex").join("config.toml")
+}
+
+fn strip_system_binding_marker(content: &str) -> String {
+    content
+        .lines()
+        .filter(|line| line.trim() != SYSTEM_BINDING_MARKER)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Write or refresh the system-layer Router binding. Existing unrelated
+/// content is preserved; a foreign file that pins a different
+/// `model_provider` without our marker is left untouched and reported so an
+/// enterprise-managed file is never hijacked.
+pub(crate) fn write_codex_system_binding_to(
+    path: &Path,
+    catalog_path: &Path,
+    local_api_key: &str,
+    base_url: &str,
+    require_openai_auth: bool,
+    display_openai_provider: bool,
+) -> anyhow::Result<()> {
+    if local_api_key.is_empty() {
+        bail!("the local Router credential is required for the Codex system binding");
+    }
+    let base = validate_local_base_url(base_url)?;
+    let catalog_path = catalog_path.to_string_lossy().replace('\\', "/");
+    let existing = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error).context("failed to read the system Codex config"),
+    };
+    let had_marker = existing
+        .lines()
+        .any(|line| line.trim() == SYSTEM_BINDING_MARKER);
+    let body = strip_system_binding_marker(&existing);
+    let mut doc: DocumentMut = if body.trim().is_empty() {
+        DocumentMut::new()
+    } else {
+        body.parse()
+            .context("system Codex config.toml is not valid TOML")?
+    };
+    if !had_marker {
+        if let Some(provider) = doc.get("model_provider").and_then(Item::as_str) {
+            if provider != "codex_router" {
+                bail!(
+                    "system Codex config.toml already sets model_provider = \"{provider}\"; leaving the foreign file untouched"
+                );
+            }
+        }
+        // One-time safety net before merging into foreign content.
+        if !existing.trim().is_empty() {
+            let backup = path.with_file_name(format!(
+                "{}.codex-router.bak",
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("config.toml")
+            ));
+            if !backup.exists() {
+                std::fs::write(&backup, &existing)
+                    .context("failed to back up the system Codex config")?;
+            }
+        }
+    }
+
+    doc.insert("model_provider", toml_edit::value("codex_router"));
+    doc.insert("model_catalog_json", toml_edit::value(&catalog_path));
+    let mut features = doc
+        .remove("features")
+        .and_then(|item| item.into_table().ok())
+        .unwrap_or_default();
+    features.insert("fast_mode", toml_edit::value(true));
+    doc["features"] = toml_edit::Item::Table(features);
+    let mut desktop = doc
+        .remove("desktop")
+        .and_then(|item| item.into_table().ok())
+        .unwrap_or_default();
+    if !desktop.contains_key("enabled-reasoning-efforts") {
+        let mut levels = toml_edit::Array::new();
+        for level in ["low", "medium", "high", "xhigh", "ultra", "max"] {
+            levels.push(level);
+        }
+        desktop.insert("enabled-reasoning-efforts", toml_edit::value(levels));
+    }
+    doc["desktop"] = toml_edit::Item::Table(desktop);
+    let provider = build_codex_router_provider(
+        &base,
+        local_api_key,
+        require_openai_auth,
+        display_openai_provider,
+    );
+    let model_providers =
+        doc["model_providers"].or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+    model_providers["codex_router"] = toml_edit::Item::Table(provider);
+
+    let mut text = doc.to_string();
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    let text = format!("{SYSTEM_BINDING_MARKER}\n{text}");
+    if existing == text {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    crate::config::atomic_write(path, text.as_bytes())
+        .context("failed to write the system Codex config")?;
+    Ok(())
+}
+
+pub fn write_codex_system_binding(
+    catalog_path: &Path,
+    local_api_key: &str,
+    base_url: &str,
+    require_openai_auth: bool,
+    display_openai_provider: bool,
+) -> anyhow::Result<()> {
+    write_codex_system_binding_to(
+        &codex_system_config_path(),
+        catalog_path,
+        local_api_key,
+        base_url,
+        require_openai_auth,
+        display_openai_provider,
+    )
+}
+
+/// Remove the Router-owned keys from the system-layer Codex config, deleting
+/// the file when nothing else remains. A foreign file without our marker and
+/// without a Router provider binding is left untouched.
+pub(crate) fn remove_codex_system_binding_from(path: &Path) -> anyhow::Result<bool> {
+    let existing = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("failed to read the system Codex config"),
+    };
+    let had_marker = existing
+        .lines()
+        .any(|line| line.trim() == SYSTEM_BINDING_MARKER);
+    let body = strip_system_binding_marker(&existing);
+    let mut doc: DocumentMut = body
+        .parse()
+        .context("system Codex config.toml is not valid TOML")?;
+    let router_provider =
+        doc.get("model_provider").and_then(Item::as_str) == Some("codex_router");
+    let router_provider_block = doc
+        .get("model_providers")
+        .and_then(Item::as_table_like)
+        .is_some_and(|providers| providers.get("codex_router").is_some());
+    if !had_marker && !router_provider && !router_provider_block {
+        return Ok(false);
+    }
+    if router_provider {
+        doc.remove("model_provider");
+    }
+    let prune_providers = if let Some(providers) = doc["model_providers"].as_table_like_mut() {
+        providers.remove("codex_router");
+        providers.iter().next().is_none()
+    } else {
+        false
+    };
+    if prune_providers {
+        doc.remove("model_providers");
+    }
+    if had_marker {
+        doc.remove("model_catalog_json");
+        let prune_features = if let Some(features) = doc["features"].as_table_like_mut() {
+            features.remove("fast_mode");
+            features.iter().next().is_none()
+        } else {
+            false
+        };
+        if prune_features {
+            doc.remove("features");
+        }
+        let prune_desktop = if let Some(desktop) = doc["desktop"].as_table_like_mut() {
+            desktop.remove("enabled-reasoning-efforts");
+            desktop.iter().next().is_none()
+        } else {
+            false
+        };
+        if prune_desktop {
+            doc.remove("desktop");
+        }
+    }
+    let text = doc.to_string();
+    if text.trim().is_empty() {
+        std::fs::remove_file(path).context("failed to remove the system Codex config")?;
+        // Best-effort cleanup of directories Codex-Router created.
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::remove_dir(dir);
+            if let Some(parent) = dir.parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
+        }
+    } else {
+        crate::config::atomic_write(path, text.as_bytes())
+            .context("failed to update the system Codex config")?;
+    }
+    Ok(true)
+}
+
+pub fn remove_codex_system_binding() -> anyhow::Result<bool> {
+    remove_codex_system_binding_from(&codex_system_config_path())
 }
 
 #[cfg(test)]
@@ -806,7 +1125,7 @@ mod tests {
         assert!(generated.contains("name = \"Codex-Router\""));
         assert!(generated.contains("requires_openai_auth = true"));
         assert!(generated.contains("request_max_retries = 1"));
-        assert!(generated.contains("stream_max_retries = 3"));
+        assert!(generated.contains("stream_max_retries = 6"));
         assert!(!generated.contains("forced_login_method"));
         assert!(generated.contains("model_catalog_json = \"C:/isolated/model-catalog.json\""));
         assert_eq!(
@@ -1192,6 +1511,7 @@ sandbox = "unelevated"
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
         let codex_home = tmp.join("codex-home");
+        let system_config = tmp.join("system-config.toml");
         std::fs::create_dir_all(&codex_home).unwrap();
         let auth = br#"{\"auth_mode\":\"chatgpt\",\"tokens\":{\"access_token\":\"fixture-only\"}}"#;
         std::fs::write(codex_home.join("auth.json"), auth).unwrap();
@@ -1225,7 +1545,7 @@ sandbox = "unelevated"
         };
 
         assert!(
-            repair_codex_router_binding_with_key(&cfg, &tmp, "fixture-local-router-key").unwrap()
+            repair_codex_router_binding_impl(&cfg, &tmp, "fixture-local-router-key", &system_config).unwrap()
         );
         let repaired = std::fs::read_to_string(codex_home.join("config.toml")).unwrap();
         assert!(repaired.contains("model_provider = \"codex_router\""));
@@ -1243,7 +1563,7 @@ sandbox = "unelevated"
             toml_edit::value("stale-nonempty-router-key");
         std::fs::write(codex_home.join("config.toml"), stale_bearer.to_string()).unwrap();
         assert!(
-            repair_codex_router_binding_with_key(&cfg, &tmp, "fixture-local-router-key").unwrap()
+            repair_codex_router_binding_impl(&cfg, &tmp, "fixture-local-router-key", &system_config).unwrap()
         );
         let repaired = std::fs::read_to_string(codex_home.join("config.toml")).unwrap();
         assert!(repaired.contains("experimental_bearer_token = \"fixture-local-router-key\""));
@@ -1253,15 +1573,101 @@ sandbox = "unelevated"
         stale_catalog["model_catalog_json"] = toml_edit::value("C:/stale/model-catalog.json");
         std::fs::write(codex_home.join("config.toml"), stale_catalog.to_string()).unwrap();
         assert!(
-            repair_codex_router_binding_with_key(&cfg, &tmp, "fixture-local-router-key").unwrap()
+            repair_codex_router_binding_impl(&cfg, &tmp, "fixture-local-router-key", &system_config).unwrap()
         );
         let repaired = std::fs::read_to_string(codex_home.join("config.toml")).unwrap();
         assert!(!repaired.contains("C:/stale/model-catalog.json"));
 
         assert!(
-            !repair_codex_router_binding_with_key(&cfg, &tmp, "fixture-local-router-key").unwrap()
+            !repair_codex_router_binding_impl(&cfg, &tmp, "fixture-local-router-key", &system_config).unwrap()
         );
         assert_eq!(std::fs::read(codex_home.join("auth.json")).unwrap(), auth);
+
+        // Every repair also refreshes the system-layer safety net, even when
+        // the user-layer binding was already intact.
+        let system = std::fs::read_to_string(&system_config).unwrap();
+        assert!(system.contains(SYSTEM_BINDING_MARKER));
+        assert!(system.contains("model_provider = \"codex_router\""));
+        assert!(system.contains("[model_providers.codex_router]"));
+        assert!(system.contains("experimental_bearer_token = \"fixture-local-router-key\""));
+        assert!(system.contains("requires_openai_auth = true"));
+        assert!(system.contains("fast_mode = true"));
+        assert_eq!(
+            system.matches(SYSTEM_BINDING_MARKER).count(),
+            1,
+            "rewrites must stay idempotent"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn overwrite_probe_reports_fingerprint_only_when_binding_is_broken() {
+        let tmp = std::env::temp_dir().join(format!(
+            "codex-router-binding-probe-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let codex_home = tmp.join("codex-home");
+        let system_config = tmp.join("system-config.toml");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let cfg = RouterConfig {
+            default_model: "gpt-5.6-sol".to_owned(),
+            models: vec![ModelConfig {
+                source: "apikey".to_owned(),
+                model: "gpt-5.6-sol".to_owned(),
+                ..Default::default()
+            }],
+            deploy: crate::config::DeployConfig {
+                codex_home: codex_home.to_string_lossy().into_owned(),
+                sub2api_host: "http://127.0.0.1:18082".to_owned(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // A missing config.toml counts as overwritten (deleted) and reports
+        // the empty-content fingerprint.
+        let missing =
+            probe_codex_router_binding_overwrite_with_key(&cfg, &tmp, "fixture-local-router-key")
+                .unwrap();
+        assert_eq!(
+            missing.as_deref(),
+            Some(codex_config_fingerprint("").as_str())
+        );
+
+        // Repair writes the standard binding; the probe then reports intact.
+        assert!(
+            repair_codex_router_binding_impl(&cfg, &tmp, "fixture-local-router-key", &system_config).unwrap()
+        );
+        assert!(
+            probe_codex_router_binding_overwrite_with_key(&cfg, &tmp, "fixture-local-router-key")
+                .unwrap()
+                .is_none()
+        );
+
+        // An external program rewriting the file is detected, and the
+        // fingerprint tracks that exact overwritten content.
+        let overwritten = "model = \"gpt-5.6-sol\"\nmodel_provider = \"micu\"\n";
+        std::fs::write(codex_home.join("config.toml"), overwritten).unwrap();
+        let detected =
+            probe_codex_router_binding_overwrite_with_key(&cfg, &tmp, "fixture-local-router-key")
+                .unwrap();
+        assert_eq!(
+            detected.as_deref(),
+            Some(codex_config_fingerprint(overwritten).as_str())
+        );
+
+        // A second, different overwrite yields a different fingerprint.
+        let overwritten_again = "model_provider = \"micu\"\nmodel = \"deepseek-v4-flash\"\n";
+        std::fs::write(codex_home.join("config.toml"), overwritten_again).unwrap();
+        let detected_again =
+            probe_codex_router_binding_overwrite_with_key(&cfg, &tmp, "fixture-local-router-key")
+                .unwrap();
+        assert_eq!(
+            detected_again.as_deref(),
+            Some(codex_config_fingerprint(overwritten_again).as_str())
+        );
+        assert_ne!(detected, detected_again);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -1304,11 +1710,139 @@ sandbox = "unelevated"
             ..Default::default()
         };
 
-        write_codex_config_from_router_config(&cfg, &router_root).unwrap();
+        write_codex_config_from_router_config_impl(&cfg, &router_root, &tmp.join("system.toml"))
+            .unwrap();
         let written = std::fs::read_to_string(codex_home.join("config.toml")).unwrap();
         assert!(written.contains("model = \"deepseek-v4-flash\""));
         assert!(written.contains("model_reasoning_effort = \"high\""));
         assert!(!written.contains("model = \"gpt-5.6-sol\""));
+        let system = std::fs::read_to_string(tmp.join("system.toml")).unwrap();
+        assert!(system.contains("model_provider = \"codex_router\""));
+        assert!(system.contains(SYSTEM_BINDING_MARKER));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn system_binding_write_preserves_foreign_keys_and_removal_restores_them() {
+        let tmp = std::env::temp_dir().join(format!(
+            "codex-router-system-binding-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("config.toml");
+        let catalog = tmp.join("model-catalog.json");
+        std::fs::write(&catalog, "{}").unwrap();
+        std::fs::write(
+            &path,
+            "# enterprise defaults\napproval_policy = \"never\"\n\n[features]\nmy_feature = true\n",
+        )
+        .unwrap();
+
+        write_codex_system_binding_to(
+            &path,
+            &catalog,
+            "fixture-local-key",
+            "http://127.0.0.1:18082",
+            true,
+            false,
+        )
+        .unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains(SYSTEM_BINDING_MARKER));
+        assert!(written.contains("approval_policy = \"never\""));
+        assert!(written.contains("my_feature = true"));
+        assert!(written.contains("model_provider = \"codex_router\""));
+        assert!(written.contains("[model_providers.codex_router]"));
+        assert!(written.contains("experimental_bearer_token = \"fixture-local-key\""));
+        assert!(written.contains("fast_mode = true"));
+        assert!(written.contains("enabled-reasoning-efforts"));
+        assert!(written.contains("model_catalog_json = "));
+        // The first merge into foreign content leaves a one-time backup.
+        assert!(tmp.join("config.toml.codex-router.bak").exists());
+
+        // Rewriting over our own marker keeps foreign keys and stays stable.
+        write_codex_system_binding_to(
+            &path,
+            &catalog,
+            "fixture-local-key-2",
+            "http://127.0.0.1:18082",
+            true,
+            false,
+        )
+        .unwrap();
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        assert!(rewritten.contains("experimental_bearer_token = \"fixture-local-key-2\""));
+        assert!(rewritten.contains("approval_policy = \"never\""));
+        assert_eq!(rewritten.matches(SYSTEM_BINDING_MARKER).count(), 1);
+
+        // Removal restores the foreign document without Router keys.
+        assert!(remove_codex_system_binding_from(&path).unwrap());
+        let restored = std::fs::read_to_string(&path).unwrap();
+        assert!(!restored.contains(SYSTEM_BINDING_MARKER));
+        assert!(!restored.contains("codex_router"));
+        assert!(!restored.contains("model_catalog_json"));
+        assert!(!restored.contains("fast_mode"));
+        assert!(!restored.contains("enabled-reasoning-efforts"));
+        assert!(restored.contains("approval_policy = \"never\""));
+        assert!(restored.contains("my_feature = true"));
+
+        // A foreign file without Router content is left untouched.
+        assert!(!remove_codex_system_binding_from(&path).unwrap());
+        assert!(!remove_codex_system_binding_from(&tmp.join("missing.toml")).unwrap());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn system_binding_write_refuses_foreign_model_provider() {
+        let tmp = std::env::temp_dir().join(format!(
+            "codex-router-system-foreign-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("config.toml");
+        let original = "model_provider = \"enterprise\"\n";
+        std::fs::write(&path, original).unwrap();
+
+        let error = write_codex_system_binding_to(
+            &path,
+            &tmp.join("model-catalog.json"),
+            "fixture-local-key",
+            "http://127.0.0.1:18082",
+            true,
+            false,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("enterprise"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn system_binding_removal_deletes_a_pure_router_file() {
+        let tmp = std::env::temp_dir().join(format!(
+            "codex-router-system-pure-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("config.toml");
+        write_codex_system_binding_to(
+            &path,
+            &tmp.join("model-catalog.json"),
+            "fixture-local-key",
+            "http://127.0.0.1:18082",
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(path.exists());
+        assert!(remove_codex_system_binding_from(&path).unwrap());
+        assert!(!path.exists());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -410,7 +410,7 @@ where
             .entry(model.model.clone())
             .or_insert_with(|| Value::String(upstream));
         let mut extra = parse_extra(&model.extra)?;
-        apply_openai_channel_policy(&model.base_url, &model.model, &mut extra);
+        apply_openai_channel_policy(model, &mut extra);
         extra.insert(
             "codex_router_oauth_fallback".to_owned(),
             Value::Bool(route.is_oauth_fallback),
@@ -427,7 +427,11 @@ where
             .filter(|candidate| {
                 candidate.source != "oauth"
                     && super::same_model_identity(&candidate.model, &model.model)
-                    && super::is_fallback_channel_selected(cfg, candidate)
+                    && cfg.models.iter().any(|oauth| {
+                        oauth.source == "oauth"
+                            && super::same_model_identity(&oauth.model, &model.model)
+                            && super::is_eligible_oauth_api_fallback(cfg, oauth, candidate)
+                    })
             })
             .map(|candidate| candidate.priority.max(1))
             .min()
@@ -1087,50 +1091,54 @@ fn official_direct_api_host(base_url: &str) -> bool {
     )
 }
 
-fn apply_openai_channel_policy(base_url: &str, model_id: &str, extra: &mut Map<String, Value>) {
-    let host = Url::parse(base_url)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
-        .unwrap_or_default();
-    if !extra.contains_key("openai_responses_mode") && host != "api.openai.com" {
-        let model = model_id.trim().trim_start_matches('~');
-        let mode = if host == "api.430123.xyz" {
-            "force_responses"
-        } else if (host == "openrouter.ai" && !model.starts_with("deepseek/"))
-            || matches!(
-                host.as_str(),
-                "api.kimi.com"
-                    | "api.moonshot.ai"
-                    | "api.moonshot.cn"
-                    | "api.deepseek.com"
-                    | "ark.cn-beijing.volces.com"
-            )
-        {
-            "force_chat_completions"
-        } else {
-            "auto"
-        };
-        extra.insert(
-            "openai_responses_mode".to_owned(),
-            Value::String(mode.to_owned()),
-        );
+fn apply_openai_channel_policy(model: &ModelConfig, extra: &mut Map<String, Value>) {
+    let profile = super::classify_channel_route(model);
+    extra.insert(
+        "codex_router_vendor".to_owned(),
+        Value::String(profile.vendor.clone()),
+    );
+    extra.insert(
+        "codex_router_source_type".to_owned(),
+        Value::String(profile.source_type.as_str().to_owned()),
+    );
+    extra.insert(
+        "codex_router_gateway".to_owned(),
+        Value::String(profile.gateway.as_str().to_owned()),
+    );
+    extra.insert(
+        "codex_router_upstream_protocol".to_owned(),
+        Value::String(profile.upstream_protocol.as_str().to_owned()),
+    );
+    extra.insert(
+        "codex_router_billing_mode".to_owned(),
+        Value::String(profile.billing_mode.clone()),
+    );
+    extra.insert(
+        "allow_fallback".to_owned(),
+        Value::Bool(profile.allow_fallback),
+    );
+    extra
+        .entry("openai_responses_mode".to_owned())
+        .or_insert_with(|| Value::String(profile.upstream_protocol.responses_mode().to_owned()));
+    if profile.base_url.to_ascii_lowercase().contains("api.openai.com")
+        && extra
+            .get("openai_responses_mode")
+            .and_then(Value::as_str)
+            .is_some_and(|mode| mode == "force_responses")
+    {
+        extra.remove("openai_responses_mode");
     }
-    if !extra.contains_key("openai_compact_supported") {
-        match host.as_str() {
-            "api.430123.xyz" => {
-                extra.insert("openai_compact_supported".to_owned(), Value::Bool(true));
-            }
-            "openrouter.ai"
-            | "api.kimi.com"
-            | "api.moonshot.ai"
-            | "api.moonshot.cn"
-            | "api.deepseek.com"
-            | "ark.cn-beijing.volces.com" => {
-                extra.insert("openai_compact_supported".to_owned(), Value::Bool(false));
-            }
-            _ => {}
-        }
-    }
+    extra
+        .entry("openai_compact_supported".to_owned())
+        .or_insert_with(|| {
+            Value::Bool(matches!(
+                (profile.source_type, profile.upstream_protocol),
+                (
+                    super::ChannelSourceType::Relay,
+                    super::UpstreamProtocol::Responses
+                )
+            ))
+        });
 }
 
 fn upstream_model_id(model_id: &str, base_url: &str) -> String {
@@ -1630,8 +1638,11 @@ mod tests {
         );
         let mut extra = Map::new();
         apply_openai_channel_policy(
-            "https://api.kimi.com/coding/v1",
-            "kimi-for-coding",
+            &ModelConfig {
+                model: "kimi-for-coding".to_owned(),
+                base_url: "https://api.kimi.com/coding/v1".to_owned(),
+                ..Default::default()
+            },
             &mut extra,
         );
         assert_eq!(
@@ -1639,6 +1650,9 @@ mod tests {
             Value::String("force_chat_completions".to_owned())
         );
         assert_eq!(extra["openai_compact_supported"], Value::Bool(false));
+        assert_eq!(extra["codex_router_source_type"], "coding_plan");
+        assert_eq!(extra["codex_router_upstream_protocol"], "chat_completions");
+        assert_eq!(extra["allow_fallback"], false);
         assert!(official_direct_api_host("https://api.deepseek.com/v1"));
         assert!(official_direct_api_host("https://api.kimi.com/coding/v1"));
         assert!(!official_direct_api_host("https://api.openai.com/v1"));

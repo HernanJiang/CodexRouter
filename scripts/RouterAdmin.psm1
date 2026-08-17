@@ -1626,6 +1626,7 @@ function Get-RouterOpenAIChannelPolicy {
         $openRouterChatBridgeRequired = $hostName -eq 'openrouter.ai' -and
             -not [string]::IsNullOrWhiteSpace($normalizedOpenRouterModelId) -and
             $normalizedOpenRouterModelId -notmatch '^(?i)deepseek/'
+        $arkPath = if ($null -ne $uri) { $uri.AbsolutePath.ToLowerInvariant() } else { '' }
         $mode = if ($hostName -eq 'api.430123.xyz') {
             'force_responses'
         } elseif ($openRouterChatBridgeRequired) {
@@ -1633,10 +1634,14 @@ function Get-RouterOpenAIChannelPolicy {
             # the native Responses path. The compatibility bridge preserves
             # those tools by translating them to Chat Completions functions.
             'force_chat_completions'
+        } elseif ($hostName -eq 'ark.cn-beijing.volces.com' -and
+            ($arkPath.StartsWith('/api/coding') -or $arkPath.StartsWith('/api/plan'))) {
+            'force_responses'
         } elseif ($hostName -in @(
             'api.kimi.com',
             'api.moonshot.ai',
             'api.moonshot.cn',
+            'api.deepseek.com',
             'ark.cn-beijing.volces.com'
         )) {
             'force_chat_completions'
