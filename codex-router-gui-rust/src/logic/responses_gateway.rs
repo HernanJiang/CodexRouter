@@ -26,11 +26,20 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const RATE_LIMIT_RETRIES: usize = 3;
 
 struct GatewayState {
     stop: std::sync::Arc<AtomicBool>,
     listen: String,
     upstream: String,
+}
+
+struct UpstreamResponse {
+    stream: TcpStream,
+    headers: Vec<u8>,
+    leftover: Vec<u8>,
+    status: u16,
+    header_map: HashMap<String, String>,
 }
 
 static GATEWAY: OnceLock<Mutex<Option<GatewayState>>> = OnceLock::new();
@@ -167,6 +176,20 @@ fn handle_client(mut client: TcpStream, upstream: &str) -> anyhow::Result<()> {
             headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_owned());
         }
     }
+    if method == "GET"
+        && (path == "/"
+            || path == "/v1"
+            || path.starts_with("/login?")
+            || path == "/login")
+    {
+        send_status(
+            &mut client,
+            200,
+            "text/plain; charset=utf-8",
+            b"Codex-Router Responses gateway is running. API endpoint: /v1/responses. Admin endpoint: http://127.0.0.1:18080/admin/accounts.",
+        )?;
+        return Ok(());
+    }
     let mut body = leftover;
     if let Some(length) = headers
         .get("content-length")
@@ -181,39 +204,50 @@ fn handle_client(mut client: TcpStream, upstream: &str) -> anyhow::Result<()> {
     }
 
     let mut request_body = body;
+    let mut openai_family = false;
     if method == "POST" && is_responses_path(&path) {
         if let Ok(mut json_body) = serde_json::from_slice::<Value>(&request_body) {
-            let stats = sanitize_responses_request(&path, &mut json_body);
-            if is_compact_path(&path) && !stats.openai_family {
-                let output = json_body
-                    .get("input")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                let payload =
-                    serde_json::to_vec(&synthetic_compact_response(&stats.model, &output))?;
-                send_status(&mut client, 200, "application/json", &payload)?;
-                return Ok(());
+            openai_family = json_body
+                .get("model")
+                .and_then(Value::as_str)
+                .is_some_and(is_openai_family_model);
+            if !openai_family {
+                let stats = sanitize_responses_request(&path, &mut json_body);
+                if is_compact_path(&path) {
+                    let output = json_body
+                        .get("input")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    let payload =
+                        serde_json::to_vec(&synthetic_compact_response(&stats.model, &output))?;
+                    send_status(&mut client, 200, "application/json", &payload)?;
+                    return Ok(());
+                }
+                request_body = serde_json::to_vec(&json_body)?;
             }
-            request_body = serde_json::to_vec(&json_body)?;
         }
     }
 
-    let mut upstream_stream = connect_upstream(upstream)?;
-    write_upstream_request(
-        &mut upstream_stream,
+    let response = open_upstream_with_rate_limit_retry(
+        upstream,
         &method,
         &path,
-        &mut headers,
+        &headers,
         &request_body,
-        upstream,
     )?;
-
-    let (response_headers, response_leftover) = read_headers(&mut upstream_stream)?;
-    let response_header_text = String::from_utf8_lossy(&response_headers);
-    let status = parse_status(&response_header_text).unwrap_or(200);
-    let response_headers_map = parse_headers(&response_header_text);
+    let mut upstream_stream = response.stream;
+    let response_headers = response.headers;
+    let response_leftover = response.leftover;
+    let status = response.status;
+    let response_headers_map = response.header_map;
     if status < 400 || !is_responses_path(&path) {
+        if status < 400 && is_responses_path(&path) && openai_family {
+            client.write_all(&response_headers)?;
+            client.write_all(&response_leftover)?;
+            std::io::copy(&mut upstream_stream, &mut client)?;
+            return Ok(());
+        }
         if status < 400 && is_responses_path(&path) {
             let content_type = content_type_of(&response_headers_map);
             let streaming = content_type.contains("text/event-stream")
@@ -303,6 +337,42 @@ fn connect_upstream(upstream: &str) -> anyhow::Result<TcpStream> {
     stream.set_read_timeout(Some(Duration::from_secs(300))).ok();
     stream.set_write_timeout(Some(Duration::from_secs(300))).ok();
     Ok(stream)
+}
+
+fn open_upstream_with_rate_limit_retry(
+    upstream: &str,
+    method: &str,
+    path: &str,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+) -> anyhow::Result<UpstreamResponse> {
+    for attempt in 0..=RATE_LIMIT_RETRIES {
+        let mut stream = connect_upstream(upstream)?;
+        let mut request_headers = headers.clone();
+        write_upstream_request(
+            &mut stream,
+            method,
+            path,
+            &mut request_headers,
+            body,
+            upstream,
+        )?;
+        let (response_headers, leftover) = read_headers(&mut stream)?;
+        let response_header_text = String::from_utf8_lossy(&response_headers);
+        let status = parse_status(&response_header_text).unwrap_or(200);
+        let response_headers_map = parse_headers(&response_header_text);
+        if status != 429 || attempt == RATE_LIMIT_RETRIES {
+            return Ok(UpstreamResponse {
+                stream,
+                headers: response_headers,
+                leftover,
+                status,
+                header_map: response_headers_map,
+            });
+        }
+        thread::sleep(Duration::from_millis(250 * (attempt as u64 + 1)));
+    }
+    unreachable!()
 }
 
 fn write_upstream_request(
@@ -479,11 +549,55 @@ fn write_sse_prelude(
     Ok(())
 }
 
-fn flush_sse_events(client: &mut TcpStream, carry: &mut String) -> anyhow::Result<()> {
-    while let Some(split_at) = carry.find("\n\n") {
-        let complete = carry[..=split_at + 1].to_owned();
-        *carry = carry[split_at + 2..].to_owned();
+fn take_sse_event(carry: &mut String) -> Option<String> {
+    let lf = carry.find("\n\n");
+    let crlf = carry.find("\r\n\r\n");
+    let (end, skip) = match (lf, crlf) {
+        (Some(lf_at), Some(crlf_at)) if crlf_at <= lf_at => (crlf_at, 4),
+        (Some(lf_at), _) => (lf_at, 2),
+        (None, Some(crlf_at)) => (crlf_at, 4),
+        (None, None) => return None,
+    };
+    let event = carry[..end + skip].to_owned();
+    carry.replace_range(..end + skip, "");
+    Some(event)
+}
+
+fn sse_event_is_terminal(event: &str) -> bool {
+    event.lines().any(|line| {
+        let data = line.trim_start().strip_prefix("data:").map(str::trim);
+        if data == Some("[DONE]") {
+            return true;
+        }
+        data.and_then(|value| serde_json::from_str::<Value>(value).ok())
+            .and_then(|json| json.get("type").and_then(Value::as_str).map(str::to_owned))
+            .is_some_and(|kind| {
+                matches!(
+                    kind.as_str(),
+                    "response.completed" | "response.failed" | "response.incomplete"
+                )
+            })
+    })
+}
+
+fn flush_sse_events(
+    client: &mut TcpStream,
+    carry: &mut String,
+    terminal: &mut bool,
+) -> anyhow::Result<()> {
+    while let Some(complete) = take_sse_event(carry) {
+        *terminal |= sse_event_is_terminal(&complete);
         client.write_all(rewrite_sse_text(&complete).as_bytes())?;
+    }
+    Ok(())
+}
+
+fn finish_sse(client: &mut TcpStream, carry: &str, terminal: bool) -> anyhow::Result<()> {
+    if !carry.is_empty() {
+        client.write_all(rewrite_sse_text(carry).as_bytes())?;
+    }
+    if !terminal {
+        client.write_all(b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"upstream_stream_interrupted\",\"message\":\"Upstream stream ended before completion.\"}}}\n\n")?;
     }
     Ok(())
 }
@@ -495,43 +609,44 @@ fn decode_chunked_to_sse(
 ) -> anyhow::Result<()> {
     let mut raw = leftover;
     let mut decoded = String::new();
+    let mut terminal = false;
     loop {
         if let Some(line_end) = raw.windows(2).position(|w| w == b"\r\n") {
             let line = String::from_utf8_lossy(&raw[..line_end]).into_owned();
-            let size = usize::from_str_radix(line.trim(), 16).unwrap_or(0);
+            let size = parse_chunk_size(&line)?;
             let after_size = line_end + 2;
             if size == 0 {
-                flush_sse_events(client, &mut decoded)?;
-                return Ok(());
+                flush_sse_events(client, &mut decoded, &mut terminal)?;
+                return finish_sse(client, &decoded, terminal);
             }
             if raw.len() < after_size + size + 2 {
                 let mut buffer = [0_u8; 8192];
                 let read = match upstream.read(&mut buffer) {
-                    Ok(0) => break,
+                    Ok(0) => return finish_sse(client, &decoded, terminal),
                     Ok(read) => read,
-                    Err(_) => break,
+                    Err(_) => return finish_sse(client, &decoded, terminal),
                 };
                 raw.extend_from_slice(&buffer[..read]);
                 continue;
             }
             decoded.push_str(&String::from_utf8_lossy(&raw[after_size..after_size + size]));
             raw.drain(..after_size + size + 2);
-            flush_sse_events(client, &mut decoded)?;
+            flush_sse_events(client, &mut decoded, &mut terminal)?;
             continue;
         }
         let mut buffer = [0_u8; 8192];
         let read = match upstream.read(&mut buffer) {
-            Ok(0) => break,
+            Ok(0) => return finish_sse(client, &decoded, terminal),
             Ok(read) => read,
-            Err(_) => break,
+            Err(_) => return finish_sse(client, &decoded, terminal),
         };
         raw.extend_from_slice(&buffer[..read]);
     }
-    flush_sse_events(client, &mut decoded)?;
-    if !decoded.is_empty() {
-        client.write_all(rewrite_sse_text(&decoded).as_bytes())?;
-    }
-    Ok(())
+}
+
+fn parse_chunk_size(line: &str) -> anyhow::Result<usize> {
+    let size_text = line.split(';').next().unwrap_or_default().trim();
+    usize::from_str_radix(size_text, 16).context("invalid upstream chunk size")
 }
 
 fn forward_plain_sse(
@@ -540,21 +655,19 @@ fn forward_plain_sse(
     leftover: Vec<u8>,
 ) -> anyhow::Result<()> {
     let mut carry = String::from_utf8_lossy(&leftover).into_owned();
+    let mut terminal = false;
     loop {
-        flush_sse_events(client, &mut carry)?;
+        flush_sse_events(client, &mut carry, &mut terminal)?;
         let mut buffer = [0_u8; 8192];
         let read = match upstream.read(&mut buffer) {
             Ok(0) => break,
             Ok(read) => read,
-            Err(_) => break,
+            Err(_) => return finish_sse(client, &carry, terminal),
         };
         carry.push_str(&String::from_utf8_lossy(&buffer[..read]));
     }
-    flush_sse_events(client, &mut carry)?;
-    if !carry.is_empty() {
-        client.write_all(rewrite_sse_text(&carry).as_bytes())?;
-    }
-    Ok(())
+    flush_sse_events(client, &mut carry, &mut terminal)?;
+    finish_sse(client, &carry, terminal)
 }
 
 fn forward_agent_sse(
@@ -643,6 +756,30 @@ mod tests {
     }
 
     #[test]
+    fn browser_navigation_does_not_forward_login_redirects() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let gateway = TcpListener::bind("127.0.0.1:0").unwrap();
+        let gateway_addr = gateway.local_addr().unwrap();
+        let upstream_url = format!("http://127.0.0.1:{}", upstream_addr.port());
+        thread::spawn(move || {
+            let (stream, _) = gateway.accept().unwrap();
+            handle_client(stream, &upstream_url).unwrap();
+        });
+
+        let mut client = TcpStream::connect(gateway_addr).unwrap();
+        client
+            .write_all(b"GET /v1 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.contains("200 OK"));
+        assert!(response.contains("Responses gateway is running"));
+        assert!(upstream.set_nonblocking(true).is_ok());
+        assert!(upstream.accept().is_err());
+    }
+
+    #[test]
     fn gateway_sanitizes_grok_responses_before_upstream() {
         let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
         let upstream_addr = upstream.local_addr().unwrap();
@@ -694,5 +831,146 @@ mod tests {
         assert!(json.get("include").is_none());
         assert_eq!(json["input"][0]["output"], "plain tool output");
         assert!(json["input"][0].get("encrypted_content").is_none());
+    }
+
+    #[test]
+    fn chatgpt_request_is_forwarded_without_rewriting() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let received = std::sync::Arc::new(Mutex::new(None::<Vec<u8>>));
+        let received_clone = received.clone();
+        thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            let (headers, leftover) = read_headers(&mut socket).unwrap();
+            let header_text = String::from_utf8_lossy(&headers);
+            let length = parse_headers(&header_text)
+                .get("content-length")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            let mut body = leftover;
+            read_exact_more(&mut socket, &mut body, length).unwrap();
+            body.truncate(length);
+            *received_clone.lock().unwrap() = Some(body);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n11\r\ndata: {\"ok\":1}\r\n\r\n\r\n0\r\n\r\n")
+                .unwrap();
+        });
+
+        let gateway = TcpListener::bind("127.0.0.1:0").unwrap();
+        let gateway_addr = gateway.local_addr().unwrap();
+        let upstream_url = format!("http://127.0.0.1:{}", upstream_addr.port());
+        thread::spawn(move || {
+            let (stream, _) = gateway.accept().unwrap();
+            handle_client(stream, &upstream_url).unwrap();
+        });
+
+        let mut client = TcpStream::connect(gateway_addr).unwrap();
+        let body = br#"{"model":"gpt-5.6-sol","include":["reasoning.encrypted_content"],"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}"#;
+        let request = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        client.write_all(request.as_bytes()).unwrap();
+        client.write_all(body).unwrap();
+        let mut response = Vec::new();
+        client.take(2048).read_to_end(&mut response).ok();
+        let forwarded = loop {
+            if let Some(value) = received.lock().unwrap().clone() {
+                break value;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(forwarded, body);
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.contains("Transfer-Encoding: chunked") || text.contains("transfer-encoding: chunked"));
+        assert!(text.contains("data: {\"ok\":1}"));
+    }
+
+    #[test]
+    fn sse_events_split_on_crlf_boundaries() {
+        let mut carry = "data: one\r\n\r\ndata: two\n\npartial".to_owned();
+        assert_eq!(take_sse_event(&mut carry).as_deref(), Some("data: one\r\n\r\n"));
+        assert_eq!(take_sse_event(&mut carry).as_deref(), Some("data: two\n\n"));
+        assert_eq!(take_sse_event(&mut carry), None);
+        assert_eq!(carry, "partial");
+    }
+
+    #[test]
+    fn sse_terminal_events_and_chunk_extensions_are_recognized() {
+        assert!(sse_event_is_terminal(
+            "data: {\"type\":\"response.completed\"}\n\n"
+        ));
+        assert!(sse_event_is_terminal("data: [DONE]\n\n"));
+        assert!(!sse_event_is_terminal(
+            "data: {\"type\":\"response.output_text.delta\"}\n\n"
+        ));
+        assert_eq!(parse_chunk_size("1a;foo=bar").unwrap(), 26);
+        assert!(parse_chunk_size("not-hex").is_err());
+    }
+
+    #[test]
+    fn interrupted_plain_sse_emits_a_failed_terminal_event() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            socket
+                .write_all(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"half\"}\n\n")
+                .unwrap();
+        });
+        let client_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client_addr = client_listener.local_addr().unwrap();
+        let mut upstream_stream = TcpStream::connect(upstream_addr).unwrap();
+        let worker = thread::spawn(move || {
+            let (mut client, _) = client_listener.accept().unwrap();
+            forward_plain_sse(&mut client, &mut upstream_stream, Vec::new()).unwrap();
+        });
+        let mut client = TcpStream::connect(client_addr).unwrap();
+        let mut output = String::new();
+        client.read_to_string(&mut output).unwrap();
+        worker.join().unwrap();
+        assert!(output.contains("response.output_text.delta"));
+        assert!(output.contains("response.failed"));
+        assert!(output.contains("upstream_stream_interrupted"));
+    }
+
+    #[test]
+    fn rate_limited_request_retries_until_a_healthy_account_answers() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+        thread::spawn(move || {
+            for index in 0..3 {
+                let (mut socket, _) = upstream.accept().unwrap();
+                let (headers, leftover) = read_headers(&mut socket).unwrap();
+                let length = parse_headers(&String::from_utf8_lossy(&headers))
+                    .get("content-length")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let mut body = leftover;
+                read_exact_more(&mut socket, &mut body, length).unwrap();
+                attempts_clone.fetch_add(1, Ordering::Relaxed);
+                let response = if index < 2 {
+                    b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .as_slice()
+                } else {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                        .as_slice()
+                };
+                socket.write_all(response).unwrap();
+            }
+        });
+
+        let response = open_upstream_with_rate_limit_retry(
+            &format!("http://127.0.0.1:{}", upstream_addr.port()),
+            "POST",
+            "/v1/responses",
+            &HashMap::new(),
+            b"{}",
+        )
+        .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
     }
 }

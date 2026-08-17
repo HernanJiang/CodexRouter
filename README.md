@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.7.4-0969da" alt="Version 1.7.4">
+  <img src="https://img.shields.io/badge/version-1.7.5-0969da" alt="Version 1.7.5">
   <img src="https://img.shields.io/badge/platform-Windows%20%2F%20macOS%20%2F%20Linux-0078d4" alt="Windows / macOS / Linux">
   <img src="https://img.shields.io/badge/architecture-x64-555555" alt="x64">
   <img src="https://img.shields.io/badge/runtime-portable%20%2B%20installer-2ea44f" alt="Portable and installer runtime">
@@ -113,11 +113,11 @@ The current runtime retains the memory and background-work optimizations. Idle t
 
 ## Download And First Run
 
-Download the Windows x64 package from [GitHub Releases](https://github.com/HernanJiang/CodexRouter/releases/tag/v1.7.4):
+Download the Windows x64 package from [GitHub Releases](https://github.com/HernanJiang/CodexRouter/releases/tag/v1.7.5):
 
-`Codex-Router-Portable-1.7.4-windows-x64.zip`
+`Codex-Router-Portable-1.7.5-windows-x64.zip`
 
-An optional per-user installer is also provided as `Codex-Router-Installer-1.7.4-windows-x64.exe`. It opens a setup wizard so you can choose the install location, keep a desktop shortcut by default, and confirm before installation starts. The default location is `%LOCALAPPDATA%\Programs\CodexRouter\1.7.4`. No administrator access is required.
+An optional per-user installer is also provided as `Codex-Router-Installer-1.7.5-windows-x64.exe`. It opens a setup wizard so you can choose the install location, keep a desktop shortcut by default, and confirm before installation starts. The default location is `%LOCALAPPDATA%\Programs\CodexRouter\1.7.5`. No administrator access is required.
 
 This GitHub Release publishes the verified Windows installer and portable package. Theoretical macOS / Linux binaries can still be produced from source via the repository workflow; they have not been tested on real machines. The current supported runtime remains Windows 10/11 x64.
 

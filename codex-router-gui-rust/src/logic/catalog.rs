@@ -133,12 +133,6 @@ fn is_openai_catalog_model(model: &ModelConfig) -> bool {
         || crate::logic::responses_compat::is_openai_family_model(&model.model)
 }
 
-fn catalog_has_third_party(visible: &[&ModelRoute]) -> bool {
-    visible
-        .iter()
-        .any(|route| !is_openai_catalog_model(&route.model))
-}
-
 /// Build the route plan that determines which model entries appear in the Codex
 /// catalog and which channels participate in the Sub2API routing.
 pub fn build_route_plan(cfg: &RouterConfig) -> Vec<ModelRoute> {
@@ -377,7 +371,6 @@ pub fn build_model_catalog_with_root(cfg: &RouterConfig, router_root: &Path) -> 
     let template = load_catalog_template(router_root);
     let route_plan = build_route_plan(cfg);
     let visible: Vec<&ModelRoute> = route_plan.iter().filter(|r| r.include_in_catalog).collect();
-    let mixed_third_party = catalog_has_third_party(&visible);
     let mut entries = Vec::new();
     for (index, route) in visible.iter().enumerate() {
         let model = &route.model;
@@ -454,7 +447,7 @@ pub fn build_model_catalog_with_root(cfg: &RouterConfig, router_root: &Path) -> 
         if is_restricted_oauth_model(model) || !is_openai_catalog_model(model) {
             apply_model_identity(&mut entry, model);
             entry["use_responses_lite"] = Value::Bool(false);
-            entry["multi_agent_version"] = Value::Null;
+            entry["multi_agent_version"] = Value::String("v1".to_owned());
             entry["tool_mode"] = Value::String("default".to_owned());
             entry["supports_search_tool"] = Value::Bool(false);
             entry["web_search_tool_type"] = Value::Null;
@@ -465,17 +458,10 @@ pub fn build_model_catalog_with_root(cfg: &RouterConfig, router_root: &Path) -> 
                 .get("use_responses_lite")
                 .cloned()
                 .unwrap_or(Value::Bool(true));
-            // Mixed catalogs keep ChatGPT on multi-agent v1. V2 encrypts
-            // inter-agent function outputs; third-party children return
-            // plaintext in that field and the parent then fails to decrypt.
-            entry["multi_agent_version"] = if mixed_third_party {
-                Value::String("v1".to_owned())
-            } else {
-                entry
-                    .get("multi_agent_version")
-                    .cloned()
-                    .unwrap_or(Value::String("v2".to_owned()))
-            };
+            entry["multi_agent_version"] = entry
+                .get("multi_agent_version")
+                .cloned()
+                .unwrap_or(Value::String("v2".to_owned()));
             entry["tool_mode"] = entry
                 .get("tool_mode")
                 .cloned()
@@ -621,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn grok_oauth_stays_off_encrypted_multi_agent_protocol() {
+    fn grok_oauth_uses_compatible_multi_agent_protocol() {
         let cfg = crate::config::RouterConfig {
             models: vec![ModelConfig {
                 model: "grok-4.6".to_owned(),
@@ -635,11 +621,12 @@ mod tests {
         };
         let catalog = build_model_catalog(&cfg);
         assert_eq!(catalog[0]["use_responses_lite"], false);
-        assert!(catalog[0]["multi_agent_version"].is_null());
+        assert_eq!(catalog[0]["multi_agent_version"], "v1");
+        assert_eq!(catalog[0]["shell_type"], "shell_command");
     }
 
     #[test]
-    fn mixed_catalog_forces_chatgpt_onto_multi_agent_v1() {
+    fn mixed_catalog_keeps_chatgpt_multi_agent_without_default_luna() {
         let cfg = crate::config::RouterConfig {
             models: vec![
                 ModelConfig {
@@ -665,7 +652,10 @@ mod tests {
             .iter()
             .find(|entry| entry["slug"] == "gpt-5.6-sol")
             .unwrap();
-        assert_eq!(chatgpt["multi_agent_version"], "v1");
+        assert_eq!(chatgpt["multi_agent_version"], "v2");
+        assert_eq!(chatgpt["tool_mode"], "code_mode_only");
+        assert_eq!(chatgpt["shell_type"], "shell_command");
+        assert_eq!(chatgpt["apply_patch_tool_type"], "freeform");
     }
 
     #[test]
@@ -755,7 +745,8 @@ mod tests {
             assert!(!instructions.contains("GPT-5"));
             assert_eq!(entry["use_responses_lite"], false);
             assert_eq!(entry["tool_mode"], "default");
-            assert!(entry["multi_agent_version"].is_null());
+            assert_eq!(entry["multi_agent_version"], "v1");
+            assert_eq!(entry["shell_type"], "shell_command");
             assert!(entry.get("apply_patch_tool_type").is_none());
         }
         assert!(kimi["base_instructions"].as_str().unwrap().contains("你是Kimi"));

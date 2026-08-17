@@ -368,6 +368,17 @@ mod ordering_tests {
             }],
             ..Default::default()
         };
+        let volcengine = super::UsageAccount {
+            id: 4,
+            kind: "apikey".into(),
+            platform: "Volcengine Coding Plan".into(),
+            windows: vec![super::UsageWindow {
+                kind: "weekly".into(),
+                used_percent: Some(20.0),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
         assert_eq!(
             super::CodexRouterApp::usage_plan_group_key(&grok_a),
             super::CodexRouterApp::usage_plan_group_key(&grok_b)
@@ -377,6 +388,10 @@ mod ordering_tests {
         assert_eq!(groups[0].len(), 2);
         assert_eq!(groups[0][0].id, 1);
         assert_eq!(groups[0][1].id, 2);
+        assert_ne!(
+            super::CodexRouterApp::usage_plan_group_key(&kimi),
+            super::CodexRouterApp::usage_plan_group_key(&volcengine)
+        );
     }
 
     #[test]
@@ -785,7 +800,10 @@ impl eframe::App for CodexRouterApp {
         }
         let palette = theme::palette(&self.config.ui_theme);
         let viewport_height = ctx.content_rect().height();
-        let compact_layout = viewport_height < 700.0;
+        let maximized = ctx.input(|input| {
+            input.viewport().maximized == Some(true) || input.viewport().fullscreen == Some(true)
+        });
+        let compact_layout = !maximized && viewport_height < 700.0;
         let shell = shell_metrics(viewport_height);
         if self.installed_theme != self.config.ui_theme
             || self.installed_compact_layout != compact_layout
@@ -2921,11 +2939,8 @@ impl CodexRouterApp {
                                     .map(|value| value.is_object())
                                     .unwrap_or(false);
                             let oauth_model = this.temp_model.source == "oauth";
-                            let volcengine_coding_plan = this
-                                .temp_model
-                                .base_url
-                                .to_ascii_lowercase()
-                                .contains("ark.cn-beijing.volces.com/api/coding");
+                            let volcengine_coding_plan =
+                                super::logic::is_volcengine_plan_url(&this.temp_model.base_url);
                             let valid = !this.temp_model.model.trim().is_empty()
                                 && json_valid
                                 && (oauth_model

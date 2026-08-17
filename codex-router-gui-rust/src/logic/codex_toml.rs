@@ -8,7 +8,7 @@ use anyhow::{bail, Context};
 use std::path::{Path, PathBuf};
 use toml_edit::{DocumentMut, Item};
 
-const CODEX_ROUTER_MAX_RETRIES: i64 = 5;
+const CODEX_ROUTER_MAX_RETRIES: i64 = 3;
 
 const REASONING_LEVELS: &[&str] = &[
     "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
@@ -111,7 +111,6 @@ pub fn generate_codex_router_config(
     if doc.get("forced_login_method").and_then(Item::as_str) == Some("chatgpt") {
         doc.remove("forced_login_method");
     }
-
     // features.apps = false
     let mut features = doc
         .remove("features")
@@ -130,10 +129,11 @@ pub fn generate_codex_router_config(
     if fast_mode {
         doc.insert("service_tier", toml_edit::value("fast"));
         new_thread.insert("service_tier", toml_edit::value("fast"));
-        features.insert("fast_mode", toml_edit::value(true));
-    } else {
-        features.insert("fast_mode", toml_edit::value(false));
     }
+    // This is Codex's feature-visibility gate, not the selected service tier.
+    // Per-model catalog capabilities decide whether Fast is offered, while
+    // `service_tier = "fast"` above decides whether it is currently active.
+    features.insert("fast_mode", toml_edit::value(true));
 
     // Copy permission-related settings from a source document.
     let mut windows = doc
@@ -568,22 +568,22 @@ fn codex_router_settings(cfg: &RouterConfig) -> CodexRouterSettings {
         .as_ref()
         .map(|route| route.public_model_id.clone())
         .unwrap_or_else(|| "gpt-5.6-sol".to_owned());
-    let (reasoning_effort, fast_mode) = default_route
+    let (reasoning_effort, supports_fast) = default_route
         .as_ref()
         .map(|route| {
             let reasoning = super::resolve_reasoning(&route.model, Some(&cfg.reasoning));
             (
                 reasoning.default_level,
-                reasoning.supports_fast && route.model.fast_mode,
+                reasoning.supports_fast,
             )
         })
         .unwrap_or_else(|| ("medium".to_owned(), false));
     CodexRouterSettings {
         model,
         reasoning_effort,
-        fast_mode,
-        // Keep the ChatGPT account in the Desktop corner. Custom models still
-        // go through the local Router bearer + catalog.
+        fast_mode: supports_fast,
+        // Keep Codex's ChatGPT login contract for the local Responses provider;
+        // Sub2API still owns the selected upstream OAuth/API route.
         require_openai_auth: true,
         display_openai_provider: false,
     }
@@ -618,19 +618,7 @@ fn codex_router_repair_settings(cfg: &RouterConfig, existing: &str) -> CodexRout
         .filter(|value| REASONING_LEVELS.contains(&value.to_ascii_lowercase().as_str()))
         .map(|value| value.to_ascii_lowercase())
         .unwrap_or(reasoning.default_level);
-    let explicit_fast_mode = document
-        .get("service_tier")
-        .and_then(Item::as_str)
-        .map(|value| value == "fast")
-        .or_else(|| {
-            document
-                .get("features")
-                .and_then(Item::as_table_like)
-                .and_then(|features| features.get("fast_mode"))
-                .and_then(Item::as_bool)
-        });
-    settings.fast_mode =
-        reasoning.supports_fast && explicit_fast_mode.unwrap_or(route.model.fast_mode);
+    settings.fast_mode = reasoning.supports_fast;
     settings
 }
 
@@ -666,6 +654,19 @@ fn codex_router_binding_matches(
             .get("experimental_bearer_token")
             .and_then(Item::as_str)
             != Some(local_api_key)
+        || provider
+            .get("requires_openai_auth")
+            .and_then(Item::as_bool)
+            != Some(true)
+    {
+        return false;
+    }
+    if document
+        .get("features")
+        .and_then(Item::as_table_like)
+        .and_then(|features| features.get("fast_mode"))
+        .and_then(Item::as_bool)
+        != Some(true)
     {
         return false;
     }
@@ -800,13 +801,11 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        // v1.5.2 kept Codex in its normal ChatGPT account flow while the local
-        // bearer authenticated requests forwarded to Router. The model catalog
-        // remained active in that same signed-in UI.
+        // Preserve Codex's upstream ChatGPT login contract for OAuth profiles.
         assert!(generated.contains("name = \"Codex-Router\""));
         assert!(generated.contains("requires_openai_auth = true"));
-        assert!(generated.contains("request_max_retries = 5"));
-        assert!(generated.contains("stream_max_retries = 5"));
+        assert!(generated.contains("request_max_retries = 3"));
+        assert!(generated.contains("stream_max_retries = 3"));
         assert!(!generated.contains("forced_login_method"));
         assert!(generated.contains("model_catalog_json = \"C:/isolated/model-catalog.json\""));
         assert_eq!(
@@ -918,7 +917,7 @@ mod tests {
         assert!(text.contains("[desktop]"));
         assert!(text.contains("enabled-reasoning-efforts = [\"low\", \"medium\", \"high\", \"xhigh\", \"ultra\", \"max\"]"));
         assert!(!text.contains("service_tier"));
-        assert!(text.contains("fast_mode = false"));
+        assert!(text.contains("fast_mode = true"));
     }
 
     #[test]
@@ -945,6 +944,33 @@ theme = "dark"
         assert!(text.contains("window-layout = \"sidebar-wide\""));
         assert!(text.contains("theme = \"dark\""));
         assert!(text.contains("enabled-reasoning-efforts"));
+    }
+
+    #[test]
+    fn existing_agents_block_is_preserved() {
+        let existing = r#"
+[agents]
+default_subagent_model = "gpt-5.6-luna"
+default_subagent_reasoning_effort = "max"
+custom_agent_setting = "preserve-me"
+"#;
+        let text = generate_codex_router_config(
+            existing,
+            "gpt-5.6-sol",
+            "C:/catalog.json",
+            "sk-local-key",
+            "http://127.0.0.1:18082",
+            "medium",
+            false,
+            true,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(text.contains("[agents]"));
+        assert!(text.contains("default_subagent_model = \"gpt-5.6-luna\""));
+        assert!(text.contains("default_subagent_reasoning_effort = \"max\""));
+        assert!(text.contains("custom_agent_setting = \"preserve-me\""));
     }
 
     #[test]

@@ -310,7 +310,8 @@ pub(crate) fn spawn(
                                 format_diagnostic_line(source.label, source.kind, &line)
                             {
                                 if record.contains("openai.upstream_failover_switching")
-                                    && record.contains("upstream_status=429")
+                                    && (record.contains("upstream_status=402")
+                                        || record.contains("upstream_status=429"))
                                 {
                                     emitter.push(record);
                                 }

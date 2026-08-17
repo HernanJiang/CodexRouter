@@ -54,7 +54,7 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 const HEALTHY_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 const FAILED_PROBE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 const RECOVERY_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
-const BACKGROUND_SELF_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+const BACKGROUND_SELF_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3 * 60);
 const OAUTH_RECOVERY_MAX_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(5 * 60 * 60);
 const DEFAULT_ROUTER_REQUIRES_OPENAI_AUTH: bool = true;
@@ -84,6 +84,29 @@ fn fit_window_to_work_area(preferred: [f32; 2], work_area: [f32; 2]) -> [f32; 2]
         (work_area[1] - WINDOWS_NON_CLIENT_LOGICAL_ALLOWANCE[1]).max(1.0),
     ];
     [preferred[0].min(maximum[0]), preferred[1].min(maximum[1])]
+}
+
+fn window_size_is_usable(size: [f32; 2]) -> bool {
+    size[0] + 1.0 >= MIN_WINDOW_LOGICAL_SIZE[0] && size[1] + 1.0 >= MIN_WINDOW_LOGICAL_SIZE[1]
+}
+
+fn restored_window_size(last: [f32; 2]) -> [f32; 2] {
+    [
+        last[0].max(MIN_WINDOW_LOGICAL_SIZE[0]),
+        last[1].max(MIN_WINDOW_LOGICAL_SIZE[1]),
+    ]
+}
+
+fn should_leave_tray_lightweight(
+    lightweight: bool,
+    minimized: bool,
+    maximized: bool,
+    size: Option<[f32; 2]>,
+) -> bool {
+    if !lightweight {
+        return false;
+    }
+    maximized || !minimized || size.is_some_and(|size| !window_size_is_usable(size))
 }
 
 fn fit_window_to_monitor(current: [f32; 2], monitor: [f32; 2]) -> [f32; 2] {
@@ -142,11 +165,20 @@ fn primary_work_area_logical_size() -> Option<[f32; 2]> {
     ])
 }
 
+fn stored_window_size(width: f32, height: f32) -> Option<[f32; 2]> {
+    let size = [width, height];
+    window_size_is_usable(size).then_some(size)
+}
+
 fn initial_window_logical_size(compact: bool) -> [f32; 2] {
+    initial_window_logical_size_from(compact, None)
+}
+
+fn initial_window_logical_size_from(compact: bool, stored: Option<[f32; 2]>) -> [f32; 2] {
     let preferred = if compact {
         COMPACT_WINDOW_LOGICAL_SIZE
     } else {
-        DEFAULT_WINDOW_LOGICAL_SIZE
+        stored.unwrap_or(DEFAULT_WINDOW_LOGICAL_SIZE)
     };
     let work_area =
         primary_work_area_logical_size().unwrap_or(WINDOWS_1080P_200_WORK_AREA_LOGICAL_SIZE);
@@ -440,7 +472,7 @@ fn fallback_transition_notification(
 
 fn failover_account_id(record: &str) -> Option<i64> {
     if !record.contains("openai.upstream_failover_switching")
-        || !record.contains("upstream_status=429")
+        || !(record.contains("upstream_status=402") || record.contains("upstream_status=429"))
     {
         return None;
     }
@@ -824,6 +856,7 @@ struct CodexRouterApp {
     tray_lightweight_mode: bool,
     background_hide_until: Option<std::time::Instant>,
     tray_restore_guard_until: Option<std::time::Instant>,
+    last_normal_window_size: [f32; 2],
     health_probe_due: Option<std::time::Instant>,
     health_probe_running: bool,
     health_probe_failures: u32,
@@ -2555,7 +2588,7 @@ impl CodexRouterApp {
             usage_error: String::new(),
             usage_return_page: Page::Dashboard,
             // Repair an externally overwritten Codex binding immediately on
-            // startup; subsequent checks retain the ten-minute cadence.
+            // startup; subsequent checks retain the three-minute cadence.
             usage_refresh_due: (configured && router_mode_enabled).then(std::time::Instant::now),
             notified_quota_accounts: BTreeSet::new(),
             monitor_subscription_order,
@@ -2585,6 +2618,11 @@ impl CodexRouterApp {
             background_hide_until: start_in_background
                 .then(|| std::time::Instant::now() + std::time::Duration::from_secs(2)),
             tray_restore_guard_until: None,
+            last_normal_window_size: stored_window_size(
+                ui_preferences.window_width,
+                ui_preferences.window_height,
+            )
+            .unwrap_or_else(|| initial_window_logical_size(false)),
             health_probe_due: router_mode_enabled
                 .then(|| std::time::Instant::now() + FAILED_PROBE_RETRY_INTERVAL),
             health_probe_running: false,
@@ -3036,6 +3074,7 @@ impl CodexRouterApp {
             tray_lightweight_mode: false,
             background_hide_until: None,
             tray_restore_guard_until: None,
+            last_normal_window_size: DEFAULT_WINDOW_LOGICAL_SIZE,
             health_probe_due: None,
             health_probe_running: false,
             health_probe_failures: 0,
@@ -3190,6 +3229,8 @@ impl CodexRouterApp {
             share_codex_state: self.share_codex_state,
             prefer_router_mode: self.router_mode_enabled,
             oauth_model_hint_seen: self.oauth_model_hint_seen,
+            window_width: self.last_normal_window_size[0],
+            window_height: self.last_normal_window_size[1],
         };
         match preferences.save(&path) {
             Ok(()) => true,
@@ -3648,11 +3689,54 @@ impl CodexRouterApp {
         });
     }
 
+    fn remember_usable_window_size(&mut self, ctx: &egui::Context) {
+        let Some(size) = ctx.input(|input| {
+            let viewport = input.viewport();
+            if viewport.maximized == Some(true)
+                || viewport.fullscreen == Some(true)
+                || viewport.minimized == Some(true)
+            {
+                return None;
+            }
+            viewport.inner_rect.map(|rect| [rect.width(), rect.height()])
+        }) else {
+            return;
+        };
+        if window_size_is_usable(size) && self.last_normal_window_size != size {
+            self.last_normal_window_size = size;
+            let _ = self.persist_ui_preferences();
+        }
+    }
+
+    fn ensure_usable_window_size(&mut self, ctx: &egui::Context) {
+        let (maximized, minimized, size) = ctx.input(|input| {
+            let viewport = input.viewport();
+            (
+                viewport.maximized == Some(true) || viewport.fullscreen == Some(true),
+                viewport.minimized == Some(true),
+                viewport.inner_rect.map(|rect| [rect.width(), rect.height()]),
+            )
+        });
+        if maximized || minimized {
+            return;
+        }
+        if size.is_some_and(window_size_is_usable) {
+            return;
+        }
+        let restored = restored_window_size(self.last_normal_window_size);
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+            restored[0], restored[1],
+        )));
+    }
+
     fn minimize_to_tray(&mut self, ctx: &egui::Context) {
         self.close_prompt_open = false;
         self.remember_close_choice = false;
         if self.tray_icon.is_some() {
+            self.remember_usable_window_size(ctx);
             self.tray_lightweight_mode = true;
+            self.tray_restore_guard_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
             self.runtime_log_paused.store(true, Ordering::Relaxed);
             if self.fonts_loaded {
                 install_lightweight_fonts(ctx);
@@ -3708,6 +3792,12 @@ impl CodexRouterApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        if ctx.input(|input| input.viewport().maximized != Some(true)) {
+            let restored = restored_window_size(self.last_normal_window_size);
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                restored[0], restored[1],
+            )));
+        }
         ctx.request_repaint();
     }
 
@@ -3815,10 +3905,26 @@ impl CodexRouterApp {
             return;
         }
         self.tray_restore_guard_until = None;
-        // The native minimize button must behave like every other Windows app:
-        // the window stays on the taskbar. Only closing with X (when the user
-        // chose "minimize to tray") hides the window into the tray.
-        let _ = ctx;
+        let (minimized, maximized, size) = ctx.input(|input| {
+            let viewport = input.viewport();
+            (
+                viewport.minimized == Some(true),
+                viewport.maximized == Some(true) || viewport.fullscreen == Some(true),
+                viewport.inner_rect.map(|rect| [rect.width(), rect.height()]),
+            )
+        });
+        if should_leave_tray_lightweight(self.tray_lightweight_mode, minimized, maximized, size) {
+            self.restore_from_tray(ctx);
+            return;
+        }
+        if minimized {
+            return;
+        }
+        self.remember_usable_window_size(ctx);
+        if !self.fonts_loaded {
+            ensure_full_ui_fonts(self, ctx);
+        }
+        self.ensure_usable_window_size(ctx);
     }
 
     fn process_app_events(&mut self, ctx: &egui::Context) {
@@ -4850,7 +4956,7 @@ impl CodexRouterApp {
                         }
                         Err(error) => {
                             // Keep a failed backend-only reconciliation queued. The
-                            // next ten-minute self-check retries it even when Codex
+                            // next three-minute self-check retries it even when Codex
                             // config.toml itself was not overwritten.
                             self.routing_sync_pending = true;
                             self.usage_refresh_due =
@@ -4932,6 +5038,8 @@ impl CodexRouterApp {
                     self.health_probe_due = Some(std::time::Instant::now());
                 }
                 if let Some(account_id) = failover_account_id(&record) {
+                    self.routing_sync_pending = true;
+                    self.request_routing_sync();
                     if self.notified_quota_accounts.insert(account_id) {
                         if let Some((source, target)) = fallback_names_for_account(
                             &self.config,
@@ -6025,7 +6133,7 @@ impl CodexRouterApp {
     }
 
     fn local_sub2api_base_url(&self) -> String {
-        let fallback = "http://127.0.0.1:18082";
+        let fallback = "http://127.0.0.1:18080";
         let candidate = self.config.deploy.sub2api_host.trim().trim_end_matches('/');
         let Ok(mut url) = url::Url::parse(candidate) else {
             return fallback.to_owned();
@@ -7048,6 +7156,9 @@ fn try_cli_mode() -> Option<anyhow::Result<()>> {
         .iter()
         .any(|argument| argument == "--stop-router-services");
     let router_status = args.iter().any(|argument| argument == "--router-status");
+    let refresh_codex_binding = args
+        .iter()
+        .any(|argument| argument == "--refresh-codex-binding");
     let apply_staged_update = args
         .iter()
         .any(|argument| argument == "--apply-staged-update");
@@ -7058,6 +7169,7 @@ fn try_cli_mode() -> Option<anyhow::Result<()>> {
         && !ensure_router_services
         && !stop_router_services
         && !router_status
+        && !refresh_codex_binding
         && !apply_staged_update
         && !install_portable
     {
@@ -7113,6 +7225,20 @@ fn try_cli_mode() -> Option<anyhow::Result<()>> {
                 args.iter().any(|argument| argument == "--no-shortcut"),
             )?;
             write_cli_result(&serde_json::to_string(&result)?)?;
+            return Ok(());
+        }
+
+        if refresh_codex_binding {
+            let router_root = argument_value("--router-root=")
+                .map(PathBuf::from)
+                .unwrap_or_else(RouterConfig::find_router_root);
+            let config = RouterConfig::load(&crate::user_data::config_path(&router_root))?;
+            logic::write_model_catalog(&config, &router_root)?;
+            let repaired = logic::codex_toml::repair_codex_router_binding(&config, &router_root)?;
+            write_cli_result(
+                &serde_json::json!({"catalog": "refreshed", "bindingRepaired": repaired})
+                    .to_string(),
+            )?;
             return Ok(());
         }
 
@@ -7481,12 +7607,19 @@ fn main() -> eframe::Result<()> {
     let start_in_background =
         std::env::args_os().any(|argument| argument == "--background" || argument == "--watchdog");
     let compact = ui_audit.as_ref().is_some_and(|options| options.compact);
+    let stored_window = UiPreferences::load(&user_data::preferences_path(
+        &crate::config::RouterConfig::find_router_root(),
+    ))
+    .ok()
+    .and_then(|preferences| {
+        stored_window_size(preferences.window_width, preferences.window_height)
+    });
     // Keep every size in logical points and leave pixels_per_point unset. With
     // the PerMonitorV2 manifest, winit forwards live scale-factor changes to
     // eframe/egui whenever the window moves between monitors.
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size(initial_window_logical_size(compact))
+            .with_inner_size(initial_window_logical_size_from(compact, stored_window))
             .with_min_inner_size(MIN_WINDOW_LOGICAL_SIZE)
             .with_resizable(true)
             .with_clamp_size_to_monitor_size(true)
@@ -7521,9 +7654,11 @@ mod main_tests {
         next_request_generation, normalize_usage_account_messages, oauth_account_refresh_can_start,
         oauth_prepare_error_from_output, oauth_prepare_error_is_retryable,
         oauth_recovery_schedule_delay, profile_binding_ready, request_result_disposition,
-        restore_apply_ui_fields, restore_codex_and_stop_router_for_exit_with,
-        restore_codex_for_exit, retain_last_good_oauth_models, run_hidden_powershell_output,
+        restore_apply_ui_fields,         restore_codex_and_stop_router_for_exit_with,
+        restore_codex_for_exit, restored_window_size, retain_last_good_oauth_models,
+        run_hidden_powershell_output, should_leave_tray_lightweight, stored_window_size,
         scheduled_oauth_recovery_can_start, scheduled_usage_refresh_is_due,
+        window_size_is_usable,
         usage_error_for_display, AdminTaskActivity, ApplyUiRollback, IsolationKind,
         IsolationProfile, ModelConfig, OAuthAccountSummary, OAuthModelSummary, Page,
         RequestResultDisposition, RouterConfig, UsageAccount, UsageSnapshot, APP_TITLE,
@@ -7556,22 +7691,22 @@ mod main_tests {
     }
 
     #[test]
-    fn self_check_runs_every_ten_minutes_and_unknown_oauth_recovery_caps_at_five_hours() {
+    fn self_check_runs_every_three_minutes_and_unknown_oauth_recovery_caps_at_five_hours() {
         let now = std::time::Instant::now();
         assert_eq!(
             next_background_usage_refresh(now).duration_since(now),
-            std::time::Duration::from_secs(10 * 60)
+            std::time::Duration::from_secs(3 * 60)
         );
         assert_eq!(default_oauth_recovery_seconds(), 5 * 60 * 60);
         assert_eq!(
             next_failed_oauth_recovery(now).duration_since(now),
-            std::time::Duration::from_secs(10 * 60)
+            std::time::Duration::from_secs(3 * 60)
         );
         const { assert!(super::DEFAULT_ROUTER_REQUIRES_OPENAI_AUTH) };
         assert!(scheduled_usage_refresh_is_due(true, Some(now), now));
         assert_eq!(
             oauth_recovery_schedule_delay(1),
-            Some(std::time::Duration::from_secs(10 * 60))
+            Some(std::time::Duration::from_secs(3 * 60))
         );
         assert_eq!(
             oauth_recovery_schedule_delay(6 * 60 * 60),
@@ -7779,6 +7914,10 @@ mod main_tests {
             Some(7)
         );
         assert_eq!(
+            failover_account_id("[Sub2API/WARN] openai.upstream_failover_switching | upstream_status=402 | account_id=8 | class=quota"),
+            Some(8)
+        );
+        assert_eq!(
             failover_account_id("[Sub2API/WARN] openai.upstream_failover_switching | upstream_status=500 | account_id=7"),
             None
         );
@@ -7826,6 +7965,34 @@ mod main_tests {
             fit_window_to_monitor([800.0, 400.0], [960.0, 540.0]),
             [800.0, 400.0]
         );
+    }
+
+    #[test]
+    fn tray_restore_rejects_tiny_windows_and_leaves_lightweight_mode() {
+        assert!(!window_size_is_usable([40.0, 80.0]));
+        assert!(window_size_is_usable(MIN_WINDOW_LOGICAL_SIZE));
+        assert_eq!(
+            restored_window_size([40.0, 80.0]),
+            MIN_WINDOW_LOGICAL_SIZE
+        );
+        assert_eq!(stored_window_size(40.0, 80.0), None);
+        assert_eq!(
+            stored_window_size(1064.0, 820.0),
+            Some([1064.0, 820.0])
+        );
+        assert!(should_leave_tray_lightweight(
+            true,
+            false,
+            false,
+            Some([40.0, 80.0])
+        ));
+        assert!(should_leave_tray_lightweight(true, false, true, None));
+        assert!(!should_leave_tray_lightweight(
+            true,
+            true,
+            false,
+            Some(DEFAULT_WINDOW_LOGICAL_SIZE)
+        ));
     }
 
     #[cfg(windows)]

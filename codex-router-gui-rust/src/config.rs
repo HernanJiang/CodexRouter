@@ -104,6 +104,10 @@ pub struct UiPreferences {
     /// shown once and then suppressed.
     #[serde(default)]
     pub oauth_model_hint_seen: bool,
+    #[serde(default)]
+    pub window_width: f32,
+    #[serde(default)]
+    pub window_height: f32,
 }
 
 impl Default for UiPreferences {
@@ -117,6 +121,8 @@ impl Default for UiPreferences {
             share_codex_state: true,
             prefer_router_mode: false,
             oauth_model_hint_seen: false,
+            window_width: 0.0,
+            window_height: 0.0,
         }
     }
 }
@@ -847,6 +853,8 @@ mod tests {
             share_codex_state: false,
             prefer_router_mode: true,
             oauth_model_hint_seen: true,
+            window_width: 1064.0,
+            window_height: 820.0,
         };
         let json = serde_json::to_string(&preferences).unwrap();
         assert!(json.contains(r#""closeBehavior":"minimize_to_tray""#));
@@ -858,6 +866,8 @@ mod tests {
         assert_eq!(restored.monitor_api_order, vec![4, 1]);
         assert!(!restored.share_codex_state);
         assert!(restored.prefer_router_mode);
+        assert_eq!(restored.window_width, 1064.0);
+        assert_eq!(restored.window_height, 820.0);
         let legacy_no_prefer: UiPreferences =
             serde_json::from_str(r#"{"shareCodexState":true}"#).unwrap();
         assert!(!legacy_no_prefer.prefer_router_mode);

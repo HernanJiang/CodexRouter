@@ -595,7 +595,11 @@ fn query_account(
 ) -> anyhow::Result<AccountRecord> {
     let id = integer(&task.account, "id");
     let kind = string(&task.account, "type");
-    let platform = string(&task.account, "platform");
+    let platform = task
+        .channel
+        .as_ref()
+        .map(api_quota_pool_provider)
+        .unwrap_or_else(|| string(&task.account, "platform"));
     let mut query_note = String::new();
     let stats = match retry_account_read(|| {
         admin.get(
@@ -786,12 +790,17 @@ fn query_account(
 }
 
 fn failed_account_record(task: &AccountTask, timed_out: bool) -> AccountRecord {
+    let platform = task
+        .channel
+        .as_ref()
+        .map(api_quota_pool_provider)
+        .unwrap_or_else(|| string(&task.account, "platform"));
     AccountRecord {
         account: UsageAccount {
             id: integer(&task.account, "id"),
             name: string(&task.account, "name"),
             kind: string(&task.account, "type"),
-            platform: string(&task.account, "platform"),
+            platform,
             status: string(&task.account, "status"),
             health: "upstreamError".to_owned(),
             query_note: if timed_out {
@@ -1098,11 +1107,17 @@ fn query_volcengine(key: &str, cache: &Arc<Mutex<UsageCache>>) -> ProviderUsage 
     let Some(secret_key) = credential_string("VolcengineSecretAccessKey") else {
         return ProviderUsage { provider: "Volcengine Coding Plan".to_owned(), note: "Add the Volcengine control-plane AK/SK in this model to query official 5-hour, weekly, and monthly quota.".to_owned(), ..ProviderUsage::default() };
     };
-    let headers = volcengine_headers(access_key.as_str(), secret_key.as_str(), Utc::now());
+    let payload = "{}";
+    let headers = volcengine_headers(
+        access_key.as_str(),
+        secret_key.as_str(),
+        payload.as_bytes(),
+        Utc::now(),
+    );
     let request = provider_client()
         .post("https://open.volcengineapi.com/?Action=GetCodingPlanUsage&Version=2024-01-01")
         .headers(headers)
-        .body("");
+        .body(payload);
     match send_json_with_retry(request) {
         Ok(body) => {
             let mut windows = normalize_volcengine(&body);
@@ -1793,10 +1808,14 @@ fn credential_pool_digest(names: &[&str]) -> Option<String> {
 
 fn api_quota_pool_key(channel: &ModelConfig) -> String {
     let provider = api_quota_pool_provider(channel);
-    let endpoint = Url::parse(&channel.base_url)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
-        .unwrap_or_else(|| channel_base_url(channel).to_ascii_lowercase());
+    let endpoint = if coding_plan_endpoint(&channel.base_url).is_some() {
+        Url::parse(&channel.base_url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+            .unwrap_or_else(|| channel_base_url(channel).to_ascii_lowercase())
+    } else {
+        normalized_api_endpoint(&channel.base_url)
+    };
     let credential = if provider == "Volcengine Coding Plan" {
         credential_pool_digest(&["VolcengineAccessKeyId", "VolcengineSecretAccessKey"])
     } else {
@@ -1816,7 +1835,7 @@ fn merge_api_quota_pools(
     channels: &HashMap<String, ModelConfig>,
 ) -> Vec<AccountRecord> {
     let mut groups: BTreeMap<String, (String, Vec<AccountRecord>)> = BTreeMap::new();
-    for record in records {
+    for mut record in records {
         let (key, label) = channels
             .get(&record.account.name)
             .map(|channel| {
@@ -1831,6 +1850,7 @@ fn merge_api_quota_pools(
                     record.account.platform.clone(),
                 )
             });
+        record.account.platform = label.clone();
         groups
             .entry(key)
             .or_insert_with(|| (label, Vec::new()))
@@ -1855,6 +1875,16 @@ fn merge_api_quota_pools(
         merged.push(first);
     }
     merged
+}
+
+fn normalized_api_endpoint(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    let Ok(mut url) = Url::parse(trimmed) else {
+        return trimmed.to_ascii_lowercase();
+    };
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string().trim_end_matches('/').to_owned()
 }
 
 fn merge_totals(target: &mut UsageTotals, incoming: &UsageTotals) {
@@ -2851,7 +2881,12 @@ fn window_kind(seconds: i64, fallback: &str) -> String {
     .to_owned()
 }
 
-fn volcengine_headers(access_key: &str, secret: &str, now: DateTime<Utc>) -> HeaderMap {
+fn volcengine_headers(
+    access_key: &str,
+    secret: &str,
+    payload: &[u8],
+    now: DateTime<Utc>,
+) -> HeaderMap {
     type HmacSha256 = Hmac<Sha256>;
     fn sign(key: &[u8], value: &str) -> Vec<u8> {
         let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key");
@@ -2863,7 +2898,7 @@ fn volcengine_headers(access_key: &str, secret: &str, now: DateTime<Utc>) -> Hea
     let service = "ark";
     let content_type = "application/json; charset=UTF-8";
     let signed_headers = "content-type;host;x-content-sha256;x-date";
-    let payload_hash = format!("{:x}", Sha256::digest([]));
+    let payload_hash = format!("{:x}", Sha256::digest(payload));
     let x_date = now.format("%Y%m%dT%H%M%SZ").to_string();
     let short_date = &x_date[..8];
     let canonical_headers = format!("content-type:{content_type}\nhost:{host}\nx-content-sha256:{payload_hash}\nx-date:{x_date}\n");
@@ -3065,6 +3100,7 @@ mod tests {
             );
             assert_eq!(merged.len(), 1);
             assert_eq!(merged[0].account.name, "Codex-Router / Kimi Coding Plan");
+            assert_eq!(merged[0].account.platform, "Kimi Coding Plan");
             assert_eq!(merged[0].account.totals.requests, 5);
             assert_eq!(merged[0].account.windows.len(), 1);
             Ok(())
@@ -3072,6 +3108,85 @@ mod tests {
         let _ = crate::logic::delete_router_credential(&first_credential);
         let _ = crate::logic::delete_router_credential(&second_credential);
         result.unwrap();
+    }
+
+    #[test]
+    fn api_usage_uses_business_provider_and_keeps_distinct_relay_paths_separate() {
+        let kimi_name = "Codex-Router / Kimi".to_owned();
+        let volcengine_name = "Codex-Router / Volcengine".to_owned();
+        let channels = HashMap::from([
+            (
+                kimi_name.clone(),
+                ModelConfig {
+                    base_url: "https://api.kimi.com/coding/v1".to_owned(),
+                    credential_name: "missing-kimi-test-key".to_owned(),
+                    ..Default::default()
+                },
+            ),
+            (
+                volcengine_name.clone(),
+                ModelConfig {
+                    base_url: "https://ark.cn-beijing.volces.com/api/plan/v3".to_owned(),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let record = |id, name| AccountRecord {
+            account: UsageAccount {
+                id,
+                name,
+                kind: "apikey".to_owned(),
+                platform: "openai".to_owned(),
+                ..Default::default()
+            },
+            configured_model: String::new(),
+            quota_evidence: OAuthQuotaEvidence::Unknown,
+            auto_isolate_on_exhaustion: false,
+            routing_changed: false,
+        };
+        let merged = merge_api_quota_pools(
+            vec![record(1, kimi_name), record(2, volcengine_name)],
+            &channels,
+        );
+        assert_eq!(merged.len(), 2);
+        assert_eq!(
+            merged
+                .iter()
+                .map(|item| item.account.platform.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["Kimi Coding Plan", "Volcengine Coding Plan"])
+        );
+
+        let relay = |path: &str| ModelConfig {
+            base_url: format!("https://relay.example.test/{path}/v1"),
+            credential_name: "same-logical-relay-key".to_owned(),
+            ..Default::default()
+        };
+        assert_ne!(
+            api_quota_pool_key(&relay("team-a")),
+            api_quota_pool_key(&relay("team-b"))
+        );
+    }
+
+    #[test]
+    fn volcengine_signs_the_required_empty_json_payload() {
+        let now = DateTime::parse_from_rfc3339("2026-08-16T08:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let headers = volcengine_headers("test-ak", "test-sk", b"{}", now);
+        let expected_hash = format!("{:x}", Sha256::digest(b"{}"));
+        assert_eq!(
+            headers
+                .get("x-content-sha256")
+                .and_then(|value| value.to_str().ok()),
+            Some(expected_hash.as_str())
+        );
+        let authorization = headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
+        assert!(authorization.contains("Credential=test-ak/20260816/cn-beijing/ark/request"));
+        assert!(authorization.contains("SignedHeaders=content-type;host;x-content-sha256;x-date"));
     }
 
     #[test]

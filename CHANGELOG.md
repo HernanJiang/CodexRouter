@@ -2,6 +2,31 @@
 
 本文件记录面向用户的重要变化。完整技术细节以对应版本的源码和 GitHub Release 为准。
 
+## 1.7.5 - 2026-08-16
+
+### 修复
+
+- ChatGPT 请求/SSE 原样转发，降低第二轮长时间卡在“正在思考”的概率；默认重试改为 3 次。
+- 去掉 Luna 默认子 Agent 绑定，保留 ChatGPT 手动子 Agent 能力。
+- 托盘/后台唤起后恢复窗口尺寸与完整字体，最大化不再误入轻量布局。
+- DeepSeek 官方接口不再走自动代理；限流后的本地 503 改回 429，避免误当成服务挂掉再狂重试。
+- Kimi/DeepSeek 身份与 `exec_command` 工具面继续沿用 1.7.4 后续修复。
+- Grok OAuth 账号返回 402/429 时立即触发多账号故障转移；切换账号后规范化跨账号会话历史，避免健康账号因 `ModelInput` 422 被包装成 502。
+- 修复 Gemini/第三方模型长任务中途停止：未开始输出的 429 会在网关内重试以等待健康账号接管；SSE 未收到完成事件就断开时不再伪装为正常结束，而是触发 Codex 的流重试。
+- 修复火山方舟 Agent Plan 填写控制面 AK/SK 后未保存的问题；Coding Plan 与 Agent Plan 共享同一组 Windows 控制面凭据和额度池，官方额度请求改为签名 `{}` 请求体。
+- 修复 ChatGPT OAuth 耗尽后旧的未选中 OAuth 记录仍参与调度、阻止第三方按量 API 兜底接管的问题；未选中记录会退出 Router 组并停止调度，重新选择后仍可按额度恢复。
+- 修复 API 用量把内部 OpenAI-compatible 传输类型误当成业务平台的问题；Kimi Coding Plan、Volcengine Coding Plan 与普通 API 中转站不再显示为同一个 `OPENAI` 额度池，不同中转路径也不再误合并。
+- 修复侧边对话 Agent 工具被禁用：Router 不再删除用户 `[agents]` 配置；ChatGPT 使用原生 `multi_agent_version=v2`，DeepSeek、Kimi、Gemini、Grok、Claude、火山等第三方模型使用兼容 `v1` Agent 协议并开放 shell 工具。
+- 修复对话结束后弹出 `18082/login?redirect=/v1` 网页预览：Responses 网关对浏览器根路径返回本地状态页，管理后台入口使用 18080；ChatGPT 登录契约保持不变。
+- 修复 Codex 中 ChatGPT Fast 选项消失：`features.fast_mode` 作为功能可见性开关始终启用，是否实际使用 Fast 仅由 `service_tier="fast"` 控制；绑定检查会自动修复旧的隐藏开关。
+- 修复 Fast 默认与登录回归：ChatGPT/Codex provider 恢复 `requires_openai_auth=true`，并对支持 Fast 的默认模型自动写入 `service_tier="fast"`。
+
+### 调整
+
+- 后台自检与用量刷新间隔从 10 分钟改为 3 分钟。
+
+升级后请完全重启 Codex-Router 和 Codex。
+
 ## 1.7.4 - 2026-08-16
 
 ### 修复

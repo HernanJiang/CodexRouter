@@ -77,7 +77,7 @@ fn sync_routing_only_with_admin(admin: &impl AdminApi, cfg: &RouterConfig) -> an
             continue;
         }
         let id = usage::integer(account, "id");
-        if id <= 0 || !selected.contains(&id) {
+        if id <= 0 {
             continue;
         }
         let detail = usage::data(AdminApi::get(
@@ -105,6 +105,15 @@ fn sync_routing_only_with_admin(admin: &impl AdminApi, cfg: &RouterConfig) -> an
                     "group_ids": groups,
                     "confirm_mixed_channel_risk": true,
                 }),
+            )?;
+        }
+        if !wanted
+            && usage::get(&detail, "schedulable").and_then(Value::as_bool) != Some(false)
+        {
+            AdminApi::post(
+                admin,
+                &format!("/api/v1/admin/accounts/{id}/schedulable"),
+                Some(&json!({ "schedulable": false })),
             )?;
         }
     }
@@ -448,7 +457,9 @@ where
         let desired_proxy = reconcile_proxy_id(
             current_proxy,
             managed_proxy,
-            route.join_router && !target_policy.is_some_and(|policy| policy.bypass),
+            route.join_router
+                && !target_policy.is_some_and(|policy| policy.bypass)
+                && !official_direct_api_host(&model.base_url),
         );
         let mut body = json!({
             "name": account_name,
@@ -579,6 +590,15 @@ fn sync_oauth_and_stale_accounts(
                 body["proxy_id"] = proxy_id.into();
             }
             admin.put(&format!("/api/v1/admin/accounts/{id}"), &body)?;
+            if !wanted
+                && usage::get(&detail, "schedulable").and_then(Value::as_bool) != Some(false)
+            {
+                AdminApi::post(
+                    admin,
+                    &format!("/api/v1/admin/accounts/{id}/schedulable"),
+                    Some(&json!({ "schedulable": false })),
+                )?;
+            }
         } else if currently_managed
             && usage::string(&detail, "name").starts_with("Codex-Router / ")
             && !managed_names.contains(&usage::string(&detail, "name"))
@@ -656,6 +676,8 @@ fn oauth_should_isolate(account: &Value) -> bool {
             "quota",
             "rate_limit",
             "rate limit",
+            "usage limit",
+            "billing cycle",
             "exhausted",
             "限额",
             "额度",
@@ -1041,6 +1063,21 @@ fn parse_extra(raw: &str) -> anyhow::Result<Map<String, Value>> {
         .context("ROUTER_DEPLOY_MODEL_EXTRA_INVALID: expected an object")
 }
 
+fn official_direct_api_host(base_url: &str) -> bool {
+    matches!(
+        Url::parse(base_url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+            .unwrap_or_default()
+            .as_str(),
+        "api.deepseek.com"
+            | "api.kimi.com"
+            | "api.moonshot.ai"
+            | "api.moonshot.cn"
+            | "ark.cn-beijing.volces.com"
+    )
+}
+
 fn apply_openai_channel_policy(base_url: &str, model_id: &str, extra: &mut Map<String, Value>) {
     let host = Url::parse(base_url)
         .ok()
@@ -1304,6 +1341,66 @@ mod tests {
     }
 
     #[test]
+    fn routing_only_sync_detaches_unselected_oauth_duplicates() {
+        let groups_path = "/api/v1/admin/groups/all?include_inactive=true";
+        let accounts_path = "/api/v1/admin/accounts?page=1&page_size=200";
+        let selected_path = "/api/v1/admin/accounts/7";
+        let duplicate_path = "/api/v1/admin/accounts/11";
+        let routes_path = "/api/v1/admin/groups/3/composite-routes";
+        let admin = MockAdmin::default()
+            .with_response(
+                groups_path,
+                json!([{"id": 3, "name": MANAGED_GROUP_NAME}]),
+            )
+            .with_response(
+                accounts_path,
+                json!({"items": [
+                    {"id": 7, "type": "oauth", "platform": "openai", "group_ids": [3]},
+                    {"id": 11, "type": "oauth", "platform": "openai", "group_ids": [3, 99]}
+                ]}),
+            )
+            .with_response(
+                selected_path,
+                json!({"id": 7, "status": "error", "schedulable": false, "group_ids": [3]}),
+            )
+            .with_response(
+                duplicate_path,
+                json!({"id": 11, "status": "active", "schedulable": true, "group_ids": [3, 99]}),
+            )
+            .with_response(routes_path, json!({"items": []}));
+        let cfg = RouterConfig {
+            oauth_account_ids: Some(vec![7]),
+            oauth_fallback: OAuthFallback {
+                enabled: true,
+                ..Default::default()
+            },
+            models: vec![
+                model("oauth", "gpt-5.6-sol", 7),
+                model("apikey", "gpt-5.6-sol", 0),
+            ],
+            ..Default::default()
+        };
+
+        sync_routing_only_with_admin(&admin, &cfg).unwrap();
+
+        let update = admin
+            .calls()
+            .into_iter()
+            .find(|call| call.method == "PUT" && call.path == duplicate_path)
+            .unwrap();
+        assert_eq!(update.body.unwrap()["group_ids"], json!([99]));
+        let scheduling_update = admin
+            .calls()
+            .into_iter()
+            .find(|call| call.method == "POST" && call.path == format!("{duplicate_path}/schedulable"))
+            .unwrap();
+        assert_eq!(
+            scheduling_update.body.unwrap()["schedulable"],
+            json!(false)
+        );
+    }
+
+    #[test]
     fn routing_only_sync_restores_every_selected_duplicate_oauth_account() {
         let groups_path = "/api/v1/admin/groups/all?include_inactive=true";
         let accounts_path = "/api/v1/admin/accounts?page=1&page_size=200";
@@ -1533,6 +1630,9 @@ mod tests {
             Value::String("force_chat_completions".to_owned())
         );
         assert_eq!(extra["openai_compact_supported"], Value::Bool(false));
+        assert!(official_direct_api_host("https://api.deepseek.com/v1"));
+        assert!(official_direct_api_host("https://api.kimi.com/coding/v1"));
+        assert!(!official_direct_api_host("https://api.openai.com/v1"));
     }
 
     #[test]

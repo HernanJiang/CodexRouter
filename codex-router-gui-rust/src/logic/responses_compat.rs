@@ -70,7 +70,7 @@ pub fn third_party_identity(model: &str) -> Option<(&'static str, &'static str)>
 pub fn third_party_identity_clause(model: &str) -> Option<String> {
     let (name, short) = third_party_identity(model)?;
     Some(format!(
-        "# 模型身份\n你是{name}，通过 Codex-Router 接入。不要自称 GPT、ChatGPT 或 Codex 官方模型。写测试报告必须写入 D:\\\\Work\\\\CodexRouter\\\\Test\\\\Agent_Test_1.7.4_{short}.md，禁止使用 chatgpt 或 unknown 作为文件名。调用工具时使用系统声明的工具名 exec_command，参数字段为 cmd。若工具列表没有 exec_command，仍然调用 exec_command，参数用 cmd。\n"
+        "# 模型身份\n你是{name}，通过 Codex-Router 接入。不要自称 GPT、ChatGPT 或 Codex 官方模型。写测试报告必须写入 D:\\\\Work\\\\CodexRouter\\\\Test\\\\Agent_Test_1.7.5_{short}.md，禁止使用 chatgpt 或 unknown 作为文件名。调用工具时使用系统声明的工具名 exec_command，参数字段为 cmd。若工具列表没有 exec_command，仍然调用 exec_command，参数用 cmd。\n"
     ))
 }
 
@@ -237,6 +237,37 @@ fn sanitize_content_parts(item: &mut Map<String, Value>) -> usize {
         converted += 1;
     }
     converted
+}
+
+fn sanitize_grok_item(mut item: Map<String, Value>) -> (Value, usize) {
+    let kind = item_type(&Value::Object(item.clone()));
+    match kind.as_str() {
+        "message" => {
+            let converted = sanitize_content_parts(&mut item);
+            (Value::Object(item), converted)
+        }
+        "function_call" => {
+            let mut converted = 0;
+            if let Some(arguments) = item.get_mut("arguments") {
+                if !arguments.is_string() {
+                    *arguments = Value::String(arguments.to_string());
+                    converted += 1;
+                }
+            }
+            (Value::Object(item), converted)
+        }
+        "function_call_output" => {
+            let mut converted = 0;
+            if let Some(output) = item.get_mut("output") {
+                if !output.is_string() {
+                    *output = Value::String(output.to_string());
+                    converted += 1;
+                }
+            }
+            (Value::Object(item), converted)
+        }
+        _ => (message_from_text(summarize_item(&Value::Object(item))), 1),
+    }
 }
 
 fn unsupported_third_party_item(kind: &str) -> bool {
@@ -416,6 +447,7 @@ pub fn sanitize_responses_request(path: &str, body: &mut Value) -> SanitizeStats
         ..SanitizeStats::default()
     };
     stats.openai_family = is_openai_family_model(&stats.model);
+    let grok = stats.model.to_ascii_lowercase().contains("grok");
     let Some(object) = body.as_object_mut() else {
         return stats;
     };
@@ -446,6 +478,12 @@ pub fn sanitize_responses_request(path: &str, body: &mut Value) -> SanitizeStats
             stats.stripped_encrypted += sanitize_function_output(&mut map, stats.openai_family);
             stats.stripped_encrypted += sanitize_reasoning(&mut map, stats.openai_family);
             if !stats.openai_family {
+                if grok {
+                    let (item, converted) = sanitize_grok_item(map);
+                    stats.converted_items += converted;
+                    replacement.push(item);
+                    continue;
+                }
                 stats.converted_items += sanitize_content_parts(&mut map);
                 if unsupported_third_party_item(&kind) {
                     replacement.push(message_from_text(summarize_item(&Value::Object(map))));
@@ -973,6 +1011,23 @@ pub fn rewrite_poisoned_upstream_status(status: u16, body: &str) -> u16 {
     if should_retry_after_upstream_error(status, body) && matches!(status, 500 | 502 | 503) {
         400
     } else {
+        rewrite_exhausted_account_status(status, body)
+    }
+}
+
+pub fn rewrite_exhausted_account_status(status: u16, body: &str) -> u16 {
+    if status != 503 {
+        return status;
+    }
+    let lower = body.to_ascii_lowercase();
+    if lower.contains("no available accounts")
+        || lower.contains("too many requests")
+        || lower.contains("rate_limit")
+        || lower.contains("rate limit")
+        || lower.contains("service temporarily unavailable")
+    {
+        429
+    } else {
         status
     }
 }
@@ -1036,9 +1091,30 @@ mod tests {
         assert!(stats.converted_items >= 1);
         assert_eq!(body["include"], json!(["file_search_call.results"]));
         assert!(body["input"][0].get("encrypted_content").is_none());
+        assert_eq!(body["input"][0]["type"], "message");
         assert_eq!(body["input"][1]["output"], "the tool printed hello");
         assert_eq!(body["input"][2]["type"], "message");
         assert_eq!(body["input"][3]["content"][0]["text"], "continue");
+    }
+
+    #[test]
+    fn grok_request_canonicalizes_cross_account_history() {
+        let mut body = json!({
+            "model": "grok-4.6",
+            "input": [
+                {"type":"reasoning","summary":[{"type":"summary_text","text":"plan"}]},
+                {"type":"function_call","name":"exec_command","call_id":"c1","arguments":{"cmd":"pwd"}},
+                {"type":"function_call_output","call_id":"c1","output":{"stdout":"ok"}},
+                {"type":"unknown_future_item","text":"continue safely"}
+            ]
+        });
+
+        let stats = sanitize_responses_request("/v1/responses", &mut body);
+        assert!(stats.converted_items >= 4);
+        assert_eq!(body["input"][0]["type"], "message");
+        assert!(body["input"][1]["arguments"].is_string());
+        assert!(body["input"][2]["output"].is_string());
+        assert_eq!(body["input"][3]["type"], "message");
     }
 
     #[test]
@@ -1155,7 +1231,7 @@ mod tests {
         assert!(body["instructions"]
             .as_str()
             .unwrap()
-            .contains("Agent_Test_1.7.4_kimi.md"));
+            .contains("Agent_Test_1.7.5_kimi.md"));
     }
 
     #[test]
@@ -1218,6 +1294,14 @@ mod tests {
         assert_eq!(
             rewrite_poisoned_upstream_status(502, "Our servers are currently overloaded."),
             502
+        );
+        assert_eq!(
+            rewrite_poisoned_upstream_status(503, "no available accounts"),
+            429
+        );
+        assert_eq!(
+            rewrite_poisoned_upstream_status(503, "Service temporarily unavailable"),
+            429
         );
     }
 }

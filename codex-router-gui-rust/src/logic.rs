@@ -1478,11 +1478,7 @@ pub fn store_credentials(cfg: &mut RouterConfig, _router_root: &Path) -> anyhow:
             ));
             updated_model_keys += 1;
         }
-        if model
-            .base_url
-            .to_ascii_lowercase()
-            .contains("ark.cn-beijing.volces.com/api/coding")
-        {
+        if is_volcengine_plan_url(&model.base_url) {
             if !model.volcengine_access_key_id.trim().is_empty() {
                 writes.push((
                     "VolcengineAccessKeyId".to_owned(),
@@ -1530,6 +1526,12 @@ pub fn store_credentials(cfg: &mut RouterConfig, _router_root: &Path) -> anyhow:
     cfg.proxy.password.clear();
     cfg.local_api_key.clear();
     Ok(updated_model_keys)
+}
+
+pub fn is_volcengine_plan_url(base_url: &str) -> bool {
+    let base_url = base_url.to_ascii_lowercase();
+    base_url.contains("ark.cn-beijing.volces.com/api/coding")
+        || base_url.contains("ark.cn-beijing.volces.com/api/plan")
 }
 
 pub fn isolate_profile_credentials(
@@ -3093,6 +3095,19 @@ base_url = "https://api.430123.xyz/v1"
         let _ = delete_router_credential(&updated_credential);
         std::fs::remove_dir_all(root).unwrap();
         result.unwrap();
+    }
+
+    #[test]
+    fn volcengine_coding_and_agent_plans_share_control_plane_credentials() {
+        assert!(is_volcengine_plan_url(
+            "https://ark.cn-beijing.volces.com/api/coding/v3"
+        ));
+        assert!(is_volcengine_plan_url(
+            "https://ark.cn-beijing.volces.com/api/plan/v3"
+        ));
+        assert!(!is_volcengine_plan_url(
+            "https://ark.cn-beijing.volces.com/api/v3"
+        ));
     }
 
     #[test]
