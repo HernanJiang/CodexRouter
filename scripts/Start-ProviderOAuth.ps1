@@ -3,6 +3,7 @@ param(
     [ValidateSet('openai', 'anthropic', 'gemini', 'antigravity', 'grok')]
     [string]$Provider,
     [int]$TimeoutSeconds = 600,
+    [string]$RouterRoot = '',
     [switch]$ComplianceAccepted,
     [switch]$ProbeOnly,
     [switch]$PrepareOnly
@@ -11,7 +12,11 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$routerRoot = Split-Path -Parent $PSScriptRoot
+$routerRoot = if ([string]::IsNullOrWhiteSpace($RouterRoot)) {
+    Split-Path -Parent $PSScriptRoot
+} else {
+    [IO.Path]::GetFullPath($RouterRoot)
+}
 $prepareStage = 'components'
 
 function Get-OAuthPrepareFailureCode {

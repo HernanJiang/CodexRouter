@@ -94,8 +94,9 @@ jobs:
           if ($roots.Count -ne 1) { throw 'The published stage root is unavailable.' }
           $root = $roots[0].FullName
           try {
-            $output = & (Join-Path $root 'scripts/Start-ProviderOAuth.ps1') `
+            $output = & ./scripts/Start-ProviderOAuth.ps1 `
               -Provider openai `
+              -RouterRoot $root `
               -PrepareOnly `
               -TimeoutSeconds 360
             if ($LASTEXITCODE -ne 0) { throw 'First OAuth preparation exited unsuccessfully.' }
