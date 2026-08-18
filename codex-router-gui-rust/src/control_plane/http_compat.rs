@@ -165,11 +165,37 @@ pub async fn sync_backend(state: &ControlState) -> Result<usize> {
     let Some(backend) = state.backend.clone() else {
         return Ok(0);
     };
+    // The CLI is the authority for file-based auth indexes. Its synthesizer
+    // may normalize paths or retain an existing index, so reproducing the
+    // hash locally is only a startup fallback and is not sufficient for
+    // account-level ledger attribution after a live auth reload.
+    let cli_file_indexes: HashMap<String, String> = state
+        .cli
+        .get("/v0/management/auth-files")
+        .await
+        .ok()
+        .and_then(|value| {
+            let files = value.get("files").cloned().unwrap_or(value);
+            files.as_array().map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        let name = item
+                            .get("name")
+                            .or_else(|| item.get("filename"))
+                            .and_then(Value::as_str)?;
+                        let index = item.get("auth_index").and_then(Value::as_str)?;
+                        Some((name.to_owned(), index.to_owned()))
+                    })
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
     let rows = state.store.with_connection(|connection| {
         let mut statement = connection.prepare(
             "SELECT r.id, r.public_model, r.upstream_model, r.target_platform, r.priority,
                     a.id, a.platform, a.account_type, a.priority, a.weight, a.payload, a.auth_index,
-                    a.schedulable, p.normalized_url
+                    a.auth_file, a.schedulable, p.normalized_url
              FROM composite_routes r
              JOIN account_groups ag ON ag.group_id = r.group_id
              JOIN accounts a ON a.id = ag.account_id
@@ -193,8 +219,9 @@ pub async fn sync_backend(state: &ControlState) -> Result<usize> {
                 row.get::<_, i64>(9)?,
                 row.get::<_, String>(10)?,
                 row.get::<_, String>(11)?,
-                row.get::<_, i64>(12)?,
-                row.get::<_, Option<String>>(13)?,
+                row.get::<_, String>(12)?,
+                row.get::<_, i64>(13)?,
+                row.get::<_, Option<String>>(14)?,
             ))
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -218,7 +245,8 @@ pub async fn sync_backend(state: &ControlState) -> Result<usize> {
         account_priority,
         weight,
         payload,
-        auth_index,
+        _auth_index,
+        auth_file,
         schedulable,
         joined_proxy_url,
     ) in rows
@@ -250,7 +278,11 @@ pub async fn sync_backend(state: &ControlState) -> Result<usize> {
         if account_type == "oauth" {
             // OAuth credentials live in CLI auth files; pool namespacing is
             // applied by patching the auth file prefix.
-            let auth_file = backend.auth_dir.join(format!("{auth_index}.json"));
+            let auth_file_name = std::path::PathBuf::from(&auth_file)
+                .file_name()
+                .map(|name| name.to_owned())
+                .context("OAuth auth file name is missing")?;
+            let auth_file = backend.auth_dir.join(auth_file_name);
             if auth_file.is_file() {
                 if let Ok(text) = std::fs::read_to_string(&auth_file) {
                     if let Ok(document) = serde_json::from_str::<Value>(&text) {
@@ -259,17 +291,26 @@ pub async fn sync_backend(state: &ControlState) -> Result<usize> {
                             .and_then(Value::as_str)
                             .unwrap_or_default();
                         if !auth_type.is_empty() {
-                            let cli_index = config_compiler::cli_file_auth_index(
-                                auth_type,
-                                &auth_file.to_string_lossy(),
-                            );
+                            let file_name = auth_file
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or_default();
+                            let cli_index =
+                                cli_file_indexes.get(file_name).cloned().unwrap_or_else(|| {
+                                    config_compiler::cli_file_auth_index(
+                                        auth_type,
+                                        &auth_file.to_string_lossy(),
+                                    )
+                                });
                             cli_index_map.insert(cli_index, account_id);
                         }
                     }
                 }
-                if let Err(error) = patch_auth_file_prefix(
+                if let Err(error) = patch_auth_file_route(
                     &auth_file,
                     &config_compiler::pool_prefix(&pool_route_id, &target_platform),
+                    &upstream_model,
+                    &public_model,
                 ) {
                     let _ = state.logger.write(json!({"level":"WARN","event":"backend.auth_file_prefix_failed","error_description":error.to_string()}));
                 }
@@ -369,9 +410,48 @@ pub fn patch_auth_file_prefix(path: &std::path::Path, prefix: &str) -> Result<()
         .with_context(|| format!("read auth file {}", path.display()))?;
     let mut value: Value = serde_json::from_str(&text).context("parse auth file JSON")?;
     value["prefix"] = Value::String(prefix.to_owned());
-    let temporary = path.with_extension("tmp");
-    std::fs::write(&temporary, serde_json::to_vec_pretty(&value)?)?;
-    std::fs::rename(&temporary, path)?;
+    // CLIProxyAPI watches the auth directory/file identity on Windows. An
+    // atomic rename replaces the watched inode and the CLI keeps the old
+    // in-memory prefix, producing `unknown provider for model cr_...`. Keep
+    // the file identity and let the CLI watcher reload the changed contents.
+    std::fs::write(path, serde_json::to_vec_pretty(&value)?)?;
+    Ok(())
+}
+
+/// Apply a Router pool prefix and public-to-upstream alias to an OAuth auth
+/// file. CLIProxyAPI registers OAuth models from the native upstream IDs; the
+/// alias makes the Router's internal `prefix/public_model` request resolvable
+/// without changing the shared API-key model rewrite contract.
+pub fn patch_auth_file_route(
+    path: &std::path::Path,
+    prefix: &str,
+    upstream_model: &str,
+    public_model: &str,
+) -> Result<()> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("read auth file {}", path.display()))?;
+    let mut value: Value = serde_json::from_str(&text).context("parse auth file JSON")?;
+    value["prefix"] = Value::String(prefix.to_owned());
+    if !value.get("model_aliases").is_some_and(Value::is_array) {
+        value["model_aliases"] = Value::Array(Vec::new());
+    }
+    let aliases = value
+        .get_mut("model_aliases")
+        .and_then(Value::as_array_mut)
+        .expect("model_aliases was initialized as an array");
+    let exists = aliases.iter().any(|entry| {
+        entry.get("name").and_then(Value::as_str) == Some(upstream_model)
+            && entry.get("alias").and_then(Value::as_str) == Some(public_model)
+    });
+    if !exists {
+        aliases.push(json!({
+            "name": upstream_model,
+            "alias": public_model,
+            "force-mapping": true,
+        }));
+    }
+    // Preserve the watched file identity on Windows; see patch_auth_file_prefix.
+    std::fs::write(path, serde_json::to_vec_pretty(&value)?)?;
     Ok(())
 }
 
@@ -1248,13 +1328,13 @@ pub async fn delete_account(
     Path(id): Path<i64>,
 ) -> Response {
     guarded!(state, headers);
-    let auth_index = state
+    let auth_material = state
         .store
         .with_connection(|connection| {
-            Ok::<String, anyhow::Error>(connection.query_row(
-                "SELECT auth_index FROM accounts WHERE id=?1 AND deleted_at IS NULL",
+            Ok::<(String, String), anyhow::Error>(connection.query_row(
+                "SELECT auth_index,auth_file FROM accounts WHERE id=?1 AND deleted_at IS NULL",
                 rusqlite::params![id],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )?)
         })
         .ok();
@@ -1279,10 +1359,16 @@ pub async fn delete_account(
             if let Err(error) = crate::credentials::delete_text(&account_secret_name(id)) {
                 let _ = state.logger.write(json!({"level":"WARN","event":"control.account_secret_delete_failed","account_id":id,"error_description":error.to_string()}));
             }
-            if let (Some(backend), Some(index)) = (state.backend.as_ref(), auth_index) {
-                let auth_file = backend.auth_dir.join(format!("{index}.json"));
+            if let (Some(backend), Some((auth_index, auth_file_name))) =
+                (state.backend.as_ref(), auth_material)
+            {
+                let safe_name = std::path::PathBuf::from(&auth_file_name)
+                    .file_name()
+                    .map(|name| name.to_owned())
+                    .unwrap_or_else(|| std::ffi::OsString::from(format!("{auth_index}.json")));
+                let auth_file = backend.auth_dir.join(safe_name);
                 if auth_file.is_file() {
-                    let _ = std::fs::remove_file(&auth_file);
+                    let _ = std::fs::remove_file(auth_file);
                 }
             }
             let _ = sync_backend(&state).await;
@@ -2275,7 +2361,7 @@ pub async fn openai_create_from_oauth(
     let result = state.store.with_connection(|connection| {
         connection.execute(
             "INSERT INTO accounts(platform,account_type,auth_index,auth_file,stable_identity_hmac,status,schedulable,priority,weight,payload) VALUES('openai','oauth',?1,?2,?3,'active',1,?4,1,?5)",
-            rusqlite::params![auth_index, format!("{auth_index}.json"), identity, priority, payload.to_string()],
+            rusqlite::params![auth_index, auth_file, identity, priority, payload.to_string()],
         )?;
         let id = connection.last_insert_rowid();
         sync_account_groups(connection, id, &group_ids)?;
@@ -2572,10 +2658,13 @@ mod tests {
         let path = write_auth_file(&root, "cr-account-test", &document).unwrap();
         assert!(path.is_file());
         patch_auth_file_prefix(&path, "cr_r1_openai").unwrap();
+        patch_auth_file_route(&path, "cr_r1_openai", "gpt-5.4", "public-gpt").unwrap();
         let written: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(written["prefix"], "cr_r1_openai");
         assert_eq!(written["access_token"], "at");
+        assert_eq!(written["model_aliases"][0]["name"], "gpt-5.4");
+        assert_eq!(written["model_aliases"][0]["alias"], "public-gpt");
         assert!(write_auth_file(&root, "../escape", &document).is_err());
     }
 
