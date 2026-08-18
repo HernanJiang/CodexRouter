@@ -21,6 +21,7 @@ use codex_router_lib::state::StateStore;
 use codex_router_lib::telemetry::ledger as usage_ledger;
 use codex_router_lib::telemetry::structured_log::{self, StructuredLogger, TerminalSpanGuard};
 use serde_json::Value;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
@@ -2657,6 +2658,33 @@ async fn image_batch_item_content(
     }
 }
 
+/// Bound for one batch download archive; larger batches must be fetched
+/// item-by-item through the content endpoint instead.
+const MAX_BATCH_DOWNLOAD_BYTES: usize = 256 * 1024 * 1024;
+
+/// Manager doc 7.1: the batch download endpoint streams a zip archive of every
+/// completed item. The output files are stored JSON and are added as
+/// `{custom_id}.json` entries; entry names are sanitized so a hostile custom_id
+/// cannot plant a path-traversal entry inside the archive.
+fn sanitize_zip_entry_name(custom_id: &str) -> String {
+    let sanitized: String = custom_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = sanitized.trim_matches(|character| character == '.' || character == '_');
+    if trimmed.is_empty() {
+        "item".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
 async fn image_batch_download(
     State(state): State<HostState>,
     AxumPath(id): AxumPath<String>,
@@ -2670,7 +2698,11 @@ async fn image_batch_download(
         Ok(batch) => batch,
         Err(response) => return response,
     };
-    let mut lines = Vec::new();
+    let cursor = std::io::Cursor::new(Vec::new());
+    let mut writer = zip::ZipWriter::new(cursor);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    let mut total_bytes = 0usize;
     if let Some(rows) = batch["items"].as_array() {
         for row in rows {
             if row["status"] != "completed" {
@@ -2682,21 +2714,49 @@ async fn image_batch_download(
             let Ok(path) = data_ops::task_output_path(&router_root(), output_ref) else {
                 continue;
             };
-            if let Ok(bytes) = std::fs::read(&path) {
-                if let Ok(output) = serde_json::from_slice::<Value>(&bytes) {
-                    lines.push(
-                        serde_json::json!({"custom_id": row["custom_id"], "output": output})
-                            .to_string(),
-                    );
-                }
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let Ok(output) = serde_json::from_slice::<Value>(&bytes) else {
+                continue;
+            };
+            let custom_id = row["custom_id"].as_str().unwrap_or("item");
+            let entry_bytes = serde_json::to_vec(&output).unwrap_or_default();
+            total_bytes = total_bytes.saturating_add(entry_bytes.len());
+            if total_bytes > MAX_BATCH_DOWNLOAD_BYTES {
+                return error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "CR-REQ-0004",
+                    "batch download exceeds the 256 MiB size limit; fetch items individually",
+                    &request_id,
+                );
             }
+            let _ = writer.start_file(
+                format!("{}.json", sanitize_zip_entry_name(custom_id)),
+                options,
+            );
+            let _ = writer.write_all(&entry_bytes);
         }
     }
-    let mut body = lines.join("\n");
-    body.push('\n');
+    let body = match writer.finish() {
+        Ok(cursor) => cursor.into_inner(),
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "CR-STO-0011",
+                "could not build the batch download archive",
+                &request_id,
+            );
+        }
+    };
     Response::builder()
         .status(StatusCode::OK)
-        .header("content-type", "application/x-ndjson")
+        .header("content-type", "application/zip")
+        .header(
+            "content-disposition",
+            format!("attachment; filename=\"batch-{id}.zip\""),
+        )
+        .header("content-length", body.len().to_string())
         .header("x-request-id", &request_id)
         .body(Body::from(body))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
@@ -2864,5 +2924,21 @@ async fn antigravity_usage(State(state): State<HostState>, request: Request) -> 
             "usage aggregation failed",
             &request_id,
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_zip_entry_name;
+
+    #[test]
+    fn zip_entry_names_are_sanitized_against_path_traversal() {
+        assert_eq!(sanitize_zip_entry_name("img-001"), "img-001");
+        assert_eq!(sanitize_zip_entry_name("a/b"), "a_b");
+        assert_eq!(sanitize_zip_entry_name("../etc"), "etc");
+        assert_eq!(sanitize_zip_entry_name(r"..\..\win"), "win");
+        assert_eq!(sanitize_zip_entry_name("  "), "item");
+        assert_eq!(sanitize_zip_entry_name("..."), "item");
+        assert_eq!(sanitize_zip_entry_name("a b:c"), "a_b_c");
     }
 }
