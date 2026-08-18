@@ -11,15 +11,15 @@ use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, delete, get, post, put};
 use axum::{Json, Router};
-use codex_router::backend::cli_proxy::CliProxyManagementClient;
-use codex_router::backend::config_compiler::{self, CliProxyConfig};
-use codex_router::control_plane::http_compat as compat;
-use codex_router::control_plane::ControlState;
-use codex_router::data_ops;
-use codex_router::routing::{ContinuationBindings, PoolRoute, RouteTable};
-use codex_router::state::StateStore;
-use codex_router::telemetry::ledger as usage_ledger;
-use codex_router::telemetry::structured_log::{self, StructuredLogger, TerminalSpanGuard};
+use codex_router_lib::backend::cli_proxy::CliProxyManagementClient;
+use codex_router_lib::backend::config_compiler::{self, CliProxyConfig};
+use codex_router_lib::control_plane::http_compat as compat;
+use codex_router_lib::control_plane::ControlState;
+use codex_router_lib::data_ops;
+use codex_router_lib::routing::{ContinuationBindings, PoolRoute, RouteTable};
+use codex_router_lib::state::StateStore;
+use codex_router_lib::telemetry::ledger as usage_ledger;
+use codex_router_lib::telemetry::structured_log::{self, StructuredLogger, TerminalSpanGuard};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -75,24 +75,24 @@ fn sha256_file(path: &Path) -> Result<String> {
 }
 
 pub fn ensure_local_api_key() -> Result<Zeroizing<String>> {
-    if let Some(key) = codex_router::credentials::read_text("LocalApiKey")? {
+    if let Some(key) = codex_router_lib::credentials::read_text("LocalApiKey")? {
         if !key.trim().is_empty() {
             return Ok(key);
         }
     }
     let key = Zeroizing::new(format!("sk-local-{}", uuid::Uuid::now_v7().simple()));
-    codex_router::credentials::write_text("LocalApiKey", &key)?;
+    codex_router_lib::credentials::write_text("LocalApiKey", &key)?;
     Ok(key)
 }
 
 fn ensure_management_secret() -> Result<Zeroizing<String>> {
-    if let Some(secret) = codex_router::credentials::read_text("CliManagementSecret")? {
+    if let Some(secret) = codex_router_lib::credentials::read_text("CliManagementSecret")? {
         if !secret.trim().is_empty() {
             return Ok(secret);
         }
     }
     let secret = Zeroizing::new(format!("cr-mgmt-{}", uuid::Uuid::now_v7().simple()));
-    codex_router::credentials::write_text("CliManagementSecret", &secret)?;
+    codex_router_lib::credentials::write_text("CliManagementSecret", &secret)?;
     Ok(secret)
 }
 
@@ -157,7 +157,7 @@ async fn start_cli(root: &Path, config_path: &Path) -> Result<Child> {
     }
     let stdout = std::fs::File::create(root.join(r"logs\cli-proxy-stdout.log"))?;
     let stderr = std::fs::File::create(root.join(r"logs\cli-proxy-stderr.log"))?;
-    Command::new(&executable)
+    let child = Command::new(&executable)
         .arg("-config")
         .arg(config_path)
         .arg("-local-model")
@@ -165,7 +165,64 @@ async fn start_cli(root: &Path, config_path: &Path) -> Result<Child> {
         .stdout(stdout)
         .stderr(stderr)
         .spawn()
-        .with_context(|| format!("CR-CLI-0002: spawn {}", executable.display()))
+        .with_context(|| format!("CR-CLI-0002: spawn {}", executable.display()))?;
+    if let Err(err) = assign_kill_on_close_job(&child) {
+        eprintln!("[router-host] warn: {err:#}");
+    }
+    Ok(child)
+}
+
+/// Bind the CLI child to a kill-on-close Job Object so the CLI cannot outlive
+/// this host, even when the host is terminated without running the ctrl-c
+/// cleanup path. Failure is reported as CR-CLI-0011 but does not block
+/// startup: port-based cleanup in the GUI lifecycle is the second net.
+fn assign_kill_on_close_job(child: &Child) -> Result<()> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    let process = child
+        .raw_handle()
+        .context("CR-CLI-0011: CLI child handle unavailable")?
+        as windows_sys::Win32::Foundation::HANDLE;
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            bail!(
+                "CR-CLI-0011: CreateJobObjectW failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ) == 0
+        {
+            CloseHandle(job);
+            bail!(
+                "CR-CLI-0011: SetInformationJobObject failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        if AssignProcessToJobObject(job, process) == 0 {
+            CloseHandle(job);
+            bail!(
+                "CR-CLI-0011: AssignProcessToJobObject failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        // Deliberately leak `job`: closing it now would kill the CLI. When this
+        // host process exits (even via TerminateProcess) the OS closes the
+        // handle and the Job Object terminates the CLI.
+    }
+    Ok(())
 }
 
 async fn wait_cli_ready(cli: &CliProxyManagementClient) -> Result<()> {
@@ -286,6 +343,7 @@ pub fn public_router(state: HostState) -> Router {
             put(compat::update_api_key).delete(compat::delete_api_key),
         )
         .route("/v1/usage", get(data_usage))
+        .route("/antigravity/v1/usage", get(antigravity_usage))
         .route("/v1/sub2api/billing", get(data_billing))
         .route("/v1/embeddings", post(data_embeddings))
         .route("/v1/images/generations/async", post(image_async_generate))
@@ -383,6 +441,40 @@ fn map_path(uri: &str) -> String {
     match query {
         Some(query) => format!("{mapped}?{query}"),
         None => mapped,
+    }
+}
+
+/// Model segment of a Gemini `/v1beta/models/{model}:{action}` path.
+fn extract_v1beta_model(mapped: &str) -> Option<&str> {
+    let path = mapped.split('?').next().unwrap_or(mapped);
+    let rest = path.strip_prefix("/v1beta/models/")?;
+    let (model, action) = rest.split_once(':')?;
+    if model.is_empty() || action.is_empty() {
+        None
+    } else {
+        Some(model)
+    }
+}
+
+/// Replace the model segment of a v1beta path with the internal
+/// `{prefix}/{public_model}` form, preserving action and query string. The
+/// CLI registers v1beta as a wildcard route and splits on `:`, so the slash
+/// inside the internal model is safe upstream.
+fn rewrite_v1beta_path_model(mapped: &str, internal_model: &str) -> String {
+    let (path, query) = match mapped.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (mapped, None),
+    };
+    let Some(rest) = path.strip_prefix("/v1beta/models/") else {
+        return mapped.to_owned();
+    };
+    let Some((_, action)) = rest.split_once(':') else {
+        return mapped.to_owned();
+    };
+    let rewritten = format!("/v1beta/models/{internal_model}:{action}");
+    match query {
+        Some(query) => format!("{rewritten}?{query}"),
+        None => rewritten,
     }
 }
 
@@ -527,15 +619,27 @@ fn record_ledger(state: &HostState, input: &usage_ledger::LedgerInput<'_>) {
 }
 
 /// Public `/v1/models` answer: only Router-public models, in catalog order.
-fn public_models_response(state: &HostState, request_id: &str) -> Response {
+fn public_models_response(state: &HostState, request_id: &str, provider: Option<&str>) -> Response {
     let routes = state
         .control
         .routes
         .read()
         .unwrap_or_else(|error| error.into_inner())
         .clone();
-    let models: Vec<Value> = routes
-        .public_models()
+    let public: Vec<String> = match provider {
+        Some(provider) => {
+            let mut seen = std::collections::BTreeSet::new();
+            routes
+                .routes()
+                .iter()
+                .filter(|route| route.provider == provider)
+                .map(|route| route.public_model.clone())
+                .filter(|model| seen.insert(model.clone()))
+                .collect()
+        }
+        None => routes.public_models(),
+    };
+    let models: Vec<Value> = public
         .iter()
         .map(|model| serde_json::json!({"id": model, "object": "model", "created": 0, "owned_by": "codex-router"}))
         .collect();
@@ -553,12 +657,17 @@ struct PlanResult {
     pool_id: String,
     pool_prefix: String,
     upstream_model: String,
+    /// `{prefix}/{public_model}` as sent to the CLI; needed to rewrite
+    /// path-carried models (Gemini v1beta) back into the URL.
+    internal_model: String,
 }
 
 fn plan_request(
     state: &HostState,
     bytes: &[u8],
     session_header: Option<&str>,
+    path_model: Option<&str>,
+    provider_constraint: Option<&str>,
 ) -> std::result::Result<PlanResult, Value> {
     let mut parsed: Value = match serde_json::from_slice(bytes) {
         Ok(value) => value,
@@ -568,25 +677,31 @@ fn plan_request(
             )
         }
     };
-    let Some(model) = parsed
+    let body_model = parsed
         .get("model")
         .and_then(Value::as_str)
-        .map(str::to_owned)
-    else {
+        .map(str::to_owned);
+    let Some(model) = body_model.clone().or_else(|| path_model.map(str::to_owned)) else {
         return Ok(PlanResult {
             body: bytes.to_vec(),
             public_model: String::new(),
             pool_id: String::new(),
             pool_prefix: String::new(),
             upstream_model: String::new(),
+            internal_model: String::new(),
         });
     };
-    let table = state
+    let mut table = state
         .control
         .routes
         .read()
         .unwrap_or_else(|error| error.into_inner())
         .clone();
+    if let Some(provider) = provider_constraint {
+        // Forced-pool surfaces (Antigravity) see only their provider's pools;
+        // a missing route reports CR-RTE-0001 exactly like the public plane.
+        table = table.filtered_by_provider(provider);
+    }
     let continuation_key = table.continuation_key(
         parsed.get("conversation_id").and_then(Value::as_str),
         parsed.get("previous_response_id").and_then(Value::as_str),
@@ -604,7 +719,7 @@ fn plan_request(
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .clone();
-    let selected = match codex_router::routing::select_pool(
+    let selected = match codex_router_lib::routing::select_pool(
         &table,
         &model,
         continuation_key.as_deref(),
@@ -635,14 +750,17 @@ fn plan_request(
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .bind(key.clone(), selected.pool_id.clone(), CONTINUATION_TTL);
-        let _ = codex_router::routing::persist_binding(
+        let _ = codex_router_lib::routing::persist_binding(
             &state.control.store,
             &key,
             &selected.pool_id,
             CONTINUATION_TTL,
         );
     }
-    parsed["model"] = Value::String(table.rewrite_request_model(&model, &selected));
+    let internal_model = table.rewrite_request_model(&model, &selected);
+    if body_model.is_some() {
+        parsed["model"] = Value::String(internal_model.clone());
+    }
     let body = serde_json::to_vec(&parsed).map_err(|_| serde_json::json!({"status": 400, "code": "CR-REQ-0006", "message": "could not encode request"}))?;
     Ok(PlanResult {
         body,
@@ -650,6 +768,7 @@ fn plan_request(
         pool_id: selected.pool_id.clone(),
         pool_prefix: selected.prefix.clone(),
         upstream_model: selected.upstream_model.clone(),
+        internal_model,
     })
 }
 
@@ -759,6 +878,269 @@ impl SseRewriter {
     }
 }
 
+/// Detect a WebSocket upgrade request (RFC 6455 handshake).
+fn is_websocket_upgrade(request: &Request) -> bool {
+    let connection = request
+        .headers()
+        .get(axum::http::header::CONNECTION)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    let upgrade = request
+        .headers()
+        .get("upgrade")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    connection.split(',').any(|part| part.trim() == "upgrade") && upgrade.contains("websocket")
+}
+
+/// Resolve the CLIProxyAPI loopback socket address from the configured base URI.
+fn cli_socket_addr(cli_base: &str) -> String {
+    let stripped = cli_base.trim().trim_end_matches('/');
+    stripped
+        .strip_prefix("http://")
+        .or_else(|| stripped.strip_prefix("https://"))
+        .map(str::to_owned)
+        .unwrap_or_else(|| stripped.to_owned())
+}
+
+/// Read an HTTP response head (through the blank line) from the CLI socket.
+async fn read_response_head(stream: &mut tokio::net::TcpStream) -> std::io::Result<Vec<u8>> {
+    let mut buffer = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+    loop {
+        let read = tokio::io::AsyncReadExt::read(stream, &mut chunk).await?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "CLI closed before sending response headers",
+            ));
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+            return Ok(buffer);
+        }
+        if buffer.len() > 64 * 1024 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "CLI response head is too large",
+            ));
+        }
+    }
+}
+
+/// Build an axum response from a raw HTTP head returned by the CLI.
+fn response_from_raw_head(head: &[u8], request_id: &str, body: Body) -> Response {
+    let text = String::from_utf8_lossy(head);
+    let mut lines = text.lines();
+    let status_line = lines.next().unwrap_or("HTTP/1.1 400 Bad Request");
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse::<u16>().ok())
+        .map(StatusCode::from_u16)
+        .and_then(Result::ok)
+        .unwrap_or(StatusCode::BAD_REQUEST);
+    let mut builder = axum::response::Response::builder().status(status);
+    for line in lines {
+        if let Some((name, value)) = line.split_once(':') {
+            let name = name.trim();
+            if matches!(
+                name.to_ascii_lowercase().as_str(),
+                "content-length"
+                    | "host"
+                    | "transfer-encoding"
+                    | "proxy-authenticate"
+                    | "proxy-authorization"
+            ) {
+                continue;
+            }
+            if let (Ok(header_name), Ok(header_value)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value.trim()),
+            ) {
+                builder = builder.header(header_name, header_value);
+            }
+        }
+    }
+    builder
+        .header("x-request-id", request_id)
+        .body(body)
+        .unwrap_or_else(|_| {
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                "CR-ADP-0008",
+                "cannot build upstream response",
+                request_id,
+            )
+        })
+}
+
+/// Bidirectionally relay bytes between the upgraded client stream and the CLI.
+async fn relay_websocket(
+    on_upgrade: hyper::upgrade::OnUpgrade,
+    cli: tokio::net::TcpStream,
+    leftover: Vec<u8>,
+) -> anyhow::Result<()> {
+    let upgraded = on_upgrade
+        .await
+        .context("WebSocket upgrade was cancelled")?;
+    // Upgraded implements hyper::rt Read/Write; TokioIo bridges it into
+    // tokio AsyncRead/Write so it can be copy_bidirectional'd with the CLI
+    // TcpStream.
+    let mut client = hyper_util::rt::TokioIo::new(upgraded);
+    let mut upstream = cli;
+    if !leftover.is_empty() {
+        tokio::io::AsyncWriteExt::write_all(&mut client, &leftover).await?;
+    }
+    tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+    Ok(())
+}
+
+/// Proxy a WebSocket upgrade to the CLI and tunnel frames bidirectionally.
+async fn proxy_websocket(
+    state: &HostState,
+    request: Request,
+    mapped: &str,
+    request_id: &str,
+) -> Response {
+    let on_upgrade = request
+        .extensions()
+        .get::<hyper::upgrade::OnUpgrade>()
+        .cloned();
+    let Some(on_upgrade) = on_upgrade else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "CR-STR-0008",
+            "WebSocket upgrade context is missing",
+            request_id,
+        );
+    };
+    let (parts, _body) = request.into_parts();
+    let mut handshake = format!("{} {mapped} HTTP/1.1\r\n", parts.method.as_str());
+    // hyper consumes Connection/Upgrade while handling the upgrade, so they are
+    // gone from the parsed headers; re-emit them so the CLI sees a valid
+    // RFC 6455 handshake.
+    handshake.push_str("connection: Upgrade\r\n");
+    handshake.push_str("upgrade: websocket\r\n");
+    for name in [
+        "sec-websocket-key",
+        "sec-websocket-version",
+        "sec-websocket-protocol",
+        "accept",
+        "openai-beta",
+        "anthropic-version",
+        "anthropic-beta",
+        "x-codex-client",
+        "session_id",
+    ] {
+        if let Some(value) = parts.headers.get(name) {
+            if let Ok(text) = value.to_str() {
+                handshake.push_str(&format!("{name}: {text}\r\n"));
+            }
+        }
+    }
+    if let Some(host) = parts
+        .headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+    {
+        handshake.push_str(&format!("host: {host}\r\n"));
+    }
+    handshake.push_str(&format!(
+        "authorization: Bearer {}\r\n",
+        state.local_key.as_str()
+    ));
+    handshake.push_str(&format!("x-request-id: {request_id}\r\n\r\n"));
+
+    let cli_addr = cli_socket_addr(&state.cli_base);
+    let mut cli = match tokio::net::TcpStream::connect(&cli_addr).await {
+        Ok(stream) => stream,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                "CR-CLI-0004",
+                "CLIProxyAPI failed while handling the request",
+                request_id,
+            );
+        }
+    };
+    if tokio::io::AsyncWriteExt::write_all(&mut cli, handshake.as_bytes())
+        .await
+        .is_err()
+    {
+        return error_response(
+            StatusCode::BAD_GATEWAY,
+            "CR-CLI-0004",
+            "CLIProxyAPI failed while handling the request",
+            request_id,
+        );
+    }
+    let head = match read_response_head(&mut cli).await {
+        Ok(head) => head,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                "CR-CLI-0004",
+                "CLIProxyAPI failed while handling the request",
+                request_id,
+            );
+        }
+    };
+    let head_text = String::from_utf8_lossy(&head);
+    let status_line = head_text.lines().next().unwrap_or("");
+    let upgraded_ok = status_line.contains(" 101")
+        || status_line.starts_with("HTTP/1.1 101")
+        || status_line.contains("101 Switching");
+    if !upgraded_ok {
+        // The CLI rejected the handshake; forward its response (including any
+        // short body) to the client unchanged.
+        let content_length = head_text
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        let body = if content_length > 0 && content_length <= 64 * 1024 {
+            let mut body_bytes = Vec::with_capacity(content_length);
+            let mut remaining = content_length;
+            let mut chunk = [0u8; 1024];
+            while remaining > 0 {
+                let read = tokio::io::AsyncReadExt::read(&mut cli, &mut chunk)
+                    .await
+                    .unwrap_or(0);
+                if read == 0 {
+                    break;
+                }
+                let take = read.min(remaining);
+                body_bytes.extend_from_slice(&chunk[..take]);
+                remaining -= take;
+            }
+            Body::from(body_bytes)
+        } else {
+            Body::empty()
+        };
+        return response_from_raw_head(&head, request_id, body);
+    }
+    let separator = head
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| position + 4)
+        .unwrap_or(head.len());
+    let leftover = head[separator..].to_vec();
+    let head_only = &head[..separator];
+    let response = response_from_raw_head(head_only, request_id, Body::empty());
+    tokio::spawn(async move {
+        let _ = relay_websocket(on_upgrade, cli, leftover).await;
+    });
+    response
+}
+
 async fn data_plane(State(state): State<HostState>, request: Request) -> Response {
     let started = Instant::now();
     let request_id = crate_request_id(&request);
@@ -778,6 +1160,18 @@ async fn data_plane(State(state): State<HostState>, request: Request) -> Respons
         return response;
     }
     let mapped = map_path(&request.uri().to_string());
+    if is_websocket_upgrade(&request) {
+        let response = proxy_websocket(&state, request, &mapped, &request_id).await;
+        let _ = terminal.complete("ok", Some(101), None, 1);
+        return response;
+    }
+    // Forced Antigravity pool: `/antigravity/v1*` shares the CLI data plane but
+    // pool selection and the public catalog are constrained to provider
+    // "antigravity" (manager doc 7.1).
+    let (mapped, provider_constraint) = match mapped.strip_prefix("/antigravity") {
+        Some(rest) if rest.starts_with("/v1") => (rest.to_owned(), Some("antigravity")),
+        _ => (mapped, None),
+    };
     let method = reqwest::Method::from_bytes(request.method().as_str().as_bytes())
         .unwrap_or(reqwest::Method::GET);
     if method == reqwest::Method::GET && mapped.split('?').next() == Some("/v1/models") {
@@ -791,7 +1185,7 @@ async fn data_plane(State(state): State<HostState>, request: Request) -> Respons
             // A populated route table owns the public catalog; an empty one falls
             // through to the CLI native model list below.
             let _ = terminal.complete("ok", Some(200), None, 1);
-            return public_models_response(&state, &request_id);
+            return public_models_response(&state, &request_id, provider_constraint);
         }
     }
     let session_header = request
@@ -822,7 +1216,13 @@ async fn data_plane(State(state): State<HostState>, request: Request) -> Respons
         && !bytes.is_empty()
         && matches!(method, reqwest::Method::POST | reqwest::Method::PUT)
     {
-        match plan_request(&state, &bytes, session_header.as_deref()) {
+        match plan_request(
+            &state,
+            &bytes,
+            session_header.as_deref(),
+            extract_v1beta_model(&mapped),
+            provider_constraint,
+        ) {
             Ok(plan) => plan,
             Err(error) => {
                 let status = StatusCode::from_u16(
@@ -849,7 +1249,15 @@ async fn data_plane(State(state): State<HostState>, request: Request) -> Respons
             pool_id: String::new(),
             pool_prefix: String::new(),
             upstream_model: String::new(),
+            internal_model: String::new(),
         }
+    };
+    // Gemini v1beta carries the model in the URL path; rewrite it to the
+    // internal `{prefix}/{public_model}` form after planning.
+    let mapped = if !plan.internal_model.is_empty() && extract_v1beta_model(&mapped).is_some() {
+        rewrite_v1beta_path_model(&mapped, &plan.internal_model)
+    } else {
+        mapped
     };
     let protocol = protocol_of(&mapped);
     let url = format!("{}{}", state.cli_base, mapped);
@@ -1285,7 +1693,7 @@ fn select_available_pool(
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .clone();
-    codex_router::routing::select_pool(&table, model, None, &bindings)
+    codex_router_lib::routing::select_pool(&table, model, None, &bindings)
         .cloned()
         .map_err(|_| {
             (
@@ -2407,6 +2815,53 @@ async fn image_batch_outputs_clear(
             StatusCode::INTERNAL_SERVER_ERROR,
             "CR-STO-0004",
             "clearing batch outputs failed",
+            &request_id,
+        ),
+    }
+}
+
+/// Antigravity-scoped usage: same ledger aggregation as `/v1/usage`, filtered
+/// to public models that have at least one Antigravity pool.
+async fn antigravity_usage(State(state): State<HostState>, request: Request) -> Response {
+    let request_id = crate_request_id(&request);
+    if let Some(denied) = authorize_data_request(&state, &request, &request_id) {
+        return denied;
+    }
+    let models: std::collections::BTreeSet<String> = state
+        .control
+        .routes
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+        .routes()
+        .iter()
+        .filter(|route| route.provider == "antigravity")
+        .map(|route| route.public_model.clone())
+        .collect();
+    match data_ops::usage_by_model(&state.control.store) {
+        Ok(mut body) => {
+            if let Some(rows) = body["data"].as_array_mut() {
+                rows.retain(|row| {
+                    row["model"]
+                        .as_str()
+                        .is_some_and(|model| models.contains(model))
+                });
+            }
+            let mut total_requests = 0i64;
+            let mut total_tokens = 0i64;
+            if let Some(rows) = body["data"].as_array() {
+                for row in rows {
+                    total_requests += row["requests"].as_i64().unwrap_or(0);
+                    total_tokens += row["total_tokens"].as_i64().unwrap_or(0);
+                }
+            }
+            body["total_requests"] = Value::from(total_requests);
+            body["total_tokens"] = Value::from(total_tokens);
+            json_data_response(StatusCode::OK, body, &request_id)
+        }
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CR-STO-0003",
+            "usage aggregation failed",
             &request_id,
         ),
     }

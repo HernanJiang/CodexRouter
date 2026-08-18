@@ -1392,7 +1392,7 @@ mod tests {
             &source,
             &[
                 ("Codex-Router.exe", b"new"),
-                ("app/sub2api.exe", b"sub2api"),
+                ("app/cli-proxy-api.exe", b"cli"),
             ],
         );
         write_release_archive(&source, &archive, "Codex-Router-New");
@@ -1400,7 +1400,7 @@ mod tests {
         let staged = extract_and_verify_archive(&active, &archive, "1.5.9").unwrap();
 
         assert_eq!(fs::read(staged.join("Codex-Router.exe")).unwrap(), b"new");
-        assert!(staged.join("app/sub2api.exe").is_file());
+        assert!(staged.join("app/cli-proxy-api.exe").is_file());
         assert_eq!(staged.parent().unwrap().parent().unwrap(), parent);
         fs::remove_dir_all(parent).unwrap();
     }
@@ -1416,7 +1416,7 @@ mod tests {
             &source,
             &[
                 ("Codex-Router.exe", b"first"),
-                ("app/sub2api.exe", b"sub2api"),
+                ("app/cli-proxy-api.exe", b"cli"),
             ],
         );
         write_release_archive(&source, &archive, "Codex-Router-Portable-1.5.8");
@@ -1436,7 +1436,7 @@ mod tests {
             &source,
             &[
                 ("Codex-Router.exe", b"second"),
-                ("app/sub2api.exe", b"sub2api"),
+                ("app/cli-proxy-api.exe", b"cli"),
             ],
         );
         write_release_archive(&source, &archive, "Codex-Router-Portable-1.5.8");
@@ -1463,7 +1463,7 @@ mod tests {
             &source,
             &[
                 ("Codex-Router.exe", b"new"),
-                ("app/sub2api.exe", b"sub2api"),
+                ("app/cli-proxy-api.exe", b"cli"),
             ],
         );
         write_release_archive(&source, &archive, "Codex-Router-Portable-1.5.8");
@@ -1536,7 +1536,7 @@ mod tests {
             &[
                 ("Codex-Router.exe", b"new"),
                 ("config/default.json", b"new-default"),
-                ("app/sub2api.exe", b"new-sub2api"),
+                ("app/cli-proxy-api.exe", b"new-cli"),
             ],
         );
 
@@ -1557,7 +1557,7 @@ mod tests {
             fs::read(root.join("data/postgres/PG_VERSION")).unwrap(),
             b"17"
         );
-        assert!(staged.join("app/sub2api.exe").is_file());
+        assert!(staged.join("app/cli-proxy-api.exe").is_file());
         fs::remove_dir_all(parent).unwrap();
     }
 

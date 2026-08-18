@@ -622,7 +622,7 @@ dependencies = [
 
 [[package]]
 name = "codex-router"
-version = "1.7.10"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -633,6 +633,8 @@ dependencies = [
  "egui",
  "futures-util",
  "hmac",
+ "hyper",
+ "hyper-util",
  "image",
  "regex",
  "reqwest",
@@ -643,6 +645,7 @@ dependencies = [
  "serde_yaml",
  "sha2",
  "tokio",
+ "tokio-util",
  "toml_edit 0.22.27",
  "tower-http",
  "tray-icon",
@@ -4268,6 +4271,7 @@ checksum = "494815d09bf52b5548659851081238f0ca39ff638363907596da739561c62c52"
 dependencies = [
  "bytes",
  "futures-core",
+ "futures-io",
  "futures-sink",
  "libc",
  "pin-project-lite",

@@ -1,8 +1,8 @@
 # CodexRouter 条款与合规说明
 
-软件版本：v1.7.10
-发布日期：2026-08-17
-承诺修订：v1.1（2026-08-01）
+软件版本：v2.0.0
+发布日期：2026-08-18
+承诺修订：v1.3（2026-08-18）
 版权所有：Hernan_Jiang
 官方发布地址：https://github.com/HernanJiang/CodexRouter
 
@@ -12,7 +12,7 @@
 
 1. 本承诺适用于 Codex-Router 的源代码、配置向导、脚本、文档、界面设计、Logo、名称、可执行文件、便携包、更新包及其修改版本。
 2. Codex-Router 中由 Hernan_Jiang 原创的内容，其著作权及其他合法权益由 Hernan_Jiang 保留。公开源代码允许在本承诺范围内审查、学习、个人使用、修改和分发，但不表示放弃权利；因保留非商业限制，本许可证属于源码可用许可证，而非 OSI 认可的开源许可证。
-3. Sub2API、PostgreSQL、Redis、egui 及其他第三方组件不属于 Codex-Router 作者的原创产权，分别受各自上游许可证、合规文件和权利声明约束。
+3. CLIProxyAPI、SQLite、egui 及其他第三方组件不属于 Codex-Router 作者的原创产权，分别受各自上游许可证、合规文件和权利声明约束。
 
 https://www.gnu.org/licenses/agpl-3.0.html
 
@@ -41,9 +41,11 @@ https://www.gnu.org/licenses/agpl-3.0.html
 3. 不得通过改名、换 Logo、换配色、轻微修改界面、混淆代码、重新编译或增加少量功能，将本项目或衍生版本冒充为独立原创作品。
 4. 未经书面许可，不得使用 Codex-Router 名称、Logo、截图或界面风格暗示获得作者授权、官方合作、认证、担保或背书。
 
-Sub2API 是独立第三方项目，其代码受 LGPL-3.0-or-later 许可证约束，并须遵守上游《Sub2API 部署与运营合规承诺》。本说明不主张对 Sub2API 的所有权，也不限制上游许可证依法授予的权利。使用内置集成时，须对全部账号、接口和数据取得合法授权，并遵守上游提供方条款与适用法律；不得以 Codex-Router 名义提供收费中转、额度分发、共享订阅或账号出租，不得暗示 Codex-Router、Sub2API 或其作者授权、认可、担保或共同经营第三方服务。
+## 五、CLIProxyAPI 组件
 
-Sub2API 上游完整承诺：https://github.com/Wei-Shaw/sub2api/blob/main/docs/legal/admin-compliance.zh.md
+CLIProxyAPI 是独立第三方项目，其代码受 MIT 许可证约束。本说明不主张对 CLIProxyAPI 的所有权，也不限制上游许可证依法授予的权利。使用内置集成时，须对全部账号、接口和数据取得合法授权，并遵守上游提供方条款与适用法律；不得以 Codex-Router 名义提供收费中转、额度分发、共享订阅或账号出租，不得暗示 Codex-Router、CLIProxyAPI 或其作者授权、认可、担保或共同经营第三方服务。
+
+CLIProxyAPI 上游项目：https://github.com/router-for-me/CLIProxyAPI
 
 ## 六、第三方组件与许可证
 
@@ -65,4 +67,4 @@ Sub2API 上游完整承诺：https://github.com/Wei-Shaw/sub2api/blob/main/docs/
 2. 新版本可随附更新后的条款；下载或使用新版本前应重新阅读。任何第三方无权代表著作权人修改、解释或授予例外。
 3. 若部分条款依法无效或不可执行，不影响其他条款继续有效；依法不能排除或限制的权利与责任依适用法律处理。
 
-确认即表示：我已完整阅读、理解并同意上述《Codex-Router 使用与分发承诺》，并同时知悉且承诺遵守 Sub2API 及其他第三方组件的上游许可证和合规要求。
+确认即表示：我已完整阅读、理解并同意上述《Codex-Router 使用与分发承诺》，并同时知悉且承诺遵守 CLIProxyAPI 及其他第三方组件的上游许可证要求。

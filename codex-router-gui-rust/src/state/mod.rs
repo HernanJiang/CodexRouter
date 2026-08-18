@@ -1,6 +1,8 @@
 //! SQLite-backed Router state. One connection is deliberately serialized: every
 //! writer enters the same queue, while WAL permits readers in future versions.
 
+pub mod legacy_migration;
+
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;

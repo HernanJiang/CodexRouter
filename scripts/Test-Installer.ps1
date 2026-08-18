@@ -82,8 +82,8 @@ $installRoot = Join-Path $testRoot 'installed'
 try {
     [IO.Directory]::CreateDirectory((Join-Path $payload 'app')) | Out-Null
     [IO.File]::WriteAllText((Join-Path $payload 'Codex-Router.exe'), 'router-test')
-    [IO.File]::WriteAllText((Join-Path $payload 'app\sub2api.exe'), 'sub2api-test')
-    $manifest = @('Codex-Router.exe', 'app/sub2api.exe') | ForEach-Object {
+    [IO.File]::WriteAllText((Join-Path $payload 'app\cli-proxy-api.exe'), 'cli-proxy-api-test')
+    $manifest = @('Codex-Router.exe', 'app/cli-proxy-api.exe') | ForEach-Object {
         $manifestPath = Join-Path $payload ($_ -replace '/', '\')
         [ordered]@{
             path = $_
@@ -111,7 +111,7 @@ try {
     if (-not [bool]$result.installed -or [string]$result.version -ne $version) {
         throw 'Installer returned invalid completion metadata.'
     }
-    foreach ($relativePath in @('Codex-Router.exe', 'app\sub2api.exe')) {
+    foreach ($relativePath in @('Codex-Router.exe', 'app\cli-proxy-api.exe')) {
         if (-not (Test-Path -LiteralPath (Join-Path $installRoot $relativePath) -PathType Leaf)) {
             throw "Installer did not copy required payload: $relativePath"
         }
@@ -155,7 +155,7 @@ if (-not [string]::IsNullOrWhiteSpace($ArchivePath)) {
             [string]$exe.VersionInfo.CompanyName -ne 'Hernan_JIANG') {
             throw 'Real installer returned invalid version or publisher metadata.'
         }
-        foreach ($relativePath in @('Start-Codex-Router.cmd', 'app\sub2api.exe')) {
+        foreach ($relativePath in @('Start-Codex-Router.cmd', 'app\cli-proxy-api.exe')) {
             if (-not (Test-Path -LiteralPath (Join-Path $realInstallRoot $relativePath) -PathType Leaf)) {
                 throw "Real installer did not copy required payload: $relativePath"
             }

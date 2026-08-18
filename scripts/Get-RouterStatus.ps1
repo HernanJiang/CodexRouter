@@ -3,12 +3,22 @@ Import-Module (Join-Path $PSScriptRoot 'CredentialStore.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'RouterAdmin.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'ProxyDiscovery.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'UserData.psm1') -Force
-$sub2apiBaseUri = Get-RouterBaseUri
-$sub2apiPort = ([Uri]$sub2apiBaseUri).Port
+$routerBaseUri = Get-RouterBaseUri
+$routerPort = ([Uri]$routerBaseUri).Port
+$cliPort = 18081
+$cliPortOverride = [Environment]::GetEnvironmentVariable('CODEX_ROUTER_CLI_PORT', 'Process')
+if ([string]::IsNullOrWhiteSpace($cliPortOverride)) {
+    $cliPortOverride = [Environment]::GetEnvironmentVariable('CODEX_ROUTER_CLI_PORT', 'User')
+}
+if (-not [string]::IsNullOrWhiteSpace($cliPortOverride)) {
+    $parsed = 0
+    if ([int]::TryParse($cliPortOverride.Trim(), [ref]$parsed) -and $parsed -gt 0 -and $parsed -le 65535) {
+        $cliPort = $parsed
+    }
+}
 $ports = @(
-    @{Name='PostgreSQL'; Port=15432},
-    @{Name='Redis'; Port=16379},
-    @{Name='Sub2API'; Port=$sub2apiPort}
+    @{Name='Router Host'; Port=$routerPort},
+    @{Name='CLIProxyAPI'; Port=$cliPort}
 )
 
 foreach ($item in $ports) {
@@ -62,7 +72,7 @@ if ($null -ne $proxySettings.ProxyUrl) {
 
 try {
     $apiKey = Get-RouterCredential -Name 'LocalApiKey'
-    $request = [Net.HttpWebRequest]::Create("$sub2apiBaseUri/v1/models")
+    $request = [Net.HttpWebRequest]::Create("$routerBaseUri/v1/models")
     $request.Method = 'GET'
     $request.Proxy = $null
     $request.Timeout = 4000

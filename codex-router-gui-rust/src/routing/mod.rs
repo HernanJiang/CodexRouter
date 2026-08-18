@@ -73,6 +73,20 @@ impl RouteTable {
         models
     }
 
+    /// Provider-scoped view used by forced-pool surfaces (Antigravity). The
+    /// routes are already enabled and priority-ordered, so filtering keeps
+    /// selection semantics identical inside the view.
+    pub fn filtered_by_provider(&self, provider: &str) -> RouteTable {
+        RouteTable {
+            routes: self
+                .routes
+                .iter()
+                .filter(|route| route.provider == provider)
+                .cloned()
+                .collect(),
+        }
+    }
+
     pub fn pools(&self, public_model: &str) -> Vec<&PoolRoute> {
         self.routes
             .iter()

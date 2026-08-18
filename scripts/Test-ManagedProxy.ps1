@@ -62,7 +62,7 @@ Assert-True (
     ([Net.IPAddress]::Parse([string]$state.Items[0].host)).Equals([Net.IPAddress]::IPv6Loopback)
 ) 'IPv6 proxy host was not stored without brackets.'
 Assert-True ($state.Items[0].port -eq 1080) 'Proxy port was not preserved.'
-Assert-True ($null -eq $state.Calls[1].Body.PSObject.Properties['password']) 'A password field was sent to Sub2API.'
+Assert-True ($null -eq $state.Calls[1].Body.PSObject.Properties['password']) 'A password field was sent to the Router admin API.'
 
 $proxySettings.ProxyUrl = 'http://proxy.example.test:8080'
 $updated = Sync-RouterManagedProxy `

@@ -1,0 +1,14 @@
+SQLite Public Domain Notice
+===========================
+
+The 2.0.0 Router stack stores its state in an embedded SQLite database
+(router.db) through the rusqlite crate, which bundles the SQLite amalgamation.
+
+SQLite is in the public domain and does not require a license:
+https://www.sqlite.org/copyright.html
+
+The bundled source carries this blessing in place of a copyright notice:
+
+    May you do good and not evil.
+    May you find forgiveness for yourself and forgive others.
+    May you share freely, never taking more than you give.

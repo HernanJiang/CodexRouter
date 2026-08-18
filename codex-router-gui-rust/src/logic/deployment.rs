@@ -155,7 +155,7 @@ where
     F: FnMut(String),
 {
     check_cancel(cancel)?;
-    on_log("[2/7] Starting PostgreSQL, Redis, and Sub2API...".to_owned());
+    on_log("[2/7] Starting Router Host and CLIProxyAPI...".to_owned());
     crate::lifecycle::ensure_services(router_root, true, cancel, true)
         .context("ROUTER_DEPLOY_NATIVE_LIFECYCLE_FAILED")?;
     on_log("CR-FLAG STAGE-02-SERVICES-OK".to_owned());
@@ -169,7 +169,7 @@ where
     on_log("CR-FLAG STAGE-03-ADMIN-OK".to_owned());
 
     check_cancel(cancel)?;
-    on_log("[4/7] Checking Sub2API compliance status...".to_owned());
+    on_log("[4/7] Checking Router compliance status...".to_owned());
     let summary = sync_router_state(&admin, router_root, cfg, proxy_runtime, cancel, &mut on_log)?;
     on_log("CR-FLAG STAGE-06-CODEX-OK".to_owned());
     on_log("[7/7] Deployment complete.".to_owned());
@@ -337,7 +337,7 @@ fn ensure_group(admin: &impl AdminApi, models: &[String]) -> anyhow::Result<i64>
             .unwrap_or_default(),
     );
     if id <= 0 {
-        bail!("ROUTER_DEPLOY_GROUP_INVALID: Sub2API did not return a group id")
+        bail!("ROUTER_DEPLOY_GROUP_INVALID: Router Host did not return a group id")
     }
     Ok(id)
 }

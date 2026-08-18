@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.7.10-0969da" alt="Version 1.7.10">
+  <img src="https://img.shields.io/badge/version-1.7.10-0969da" alt="Version 2.0.0">
   <img src="https://img.shields.io/badge/platform-Windows%20%2F%20macOS%20%2F%20Linux-0078d4" alt="Windows / macOS / Linux">
   <img src="https://img.shields.io/badge/architecture-x64-555555" alt="x64">
   <img src="https://img.shields.io/badge/runtime-portable%20%2B%20installer-2ea44f" alt="Portable and installer runtime">
@@ -39,7 +39,7 @@ Version history is published in [GitHub Releases](https://github.com/HernanJiang
   <img src="assets/release/promotion.png" alt="CodexRouter overview" width="100%">
 </p>
 
-CodexRouter is a Windows desktop router built around Sub2API and a Rust desktop console. The Windows x64 release provides both a self-contained portable package and a per-user installer; both include PostgreSQL, Redis, Sub2API, the router runtime, and the required app-local VC++ runtime. Services listen on the local loopback interface.
+CodexRouter is a Windows desktop router built around CLIProxyAPI, the Router Host compatibility layer, and a Rust desktop console. The Windows x64 release provides both a self-contained portable package and a per-user installer; both include CLIProxyAPI, the Router Host, an embedded SQLite state store, the router runtime, the Gemini CLI plugin, and the required app-local VC++ runtime. Services listen on the local loopback interface.
 
 ### Why it is useful
 
@@ -65,14 +65,14 @@ Switch models directly from the Codex model menu and continue in the same contex
 
 ### OAuth and API hybrid routing
 
-- Supports the Sub2API login entries for OpenAI/ChatGPT, Anthropic/Claude, Google Gemini, Google Antigravity, and xAI/Grok.
+- Supports the OAuth login entries for OpenAI/ChatGPT, Anthropic/Claude, Google Gemini, Google Antigravity, and xAI/Grok.
 - Shows the account plan, status, available capacity, reset information, and models discovered by the upstream platform.
 - Every manual or scheduled self-check refreshes each OAuth account's live available-model list. Only models declared by that account are shown, discovery never imports them automatically, and a model is added only after the user clicks its `+ model` button.
 - An added OAuth model can be removed from the current profile from its right-click menu. Save & apply respects the deletion and does not restore it from discovery.
 - Stores OAuth account selection independently for each routing profile. Only models the user added and enabled participate in that profile.
 - With automatic continuity enabled, prefers subscription capacity for a matching model and falls back to a lower-priority API channel when the subscription is exhausted or unhealthy. With it disabled, no automatic handoff occurs and the selected model entry determines the quota source.
 - Uses the upstream reset time when available. When no reset time is exposed, Router performs a low-frequency recovery probe and automatically returns to the subscription after recovery.
-- Keeps OAuth tokens under Sub2API management. Tokens are not written to the CodexRouter configuration file and are not offered as plaintext exports.
+- Keeps OAuth tokens under CLIProxyAPI management. Tokens are not written to the CodexRouter configuration file and are not offered as plaintext exports.
 
 ### Model-aware controls
 
@@ -117,13 +117,13 @@ Download the Windows x64 package from [GitHub Releases](https://github.com/Herna
 
 `Codex-Router-Portable-1.7.10-windows-x64.zip`
 
-An optional per-user installer is also provided as `Codex-Router-Installer-1.7.10-windows-x64.exe`. It opens a setup wizard so you can choose the install location, keep a desktop shortcut by default, and confirm before installation starts. The default location is `%LOCALAPPDATA%\Programs\CodexRouter\1.7.10`. No administrator access is required.
+An optional per-user installer is also provided as `Codex-Router-Installer-2.0.0-windows-x64.exe`. It opens a setup wizard so you can choose the install location, keep a desktop shortcut by default, and confirm before installation starts. The default location is `%LOCALAPPDATA%\Programs\CodexRouter\1.7.10`. No administrator access is required.
 
 This GitHub Release publishes the verified Windows installer and portable package. Theoretical macOS / Linux binaries can still be produced from source via the repository workflow; they have not been tested on real machines. The current supported runtime remains Windows 10/11 x64.
 
 For transient pre-output stream failures such as `Upstream request failed`, the router now allows up to five same-account retries by default with a longer 1.5-second interval. The request is never replayed after visible model output has started.
 
-The package is portable and does not require Python, Node.js, Rust, PostgreSQL, Redis, or a separately installed VC++ runtime. Extract the complete directory before launching it. Do not move only the GUI executable out of the package.
+The package is portable and does not require Python, Node.js, Rust, or a separately installed VC++ runtime. Extract the complete directory before launching it. Do not move only the GUI executable out of the package.
 
 The first launch opens on page one of the end-to-end guide. It walks through the project, login, model, network, and deployment steps, so a new installation has no separate setup manual or high learning cost.
 
@@ -145,11 +145,11 @@ The current supported runtime is Windows 10/11 x64. ARM64 Windows is not include
 ## Security And Terms
 
 - API keys, proxy passwords, and the local Router key are stored through Windows Credential Manager.
-- OAuth tokens remain managed by Sub2API and are not copied into the Router configuration.
+- OAuth tokens remain managed by CLIProxyAPI and are not copied into the Router configuration.
 - Release packages exclude user configuration, logs, databases, OAuth state, backups, and developer paths.
 - Runtime services bind to `127.0.0.1` by default. The management endpoint is not intended for remote exposure.
 - The complete terms are available in [English](TERMS.en.md) and [中文](TERMS.zh-CN.md).
-- CodexRouter original work is licensed for personal, non-commercial use under the included terms. Sub2API and other third-party components remain subject to their upstream licenses and notices.
+- CodexRouter original work is licensed for personal, non-commercial use under the included terms. CLIProxyAPI, the Gemini CLI plugin, and other third-party components remain subject to their upstream licenses and notices.
 
 For the full directory layout and upgrade behavior, see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and the release package README.
 

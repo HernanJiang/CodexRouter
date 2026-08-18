@@ -21,8 +21,9 @@ use std::io::{Read, Write};
 #[cfg(test)]
 use std::io::{Seek, SeekFrom};
 use std::net::{IpAddr, TcpStream, ToSocketAddrs};
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::os::windows::process::CommandExt;
 #[cfg(test)]
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,7 +46,7 @@ const TRAY_TOOLTIP_EN: &str = concat!(
     " - lightweight tray mode (forwarding protection only)"
 );
 const CURRENT_CONFIG_VERSION: &str = APP_VERSION;
-const CURRENT_TERMS_VERSION: &str = "codex-router-terms-v1.2.2-2026-08-04";
+const CURRENT_TERMS_VERSION: &str = "codex-router-terms-v1.3.0-2026-08-18";
 const OFFICIAL_GITHUB_URL: &str = "https://github.com/HernanJiang/CodexRouter";
 const MAX_LOG_BYTES: usize = 256 * 1024;
 const RETAIN_LOG_BYTES: usize = 192 * 1024;
@@ -853,7 +854,6 @@ struct CodexRouterApp {
     grok_sso_auto_select_pending: bool,
     channel_preset_dialog_open: bool,
     recommended_platform_dialog_open: bool,
-    sub2api_intro_open: bool,
     log_scroll_to_bottom: bool,
     log_follow_latest: bool,
     log_dialog_open: bool,
@@ -1142,12 +1142,12 @@ fn deployment_progress_line(zh: bool, line: &str) -> Option<String> {
     }
     const PROGRESS: &[Progress] = &[
         Progress {
-            marker: "Sub2API compliance acknowledgement recorded",
+            marker: "Router compliance acknowledgement recorded",
             zh: "已记录本机管理员的 Sub2API 合规确认",
             en: "Recorded the Sub2API compliance acknowledgement for this local administrator",
         },
         Progress {
-            marker: "Sub2API administrator ready",
+            marker: "Router administrator ready",
             zh: "Sub2API 管理员已就绪",
             en: "Sub2API administrator is ready",
         },
@@ -1227,7 +1227,7 @@ fn deployment_progress_line(zh: bool, line: &str) -> Option<String> {
             en: "Local Router services are running",
         },
         Progress {
-            marker: "Codex Router secrets and PostgreSQL",
+            marker: "Codex Router secrets and data directory",
             zh: "本地凭据与数据库目录已就绪",
             en: "Local secrets and database directory are ready",
         },
@@ -1261,8 +1261,8 @@ fn localized_router_flag(zh: bool, rest: &str) -> String {
             "Step 1/7 done: local credentials and database are ready",
         ),
         "STAGE-02-SERVICES-OK" => (
-            "步骤 2/7 完成：PostgreSQL / Redis / Sub2API 已启动",
-            "Step 2/7 done: PostgreSQL, Redis, and Sub2API are running",
+            "步骤 2/7 完成：Router Host / CLIProxyAPI 已启动",
+            "Step 2/7 done: Router Host and CLIProxyAPI are running",
         ),
         "STAGE-03-ADMIN-OK" => (
             "步骤 3/7 完成：管理接口登录成功",
@@ -1373,8 +1373,8 @@ fn localized_deployment_line(zh: bool, line: String) -> String {
         ),
         (
             "[2/7]",
-            "[2/7] 正在启动 PostgreSQL、Redis 与 Sub2API…",
-            "[2/7] Starting PostgreSQL, Redis, and Sub2API…",
+            "[2/7] 正在启动 Router Host 与 CLIProxyAPI…",
+            "[2/7] Starting Router Host and CLIProxyAPI…",
         ),
         (
             "[3/7]",
@@ -2637,7 +2637,6 @@ impl CodexRouterApp {
             grok_sso_auto_select_pending: false,
             channel_preset_dialog_open: false,
             recommended_platform_dialog_open: false,
-            sub2api_intro_open: false,
             log_scroll_to_bottom: true,
             log_follow_latest: true,
             log_dialog_open: false,
@@ -3104,7 +3103,6 @@ impl CodexRouterApp {
             grok_sso_auto_select_pending: false,
             channel_preset_dialog_open: false,
             recommended_platform_dialog_open: false,
-            sub2api_intro_open: false,
             log_scroll_to_bottom: true,
             log_follow_latest: true,
             log_dialog_open: false,
@@ -3169,7 +3167,6 @@ impl CodexRouterApp {
             }
             "apply-success" => app.apply_success_dialog_open = true,
             "logs" => app.log_dialog_open = true,
-            "sub2api" => app.sub2api_intro_open = true,
             "channel-preset" => app.channel_preset_dialog_open = true,
             "recommended-platforms" => app.recommended_platform_dialog_open = true,
             "grok-sso" => app.grok_sso_dialog_open = true,
@@ -6203,28 +6200,6 @@ impl CodexRouterApp {
         false
     }
 
-    fn copy_sub2api_login(&mut self) {
-        if self.ui_audit_mode {
-            return;
-        }
-        let zh = self.ui_language == "zh";
-        match platform::copy_router_credential("AdminPassword", Some("admin@admin.com\r\n")) {
-            Ok(()) => {
-                self.status_text = if zh {
-                    "Sub2API 登录信息已复制"
-                } else {
-                    "Sub2API login copied"
-                }
-                .to_owned();
-            }
-            Err(error) => self.report_error(if zh {
-                format!("无法复制 Sub2API 登录信息：{error}")
-            } else {
-                format!("Could not copy the Sub2API login: {error}")
-            }),
-        }
-    }
-
     fn copy_local_api_key(&mut self) {
         if self.ui_audit_mode {
             return;
@@ -6322,16 +6297,6 @@ impl CodexRouterApp {
             .spawn();
     }
 
-    fn open_sub2api_accounts(&self) {
-        if self.ui_audit_mode {
-            return;
-        }
-        let url = format!("{}/admin/accounts", self.local_sub2api_base_url());
-        let _ = std::process::Command::new("explorer.exe")
-            .arg(url)
-            .creation_flags(0x08000000)
-            .spawn();
-    }
 
     fn local_sub2api_base_url(&self) -> String {
         let fallback = "http://127.0.0.1:18080";
@@ -6661,16 +6626,16 @@ impl CodexRouterApp {
         });
         let valid = self
             .router_root
-            .join("scripts")
-            .join("Start-Router.ps1")
+            .join("app")
+            .join("codex-router-host.exe")
             .exists()
-            && self.router_root.join("app").join("sub2api.exe").exists();
+            && self.router_root.join("app").join("cli-proxy-api.exe").exists();
         if valid {
             ui.colored_label(egui::Color32::from_rgb(22, 163, 74), "已识别完整运行环境");
         } else {
             ui.colored_label(
                 egui::Color32::from_rgb(220, 38, 38),
-                "目录中缺少 scripts/Start-Router.ps1 或 app/sub2api.exe",
+                "目录中缺少 app/codex-router-host.exe 或 app/cli-proxy-api.exe",
             );
         }
         ui.add_space(20.0);
@@ -6990,11 +6955,6 @@ impl CodexRouterApp {
             if ui.button("停止路由").clicked() {
                 self.stop_router();
                 self.log("正在停止路由...");
-            }
-            if ui.button("打开 Sub2API 管理页").clicked() {
-                let _ = std::process::Command::new("explorer.exe")
-                    .arg(self.local_sub2api_base_url())
-                    .spawn();
             }
             if self.config.auth_mode == "chatgpt_oauth"
                 && ui.button("登录 / 更新 ChatGPT OAuth").clicked()
@@ -8457,7 +8417,7 @@ mod main_tests {
     fn deployment_output_is_allowlisted_before_reaching_the_log() {
         let safe_stage =
             localized_deployment_line(false, "[2/7] secret=must-not-survive".to_owned());
-        assert_eq!(safe_stage, "[2/7] Starting PostgreSQL, Redis, and Sub2API…");
+        assert_eq!(safe_stage, "[2/7] Starting Router Host and CLIProxyAPI…");
 
         let safe_error =
             localized_deployment_line(false, "upstream failed api_key=must-not-survive".to_owned());
@@ -8470,7 +8430,7 @@ mod main_tests {
         // Every one of these is normal Apply output. Before this fix they were
         // relabeled "Deployment diagnostic: class=unclassified_error".
         for line in [
-            "Sub2API administrator ready: admin@admin.com",
+            "Router administrator ready: admin@admin.com",
             "Codex model catalog generated: C:\\catalog.json (5 models)",
             "Composite routes: desired=7; created=2; updated=1; removed=0",
             "Updated channel: Codex-Router / ChatGPT-5.6-Sol",
@@ -8484,7 +8444,7 @@ mod main_tests {
             "Codex configuration written to: C:\\Users\\x\\.codex\\config.toml",
             "Local access key is stored in Windows Credential Manager and the current user environment.",
             "Codex Router is running at http://127.0.0.1:18082",
-            "Codex Router secrets and PostgreSQL data directory are initialized.",
+            "Codex Router secrets and data directory are initialized.",
         ] {
             for zh in [true, false] {
                 // Mimic the deploy pipeline: logic.rs first reduces the line to a
@@ -8494,7 +8454,7 @@ mod main_tests {
                 } else {
                     // Keep the same markers logic.rs emits for progress lines.
                     [
-                        "Sub2API administrator ready",
+                        "Router administrator ready",
                         "Codex model catalog generated",
                         "Composite routes",
                         "Updated channel:",
@@ -8508,7 +8468,7 @@ mod main_tests {
                         "Codex configuration written to",
                         "Local access key is stored in Windows Credential Manager",
                         "Codex Router is running at",
-                        "Codex Router secrets and PostgreSQL",
+                        "Codex Router secrets and data directory",
                         "Configured ",
                     ]
                     .into_iter()

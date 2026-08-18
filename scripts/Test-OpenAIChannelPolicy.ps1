@@ -160,27 +160,19 @@ Assert-True (
     -not $official.Extra.Contains('openai_responses_mode')
 ) 'The official OpenAI API was unnecessarily forced through the compatibility layer.'
 
+# 2.0: Start-Router.ps1 is a thin console wrapper around the native Router
+# Host lifecycle. The first-output/stalled-stream failover deadlines and the
+# update-client proxy override moved into the Rust gateway and are covered by
+# the Rust test suite; the shim must only delegate and report the base URI.
 $startRouterSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Start-Router.ps1') -Raw
 Assert-True (
+    $startRouterSource -match '--ensure-router-services'
+) 'Start-Router.ps1 no longer delegates to the native Router Host lifecycle.'
+Assert-True (
+    $startRouterSource -match 'Get-RouterBaseUri'
+) 'Start-Router.ps1 does not report the Router base URI.'
+Assert-True (
     $startRouterSource -notmatch '(?m)^\s*CONFIG_FILE\s*='
-) 'Start-Router.ps1 must not replace the complete generated Sub2API config with a partial override.'
-Assert-True (
-    $startRouterSource -match 'DATA_DIR\s*=\s*\(Join-Path \$dataRoot ''sub2api''\)'
-) 'Start-Router.ps1 does not use the persistent Sub2API data directory and its generated config.'
-Assert-True (
-    $startRouterSource -match "GATEWAY_OPENAI_FIRST_OUTPUT_TIMEOUT_SECONDS\s*=\s*'60'"
-) 'The normal first-output failover deadline is missing or unexpected.'
-Assert-True (
-    $startRouterSource -match "GATEWAY_OPENAI_HIGH_EFFORT_FIRST_OUTPUT_TIMEOUT_SECONDS\s*=\s*'300'"
-) 'The high-effort first-output deadline is missing or unexpected.'
-Assert-True (
-    $startRouterSource -match "GATEWAY_STREAM_DATA_INTERVAL_TIMEOUT\s*=\s*'60'"
-) 'The stalled-stream failover deadline is missing or unexpected.'
-Assert-True (
-    $startRouterSource -match '\$environment\.UPDATE_PROXY_URL\s*=\s*\$proxySettings\.ProxyUrl'
-) 'The Sub2API update client does not inherit the discovered outbound proxy.'
-Assert-True (
-    $startRouterSource -match '\$environment\.UPDATE_PROXY_URL\s*=\s*\$null'
-) 'Direct mode does not clear the Sub2API update proxy override.'
+) 'Start-Router.ps1 must not carry a partial configuration override.'
 
 Write-Output 'OpenAI channel policy tests passed.'

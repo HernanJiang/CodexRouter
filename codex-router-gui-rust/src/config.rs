@@ -509,18 +509,8 @@ impl Default for RouterConfig {
 
 impl RouterConfig {
     pub fn is_router_root(path: &std::path::Path) -> bool {
-        path.join("app").join("sub2api.exe").is_file()
-            && path
-                .join("postgres")
-                .join("pgsql")
-                .join("bin")
-                .join("pg_ctl.exe")
-                .is_file()
-            && path
-                .join("redis")
-                .join("Redis-8.10.0-Windows-x64-msys2")
-                .join("redis-server.exe")
-                .is_file()
+        path.join("app").join("codex-router-host.exe").is_file()
+            && path.join("app").join("cli-proxy-api.exe").is_file()
     }
 
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {

@@ -1735,17 +1735,12 @@ pub(crate) fn read_router_credential_text(name: &str) -> anyhow::Result<Option<Z
         .context("Windows credential contains invalid UTF-16")
 }
 
+#[cfg(test)]
 pub(crate) fn write_router_credential_text(name: &str, secret: &str) -> anyhow::Result<()> {
     let mut encoded = secret.encode_utf16().collect::<Vec<_>>();
     let result = write_router_credential(name, &encoded);
     encoded.fill(0);
     result
-}
-
-pub(crate) fn random_hex_secret(byte_count: usize) -> anyhow::Result<Zeroizing<String>> {
-    let mut bytes = Zeroizing::new(vec![0u8; byte_count]);
-    secure_random_bytes(&mut bytes)?;
-    Ok(Zeroizing::new(hex_encode(&bytes)))
 }
 
 fn delete_router_credential(name: &str) -> anyhow::Result<()> {
@@ -2137,8 +2132,8 @@ where
         // localize it. Running it through the error classifier first turns every
         // "Updated channel:" line into class=unclassified_error.
         const PROGRESS_MARKERS: &[&str] = &[
-            "Sub2API compliance acknowledgement recorded",
-            "Sub2API administrator ready",
+            "Router compliance acknowledgement recorded",
+            "Router administrator ready",
             "Codex model catalog generated",
             "Composite routes",
             "Updated channel:",
@@ -2154,7 +2149,7 @@ where
             "Codex configuration written to",
             "Local access key is stored in Windows Credential Manager",
             "Codex Router is running at",
-            "Codex Router secrets and PostgreSQL",
+            "Codex Router secrets and data directory",
             "Codex Router is stopped",
             "Configured ",
         ];
@@ -4061,7 +4056,12 @@ base_url = "https://api.430123.xyz/v1"
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         let mut request = [0_u8; 4096];
-                        let read = stream.read(&mut request).unwrap();
+                        let read = match stream.read(&mut request) {
+                            Ok(read) if read > 0 => read,
+                            // The admin client may abort a connection before
+                            // sending (or reset a keep-alive probe); skip it.
+                            _ => continue,
+                        };
                         let request = String::from_utf8_lossy(&request[..read]).into_owned();
                         let first_line = request.lines().next().unwrap_or_default().to_owned();
                         let (status, body) = if first_line.starts_with("POST ") {

@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.7.10-0969da" alt="版本 1.7.10">
+  <img src="https://img.shields.io/badge/version-1.7.10-0969da" alt="版本 2.0.0">
   <img src="https://img.shields.io/badge/platform-Windows%20%2F%20macOS%20%2F%20Linux-0078d4" alt="Windows / macOS / Linux">
   <img src="https://img.shields.io/badge/architecture-x64-555555" alt="x64">
   <img src="https://img.shields.io/badge/runtime-portable%20%2B%20installer-2ea44f" alt="便携版与安装版运行时">
@@ -39,7 +39,7 @@ CodexRouter 保留 Codex 原有工作方式，同时通过一个模型菜单接�
   <img src="assets/release/promotion.png" alt="CodexRouter 总体功能图" width="100%">
 </p>
 
-CodexRouter 是基于 Sub2API 和 Rust 桌面控制台的 Windows 本地路由器。Windows x64 发布版同时提供自包含便携包和用户级安装器；两者都内置 PostgreSQL、Redis、Sub2API、Router 运行时以及 app-local VC++ Runtime，服务默认只监听本机回环地址。
+CodexRouter 是基于 CLIProxyAPI、Router Host 兼容层和 Rust 桌面控制台的 Windows 本地路由器。Windows x64 发布版同时提供自包含便携包和用户级安装器；两者都内置 CLIProxyAPI、Router Host、嵌入式 SQLite 状态层、Router 运行时、Gemini CLI 插件以及 app-local VC++ Runtime，服务默认只监听本机回环地址。
 
 ### 适合解决的问题
 
@@ -65,14 +65,14 @@ CodexRouter 可以将 OAuth 和 API 渠道合并为 Codex 可见的模型目录�
 
 ### OAuth 订阅与 API 混合路由
 
-- 支持 Sub2API 当前提供的 OpenAI/ChatGPT、Anthropic/Claude、Google Gemini、Google Antigravity 与 xAI/Grok 登录入口。
+- 支持 OpenAI/ChatGPT、Anthropic/Claude、Google Gemini、Google Antigravity 与 xAI/Grok 的 OAuth 登录入口。
 - 登录后可查看账号套餐、状态、可用额度、重置时间以及平台实际发现的模型。
 - 每次手动或后台自检都会刷新各 OAuth 账号实时声明的可用模型列表。界面只展示该账号实际返回的模型，发现过程不会自动导入，只有用户逐个点击“＋ 模型”后才会加入。
 - 已加入的 OAuth 模型可通过右键菜单从当前配置删除。“保存并应用”会尊重删除结果，不会由模型发现重新补回。
 - 每套路由配置独立保存 OAuth 账号选择，只有用户已手动加入并启用的模型才参与当前路由。
 - 开启自动接续时，同名模型优先使用订阅额度，限额或故障时转入较低优先级的 API Key 渠道；关闭时不自动转接，由模型列表中的独立条目决定额度来源。
 - 上游提供重置时间时按实际时间恢复；无法取得重置时间时执行低频保底探测，成功后自动回切。
-- OAuth 令牌由 Sub2API 管理，不写入 CodexRouter 配置文件，也不提供明文导出。
+- OAuth 令牌由 CLIProxyAPI 管理，不写入 CodexRouter 配置文件，也不提供明文导出。
 
 ### 按模型适配的控制项
 
@@ -113,17 +113,17 @@ CodexRouter 可以在 Windows 登录后直接进入轻量托盘模式，不启�
 
 ## 下载与首次启动
 
-前往 [GitHub Releases](https://github.com/HernanJiang/CodexRouter/releases/tag/v1.7.10) 下载 Windows x64 版本：
+前往 [GitHub Releases](https://github.com/HernanJiang/CodexRouter/releases/tag/v2.0.0) 下载 Windows x64 版本：
 
-`Codex-Router-Portable-1.7.10-windows-x64.zip`
+`Codex-Router-Portable-2.0.0-windows-x64.zip`
 
-同时提供可选的用户级安装器：`Codex-Router-Installer-1.7.10-windows-x64.exe`。安装时会打开向导，由你选择安装位置、默认创建桌面快捷方式，并在确认后再开始安装。默认路径为 `%LOCALAPPDATA%\Programs\CodexRouter\1.7.10`，不需要管理员权限。
+同时提供可选的用户级安装器：`Codex-Router-Installer-2.0.0-windows-x64.exe`。安装时会打开向导，由你选择安装位置、默认创建桌面快捷方式，并在确认后再开始安装。默认路径为 `%LOCALAPPDATA%\Programs\CodexRouter\2.0.0`，不需要管理员权限。
 
 本 GitHub Release 发布已验证的 Windows 安装包和便携版。macOS / Linux 理论构建仍可通过仓库 workflow 从源码生成，但未在真实机器上测试。当前受支持的运行时仍是 Windows 10/11 x64。
 
 对于 `Upstream request failed` 这类尚未向客户端输出内容的瞬时流错误，Router 默认允许同一账号最多重试 5 次，每次间隔 1.5 秒。已经开始输出模型内容后不会重复回放请求。
 
-这是一个解压即用的便携包，不要求预装 Python、Node.js、Rust、PostgreSQL、Redis 或独立 VC++ Runtime。请完整解压后启动，不要只把 `Codex-Router.exe` 单独移出目录。
+这是一个解压即用的便携包，不要求预装 Python、Node.js、Rust 或独立 VC++ Runtime。请完整解压后启动，不要只把 `Codex-Router.exe` 单独移出目录。
 
 第一次打开会直接进入全流程引导的第一页，按项目、登录、模型、网络和部署步骤带你完成配置，减少第一次使用的学习成本，不需要另找一份安装手册。
 
@@ -145,11 +145,11 @@ CodexRouter 可以在 Windows 登录后直接进入轻量托盘模式，不启�
 ## 安全与条款
 
 - API Key、代理密码和本地 Router Key 通过 Windows Credential Manager 保存。
-- OAuth Token 始终由 Sub2API 管理，不复制到 Router 配置文件。
+- OAuth Token 始终由 CLIProxyAPI 管理，不复制到 Router 配置文件。
 - 发布包排除用户配置、日志、数据库、OAuth 状态、备份和开发机路径。
 - 本地运行服务默认绑定 `127.0.0.1`，不建议将管理接口暴露到远程网络。
 - 完整条款请查看 [中文条款](TERMS.zh-CN.md) 和 [English Terms](TERMS.en.md)。
-- CodexRouter 原创部分仅授权个人、非商业使用；Sub2API 和其他第三方组件继续遵循各自的上游许可证和声明。
+- CodexRouter 原创部分仅授权个人、非商业使用；CLIProxyAPI、Gemini CLI 插件和其他第三方组件继续遵循各自的上游许可证和声明。
 
 官方仓库：<https://github.com/HernanJiang/CodexRouter>
 

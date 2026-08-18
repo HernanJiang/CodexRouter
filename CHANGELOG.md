@@ -2,6 +2,18 @@
 
 本文件记录面向用户的重要变化。完整技术细节以对应版本的源码和 GitHub Release 为准。
 
+## 2.0.0 - 2026-08-18
+
+### 变更
+
+- 本地运行时整体迁移：Sub2API + PostgreSQL + Redis 替换为 CLIProxyAPI + CodexRouter Host + 嵌入式 SQLite，安装包体积与内存占用显著下降。
+- 启动、停止、状态、修复与开机自启全部改由原生 Router Host 生命周期管理；CLIProxyAPI 进程随 Host 自动退出，不再残留孤儿进程。
+- 用量账本、路由状态、OAuth 账号与计划任务迁移到本地 SQLite；旧版本数据在首次启动时自动迁移。
+- 日志页改为展示 Router Host / CLIProxyAPI / 结构化事件流；状态页组件同步更名。
+- 条款更新至 v1.3：Sub2API 专项条款替换为 CLIProxyAPI（MIT）组件说明，升级后需要重新阅读并确认。
+
+升级后请完全重启 CodexRouter 和 Codex。
+
 ## 1.7.10 - 2026-08-17
 
 ### 新增

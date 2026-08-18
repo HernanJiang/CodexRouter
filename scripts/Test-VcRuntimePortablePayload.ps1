@@ -19,10 +19,12 @@ if (-not (Test-Path -LiteralPath $BuilderPath -PathType Leaf)) {
 
 $validation = @(& $BuilderPath -ValidateStage $stageRoot)
 
+# 2.0.0 deploys one app-local VC runtime copy beside Codex-Router.exe; both
+# the Router GUI and the Router Host / CLIProxyAPI services live under app/ and
+# resolve it from the application root.
 $runtimeNames = @('VCRUNTIME140.dll', 'VCRUNTIME140_1.dll', 'MSVCP140.dll')
-$destinationDirectories = @('', 'postgres\pgsql\bin')
+$destinationDirectories = @('')
 $expectedPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-$rootHashes = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
 $versions = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 
 foreach ($destinationDirectory in $destinationDirectories) {
@@ -41,12 +43,6 @@ foreach ($destinationDirectory in $destinationDirectories) {
         $version = [string]$item.VersionInfo.ProductVersion
         if ([string]::IsNullOrWhiteSpace($version)) { throw "VC runtime payload has no version: $relative" }
         [void]$versions.Add($version)
-        $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
-        if ([string]::IsNullOrEmpty($destinationDirectory)) {
-            $rootHashes.Add($name, $hash)
-        } elseif ($rootHashes[$name] -ne $hash) {
-            throw "VC runtime copies differ between the GUI and PostgreSQL directories: $name"
-        }
         [void]$expectedPaths.Add($relative.Replace('\', '/'))
     }
 }
@@ -64,11 +60,6 @@ foreach ($relative in $expectedPaths) {
     if (-not $manifestPaths.Contains($relative)) { throw "VC runtime dependency component is missing: $relative" }
 }
 
-$postgresVersionOutput = @(& (Join-Path $stageRoot 'postgres\pgsql\bin\postgres.exe') --version 2>&1)
-if ($LASTEXITCODE -ne 0 -or ($postgresVersionOutput -join "`n") -notmatch '(?i)postgres') {
-    throw "Packaged PostgreSQL loader smoke test failed: $($postgresVersionOutput -join ' ')"
-}
-
 [ordered]@{
     stage = $stageRoot
     valid = $true
@@ -76,5 +67,4 @@ if ($LASTEXITCODE -ne 0 -or ($postgresVersionOutput -join "`n") -notmatch '(?i)p
     files = $expectedPaths.Count
     destinations = $destinationDirectories.Count
     builderValidation = ($validation -join "`n")
-    postgresLoaderSmokeTest = ($postgresVersionOutput -join ' ').Trim()
 } | ConvertTo-Json -Compress

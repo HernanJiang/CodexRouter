@@ -926,9 +926,6 @@ impl eframe::App for CodexRouterApp {
         if self.codex_overwrite_prompt_open {
             self.show_codex_overwrite_dialog(&ctx, &palette);
         }
-        if self.sub2api_intro_open {
-            self.show_sub2api_intro(&ctx, &palette);
-        }
         if self.update_dialog_open {
             self.show_update_dialog(&ctx, &palette);
         }
@@ -4279,8 +4276,8 @@ impl CodexRouterApp {
                             ui.label(
                                 egui::RichText::new(t(
                                     zh,
-                                    "包含禁止商用、允许保留署名与官方 GitHub 发布地址的分发，以及 Sub2API 专项合规条款。",
-                                    "Includes non-commercial use, redistribution with attribution and the official GitHub release URL, and Sub2API requirements.",
+                                    "包含禁止商用、允许保留署名与官方 GitHub 发布地址的分发，以及上游组件的许可条款。",
+                                    "Includes non-commercial use, redistribution with attribution and the official GitHub release URL, plus the license terms of bundled upstream components.",
                                 ))
                                 .small()
                                 .color(palette.muted),
@@ -4638,7 +4635,6 @@ impl CodexRouterApp {
         let compact_header = ui.available_width() < 1000.0;
         let mut back_to_console = false;
         let mut back_to_previous = false;
-        let mut open_sub2api = false;
         let show_title = |ui: &mut egui::Ui| {
             ui.vertical(|ui| {
                 theme::eyebrow(
@@ -4672,12 +4668,6 @@ impl CodexRouterApp {
                         back_to_previous =
                             theme::secondary_button(ui, t(zh, "返回上一页", "Back"), palette)
                                 .clicked();
-                        open_sub2api = theme::secondary_button(
-                            ui,
-                            t(zh, "Sub2API 高级管理", "Sub2API admin"),
-                            palette,
-                        )
-                        .clicked();
                     });
                 });
             });
@@ -4693,17 +4683,8 @@ impl CodexRouterApp {
                     .clicked();
                     back_to_previous =
                         theme::secondary_button(ui, t(zh, "返回上一页", "Back"), palette).clicked();
-                    open_sub2api = theme::secondary_button(
-                        ui,
-                        t(zh, "Sub2API 高级管理", "Sub2API admin"),
-                        palette,
-                    )
-                    .clicked();
                 });
             });
-        }
-        if open_sub2api {
-            self.sub2api_intro_open = true;
         }
         if back_to_console {
             self.page = Page::Dashboard;
@@ -5106,114 +5087,6 @@ impl CodexRouterApp {
             self.delete_isolation_profile(profile);
         } else if cancel || !open {
             self.profile_delete_target = None;
-        }
-    }
-
-    fn show_sub2api_intro(&mut self, ctx: &egui::Context, palette: &theme::Palette) {
-        let zh = self.ui_language == "zh";
-        let mut open = true;
-        let mut close = false;
-        let mut launch = false;
-        let dialog_size = fit_dialog_size(
-            ctx.content_rect().size(),
-            egui::vec2(520.0, 340.0),
-            egui::vec2(400.0, 280.0),
-        );
-        egui::Window::new(t(zh, "Sub2API 本地管理", "Sub2API local administration"))
-            .id(egui::Id::new("sub2api-introduction"))
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .fixed_size(dialog_size)
-            .collapsible(false)
-            .resizable(false)
-            .vscroll(true)
-            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-            .open(&mut open)
-            .frame(
-                egui::Frame::new()
-                    .fill(palette.paper)
-                    .stroke(egui::Stroke::new(1.0, palette.line))
-                    .inner_margin(egui::Margin::same(22)),
-            )
-            .show(ctx, |ui| {
-                ui.label(
-                    egui::RichText::new(t(
-                        zh,
-                        "高级渠道管理与故障排查入口",
-                        "Advanced channel administration and troubleshooting",
-                    ))
-                    .size(19.0)
-                    .strong()
-                    .color(palette.ink),
-                );
-                ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new(t(
-                        zh,
-                        "管理员邮箱：admin@admin.com",
-                        "Administrator email: admin@admin.com",
-                    ))
-                    .monospace()
-                    .strong(),
-                );
-                ui.label(
-                    egui::RichText::new(t(
-                        zh,
-                        "管理员密码：随机生成并保存在 Windows 凭据管理器",
-                        "Administrator password: randomly generated and stored in Windows Credential Manager",
-                    ))
-                    .monospace()
-                    .strong(),
-                );
-                ui.label(
-                    egui::RichText::new(t(
-                        zh,
-                        "管理页仅监听 127.0.0.1。需要登录时，请使用下方按钮复制当前凭据。",
-                        "The admin page only listens on 127.0.0.1. Use the button below to copy the current credentials.",
-                    ))
-                    .small()
-                    .color(palette.muted),
-                );
-                ui.add_space(10.0);
-                ui.label(
-                    egui::RichText::new(t(
-                        zh,
-                        "日常 OAuth 登录、账号状态和模型导入请优先使用 Codex-Router 的 OAuth 账号页；此入口用于查看 Sub2API 的完整账户、分组、用量和错误详情。",
-                        "Use Codex-Router's OAuth page for normal sign-in, account status, and model import. This console exposes Sub2API's full account, group, usage, and error details.",
-                    ))
-                    .color(palette.muted),
-                );
-                ui.add_space(16.0);
-                ui.horizontal(|ui| {
-                    if theme::secondary_button(
-                        ui,
-                        t(zh, "复制登录信息", "Copy login"),
-                        palette,
-                    )
-                    .clicked()
-                    {
-                        self.copy_sub2api_login();
-                    }
-                    if theme::primary_button(
-                        ui,
-                        egui::RichText::new(t(zh, "打开管理页", "Open admin console"))
-                            .strong()
-                            .color(egui::Color32::WHITE),
-                        palette,
-                    )
-                    .clicked()
-                    {
-                        launch = true;
-                    }
-                    if theme::secondary_button(ui, t(zh, "取消", "Cancel"), palette).clicked() {
-                        close = true;
-                    }
-                });
-            });
-        if launch {
-            self.open_sub2api_accounts();
-            self.sub2api_intro_open = false;
-        } else if close || !open {
-            self.sub2api_intro_open = false;
         }
     }
 
@@ -5976,8 +5849,8 @@ impl CodexRouterApp {
                                 ui.label(
                                     egui::RichText::new(t(
                                         zh,
-                                        "确认后将永久删除本机 Sub2API 中保存的 OAuth 令牌和账号，并从所有路由配置中移除该账号导入的模型。",
-                                        "This permanently deletes the OAuth tokens and account stored in local Sub2API, and removes models imported from it from every route profile.",
+                                        "确认后将永久删除本机 Router 中保存的 OAuth 令牌和账号，并从所有路由配置中移除该账号导入的模型。",
+                                        "This permanently deletes the OAuth tokens and account stored in the local Router, and removes models imported from it from every route profile.",
                                     ))
                                     .color(palette.danger),
                                 );
@@ -6065,12 +5938,12 @@ impl CodexRouterApp {
             ui.label(
                 egui::RichText::new(if zh {
                     format!(
-                        "账号：{}（{}）\n数值越小，同平台调度时越优先。修改后立即写入 Sub2API，无需重新部署。",
+                        "账号：{}（{}）\n数值越小，同平台调度时越优先。修改后立即写入 Router，无需重新部署。",
                         account.name, account.platform
                     )
                 } else {
                     format!(
-                        "Account: {} ({})\nLower numbers are preferred when the same platform has multiple accounts. Changes are written to Sub2API immediately.",
+                        "Account: {} ({})\nLower numbers are preferred when the same platform has multiple accounts. Changes are written to the Router immediately.",
                         account.name, account.platform
                     )
                 })
@@ -6243,8 +6116,8 @@ impl CodexRouterApp {
                 ui.label(
                     egui::RichText::new(t(
                         zh,
-                        "授权码只通过标准输入交给本机 Sub2API，不写入配置、日志或命令行。",
-                        "Tokens are sent to local Sub2API over standard input and are never written to config, logs, or command-line arguments.",
+                        "授权码只通过标准输入交给本机 Router，不写入配置、日志或命令行。",
+                        "Tokens are sent to the local Router over standard input and are never written to config, logs, or command-line arguments.",
                     ))
                     .small()
                     .color(palette.muted),
@@ -6855,8 +6728,8 @@ impl CodexRouterApp {
                 t(zh, "添加登录平台", "ADD A LOGIN PROVIDER"),
                 t(
                     zh,
-                    "登录账号由 Sub2API 安全保管；本页的启用账号、模型和回退策略只属于当前配置",
-                    "Sub2API securely stores sign-ins; enabled accounts, models, and fallback policy on this page belong only to the current profile",
+                    "登录账号由本机 Router 安全保管；本页的启用账号、模型和回退策略只属于当前配置",
+                    "The local Router securely stores sign-ins; enabled accounts, models, and fallback policy on this page belong only to the current profile",
                 ),
                 palette,
             );
@@ -6950,18 +6823,6 @@ impl CodexRouterApp {
                 {
                     self.grok_sso_dialog_open = true;
                     self.grok_sso_error.clear();
-                }
-                if ui
-                    .add_sized(
-                        [ui.available_width(), 34.0],
-                        egui::Button::new(t(zh, "Sub2API 高级管理", "Sub2API admin"))
-                            .fill(palette.paper_alt)
-                            .stroke(egui::Stroke::new(1.0, palette.line))
-                            .corner_radius(egui::CornerRadius::same(6)),
-                    )
-                    .clicked()
-                {
-                    self.sub2api_intro_open = true;
                 }
             });
             ui.add_space(8.0);
@@ -7509,7 +7370,7 @@ impl CodexRouterApp {
                 model: imported_model_id,
                 alias: model.display_name,
                 alias_customized: Some(false),
-                base_url: format!("Sub2API OAuth / {}", account.platform),
+                base_url: format!("Router OAuth / {}", account.platform),
                 priority: self.config.oauth_fallback.official_priority,
                 source: "oauth".into(),
                 oauth_account_id: account.id,

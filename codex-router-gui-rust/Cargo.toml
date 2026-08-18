@@ -1,6 +1,6 @@
 [package]
 name = "codex-router"
-version = "1.7.10"
+version = "2.0.0"
 edition = "2021"
 
 [target.'cfg(windows)'.dependencies]
@@ -23,7 +23,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 toml_edit = "0.22"
 zeroize = "1.8"
 zip = { version = "4.6", default-features = false, features = ["deflate"] }
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinHttp", "Win32_Networking_WinSock", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinHttp", "Win32_Networking_WinSock", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
 windows = { version = "0.61", features = ["Win32_System_Com", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(windows)'.build-dependencies]
@@ -31,16 +31,23 @@ windres = "0.2"
 
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
+hyper = "1"
+hyper-util = { version = "0.1", features = ["tokio"] }
 futures-util = "0.3"
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream", "blocking"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde_yaml = "0.9"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "sync", "time", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "sync", "time", "signal", "net", "io-util"] }
+tokio-util = { version = "0.7", features = ["compat"] }
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 uuid = { version = "1", features = ["v7", "serde"] }
 
 [lib]
-name = "codex_router"
+# The lib must not share a crate name with the `codex-router` bin (whose crate
+# name is `codex_router`): the collision makes rustc skip native-library
+# propagation from this rlib, silently dropping the Windows icon/manifest/
+# version resource from the GUI executable.
+name = "codex_router_lib"
 path = "src/lib.rs"
 
 [[bin]]

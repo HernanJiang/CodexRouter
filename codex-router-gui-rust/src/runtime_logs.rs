@@ -1,7 +1,5 @@
 use eframe::egui;
 use regex::Regex;
-use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -148,9 +146,8 @@ fn dropped_summary(records: u64, batches: u64, bytes: u64) -> String {
 
 #[derive(Clone, Copy)]
 enum LogKind {
-    Sub2Api,
-    PostgreSql,
-    Redis,
+    RouterEvents,
+    CliProxyApi,
     Stderr,
 }
 
@@ -264,24 +261,34 @@ pub(crate) fn spawn(
 ) {
     std::thread::spawn(move || {
         let mut sources = vec![
-            LogSource::new(&router_root, "Sub2API", "sub2api.log", LogKind::Sub2Api),
             LogSource::new(
                 &router_root,
-                "Sub2API stderr",
-                "sub2api-stderr.log",
+                "Router Host",
+                "router-host-stdout.log",
                 LogKind::Stderr,
             ),
             LogSource::new(
                 &router_root,
-                "PostgreSQL",
-                "postgres.log",
-                LogKind::PostgreSql,
+                "Router Host stderr",
+                "router-host-stderr.log",
+                LogKind::Stderr,
             ),
-            LogSource::new(&router_root, "Redis", "redis-stdout.log", LogKind::Redis),
             LogSource::new(
                 &router_root,
-                "Redis stderr",
-                "redis-stderr.log",
+                "Router events",
+                "router-events.jsonl",
+                LogKind::RouterEvents,
+            ),
+            LogSource::new(
+                &router_root,
+                "CLIProxyAPI",
+                "cli-proxy-stdout.log",
+                LogKind::CliProxyApi,
+            ),
+            LogSource::new(
+                &router_root,
+                "CLIProxyAPI stderr",
+                "cli-proxy-stderr.log",
                 LogKind::Stderr,
             ),
             LogSource::new(
@@ -388,21 +395,20 @@ pub(crate) fn spawn(
 
 pub(crate) fn signals_router_health_failure(record: &str) -> bool {
     let normalized = record.to_ascii_lowercase();
-    if normalized.contains("class=upstream")
-        && !normalized.contains("database")
-        && !normalized.contains("postgres")
-    {
+    if normalized.contains("class=upstream") && !normalized.contains("sqlite") {
         return false;
     }
     let service_failure = normalized.contains("database")
-        || normalized.contains("postgres")
+        || normalized.contains("sqlite")
         || normalized.contains("connection refused")
         || normalized.contains("connection reset")
         || normalized.contains("context deadline exceeded")
         || normalized.contains("i/o timeout")
         || normalized.contains("timed out");
-    let relevant_source = normalized.contains("sub2api")
-        || normalized.contains("postgresql")
+    let relevant_source = normalized.contains("router host")
+        || normalized.contains("router events")
+        || normalized.contains("cliproxyapi")
+        || normalized.contains("sqlite")
         || normalized.contains("class=database")
         || normalized.contains("class=timeout")
         || normalized.contains("class=connection");
@@ -414,193 +420,47 @@ fn format_diagnostic_line(label: &str, kind: LogKind, line: &str) -> Option<Stri
         return None;
     }
     match kind {
-        LogKind::Sub2Api => format_sub2api_line(label, line),
-        LogKind::PostgreSql => {
-            is_postgres_diagnostic(line).then(|| format_plain_diagnostic(label, line))
+        LogKind::RouterEvents => {
+            is_router_events_diagnostic(line).then(|| format_plain_diagnostic(label, line))
         }
-        LogKind::Redis => is_redis_diagnostic(line).then(|| format_plain_diagnostic(label, line)),
+        LogKind::CliProxyApi => {
+            is_cli_proxy_diagnostic(line).then(|| format_plain_diagnostic(label, line))
+        }
         LogKind::Stderr => Some(format_plain_diagnostic(label, line)),
     }
 }
 
-fn format_sub2api_line(label: &str, line: &str) -> Option<String> {
-    let mut fields = line.splitn(6, '\t');
-    let timestamp = fields.next().unwrap_or_default().trim();
-    let level = fields.next().unwrap_or_default().trim();
-    let _logger = fields.next();
-    let _location = fields.next();
-    let event = fields.next().unwrap_or_default().trim();
-    let payload = fields.next().unwrap_or_default().trim();
-
-    if event.is_empty() {
-        return contains_error_signal(line).then(|| format_plain_diagnostic(label, line));
-    }
-
-    let json = serde_json::from_str::<Value>(payload).ok();
-    let status_error = json.as_ref().is_some_and(has_error_status);
-    let diagnostic = is_warning_level(level)
-        || status_error
-        || contains_error_signal(event)
-        || json
-            .as_ref()
-            .and_then(|value| value.get("error"))
-            .is_some_and(|value| !value.is_null() && value.as_str() != Some(""));
-    if !diagnostic {
-        return None;
-    }
-
-    let mut output = String::new();
-    if let Some(timestamp) = safe_timestamp(timestamp) {
-        output.push_str(&timestamp);
-        output.push(' ');
-    }
-    output.push('[');
-    output.push_str(label);
-    if is_known_level(level) {
-        output.push('/');
-        output.push_str(&level.to_ascii_uppercase());
-    }
-    output.push_str("] ");
-    output.push_str(&safe_event_name(event));
-
-    if let Some(Value::Object(object)) = json.as_ref() {
-        if let Some(value) = object
-            .get("status_code")
-            .or_else(|| object.get("status"))
-            .and_then(safe_http_status_value)
-        {
-            append_field(&mut output, "status_code", &value);
-        }
-        if let Some(value) = object
-            .get("upstream_status")
-            .and_then(safe_http_status_value)
-        {
-            append_field(&mut output, "upstream_status", &value);
-        }
-        if let Some(value) = object.get("latency_ms").and_then(safe_latency_value) {
-            append_field(&mut output, "latency_ms", &value);
-        }
-        if let Some(value) = object.get("account_id").and_then(value_as_u64) {
-            append_field(&mut output, "account_id", &value.to_string());
-        }
-        for key in ["request_id", "client_request_id"] {
-            if let Some(value) = object
-                .get(key)
-                .and_then(Value::as_str)
-                .and_then(safe_request_id)
-            {
-                append_field(&mut output, key, &value);
-            }
-        }
-        if let Some(value) = object
-            .get("stage")
-            .and_then(Value::as_str)
-            .and_then(safe_stage)
-        {
-            append_field(&mut output, "stage", &value);
-        }
-        if let Some(value) = object
-            .get("platform")
-            .and_then(Value::as_str)
-            .and_then(safe_platform)
-        {
-            append_field(&mut output, "platform", &value);
-        }
-        if let Some(value) = object
-            .get("model")
-            .and_then(Value::as_str)
-            .and_then(safe_model_name)
-        {
-            append_field(&mut output, "model", &value);
-        }
-        if let Some(value) = object
-            .get("method")
-            .and_then(Value::as_str)
-            .and_then(safe_http_method)
-        {
-            append_field(&mut output, "method", &value);
-        }
-        if let Some(path) = object
-            .get("path")
-            .and_then(Value::as_str)
-            .and_then(safe_http_path)
-        {
-            append_field(&mut output, "path", path);
-        }
-    }
-
-    let mut classes = error_classes(event);
-    if let Some(Value::Object(object)) = json.as_ref() {
-        for key in [
-            "error_code",
-            "error",
-            "reason",
-            "detail",
-            "message",
-            "error_message",
-            "upstream_error",
-            "upstream_error_message",
-        ] {
-            if let Some(value) = object.get(key) {
-                extend_error_classes(&mut classes, &value.to_string());
-            }
-        }
-        for value in [
-            object.get("status_code").or_else(|| object.get("status")),
-            object.get("upstream_status"),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if let Some(status) =
-                safe_http_status_value(value).and_then(|value| value.parse::<u16>().ok())
-            {
-                extend_classes_from_status(&mut classes, status);
-            }
-        }
-    }
-    if classes.len() > 1 {
-        classes.retain(|class| !matches!(*class, "request_failure" | "warning"));
-    }
-    if classes.is_empty() {
-        classes.push(if is_warning_level(level) {
-            "warning"
-        } else {
-            "request_failure"
-        });
-    }
-    append_field(&mut output, "class", &classes.join("+"));
-
-    Some(limit_utf8_bytes(
-        &redact_for_display(&output),
-        MAX_RECORD_BYTES,
-    ))
+/// The structured JSONL event stream is the mandated diagnostic feed; only
+/// WARN and above reaches the UI so per-request INFO traffic stays on disk.
+fn is_router_events_diagnostic(line: &str) -> bool {
+    let upper = line.to_ascii_uppercase();
+    [
+        r#""LEVEL":"WARN""#,
+        r#""LEVEL":"ERROR""#,
+        r#""LEVEL":"FATAL""#,
+        r#""LEVEL":"PANIC""#,
+    ]
+    .iter()
+    .any(|needle| upper.contains(needle))
 }
 
-fn value_as_u64(value: &Value) -> Option<u64> {
-    match value {
-        Value::Number(value) => value.as_u64(),
-        Value::String(value)
-            if !value.is_empty()
-                && value.len() <= 20
-                && value.bytes().all(|byte| byte.is_ascii_digit()) =>
-        {
-            value.parse().ok()
-        }
-        _ => None,
-    }
-}
-
-fn safe_http_status_value(value: &Value) -> Option<String> {
-    value_as_u64(value)
-        .filter(|status| (100..=599).contains(status))
-        .map(|status| status.to_string())
-}
-
-fn safe_latency_value(value: &Value) -> Option<String> {
-    value_as_u64(value)
-        .filter(|latency| *latency <= 86_400_000)
-        .map(|latency| latency.to_string())
+/// CLIProxyAPI writes Go-slog style console lines; forward only lines that
+/// carry an error signal instead of mirroring every request.
+fn is_cli_proxy_diagnostic(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    [
+        "error",
+        "warn",
+        "fatal",
+        "panic",
+        "failed",
+        "timeout",
+        "timed out",
+        "connection refused",
+        "connection reset",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn append_field(output: &mut String, key: &str, value: &str) {
@@ -608,224 +468,6 @@ fn append_field(output: &mut String, key: &str, value: &str) {
     output.push_str(key);
     output.push('=');
     output.push_str(value);
-}
-
-fn safe_request_id(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if trimmed.len() <= 20 && trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Some(trimmed.to_owned());
-    }
-    if is_canonical_uuid(trimmed) {
-        return Some(trimmed.to_ascii_lowercase());
-    }
-
-    let digest = Sha256::digest(trimmed.as_bytes());
-    let mut summary = String::with_capacity(23);
-    summary.push_str("sha256:");
-    for byte in digest.iter().take(8) {
-        use std::fmt::Write as _;
-        write!(&mut summary, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    Some(summary)
-}
-
-fn is_canonical_uuid(value: &str) -> bool {
-    value.len() == 36
-        && value.bytes().enumerate().all(|(index, byte)| {
-            if matches!(index, 8 | 13 | 18 | 23) {
-                byte == b'-'
-            } else {
-                byte.is_ascii_hexdigit()
-            }
-        })
-}
-
-fn safe_stage(value: &str) -> Option<String> {
-    let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
-    matches!(
-        normalized.as_str(),
-        "request"
-            | "routing"
-            | "validation"
-            | "authentication"
-            | "authorization"
-            | "upstream_connect"
-            | "upstream_request"
-            | "upstream_response"
-            | "stream"
-            | "streaming"
-            | "response"
-            | "decode"
-            | "encode"
-            | "retry"
-            | "fallback"
-            | "health_check"
-            | "startup"
-            | "shutdown"
-            | "database"
-            | "cache"
-    )
-    .then_some(normalized)
-}
-
-fn safe_platform(value: &str) -> Option<String> {
-    let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
-    matches!(
-        normalized.as_str(),
-        "openai"
-            | "anthropic"
-            | "gemini"
-            | "google"
-            | "antigravity"
-            | "grok"
-            | "xai"
-            | "azure_openai"
-            | "openrouter"
-            | "bedrock"
-            | "vertex"
-    )
-    .then_some(normalized)
-}
-
-fn safe_model_name(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty()
-        || trimmed.len() > 96
-        || !trimmed.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'/' | b'-')
-        })
-        || redact_for_display(trimmed) != trimmed
-    {
-        None
-    } else {
-        Some(trimmed.to_owned())
-    }
-}
-
-fn safe_http_method(value: &str) -> Option<String> {
-    let normalized = value.trim().to_ascii_uppercase();
-    matches!(
-        normalized.as_str(),
-        "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS" | "CONNECT"
-    )
-    .then_some(normalized)
-}
-
-fn safe_http_path(value: &str) -> Option<&'static str> {
-    match value.trim().trim_end_matches('/') {
-        "/v1/responses" => Some("/v1/responses"),
-        "/v1/chat/completions" => Some("/v1/chat/completions"),
-        "/v1/completions" => Some("/v1/completions"),
-        "/v1/messages" => Some("/v1/messages"),
-        "/v1/models" => Some("/v1/models"),
-        "/v1/embeddings" => Some("/v1/embeddings"),
-        "/v1/images/generations" => Some("/v1/images/generations"),
-        "/v1/audio/transcriptions" => Some("/v1/audio/transcriptions"),
-        "/v1/audio/speech" => Some("/v1/audio/speech"),
-        "/v1/realtime" => Some("/v1/realtime"),
-        "/backend-api/codex/responses" => Some("/backend-api/codex/responses"),
-        "/backend-api/codex/models" => Some("/backend-api/codex/models"),
-        "/api/v1/auth/login" => Some("/api/v1/auth/login"),
-        "/api/v1/admin/compliance" => Some("/api/v1/admin/compliance"),
-        "/api/v1/admin/compliance/accept" => Some("/api/v1/admin/compliance/accept"),
-        "/health" => Some("/health"),
-        "/healthz" => Some("/healthz"),
-        "/ready" => Some("/ready"),
-        "/readyz" => Some("/readyz"),
-        _ => None,
-    }
-}
-
-fn safe_event_name(value: &str) -> String {
-    let candidate = value
-        .split([':', '\t', '{', '}'])
-        .next()
-        .unwrap_or_default()
-        .trim();
-    if candidate.is_empty()
-        || candidate.len() > 96
-        || !candidate
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-        || !candidate
-            .bytes()
-            .any(|byte| matches!(byte, b'.' | b'_' | b'-'))
-        || redact_for_display(candidate) != candidate
-    {
-        "service_diagnostic".to_owned()
-    } else {
-        candidate.to_owned()
-    }
-}
-
-fn has_error_status(value: &Value) -> bool {
-    ["status_code", "upstream_status", "status"]
-        .iter()
-        .filter_map(|key| value.get(key))
-        .filter_map(safe_http_status_value)
-        .filter_map(|status| status.parse::<u16>().ok())
-        .any(|status| status >= 400)
-}
-
-fn is_warning_level(level: &str) -> bool {
-    matches!(
-        level.trim().to_ascii_uppercase().as_str(),
-        "WARN" | "WARNING" | "ERROR" | "FATAL" | "PANIC" | "CRITICAL"
-    )
-}
-
-fn is_known_level(level: &str) -> bool {
-    matches!(
-        level.trim().to_ascii_uppercase().as_str(),
-        "TRACE" | "DEBUG" | "INFO" | "WARN" | "WARNING" | "ERROR" | "FATAL" | "PANIC" | "CRITICAL"
-    )
-}
-
-fn contains_error_signal(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    [
-        " error",
-        "error:",
-        "_error",
-        "failed",
-        "failure",
-        "timeout",
-        "timed out",
-        "dial tcp",
-        "connection refused",
-        "connection reset",
-        "connection aborted",
-        "proxyconnect",
-        "no such host",
-        "tls handshake",
-        "certificate",
-        "unavailable",
-        "错误",
-        "失败",
-        "超时",
-        "拒绝",
-        "断开",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-}
-
-fn is_postgres_diagnostic(line: &str) -> bool {
-    let upper = line.to_ascii_uppercase();
-    [" ERROR:", " FATAL:", " PANIC:", " WARNING:"]
-        .iter()
-        .any(|needle| upper.contains(needle))
-}
-
-fn is_redis_diagnostic(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    trimmed.contains(" # ")
-        || trimmed.ends_with(" #")
-        || contains_error_signal(trimmed)
-        || trimmed.to_ascii_lowercase().contains("warning")
 }
 
 fn format_plain_diagnostic(label: &str, line: &str) -> String {
@@ -877,7 +519,32 @@ pub(crate) fn summarize_error_for_display(text: &str) -> String {
     if let Some(marker) = stable_error_marker(text) {
         append_field(&mut output, "marker", marker);
     }
+    for code in error_code_markers(text) {
+        append_field(&mut output, "code", &code);
+    }
     output
+}
+
+/// Router error codes (`CR-XXX-NNNN`) are fixed, secret-free identifiers
+/// emitted by the Router Host event stream and the desktop app. Like the
+/// stable markers above they have to survive summarization, otherwise the UI
+/// loses the exact failure the user must act on.
+fn error_code_markers(text: &str) -> Vec<String> {
+    static ERROR_CODE: OnceLock<Regex> = OnceLock::new();
+    let regex = ERROR_CODE.get_or_init(|| {
+        Regex::new(r"\bCR-[A-Z]{2,6}-\d{4}\b").expect("error code regex is valid")
+    });
+    let mut codes = Vec::new();
+    for matched in regex.find_iter(text) {
+        let code = matched.as_str().to_owned();
+        if !codes.contains(&code) {
+            codes.push(code);
+        }
+        if codes.len() >= 3 {
+            break;
+        }
+    }
+    codes
 }
 
 fn existing_sanitized_summary(text: &str) -> Option<String> {
@@ -1116,29 +783,6 @@ fn push_unique_class(classes: &mut Vec<&'static str>, class: &'static str) {
     }
 }
 
-fn extend_error_classes(classes: &mut Vec<&'static str>, text: &str) {
-    for class in error_classes(text) {
-        if !classes.contains(&class) {
-            classes.push(class);
-        }
-    }
-}
-
-fn extend_classes_from_status(classes: &mut Vec<&'static str>, status: u16) {
-    let class = match status {
-        401 => Some("authentication"),
-        403 => Some("permission"),
-        429 => Some("rate_limit"),
-        500..=599 => Some("upstream"),
-        _ => None,
-    };
-    if let Some(class) = class {
-        if !classes.contains(&class) {
-            classes.push(class);
-        }
-    }
-}
-
 fn contains_any(text: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| text.contains(needle))
 }
@@ -1299,131 +943,54 @@ mod tests {
     }
 
     #[test]
-    fn sub2api_errors_keep_diagnostics_but_drop_payloads() {
-        let line = concat!(
-            "2026-08-02T07:45:59.285Z\tWARN\thandler\tfile.go:1\topenai.forward_failed\t",
-            r#"{"request_id":"request-123","status_code":502,"upstream_status":403,"stage":"stream","error":"upstream rejected request","request_body":"private prompt","api_key":"secret-key"}"#
+    fn router_events_lines_gate_on_warn_level_and_redact_payloads() {
+        let info = r#"{"event":"request.completed","level":"INFO","http_status":200}"#;
+        assert!(format_diagnostic_line("Router events", LogKind::RouterEvents, info).is_none());
+        let warn = concat!(
+            r#"{"error_code":"CR-CFG-0005","event":"backend.config_push_failed","#,
+            r#""level":"WARN","api_key":"secret-key"}"#
         );
-        let safe = format_sub2api_line("Sub2API", line).expect("diagnostic line");
-        assert!(safe.contains("status_code=502"));
-        assert!(safe.contains("upstream_status=403"));
-        assert!(safe.contains("request_id=sha256:"));
-        assert!(safe.contains("class="));
-        assert!(safe.contains("upstream"));
-        assert!(safe.contains("permission"));
-        assert!(!safe.contains("request-123"));
-        assert!(!safe.contains("upstream rejected request"));
-        assert!(!safe.contains("private prompt"));
-        assert!(!safe.contains("secret-key"));
-        assert!(!safe.contains("request_body"));
+        let safe = format_diagnostic_line("Router events", LogKind::RouterEvents, warn)
+            .expect("warn event is diagnostic");
+        assert!(safe.contains("[Router events]"));
+        assert!(safe.contains("CR-CFG-0005"));
+        assert!(!safe.contains("secret-key"), "payload leaked: {safe}");
     }
 
     #[test]
-    fn successful_access_lines_are_not_forwarded() {
-        let line = concat!(
-            "2026-08-02T08:00:00Z\tINFO\tmiddleware\tlogger.go:82\thttp request completed\t",
-            r#"{"status_code":200,"request_id":"ok"}"#
-        );
-        assert!(format_sub2api_line("Sub2API", line).is_none());
-    }
-
-    #[test]
-    fn failed_info_lines_are_forwarded() {
-        let line = concat!(
-            "2026-08-02T08:00:00Z\tINFO\tservice\tworker.go:1\tbackground refresh failed\t",
-            r#"{"error":"dial tcp: connection refused"}"#
-        );
-        let safe = format_sub2api_line("Sub2API", line).expect("failure line");
-        assert!(safe.contains("class=connection_refused+network"));
-        assert!(!safe.contains("dial tcp"));
+    fn cli_proxy_lines_gate_on_error_keywords() {
+        assert!(format_diagnostic_line(
+            "CLIProxyAPI",
+            LogKind::CliProxyApi,
+            "level=info msg=\"request completed\" status=200"
+        )
+        .is_none());
+        let safe = format_diagnostic_line(
+            "CLIProxyAPI",
+            LogKind::CliProxyApi,
+            "level=error msg=\"upstream dial failed\"",
+        )
+        .expect("error line is diagnostic");
+        assert!(safe.contains("[CLIProxyAPI]"));
     }
 
     #[test]
     fn only_local_service_failures_trigger_an_immediate_health_probe() {
         assert!(signals_router_health_failure(
-            "[Sub2API] class=database+timeout | context deadline exceeded"
+            "[Router Host] class=timeout | context deadline exceeded"
         ));
         assert!(signals_router_health_failure(
-            "[PostgreSQL] connection reset by peer"
+            "[CLIProxyAPI] connection reset by peer"
+        ));
+        assert!(signals_router_health_failure(
+            "[Router events] {\"level\":\"ERROR\",\"error_code\":\"CR-STO-0001\",\"sqlite\":\"database is locked\"}"
         ));
         assert!(!signals_router_health_failure(
-            "[Sub2API] class=upstream | upstream provider timed out"
+            "[Router events] class=upstream | upstream provider timed out"
         ));
         assert!(!signals_router_health_failure(
             "[OAuth stderr] connection refused"
         ));
-    }
-
-    #[test]
-    fn upstream_status_and_content_policy_codes_remain_actionable() {
-        let line = concat!(
-            "2026-08-02T08:00:00Z\tERROR\thandler\tgateway.go:1\topenai.forward_failed\t",
-            r#"{"status_code":502,"upstream_status":403,"error_code":"content_policy_violation","request_id":"123e4567-e89b-12d3-a456-426614174000","error":"upstream response body: private user input"}"#
-        );
-        let safe = format_sub2api_line("Sub2API", line).expect("upstream error");
-        assert!(safe.contains("status_code=502"));
-        assert!(safe.contains("upstream_status=403"));
-        assert!(!safe.contains("error_code="));
-        assert!(!safe.contains("content_policy_violation"));
-        assert!(safe.contains("request_id=123e4567-e89b-12d3-a456-426614174000"));
-        assert!(safe.contains("content_policy"));
-        assert!(safe.contains("upstream"));
-        assert!(safe.contains("permission"));
-        assert!(!safe.contains("private user input"));
-        assert!(!safe.contains("response body"));
-    }
-
-    #[test]
-    fn dynamic_fields_are_semantically_allowlisted() {
-        let line = concat!(
-            "2026-08-02T08:00:00Z\tERROR\thandler\tgateway.go:1\t",
-            "customer Alice payment failed\t",
-            r#"{"status":403,"upstream_status":999,"latency_ms":-1,"request_id":"short-secret-value","client_request_id":"12345","error_code":"content_policy_violation","stage":"private-stage","platform":"private-provider","model":"gpt-5.6-sol","method":"secret-token","path":"/v1/users/private-customer"}"#
-        );
-        let safe = format_sub2api_line("Sub2API", line).expect("diagnostic line");
-        assert!(safe.contains("service_diagnostic"));
-        assert!(safe.contains("status_code=403"));
-        assert!(safe.contains("request_id=sha256:"));
-        assert!(safe.contains("client_request_id=12345"));
-        assert!(safe.contains("model=gpt-5.6-sol"));
-        assert!(safe.contains("class=content_policy+permission"));
-        for private in [
-            "Alice",
-            "payment",
-            "short-secret-value",
-            "content_policy_violation",
-            "private-stage",
-            "private-provider",
-            "secret-token",
-            "/v1/users/private-customer",
-            "upstream_status=999",
-            "latency_ms=",
-        ] {
-            assert!(!safe.contains(private), "private field remained in: {safe}");
-        }
-    }
-
-    #[test]
-    fn known_structured_fields_remain_actionable() {
-        let line = concat!(
-            "2026-08-02T08:00:00Z\tERROR\thandler\tgateway.go:1\topenai.forward_failed\t",
-            r#"{"status_code":502,"latency_ms":1250,"request_id":"123E4567-E89B-12D3-A456-426614174000","stage":"upstream-connect","platform":"openai","model":"gpt-5.6-sol","method":"post","path":"/v1/responses"}"#
-        );
-        let safe = format_sub2api_line("Sub2API", line).expect("diagnostic line");
-        for expected in [
-            "openai.forward_failed",
-            "status_code=502",
-            "latency_ms=1250",
-            "request_id=123e4567-e89b-12d3-a456-426614174000",
-            "stage=upstream_connect",
-            "platform=openai",
-            "model=gpt-5.6-sol",
-            "method=POST",
-            "path=/v1/responses",
-            "class=upstream",
-        ] {
-            assert!(safe.contains(expected), "missing {expected} in: {safe}");
-        }
     }
 
     #[test]

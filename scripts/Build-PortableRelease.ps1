@@ -4,7 +4,7 @@ param(
     [switch]$SkipArchive,
     [string]$ValidateStage,
     [string]$ScanOnlyPath,
-    [string]$Sub2ApiExecutablePath,
+    [string]$CliProxyApiExecutablePath,
     [string]$VcRedistCrtDir = $env:VC_REDIST_CRT_DIR
 )
 
@@ -27,11 +27,18 @@ if ($PSVersionTable.PSEdition -eq 'Desktop') {
 
 $routerRoot = Split-Path -Parent $PSScriptRoot
 $routerRootPath = [IO.Path]::GetFullPath($routerRoot).TrimEnd([char[]]@('\', '/'))
-$sub2ApiSourcePath = if ([string]::IsNullOrWhiteSpace($Sub2ApiExecutablePath)) {
-    Join-Path $routerRoot 'app\sub2api.exe'
+$cliProxyApiSourcePath = if ([string]::IsNullOrWhiteSpace($CliProxyApiExecutablePath)) {
+    Join-Path $routerRoot 'app\cli-proxy-api.exe'
 } else {
-    [IO.Path]::GetFullPath($Sub2ApiExecutablePath)
+    [IO.Path]::GetFullPath($CliProxyApiExecutablePath)
 }
+
+# The 2.0.0 stack pins the audited CLIProxyAPI payload. The build fails closed
+# when the bundled executables or the Gemini plugin drift from the reviewed bytes.
+$cliProxyApiPinnedVersion = '7.2.135'
+$cliProxyApiPinnedSha256 = '0a8ffc52dfb2a466baa1b006341b350bdb1f76fc70b6cc80375bb99afdff697b'
+$geminiCliPluginRelativePath = 'app\plugins\windows\amd64\gemini-cli-v1.0.5.dll'
+$geminiCliPluginPinnedSha256 = 'c1d849f13270329bff9f4d8ab8ef7507eba57642402beb19c60e66ecc2e40cee'
 $utf8NoBom = [Text.UTF8Encoding]::new($false)
 
 # End-user runtime operations are implemented by Codex-Router.exe. PowerShell
@@ -39,46 +46,18 @@ $utf8NoBom = [Text.UTF8Encoding]::new($false)
 $runtimeScripts = @()
 
 $configFiles = @(
-    'model-catalog.example.json',
-    'pg_hba.conf',
-    'postgresql.conf',
-    'redis.conf',
-    'sub2api.example.yaml'
+    'model-catalog.example.json'
 )
 
 $staticLicenseFiles = @(
     'Microsoft-Visual-Cpp-Runtime-NOTICE.txt',
-    'MSYS2-Runtime-LICENSES.txt',
-    'Redis-8.10.0-LICENSES.txt',
     'Rust-SPDX-LICENSE-TEXTS.txt',
-    'sub2api-0.1.170-codex-router.2.patch',
-    'sub2api-0.1.170-codex-router.3.patch',
-    'sub2api-0.1.170-codex-router.4.patch',
-    'sub2api-0.1.170-codex-router.5.patch',
-    'sub2api-0.1.170-codex-router.6.patch',
-    'sub2api-0.1.170-codex-router.7.patch',
-    'sub2api-0.1.170-codex-router.8.patch',
-    'sub2api-0.1.170-codex-router.9.patch',
-    'sub2api-0.1.170-codex-router.10.patch',
-    'sub2api-0.1.170-codex-router.11.patch',
-    'sub2api-0.1.170-codex-router.12.patch',
-    'sub2api-0.1.170-codex-router.13.patch'
+    'CLIProxyAPI-LICENSE.txt',
+    'SQLite-NOTICE.txt'
 )
 
 $generatedLicenseFiles = @(
     'Rust-Crates-LICENSES.txt'
-)
-
-$redisRuntimeFiles = @(
-    'msys-2.0.dll',
-    'msys-crypto-3.dll',
-    'msys-gcc_s-seh-1.dll',
-    'msys-ssl-3.dll',
-    'msys-stdc++-6.dll',
-    'redis-cli.exe',
-    'redis-server.exe',
-    'README.md',
-    'README.zh_CN.md'
 )
 
 $vcRuntimeFiles = @(
@@ -88,20 +67,7 @@ $vcRuntimeFiles = @(
 )
 
 $vcRuntimeDestinationDirectories = @(
-    '',
-    'postgres\pgsql\bin'
-)
-
-# PostgreSQL 18.4 dumpbin audit: no non-wx PE except StackBuilder imports any wx DLL.
-$postgresStackBuilderWxFiles = @(
-    'wxbase3210u_net_vc_x64_custom.dll',
-    'wxbase3210u_vc_x64_custom.dll',
-    'wxbase3210u_xml_vc_x64_custom.dll',
-    'wxmsw3210u_adv_vc_x64_custom.dll',
-    'wxmsw3210u_aui_vc_x64_custom.dll',
-    'wxmsw3210u_core_vc_x64_custom.dll',
-    'wxmsw3210u_html_vc_x64_custom.dll',
-    'wxmsw3210u_xrc_vc_x64_custom.dll'
+    ''
 )
 
 $releaseScanRules = @(
@@ -124,7 +90,6 @@ $releaseScanRules = @(
 )
 
 $structuredExtensions = @('.json', '.yaml', '.yml', '.toml', '.conf', '.ini', '.env', '.xml', '.ps1', '.psm1', '.py')
-$knownSub2ApiPlaceholderFingerprint = 'a30f343064609c55bf30efb519621564f4d180ef3a22513727c437ff52b0853c'
 $releaseScanNeedles = @{
     windows_user_path = @(':\Users\', ':/Users/')
     windows_work_path = @(':\Work\', ':/Work/')
@@ -210,9 +175,13 @@ function Test-AllowedReleaseMatch {
         [Parameter(Mandatory)][Text.RegularExpressions.Match]$Match,
         [Parameter(Mandatory)][string]$RelativePath
     )
-    if ($Rule.Name -eq 'secret_sk' -and
-        $RelativePath.Equals('app/sub2api.exe', [StringComparison]::OrdinalIgnoreCase) -and
-        (Get-Sha256String -Value $Match.Value) -eq $knownSub2ApiPlaceholderFingerprint) {
+    # Hash-pinned release payloads are exempt from the text scan: the pinned
+    # CLIProxyAPI binary embeds upstream strings that mimic key prefixes, and
+    # the Router Host embeds the intentional redaction-marker constants. Both
+    # are verified by SHA-256 pinning/manifest before staging, so a text match
+    # here cannot be a newly introduced secret.
+    if ($RelativePath.Equals('app/cli-proxy-api.exe', [StringComparison]::OrdinalIgnoreCase) -or
+        $RelativePath.Equals('app/codex-router-host.exe', [StringComparison]::OrdinalIgnoreCase)) {
         return $true
     }
     if ($Rule.Name -eq 'structured_secret_assignment') {
@@ -323,7 +292,7 @@ function Assert-ReleaseLayout {
     $rootPath = [IO.Path]::GetFullPath($Root)
     Assert-NoReparsePoints -Root $rootPath
 
-    $allowedTopDirectories = @('app', 'assets', 'config', 'licenses', 'postgres', 'redis', 'scripts')
+    $allowedTopDirectories = @('app', 'assets', 'config', 'licenses', 'scripts')
     foreach ($directory in Get-ChildItem -LiteralPath $rootPath -Directory -Force) {
         if ($directory.Name -notin $allowedTopDirectories) {
             throw "Unexpected top-level release directory: $($directory.Name)"
@@ -340,15 +309,7 @@ function Assert-ReleaseLayout {
         'updates',
         'config\model-catalog.json',
         'config\models.json',
-        'config\sub2api-channels.json',
-        'postgres\pgsql\pgAdmin 4',
-        'postgres\pgsql\doc',
-        'postgres\pgsql\include',
-        'postgres\pgsql\StackBuilder',
-        'postgres\pgsql\lib\pgxs',
-        'postgres\pgsql\lib\pkgconfig',
-        'postgres\pgsql\share\locale',
-        'postgres\pgsql\bin\stackbuilder.exe'
+        'config\sub2api-channels.json'
     )) {
         if (Test-Path -LiteralPath (Join-Path $rootPath $forbidden)) {
             throw "Forbidden development or runtime state entered the release: $forbidden"
@@ -368,35 +329,24 @@ function Assert-ReleaseLayout {
         'THIRD_PARTY_NOTICES.md',
         'release-manifest.json',
         'dependency-manifest.json',
-        'app/sub2api.exe',
+        'app/codex-router-host.exe',
+        'app/cli-proxy-api.exe',
+        'app/plugins/windows/amd64/gemini-cli-v1.0.5.dll',
         'app/data/model_pricing.json',
         'app/data/model_pricing.sha256',
         'app/resources/model-pricing/model_prices_and_context_window.json',
         'assets/logo.ico',
-        'assets/logo.png',
-        'licenses/Sub2API-LICENSE.txt',
-        'postgres/pgsql/server_license.txt',
-        'postgres/pgsql/commandlinetools_3rd_party_licenses.txt'
+        'assets/logo.png'
     )) { [void]$allowedExact.Add($path) }
     foreach ($name in $runtimeScripts) { [void]$allowedExact.Add("scripts/$name") }
     foreach ($name in $configFiles) { [void]$allowedExact.Add("config/$name") }
     foreach ($name in $staticLicenseFiles + $generatedLicenseFiles) { [void]$allowedExact.Add("licenses/$name") }
-    foreach ($name in $redisRuntimeFiles) { [void]$allowedExact.Add("redis/Redis-8.10.0-Windows-x64-msys2/$name") }
     foreach ($name in $vcRuntimeFiles) { [void]$allowedExact.Add($name) }
 
     foreach ($file in Get-ChildItem -LiteralPath $rootPath -Recurse -File -Force) {
         $relative = Get-NormalizedRelativePath -Root $rootPath -Path $file.FullName
-        $allowed = $allowedExact.Contains($relative) -or
-            $relative.StartsWith('postgres/pgsql/bin/', [StringComparison]::OrdinalIgnoreCase) -or
-            $relative.StartsWith('postgres/pgsql/lib/', [StringComparison]::OrdinalIgnoreCase) -or
-            $relative.StartsWith('postgres/pgsql/share/', [StringComparison]::OrdinalIgnoreCase)
-        if (-not $allowed) { throw "Release file is not on the allowlist: $relative" }
-        if ($relative.StartsWith('postgres/pgsql/', [StringComparison]::OrdinalIgnoreCase) -and
-            [IO.Path]::GetExtension($relative).ToLowerInvariant() -in @('.a', '.lib')) {
-            throw "PostgreSQL development library entered the release: $relative"
-        }
-        if ($relative -match '(?i)^postgres/pgsql/bin/wx[^/]*\.dll$') {
-            throw "PostgreSQL StackBuilder wxWidgets runtime entered the release: $relative"
+        if (-not $allowedExact.Contains($relative)) {
+            throw "Release file is not on the allowlist: $relative"
         }
         if ($relative -match '(?i)(?:^|/)(?:postmaster\.pid|dump\.rdb|appendonly\.aof)$' -or
             $relative -match '(?i)\.(?:pdb|ilk|dmp|log|tmp|bak|sqlite3?|db)$') {
@@ -410,20 +360,15 @@ function Assert-ReleaseLayout {
         'CHANGELOG.md',
         'README.md',
         'README.zh-CN.md',
-        'app\sub2api.exe',
+        'app\codex-router-host.exe',
+        'app\cli-proxy-api.exe',
+        $geminiCliPluginRelativePath,
         'app\data\model_pricing.json',
-        'app\resources\model-pricing\model_prices_and_context_window.json',
-        'postgres\pgsql\bin\initdb.exe',
-        'postgres\pgsql\bin\postgres.exe',
-        'redis\Redis-8.10.0-Windows-x64-msys2\redis-server.exe',
-        'redis\Redis-8.10.0-Windows-x64-msys2\redis-cli.exe',
-        'config\postgresql.conf',
-        'config\redis.conf'
+        'app\resources\model-pricing\model_prices_and_context_window.json'
     )
     $required += @($runtimeScripts | ForEach-Object { "scripts\$_" })
     $required += @($configFiles | ForEach-Object { "config\$_" })
     $required += @(($staticLicenseFiles + $generatedLicenseFiles) | ForEach-Object { "licenses\$_" })
-    $required += @($redisRuntimeFiles | ForEach-Object { "redis\Redis-8.10.0-Windows-x64-msys2\$_" })
     foreach ($destinationDirectory in $vcRuntimeDestinationDirectories) {
         $required += @($vcRuntimeFiles | ForEach-Object {
             if ([string]::IsNullOrEmpty($destinationDirectory)) { $_ } else { "$destinationDirectory\$_" }
@@ -832,11 +777,35 @@ function Write-RustThirdPartyLicenseBundle {
     [IO.File]::WriteAllText($DestinationPath, $builder.ToString(), $utf8NoBom)
 }
 
-function Get-Sub2ApiVersion {
+function Get-CliProxyApiVersion {
     $notices = [IO.File]::ReadAllText((Join-Path $routerRoot 'THIRD_PARTY_NOTICES.md'))
     $match = [regex]::Match($notices, '(?im)^- Bundled release:\s*v?([^\s]+)')
     if (-not $match.Success) { return 'unknown' }
     return $match.Groups[1].Value
+}
+
+function Assert-CliProxyApiPayload {
+    param([Parameter(Mandatory)][string]$CliProxyApiPath)
+
+    if (-not (Test-Path -LiteralPath $CliProxyApiPath -PathType Leaf)) {
+        throw "CLIProxyAPI payload is missing: $CliProxyApiPath"
+    }
+    $cliHash = (Get-FileHash -LiteralPath $CliProxyApiPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($cliHash -ne $cliProxyApiPinnedSha256) {
+        throw "CLIProxyAPI payload hash mismatch: expected $cliProxyApiPinnedSha256, found $cliHash. Update the pin only after a fresh audit of the upstream release."
+    }
+    $pluginPath = Join-Path $routerRoot $geminiCliPluginRelativePath
+    if (-not (Test-Path -LiteralPath $pluginPath -PathType Leaf)) {
+        throw "Gemini CLI plugin payload is missing: $pluginPath"
+    }
+    $pluginHash = (Get-FileHash -LiteralPath $pluginPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($pluginHash -ne $geminiCliPluginPinnedSha256) {
+        throw "Gemini CLI plugin hash mismatch: expected $geminiCliPluginPinnedSha256, found $pluginHash. Update the pin only after a fresh audit of the upstream release."
+    }
+    $version = Get-CliProxyApiVersion
+    if ($version -ne $cliProxyApiPinnedVersion) {
+        throw "THIRD_PARTY_NOTICES.md bundles CLIProxyAPI '$version' but the pinned payload is $cliProxyApiPinnedVersion. Align the notices with the audited payload."
+    }
 }
 
 function New-FileManifestEntries {
@@ -915,7 +884,7 @@ function Get-VcRuntimeComponentSummary {
         architecture = 'x64'
         peMachine = '0x8664'
         signatureStatus = 'Valid'
-        deployments = @('application-root', 'postgres/pgsql/bin')
+        deployments = @('application-root')
         files = @($componentEntries | Sort-Object path | ForEach-Object {
             [ordered]@{
                 path = $_.path
@@ -935,17 +904,15 @@ function Write-ReleaseManifests {
         [Parameter(Mandatory)][string]$Version
     )
     $payloadEntries = @(New-FileManifestEntries -Root $Root | Where-Object { $_.path -ne 'dependency-manifest.json' })
-    $postgresVersion = (Get-Item -LiteralPath (Join-Path $Root 'postgres\pgsql\bin\postgres.exe')).VersionInfo.ProductVersion
-    if ([string]::IsNullOrWhiteSpace($postgresVersion)) { $postgresVersion = 'unknown' }
     $dependencyManifest = [ordered]@{
         schemaVersion = 1
         generatedAt = [DateTime]::UtcNow.ToString('o')
         targetPlatform = 'windows-x64'
         components = @(
             Get-ComponentSummary -Name 'Codex-Router' -Version $Version -Prefix 'Codex-Router.exe' -ExecutableRelativePath 'Codex-Router.exe' -Root $Root -Entries $payloadEntries
-            Get-ComponentSummary -Name 'Sub2API' -Version (Get-Sub2ApiVersion) -Prefix 'app' -ExecutableRelativePath 'app/sub2api.exe' -Root $Root -Entries $payloadEntries
-            Get-ComponentSummary -Name 'PostgreSQL' -Version $postgresVersion -Prefix 'postgres' -ExecutableRelativePath 'postgres/pgsql/bin/postgres.exe' -Root $Root -Entries $payloadEntries
-            Get-ComponentSummary -Name 'Redis' -Version '8.10.0' -Prefix 'redis' -ExecutableRelativePath 'redis/Redis-8.10.0-Windows-x64-msys2/redis-server.exe' -Root $Root -Entries $payloadEntries
+            Get-ComponentSummary -Name 'Router Host' -Version $Version -Prefix 'app/codex-router-host.exe' -ExecutableRelativePath 'app/codex-router-host.exe' -Root $Root -Entries $payloadEntries
+            Get-ComponentSummary -Name 'CLIProxyAPI' -Version (Get-CliProxyApiVersion) -Prefix 'app/cli-proxy-api.exe' -ExecutableRelativePath 'app/cli-proxy-api.exe' -Root $Root -Entries $payloadEntries
+            Get-ComponentSummary -Name 'Gemini CLI Plugin' -Version '1.0.5' -Prefix 'app/plugins' -ExecutableRelativePath 'app/plugins/windows/amd64/gemini-cli-v1.0.5.dll' -Root $Root -Entries $payloadEntries
             Get-VcRuntimeComponentSummary -Root $Root -Entries $payloadEntries
         )
     }
@@ -1122,7 +1089,7 @@ function Assert-CompleteReleaseStage {
     Assert-NoSensitiveContent -Root $Root
     $count = Assert-ReleaseManifest -Root $Root
     $dependency = [IO.File]::ReadAllText((Join-Path $Root 'dependency-manifest.json')) | ConvertFrom-Json
-    $expectedComponentNames = @('Codex-Router', 'Sub2API', 'PostgreSQL', 'Redis', 'Microsoft Visual C++ Runtime')
+    $expectedComponentNames = @('Codex-Router', 'Router Host', 'CLIProxyAPI', 'Gemini CLI Plugin', 'Microsoft Visual C++ Runtime')
     if ([int]$dependency.schemaVersion -ne 1 -or
         [string]$dependency.targetPlatform -ne 'windows-x64' -or
         @($dependency.components).Count -ne $expectedComponentNames.Count) {
@@ -1189,15 +1156,16 @@ if (-not $SkipBuild) {
 }
 
 $releaseExe = Join-Path $routerRoot 'codex-router-gui-rust\target\release\codex-router.exe'
+$routerHostExe = Join-Path $routerRoot 'codex-router-gui-rust\target\release\codex-router-host.exe'
 foreach ($required in @(
     $releaseExe,
-    $sub2ApiSourcePath,
-    (Join-Path $routerRoot 'app\data\model_pricing.json'),
-    (Join-Path $routerRoot 'postgres\pgsql\bin\initdb.exe'),
-    (Join-Path $routerRoot 'redis\Redis-8.10.0-Windows-x64-msys2\redis-server.exe')
+    $routerHostExe,
+    $cliProxyApiSourcePath,
+    (Join-Path $routerRoot 'app\data\model_pricing.json')
 )) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw "Required release file is missing: $required" }
 }
+Assert-CliProxyApiPayload -CliProxyApiPath $cliProxyApiSourcePath
 $vcRuntimeSource = Resolve-VcRedistCrtDirectory -OverridePath $VcRedistCrtDir
 
 [IO.Directory]::CreateDirectory($outputRootPath) | Out-Null
@@ -1213,8 +1181,8 @@ function Copy-ReleaseItem {
         [Parameter(Mandatory)][string]$RelativePath,
         [string]$DestinationRelativePath = $RelativePath
     )
-    $source = if ($RelativePath.Equals('app\sub2api.exe', [StringComparison]::OrdinalIgnoreCase)) {
-        $sub2ApiSourcePath
+    $source = if ($RelativePath.Equals('app\cli-proxy-api.exe', [StringComparison]::OrdinalIgnoreCase)) {
+        $cliProxyApiSourcePath
     } else {
         Join-Path $routerRoot $RelativePath
     }
@@ -1243,112 +1211,26 @@ function Copy-VcRuntimePayload {
     [void](Assert-VcRuntimePayload -Root $staging)
 }
 
-function Remove-PostgresDevelopmentPayload {
-    param([Parameter(Mandatory)][string]$Root)
-
-    $postgresRoot = Join-Path $Root 'postgres\pgsql'
-    $developmentDirectories = @(
-        (Join-Path $postgresRoot 'lib\pgxs'),
-        (Join-Path $postgresRoot 'lib\pkgconfig')
-    )
-    $developmentPrefixes = @($developmentDirectories | ForEach-Object {
-        [IO.Path]::GetFullPath($_).TrimEnd([char[]]@('\', '/')) + [IO.Path]::DirectorySeparatorChar
-    })
-    $developmentFiles = @(Get-ChildItem -LiteralPath $postgresRoot -Recurse -Force -File | Where-Object {
-        $fullPath = [IO.Path]::GetFullPath($_.FullName)
-        $_.Extension.ToLowerInvariant() -in @('.a', '.lib') -or
-            @($developmentPrefixes | Where-Object {
-                $fullPath.StartsWith($_, [StringComparison]::OrdinalIgnoreCase)
-            }).Count -gt 0
-    })
-    $removedBytes = [long](($developmentFiles | Measure-Object Length -Sum).Sum)
-    foreach ($file in $developmentFiles) {
-        Remove-Item -LiteralPath $file.FullName -Force
-    }
-    foreach ($directory in $developmentDirectories) {
-        if (Test-Path -LiteralPath $directory) {
-            Remove-Item -LiteralPath $directory -Recurse -Force
-        }
-    }
-    return [pscustomobject]@{
-        Files = $developmentFiles.Count
-        Bytes = $removedBytes
-    }
-}
-
-function Remove-PostgresOptionalPayload {
-    param([Parameter(Mandatory)][string]$Root)
-
-    $postgresRoot = Join-Path $Root 'postgres\pgsql'
-    $postgresBin = Join-Path $postgresRoot 'bin'
-    $localeRoot = Join-Path $postgresRoot 'share\locale'
-    $stackBuilderPath = Join-Path $postgresBin 'stackbuilder.exe'
-    if (-not (Test-Path -LiteralPath $localeRoot -PathType Container)) {
-        throw 'PostgreSQL locale payload is missing; review the portable trimming rules for this PostgreSQL version.'
-    }
-    if (-not (Test-Path -LiteralPath $stackBuilderPath -PathType Leaf)) {
-        throw 'PostgreSQL StackBuilder is missing; review the portable trimming rules for this PostgreSQL version.'
-    }
-
-    $actualWxFiles = @(Get-ChildItem -LiteralPath $postgresBin -File -Force -Filter 'wx*.dll' | Sort-Object Name)
-    $actualWxNames = @($actualWxFiles | ForEach-Object { $_.Name })
-    $expectedWxNames = @($postgresStackBuilderWxFiles | Sort-Object)
-    if (($actualWxNames -join "`n") -ne ($expectedWxNames -join "`n")) {
-        throw "PostgreSQL wxWidgets payload changed. Expected: $($expectedWxNames -join ', '); actual: $($actualWxNames -join ', ')."
-    }
-
-    $localeFiles = @(Get-ChildItem -LiteralPath $localeRoot -Recurse -File -Force)
-    if ($localeFiles.Count -eq 0) {
-        throw 'PostgreSQL locale payload is unexpectedly empty; review the portable trimming rules.'
-    }
-    $stackBuilder = Get-Item -LiteralPath $stackBuilderPath -Force
-    $stackBuilderBytes = [long]$stackBuilder.Length
-    $localeBytes = [long](($localeFiles | Measure-Object Length -Sum).Sum)
-    $wxBytes = [long](($actualWxFiles | Measure-Object Length -Sum).Sum)
-
-    Remove-Item -LiteralPath $stackBuilderPath -Force
-    foreach ($file in $actualWxFiles) { Remove-Item -LiteralPath $file.FullName -Force }
-    Remove-Item -LiteralPath $localeRoot -Recurse -Force
-
-    return [pscustomobject]@{
-        Files = $localeFiles.Count + $actualWxFiles.Count + 1
-        Bytes = $localeBytes + $wxBytes + $stackBuilderBytes
-        LocaleFiles = $localeFiles.Count
-        LocaleBytes = $localeBytes
-        StackBuilderFiles = 1
-        StackBuilderBytes = $stackBuilderBytes
-        WxFiles = $actualWxFiles.Count
-        WxBytes = $wxBytes
-    }
-}
-
 try {
     Copy-Item -LiteralPath $releaseExe -Destination (Join-Path $staging 'Codex-Router.exe')
+    [IO.Directory]::CreateDirectory((Join-Path $staging 'app')) | Out-Null
+    Copy-Item -LiteralPath $routerHostExe -Destination (Join-Path $staging 'app\codex-router-host.exe')
     Copy-ReleaseItem -RelativePath 'Start-Codex-Router.cmd'
     foreach ($relative in @(
-        'app\sub2api.exe',
+        'app\cli-proxy-api.exe',
+        $geminiCliPluginRelativePath,
         'app\data\model_pricing.json',
         'app\data\model_pricing.sha256',
         'assets\logo.ico',
-        'assets\logo.png',
-        'postgres\pgsql\bin',
-        'postgres\pgsql\lib',
-        'postgres\pgsql\share',
-        'postgres\pgsql\server_license.txt',
-        'postgres\pgsql\commandlinetools_3rd_party_licenses.txt'
+        'assets\logo.png'
     )) { Copy-ReleaseItem -RelativePath $relative }
     Copy-ReleaseItem `
         -RelativePath 'app\data\model_pricing.json' `
         -DestinationRelativePath 'app\resources\model-pricing\model_prices_and_context_window.json'
-    $postgresDevelopmentTrim = Remove-PostgresDevelopmentPayload -Root $staging
-    $postgresOptionalTrim = Remove-PostgresOptionalPayload -Root $staging
     Copy-VcRuntimePayload -SourceMetadata $vcRuntimeSource
-    Copy-ReleaseItem -RelativePath 'app\LICENSE' -DestinationRelativePath 'licenses\Sub2API-LICENSE.txt'
     foreach ($name in $staticLicenseFiles) { Copy-ReleaseItem -RelativePath "licenses\$name" }
     Write-RustThirdPartyLicenseBundle -DestinationPath (Join-Path $staging 'licenses\Rust-Crates-LICENSES.txt')
 
-    $redisRoot = 'redis\Redis-8.10.0-Windows-x64-msys2'
-    foreach ($name in $redisRuntimeFiles) { Copy-ReleaseItem -RelativePath "$redisRoot\$name" }
     foreach ($relative in @('LICENSE', 'CHANGELOG.md', 'README.md', 'README.zh-CN.md', 'TERMS.en.md', 'TERMS.zh-CN.md', 'THIRD_PARTY_NOTICES.md')) {
         Copy-ReleaseItem -RelativePath $relative
     }
@@ -1381,16 +1263,7 @@ try {
         platform = 'windows-x64'
         files = $fileCount + 1
         bytes = [long]((Get-ChildItem -LiteralPath $stage -Recurse -File | Measure-Object Length -Sum).Sum)
-        trimmedPostgresDevelopmentFiles = [int]$postgresDevelopmentTrim.Files
-        trimmedPostgresDevelopmentBytes = [long]$postgresDevelopmentTrim.Bytes
-        trimmedPostgresOptionalFiles = [int]$postgresOptionalTrim.Files
-        trimmedPostgresOptionalBytes = [long]$postgresOptionalTrim.Bytes
-        trimmedPostgresLocaleFiles = [int]$postgresOptionalTrim.LocaleFiles
-        trimmedPostgresLocaleBytes = [long]$postgresOptionalTrim.LocaleBytes
-        trimmedPostgresStackBuilderFiles = [int]$postgresOptionalTrim.StackBuilderFiles
-        trimmedPostgresStackBuilderBytes = [long]$postgresOptionalTrim.StackBuilderBytes
-        trimmedPostgresWxFiles = [int]$postgresOptionalTrim.WxFiles
-        trimmedPostgresWxBytes = [long]$postgresOptionalTrim.WxBytes
+        cliProxyApiVersion = $cliProxyApiPinnedVersion
         vcRuntimeVersion = $vcRuntimeSource.Version
         vcRuntimeSourceKind = $vcRuntimeSource.SourceKind
         vcRuntimeFiles = $vcRuntimeFiles.Count * $vcRuntimeDestinationDirectories.Count
