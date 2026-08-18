@@ -12,6 +12,7 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use hmac::{Hmac, Mac};
+use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 use sha2::Sha256;
 use std::collections::HashMap;
@@ -1963,12 +1964,13 @@ async fn oauth_auth_url(state: &ControlState, provider: &str) -> Response {
                 );
             }
             let state_hmac = sha256_hex(session_state.as_bytes());
+            let started_at = chrono::Utc::now().to_rfc3339();
             let expires = (chrono::Utc::now() + chrono::Duration::minutes(30)).to_rfc3339();
             let _ = state.store.with_connection(|connection| {
                 connection.execute(
                     "INSERT INTO oauth_sessions(state_hmac,provider,status,expires_at,metadata) VALUES(?1,?2,'pending',?3,?4)
-                     ON CONFLICT(state_hmac) DO UPDATE SET status='pending',expires_at=excluded.expires_at",
-                    rusqlite::params![state_hmac, provider, expires, "{}"],
+                     ON CONFLICT(state_hmac) DO UPDATE SET status='pending',expires_at=excluded.expires_at,metadata=excluded.metadata",
+                    rusqlite::params![state_hmac, provider, expires, json!({"started_at": started_at}).to_string()],
                 )?;
                 Ok(())
             });
@@ -2055,6 +2057,27 @@ async fn finish_oauth_session(
     let files = state.cli.get("/v0/management/auth-files").await?;
     let items = files.get("files").cloned().unwrap_or_else(|| files.clone());
     let items = items.as_array().cloned().unwrap_or_default();
+    let session_hmac = sha256_hex(session_state.as_bytes());
+    let started_at = state
+        .store
+        .with_connection(|connection| {
+            let metadata: Option<String> = connection
+                .query_row(
+                    "SELECT metadata FROM oauth_sessions WHERE state_hmac=?1",
+                    rusqlite::params![session_hmac],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok::<Option<String>, anyhow::Error>(metadata.and_then(|value| {
+                serde_json::from_str::<Value>(&value).ok().and_then(|json| {
+                    json.get("started_at")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+            }))
+        })
+        .ok()
+        .flatten();
     let candidate = items
         .iter()
         .filter(|item| {
@@ -2063,6 +2086,25 @@ async fn finish_oauth_session(
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             provider_field == cli_name || provider_field == provider
+        })
+        .filter(|item| {
+            let Some(started_at) = started_at.as_deref() else {
+                return true;
+            };
+            let Some(started_at) = chrono::DateTime::parse_from_rfc3339(started_at).ok() else {
+                return true;
+            };
+            let created_at = item
+                .get("created_at")
+                .and_then(Value::as_str)
+                .or_else(|| item.get("modtime").and_then(Value::as_str));
+            let Some(created_at) = created_at else {
+                return true;
+            };
+            let Some(created_at) = chrono::DateTime::parse_from_rfc3339(created_at).ok() else {
+                return true;
+            };
+            created_at >= started_at
         })
         .max_by_key(|item| {
             item.get("created_at")
