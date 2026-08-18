@@ -90,6 +90,13 @@ pub fn stable_identity_hmac(platform: &str, identity: &str) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+fn deleted_account_tombstone(account_id: i64) -> String {
+    stable_identity_hmac(
+        "deleted",
+        &format!("{account_id}:{}", uuid::Uuid::now_v7().simple()),
+    )
+}
+
 pub fn sanitize_state_payload(value: &mut Value) {
     match value {
         Value::Object(object) => {
@@ -1250,8 +1257,17 @@ pub async fn delete_account(
             )?)
         })
         .ok();
+    // Keep the numeric row as a tombstone so account IDs are never reused,
+    // but release the provider identity for a later re-add of the same key.
+    // `stable_identity_hmac` has a legacy table-level UNIQUE constraint in
+    // addition to the live-row index; leaving the old HMAC in a soft-deleted
+    // row would make every legitimate re-add fail with CR-STO-0008.
+    let tombstone_identity = deleted_account_tombstone(id);
     let result = state.store.with_connection(|connection| {
-        let changed = connection.execute("UPDATE accounts SET deleted_at=CURRENT_TIMESTAMP,schedulable=0 WHERE id=?1 AND deleted_at IS NULL", rusqlite::params![id])?;
+        let changed = connection.execute(
+            "UPDATE accounts SET deleted_at=CURRENT_TIMESTAMP,schedulable=0,stable_identity_hmac=?2 WHERE id=?1 AND deleted_at IS NULL",
+            rusqlite::params![id, tombstone_identity],
+        )?;
         if changed > 0 {
             connection.execute("DELETE FROM account_groups WHERE account_id=?1", rusqlite::params![id])?;
         }
@@ -2443,6 +2459,39 @@ mod tests {
         let second = stable_identity_hmac("anthropic", "identity");
         assert_ne!(first, second);
         assert!(!first.contains("identity"));
+    }
+
+    #[test]
+    fn deleted_account_identity_can_be_readded_without_reusing_id() {
+        let root =
+            std::env::temp_dir().join(format!("router-account-readd-{}", uuid::Uuid::now_v7()));
+        let store = StateStore::open(root.join("router-state.sqlite3")).unwrap();
+        let identity = stable_identity_hmac("openai", "readd-key");
+        store
+            .with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO accounts(id,platform,account_type,auth_index,auth_file,stable_identity_hmac,status,schedulable,priority,weight,payload) VALUES(1,'openai','apikey','old','old.json',?1,'active',1,1,1,'{}')",
+                    rusqlite::params![identity],
+                )?;
+                let tombstone = deleted_account_tombstone(1);
+                connection.execute(
+                    "UPDATE accounts SET deleted_at=CURRENT_TIMESTAMP,schedulable=0,stable_identity_hmac=?2 WHERE id=?1",
+                    rusqlite::params![1_i64, tombstone],
+                )?;
+                connection.execute(
+                    "INSERT INTO accounts(id,platform,account_type,auth_index,auth_file,stable_identity_hmac,status,schedulable,priority,weight,payload) VALUES(2,'openai','apikey','new','new.json',?1,'active',1,1,1,'{}')",
+                    rusqlite::params![identity],
+                )?;
+                let count: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM accounts WHERE stable_identity_hmac=?1 AND deleted_at IS NULL",
+                    rusqlite::params![identity],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(count, 1);
+                Ok::<(), anyhow::Error>(())
+            })
+            .unwrap();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
