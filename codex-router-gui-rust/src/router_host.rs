@@ -2929,7 +2929,14 @@ async fn antigravity_usage(State(state): State<HostState>, request: Request) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_zip_entry_name;
+    use super::*;
+    use axum::body::Body as AxumBody;
+    use axum::http::Request as AxumRequest;
+    use codex_router_lib::control_plane::http_compat::BackendPaths;
+    use codex_router_lib::control_plane::ControlState as TestControlState;
+    use codex_router_lib::state::StateStore as TestStateStore;
+    use std::collections::HashMap as StdHashMap;
+    use tower::ServiceExt;
 
     #[test]
     fn zip_entry_names_are_sanitized_against_path_traversal() {
@@ -2940,5 +2947,138 @@ mod tests {
         assert_eq!(sanitize_zip_entry_name("  "), "item");
         assert_eq!(sanitize_zip_entry_name("..."), "item");
         assert_eq!(sanitize_zip_entry_name("a b:c"), "a_b_c");
+    }
+
+    fn test_host_state() -> HostState {
+        let dir = std::env::temp_dir().join(format!(
+            "codex-router-routetest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = TestStateStore::open(dir.join("router-state.sqlite3")).unwrap();
+        let logger = Arc::new(
+            StructuredLogger::open(dir.join("router-events.jsonl")).expect("open test logger"),
+        );
+        let cli = CliProxyManagementClient::new("http://127.0.0.1:1", "test-secret").unwrap();
+        let routes = Arc::new(RwLock::new(RouteTable::new(Vec::new()).unwrap()));
+        let backend = Some(Arc::new(BackendPaths {
+            config_path: dir.join("config.yaml"),
+            auth_dir: dir.join("auth"),
+            downstream_key: "test-key".to_owned(),
+            management_secret: "test-secret".to_owned(),
+            cli_port: 1,
+        }));
+        let control = TestControlState {
+            store: Arc::new(store),
+            cli,
+            logger,
+            routes,
+            backend,
+            cli_index_map: Arc::new(RwLock::new(StdHashMap::new())),
+        };
+        HostState {
+            control,
+            local_key: Arc::new(Zeroizing::new("sk-test-local-key-1234567890".to_owned())),
+            bindings: Arc::new(Mutex::new(ContinuationBindings::new())),
+            cli_base: Arc::new("http://127.0.0.1:1".to_owned()),
+            cli_child: Arc::new(Mutex::new(None)),
+            cli_data: reqwest::Client::builder().no_proxy().build().unwrap(),
+        }
+    }
+
+    /// Manager doc 11.1 S03: every section-7 static interface must be
+    /// registered on the compatibility host; a route is proven registered when
+    /// the handler responds with anything other than 404 (auth/config state
+    /// may legitimately yield 400/401/500 on a bare test state).
+    #[tokio::test]
+    async fn section7_static_interfaces_are_registered() {
+        let app = public_router(test_host_state());
+        let paths = [
+            "/health",
+            "/api/v1/auth/login",
+            "/api/v1/admin/compliance",
+            "/api/v1/admin/compliance/accept",
+            "/api/v1/admin/users/1",
+            "/api/v1/admin/settings",
+            "/api/v1/admin/groups/all",
+            "/api/v1/admin/groups",
+            "/api/v1/admin/groups/1",
+            "/api/v1/admin/groups/1/composite-routes",
+            "/api/v1/admin/groups/1/composite-routes/2",
+            "/api/v1/admin/accounts",
+            "/api/v1/admin/accounts/1",
+            "/api/v1/admin/accounts/generate-auth-url",
+            "/api/v1/admin/accounts/exchange-code",
+            "/api/v1/admin/accounts/1/scheduled-test-plans",
+            "/api/v1/admin/accounts/1/models/sync-upstream",
+            "/api/v1/admin/openai/generate-auth-url",
+            "/api/v1/admin/openai/create-from-oauth",
+            "/api/v1/admin/openai/accounts/1/quota",
+            "/api/v1/admin/grok/sso-to-oauth",
+            "/api/v1/admin/grok/accounts/1/quota",
+            "/api/v1/admin/gemini/oauth/auth-url",
+            "/api/v1/admin/gemini/oauth/exchange-code",
+            "/api/v1/admin/proxies",
+            "/api/v1/admin/proxies/1",
+            "/api/v1/admin/scheduled-test-plans",
+            "/api/v1/admin/scheduled-test-plans/1",
+            "/api/v1/keys",
+            "/api/v1/keys/1",
+            "/v1/usage",
+            "/antigravity/v1/usage",
+            "/v1/sub2api/billing",
+            "/v1/embeddings",
+            "/v1/images/generations/async",
+            "/v1/images/edits/async",
+            "/v1/images/tasks/task-1",
+            "/v1/images/batches",
+            "/v1/images/batches/models",
+            "/v1/images/batches/batch-1",
+            "/v1/images/batches/batch-1/items",
+            "/v1/images/batches/batch-1/items/custom-1/content",
+            "/v1/images/batches/batch-1/download",
+            "/v1/images/batches/batch-1/cancel",
+            "/v1/images/batches/batch-1/outputs",
+        ];
+        for path in paths {
+            let response = app
+                .clone()
+                .oneshot(
+                    AxumRequest::builder()
+                        .method("GET")
+                        .uri(path)
+                        .body(AxumBody::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "static interface is not registered: {path}"
+            );
+        }
+        // The data plane is a catch-all; an unknown data path must reach the
+        // data_plane handler (unauthorized 401 on the bare state) and never
+        // be a host-level 404.
+        let response = app
+            .oneshot(
+                AxumRequest::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .body(AxumBody::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "data plane fallback must cover /v1/responses"
+        );
     }
 }

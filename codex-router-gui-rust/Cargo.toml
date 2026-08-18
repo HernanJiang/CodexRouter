@@ -50,6 +50,9 @@ uuid = { version = "1", features = ["v7", "serde"] }
 name = "codex_router_lib"
 path = "src/lib.rs"
 
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
 [[bin]]
 name = "codex-router"
 path = "src/main.rs"
