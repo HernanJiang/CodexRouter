@@ -1,0 +1,2413 @@
+//! Hidden CodexRouter compatibility host: 18080 public, CLIProxyAPI private on 18081.
+//!
+//! The host owns: old `/api/v1` admin contract, public model catalog, two-level
+//! routing with continuation stickiness, protocol-safe model rewriting, the
+//! exactly-once usage ledger and the structured JSONL event stream.
+
+use anyhow::{bail, Context, Result};
+use axum::body::Body;
+use axum::extract::{FromRef, Path as AxumPath, Request, State};
+use axum::http::{HeaderName, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{any, delete, get, post, put};
+use axum::{Json, Router};
+use codex_router::backend::cli_proxy::CliProxyManagementClient;
+use codex_router::backend::config_compiler::{self, CliProxyConfig};
+use codex_router::control_plane::http_compat as compat;
+use codex_router::control_plane::ControlState;
+use codex_router::data_ops;
+use codex_router::routing::{ContinuationBindings, PoolRoute, RouteTable};
+use codex_router::state::StateStore;
+use codex_router::telemetry::ledger as usage_ledger;
+use codex_router::telemetry::structured_log::{self, StructuredLogger, TerminalSpanGuard};
+use serde_json::Value;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Instant;
+use tokio::process::{Child, Command};
+use zeroize::Zeroizing;
+
+const DEFAULT_PUBLIC_PORT: u16 = 18080;
+const DEFAULT_PRIVATE_PORT: u16 = 18081;
+const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+const CONTINUATION_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+#[derive(Clone)]
+pub struct HostState {
+    pub control: ControlState,
+    pub local_key: Arc<Zeroizing<String>>,
+    pub bindings: Arc<Mutex<ContinuationBindings>>,
+    pub cli_base: Arc<String>,
+    pub cli_child: Arc<Mutex<Option<Child>>>,
+    pub cli_data: reqwest::Client,
+}
+
+impl FromRef<HostState> for ControlState {
+    fn from_ref(state: &HostState) -> ControlState {
+        state.control.clone()
+    }
+}
+
+fn argument_value(prefix: &str) -> Option<String> {
+    std::env::args().find_map(|argument| argument.strip_prefix(prefix).map(str::to_owned))
+}
+
+fn router_root() -> PathBuf {
+    argument_value("--root=")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|path| path.parent().map(Path::to_path_buf))
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+                .ancestors()
+                .find(|path| path.join("scripts").is_dir() || path.join("app").is_dir())
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        })
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let digest = Sha256::digest(bytes);
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+pub fn ensure_local_api_key() -> Result<Zeroizing<String>> {
+    if let Some(key) = codex_router::credentials::read_text("LocalApiKey")? {
+        if !key.trim().is_empty() {
+            return Ok(key);
+        }
+    }
+    let key = Zeroizing::new(format!("sk-local-{}", uuid::Uuid::now_v7().simple()));
+    codex_router::credentials::write_text("LocalApiKey", &key)?;
+    Ok(key)
+}
+
+fn ensure_management_secret() -> Result<Zeroizing<String>> {
+    if let Some(secret) = codex_router::credentials::read_text("CliManagementSecret")? {
+        if !secret.trim().is_empty() {
+            return Ok(secret);
+        }
+    }
+    let secret = Zeroizing::new(format!("cr-mgmt-{}", uuid::Uuid::now_v7().simple()));
+    codex_router::credentials::write_text("CliManagementSecret", &secret)?;
+    Ok(secret)
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let temporary = path.with_extension("tmp");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&temporary, bytes)?;
+    std::fs::rename(&temporary, path)?;
+    Ok(())
+}
+
+fn default_runtime_config(
+    local_key: &str,
+    management_secret: &str,
+    port: u16,
+    auth_dir: &Path,
+) -> CliProxyConfig {
+    let mut config = CliProxyConfig {
+        port,
+        auth_dir: auth_dir.to_string_lossy().to_string(),
+        remote_management: config_compiler::RemoteManagement {
+            secret_key: management_secret.to_owned(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    config.api_keys.push(local_key.to_owned());
+    config
+}
+
+fn write_runtime_config(path: &Path, config: &CliProxyConfig) -> Result<()> {
+    config_compiler::validate(config)?;
+    let yaml = config_compiler::to_yaml(config)?;
+    atomic_write(path, yaml.as_bytes())
+}
+
+async fn start_cli(root: &Path, config_path: &Path) -> Result<Child> {
+    let executable = root.join(r"app\cli-proxy-api.exe");
+    if !executable.is_file() {
+        bail!(
+            "CR-CLI-0001: locked CLIProxyAPI executable is missing: {}",
+            executable.display()
+        );
+    }
+    let actual_hash = sha256_file(&executable)?;
+    if !actual_hash.eq_ignore_ascii_case(config_compiler::CLI_PROXY_SHA256) {
+        bail!(
+            "CR-CLI-0001: CLIProxyAPI hash mismatch: expected {}, actual {}",
+            config_compiler::CLI_PROXY_SHA256,
+            actual_hash
+        );
+    }
+    let plugin = root.join(r"app\plugins\windows\amd64\gemini-cli-v1.0.5.dll");
+    if !plugin.is_file() {
+        bail!("CR-CLI-0001: locked Gemini CLI plugin is missing");
+    }
+    let plugin_hash = sha256_file(&plugin)?;
+    if !plugin_hash.eq_ignore_ascii_case(config_compiler::GEMINI_PLUGIN_SHA256) {
+        bail!("CR-CLI-0001: Gemini CLI plugin hash mismatch");
+    }
+    let stdout = std::fs::File::create(root.join(r"logs\cli-proxy-stdout.log"))?;
+    let stderr = std::fs::File::create(root.join(r"logs\cli-proxy-stderr.log"))?;
+    Command::new(&executable)
+        .arg("-config")
+        .arg(config_path)
+        .arg("-local-model")
+        .current_dir(root.join("app"))
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()
+        .with_context(|| format!("CR-CLI-0002: spawn {}", executable.display()))
+}
+
+async fn wait_cli_ready(cli: &CliProxyManagementClient) -> Result<()> {
+    let deadline = Instant::now() + std::time::Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if cli.health().await.is_ok() {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    }
+    bail!("CR-CLI-0003: CLIProxyAPI did not become healthy within 30s")
+}
+
+pub fn public_router(state: HostState) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/api/v1/auth/login", post(compat::login))
+        .route("/api/v1/admin/compliance", get(compat::compliance))
+        .route(
+            "/api/v1/admin/compliance/accept",
+            post(compat::accept_compliance),
+        )
+        .route(
+            "/api/v1/admin/users/1",
+            get(compat::user_detail).put(compat::update_user),
+        )
+        .route(
+            "/api/v1/admin/settings",
+            get(compat::settings).put(compat::update_settings),
+        )
+        .route("/api/v1/admin/groups/all", get(compat::groups_all))
+        .route("/api/v1/admin/groups", post(compat::create_group))
+        .route("/api/v1/admin/groups/{id}", put(compat::update_group))
+        .route(
+            "/api/v1/admin/groups/{id}/composite-routes",
+            get(compat::list_composite_routes).post(compat::create_composite_route),
+        )
+        .route(
+            "/api/v1/admin/groups/{group_id}/composite-routes/{id}",
+            put(compat::update_composite_route).delete(compat::delete_composite_route),
+        )
+        .route(
+            "/api/v1/admin/accounts",
+            get(compat::accounts).post(compat::create_account),
+        )
+        .route(
+            "/api/v1/admin/accounts/{id}",
+            get(compat::account_detail)
+                .put(compat::update_account)
+                .delete(compat::delete_account),
+        )
+        .route(
+            "/api/v1/admin/accounts/generate-auth-url",
+            post(compat::oauth_auth_url_anthropic),
+        )
+        .route(
+            "/api/v1/admin/accounts/exchange-code",
+            post(compat::oauth_exchange_code_anthropic),
+        )
+        .route(
+            "/api/v1/admin/accounts/{id}/scheduled-test-plans",
+            get(compat::list_account_plans),
+        )
+        .route(
+            "/api/v1/admin/accounts/{id}/{action}",
+            post(compat::account_action).get(compat::account_action),
+        )
+        .route(
+            "/api/v1/admin/openai/generate-auth-url",
+            post(compat::oauth_auth_url_openai),
+        )
+        .route(
+            "/api/v1/admin/openai/create-from-oauth",
+            post(compat::openai_create_from_oauth),
+        )
+        .route(
+            "/api/v1/admin/openai/accounts/{id}/quota",
+            get(compat::account_quota),
+        )
+        .route(
+            "/api/v1/admin/grok/sso-to-oauth",
+            post(compat::grok_sso_to_oauth),
+        )
+        .route(
+            "/api/v1/admin/grok/accounts/{id}/quota",
+            get(compat::account_quota),
+        )
+        .route(
+            "/api/v1/admin/{provider}/oauth/auth-url",
+            post(compat::oauth_auth_url_provider),
+        )
+        .route(
+            "/api/v1/admin/{provider}/oauth/exchange-code",
+            post(compat::oauth_exchange_code_provider),
+        )
+        .route(
+            "/api/v1/admin/proxies",
+            get(compat::proxies).post(compat::create_proxy),
+        )
+        .route(
+            "/api/v1/admin/proxies/{id}",
+            put(compat::update_proxy).delete(compat::delete_proxy),
+        )
+        .route(
+            "/api/v1/admin/scheduled-test-plans",
+            get(compat::list_plans).post(compat::create_plan),
+        )
+        .route(
+            "/api/v1/admin/scheduled-test-plans/{id}",
+            put(compat::update_plan).delete(compat::delete_plan),
+        )
+        .route(
+            "/api/v1/keys",
+            get(compat::list_api_keys).post(compat::create_api_key),
+        )
+        .route(
+            "/api/v1/keys/{id}",
+            put(compat::update_api_key).delete(compat::delete_api_key),
+        )
+        .route("/v1/usage", get(data_usage))
+        .route("/v1/sub2api/billing", get(data_billing))
+        .route("/v1/embeddings", post(data_embeddings))
+        .route("/v1/images/generations/async", post(image_async_generate))
+        .route("/v1/images/edits/async", post(image_async_edit))
+        .route("/v1/images/tasks/{task_id}", get(image_task_show))
+        .route(
+            "/v1/images/batches",
+            get(image_batches_list).post(image_batch_submit),
+        )
+        .route("/v1/images/batches/models", get(image_batch_models))
+        .route(
+            "/v1/images/batches/{id}",
+            get(image_batch_show).delete(image_batch_remove),
+        )
+        .route("/v1/images/batches/{id}/items", get(image_batch_items))
+        .route(
+            "/v1/images/batches/{id}/items/{custom_id}/content",
+            get(image_batch_item_content),
+        )
+        .route(
+            "/v1/images/batches/{id}/download",
+            get(image_batch_download),
+        )
+        .route("/v1/images/batches/{id}/cancel", post(image_batch_cancel))
+        .route(
+            "/v1/images/batches/{id}/outputs",
+            delete(image_batch_outputs_clear),
+        )
+        .fallback(any(data_plane))
+        .with_state(state)
+}
+
+async fn health(State(state): State<HostState>) -> Response {
+    match compat::health_json(&state.control).await {
+        Ok(value) if value["status"] == "healthy" => compat::success(value),
+        Ok(_) => compat::failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CR-LFC-0006",
+            "Router stack is degraded",
+        ),
+        Err(_) => compat::failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CR-LFC-0006",
+            "Router health check failed",
+        ),
+    }
+}
+// ---------------------------------------------------------------------------
+// Data plane
+// ---------------------------------------------------------------------------
+
+fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+}
+
+fn data_plane_authorized(state: &HostState, request: &Request) -> bool {
+    let Some(token) = bearer_token(request.headers()) else {
+        return false;
+    };
+    if token == state.local_key.as_str() {
+        return true;
+    }
+    compat::data_key_valid(&state.control, token)
+}
+
+/// Map public paths onto CLIProxyAPI paths, preserving the query string.
+fn map_path(uri: &str) -> String {
+    let (path, query) = match uri.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (uri, None),
+    };
+    let mapped = if path == "/models" {
+        "/v1/models".to_owned()
+    } else if path == "/responses" {
+        "/v1/responses".to_owned()
+    } else if path == "/chat/completions" {
+        "/v1/chat/completions".to_owned()
+    } else if path == "/messages" {
+        "/v1/messages".to_owned()
+    } else if path == "/messages/count_tokens" {
+        "/v1/messages/count_tokens".to_owned()
+    } else if path == "/alpha/search" {
+        "/v1/alpha/search".to_owned()
+    } else if let Some(id) = path
+        .strip_prefix("/v1/videos/")
+        .and_then(|tail| tail.strip_suffix("/content"))
+    {
+        format!("/openai/v1/videos/{id}/content")
+    } else {
+        path.to_owned()
+    };
+    match query {
+        Some(query) => format!("{mapped}?{query}"),
+        None => mapped,
+    }
+}
+
+fn protocol_of(path: &str) -> &'static str {
+    if path.contains("/responses") {
+        "responses"
+    } else if path.contains("/chat/completions") || path.contains("/completions") {
+        "chat"
+    } else if path.contains("/messages") {
+        "anthropic"
+    } else if path.starts_with("/v1beta") {
+        "gemini"
+    } else {
+        "other"
+    }
+}
+
+fn upstream_error_code(status: u16) -> &'static str {
+    match status {
+        400 => "CR-UP-0001",
+        401 => "CR-UP-0002",
+        403 => "CR-UP-0003",
+        404 => "CR-UP-0004",
+        408 => "CR-UP-0005",
+        409 => "CR-UP-0006",
+        413 => "CR-UP-0007",
+        429 => "CR-UP-0008",
+        500 => "CR-UP-0009",
+        502 => "CR-UP-0010",
+        503 => "CR-UP-0011",
+        504 => "CR-UP-0012",
+        _ => "CR-CLI-0004",
+    }
+}
+
+fn extract_headers(request_headers: &axum::http::HeaderMap) -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    for name in [axum::http::header::ACCEPT, axum::http::header::CONTENT_TYPE] {
+        if let Some(value) = request_headers.get(&name) {
+            let _ = headers.insert(name, value.clone());
+        }
+    }
+    for name in [
+        "openai-beta",
+        "anthropic-version",
+        "anthropic-beta",
+        "x-codex-client",
+        "session_id",
+    ] {
+        if let (Ok(header_name), Some(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            request_headers.get(name),
+        ) {
+            let _ = headers.insert(header_name, value.clone());
+        }
+    }
+    headers
+}
+
+fn reqwest_to_axum_headers(headers: &reqwest::header::HeaderMap) -> axum::http::HeaderMap {
+    let mut output = axum::http::HeaderMap::new();
+    for (name, value) in headers.iter() {
+        if let Ok(axum_name) = HeaderName::from_bytes(name.as_str().as_bytes()) {
+            if name != reqwest::header::HOST
+                && name != reqwest::header::CONTENT_LENGTH
+                && name != reqwest::header::TRANSFER_ENCODING
+            {
+                output.insert(axum_name, value.clone());
+            }
+        }
+    }
+    output
+}
+
+fn crate_request_id(request: &Request) -> String {
+    request
+        .headers()
+        .get("x-request-id")
+        .or_else(|| request.headers().get("x-client-request-id"))
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| structured_log::accepted_request_id(Some(value)).ok())
+        .unwrap_or_else(structured_log::request_id)
+}
+
+fn error_response(status: StatusCode, code: &str, message: &str, request_id: &str) -> Response {
+    let body = serde_json::json!({
+        "error": {"message": message, "type": "codex_router_error", "param": null, "code": code},
+        "request_id": request_id
+    });
+    let mut response = (status, Json(body)).into_response();
+    if let Ok(value) = HeaderValue::from_str(code) {
+        response
+            .headers_mut()
+            .insert("x-codex-router-error-code", value);
+    }
+    if let Ok(value) = HeaderValue::from_str(request_id) {
+        response.headers_mut().insert("x-request-id", value);
+    }
+    response
+}
+
+/// Inject the Router error code into an upstream error envelope without
+/// removing or renaming any legacy field.
+fn annotate_error_body(body: &mut Value, code: &str, request_id: &str) {
+    if let Some(error) = body.get_mut("error").and_then(Value::as_object_mut) {
+        error
+            .entry("code")
+            .or_insert_with(|| Value::String(code.to_owned()));
+    }
+    if let Some(object) = body.as_object_mut() {
+        object
+            .entry("request_id")
+            .or_insert_with(|| Value::String(request_id.to_owned()));
+    }
+}
+
+/// Resolve the CLI-selected credential to a Router account id using the
+/// `X-CPA-TRACE-ID` header the CLI stamps on every data-plane response.
+/// Returns None (pool-level correlation) when the CLI did not attribute.
+fn attribute_account(state: &HostState, headers: &reqwest::header::HeaderMap) -> Option<i64> {
+    let trace = headers.get("x-cpa-trace-id")?.to_str().ok()?;
+    let auth_index = config_compiler::parse_cpa_trace_auth_index(trace)?;
+    state
+        .control
+        .cli_index_map
+        .read()
+        .ok()?
+        .get(auth_index)
+        .copied()
+}
+
+fn record_ledger(state: &HostState, input: &usage_ledger::LedgerInput<'_>) {
+    let entry = usage_ledger::ledger_entry(input);
+    if let Err(error) = usage_ledger::record_terminal(&state.control.store, &entry) {
+        let _ = state.control.logger.write(serde_json::json!({
+            "level": "WARN",
+            "event": "ledger.record_failed",
+            "request_id": input.request_id,
+            "error_description": error.to_string(),
+        }));
+    }
+}
+
+/// Public `/v1/models` answer: only Router-public models, in catalog order.
+fn public_models_response(state: &HostState, request_id: &str) -> Response {
+    let routes = state
+        .control
+        .routes
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    let models: Vec<Value> = routes
+        .public_models()
+        .iter()
+        .map(|model| serde_json::json!({"id": model, "object": "model", "created": 0, "owned_by": "codex-router"}))
+        .collect();
+    let body = serde_json::json!({"object": "list", "data": models});
+    let mut response = (StatusCode::OK, Json(body)).into_response();
+    if let Ok(value) = HeaderValue::from_str(request_id) {
+        response.headers_mut().insert("x-request-id", value);
+    }
+    response
+}
+
+struct PlanResult {
+    body: Vec<u8>,
+    public_model: String,
+    pool_id: String,
+    pool_prefix: String,
+    upstream_model: String,
+}
+
+fn plan_request(
+    state: &HostState,
+    bytes: &[u8],
+    session_header: Option<&str>,
+) -> std::result::Result<PlanResult, Value> {
+    let mut parsed: Value = match serde_json::from_slice(bytes) {
+        Ok(value) => value,
+        Err(_) => {
+            return Err(
+                serde_json::json!({"status": 400, "code": "CR-REQ-0006", "message": "request body is not valid JSON"}),
+            )
+        }
+    };
+    let Some(model) = parsed
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return Ok(PlanResult {
+            body: bytes.to_vec(),
+            public_model: String::new(),
+            pool_id: String::new(),
+            pool_prefix: String::new(),
+            upstream_model: String::new(),
+        });
+    };
+    let table = state
+        .control
+        .routes
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    let continuation_key = table.continuation_key(
+        parsed.get("conversation_id").and_then(Value::as_str),
+        parsed.get("previous_response_id").and_then(Value::as_str),
+        parsed.get("prompt_cache_key").and_then(Value::as_str),
+        session_header,
+    );
+    let pools = table.pools(&model);
+    if pools.is_empty() {
+        return Err(
+            serde_json::json!({"status": 404, "code": "CR-RTE-0001", "message": format!("no route for model {model}")}),
+        );
+    }
+    let bindings = state
+        .bindings
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    let selected = match codex_router::routing::select_pool(
+        &table,
+        &model,
+        continuation_key.as_deref(),
+        &bindings,
+    ) {
+        Ok(route) => route.clone(),
+        Err(_) => {
+            // Distinguish "continuation owner was deleted" (409, caller must
+            // start a new session) from "route exists but every credential is
+            // paused" (503, retry after recovery).
+            let owner_removed = continuation_key
+                .as_deref()
+                .and_then(|key| bindings.pool(key))
+                .is_some_and(|pool_id| !pools.iter().any(|route| route.pool_id == pool_id));
+            if owner_removed {
+                return Err(
+                    serde_json::json!({"status": 409, "code": "CR-RTE-0005", "message": "continuation owner is no longer available"}),
+                );
+            }
+            return Err(
+                serde_json::json!({"status": 503, "code": "CR-RTE-0002", "message": "no schedulable credential in pool"}),
+            );
+        }
+    };
+    if let Some(key) = continuation_key {
+        state
+            .bindings
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .bind(key.clone(), selected.pool_id.clone(), CONTINUATION_TTL);
+        let _ = codex_router::routing::persist_binding(
+            &state.control.store,
+            &key,
+            &selected.pool_id,
+            CONTINUATION_TTL,
+        );
+    }
+    parsed["model"] = Value::String(table.rewrite_request_model(&model, &selected));
+    let body = serde_json::to_vec(&parsed).map_err(|_| serde_json::json!({"status": 400, "code": "CR-REQ-0006", "message": "could not encode request"}))?;
+    Ok(PlanResult {
+        body,
+        public_model: model,
+        pool_id: selected.pool_id.clone(),
+        pool_prefix: selected.prefix.clone(),
+        upstream_model: selected.upstream_model.clone(),
+    })
+}
+
+/// Stateful SSE line rewriter: rewrites model references inside `data:` JSON
+/// payloads back to the public model and captures terminal usage frames.
+pub struct SseRewriter {
+    pending: Vec<u8>,
+    internal_model: String,
+    upstream_model: String,
+    public_model: String,
+    pub usage: Option<Value>,
+    pub terminal_seen: Option<String>,
+}
+
+impl SseRewriter {
+    pub fn new(pool_prefix: &str, public_model: &str, upstream_model: &str) -> Self {
+        Self {
+            pending: Vec::new(),
+            internal_model: format!("{pool_prefix}/{public_model}"),
+            upstream_model: upstream_model.to_owned(),
+            public_model: public_model.to_owned(),
+            usage: None,
+            terminal_seen: None,
+        }
+    }
+
+    fn rewrite_model_value(&self, value: &mut Value) {
+        let internal = self.internal_model.clone();
+        let upstream = self.upstream_model.clone();
+        let public = self.public_model.clone();
+        fn walk(value: &mut Value, internal: &str, upstream: &str, public: &str) {
+            match value {
+                Value::String(text) => {
+                    if text == internal
+                        || text == upstream
+                        || text.starts_with(&format!("{internal}/"))
+                    {
+                        *text = public.to_owned();
+                    }
+                }
+                Value::Array(items) => items
+                    .iter_mut()
+                    .for_each(|item| walk(item, internal, upstream, public)),
+                Value::Object(object) => object
+                    .values_mut()
+                    .for_each(|item| walk(item, internal, upstream, public)),
+                _ => {}
+            }
+        }
+        walk(value, &internal, &upstream, &public);
+    }
+
+    pub fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
+        self.pending.extend_from_slice(chunk);
+        let mut output = Vec::new();
+        while let Some(position) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = self.pending.drain(..=position).collect();
+            output.extend_from_slice(&self.process_line(line));
+        }
+        output
+    }
+
+    pub fn finish(&mut self) -> Vec<u8> {
+        if self.pending.is_empty() {
+            return Vec::new();
+        }
+        let line = std::mem::take(&mut self.pending);
+        self.process_line(line)
+    }
+
+    fn process_line(&mut self, line: Vec<u8>) -> Vec<u8> {
+        let text = String::from_utf8_lossy(&line);
+        let Some(json_text) = text.strip_prefix("data: ") else {
+            return line;
+        };
+        let json_text = json_text.trim_end();
+        if json_text == "[DONE]" {
+            self.terminal_seen = Some("done".to_owned());
+            return line;
+        }
+        let Ok(mut payload) = serde_json::from_str::<Value>(json_text) else {
+            return line;
+        };
+        if let Some(usage) = payload
+            .get("usage")
+            .cloned()
+            .or_else(|| payload.pointer("/response/usage").cloned())
+            .or_else(|| payload.get("usageMetadata").cloned())
+        {
+            self.usage = Some(usage);
+        }
+        if let Some(event_type) = payload.get("type").and_then(Value::as_str) {
+            if event_type.ends_with(".completed")
+                || event_type.ends_with(".failed")
+                || event_type.ends_with(".cancelled")
+            {
+                self.terminal_seen = Some(event_type.to_owned());
+            }
+        }
+        self.rewrite_model_value(&mut payload);
+        let mut rewritten = b"data: ".to_vec();
+        rewritten.extend_from_slice(
+            &serde_json::to_vec(&payload).unwrap_or_else(|_| json_text.as_bytes().to_vec()),
+        );
+        rewritten.push(b'\n');
+        rewritten
+    }
+}
+
+async fn data_plane(State(state): State<HostState>, request: Request) -> Response {
+    let started = Instant::now();
+    let request_id = crate_request_id(&request);
+    let terminal = TerminalSpanGuard::new(
+        state.control.logger.clone(),
+        request_id.clone(),
+        format!("{} {}", request.method(), request.uri().path()),
+    );
+    if !data_plane_authorized(&state, &request) {
+        let response = error_response(
+            StatusCode::UNAUTHORIZED,
+            "CR-AUT-0001",
+            "missing valid Router API key",
+            &request_id,
+        );
+        let _ = terminal.complete("unauthorized", Some(401), Some("CR-AUT-0001"), 1);
+        return response;
+    }
+    let mapped = map_path(&request.uri().to_string());
+    let method = reqwest::Method::from_bytes(request.method().as_str().as_bytes())
+        .unwrap_or(reqwest::Method::GET);
+    if method == reqwest::Method::GET && mapped.split('?').next() == Some("/v1/models") {
+        let has_routes = state
+            .control
+            .routes
+            .read()
+            .map(|table| !table.routes().is_empty())
+            .unwrap_or(false);
+        if has_routes {
+            // A populated route table owns the public catalog; an empty one falls
+            // through to the CLI native model list below.
+            let _ = terminal.complete("ok", Some(200), None, 1);
+            return public_models_response(&state, &request_id);
+        }
+    }
+    let session_header = request
+        .headers()
+        .get("x-codex-session")
+        .or_else(|| request.headers().get("session_id"))
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let forward_headers = extract_headers(request.headers());
+    let bytes = match axum::body::to_bytes(request.into_body(), MAX_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            let response = error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "CR-REQ-0004",
+                "request body is too large",
+                &request_id,
+            );
+            let _ = terminal.complete("rejected", Some(413), Some("CR-REQ-0004"), 1);
+            return response;
+        }
+    };
+    let is_json = forward_headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("json"));
+    let plan = if is_json
+        && !bytes.is_empty()
+        && matches!(method, reqwest::Method::POST | reqwest::Method::PUT)
+    {
+        match plan_request(&state, &bytes, session_header.as_deref()) {
+            Ok(plan) => plan,
+            Err(error) => {
+                let status = StatusCode::from_u16(
+                    error.get("status").and_then(Value::as_u64).unwrap_or(400) as u16,
+                )
+                .unwrap_or(StatusCode::BAD_REQUEST);
+                let code = error
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("CR-REQ-0006");
+                let message = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("invalid request");
+                let response = error_response(status, code, message, &request_id);
+                let _ = terminal.complete("rejected", Some(status.as_u16()), Some(code), 1);
+                return response;
+            }
+        }
+    } else {
+        PlanResult {
+            body: bytes.to_vec(),
+            public_model: String::new(),
+            pool_id: String::new(),
+            pool_prefix: String::new(),
+            upstream_model: String::new(),
+        }
+    };
+    let protocol = protocol_of(&mapped);
+    let url = format!("{}{}", state.cli_base, mapped);
+    let upstream_response = state
+        .cli_data
+        .request(method, &url)
+        .headers(forward_headers)
+        .header(
+            "authorization",
+            format!("Bearer {}", state.local_key.as_str()),
+        )
+        .header("x-request-id", &request_id)
+        .body(plan.body)
+        .send()
+        .await;
+    let upstream = match upstream_response {
+        Ok(upstream) => upstream,
+        Err(_) => {
+            record_ledger(
+                &state,
+                &usage_ledger::LedgerInput {
+                    request_id: &request_id,
+                    model: &plan.public_model,
+                    pool_id: &plan.pool_id,
+                    protocol,
+                    status: "failed",
+                    elapsed_ms: started.elapsed().as_millis() as i64,
+                    error_code: Some("CR-CLI-0004"),
+                    ..Default::default()
+                },
+            );
+            let response = error_response(
+                StatusCode::BAD_GATEWAY,
+                "CR-CLI-0004",
+                "CLIProxyAPI failed while handling the request",
+                &request_id,
+            );
+            let _ = terminal.complete("upstream_error", Some(502), Some("CR-CLI-0004"), 1);
+            return response;
+        }
+    };
+    let status_u16 = upstream.status().as_u16();
+    let status = StatusCode::from_u16(status_u16).unwrap_or(StatusCode::BAD_GATEWAY);
+    let ledger_account = attribute_account(&state, upstream.headers());
+    let mut response_headers = reqwest_to_axum_headers(upstream.headers());
+    response_headers.insert(
+        "x-request-id",
+        HeaderValue::from_str(&request_id).unwrap_or(HeaderValue::from_static("invalid")),
+    );
+    let is_sse = upstream
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("text/event-stream"));
+    let elapsed = started.elapsed().as_millis() as i64;
+    if is_sse {
+        let rewriter =
+            SseRewriter::new(&plan.pool_prefix, &plan.public_model, &plan.upstream_model);
+        let context = (
+            state.clone(),
+            request_id.clone(),
+            plan.public_model.clone(),
+            plan.pool_id.clone(),
+            protocol.to_owned(),
+            status_u16,
+            ledger_account,
+        );
+        let stream = wrap_sse_stream(upstream.bytes_stream(), rewriter, context, started);
+        let mut builder = Response::builder().status(status);
+        for (name, value) in response_headers.iter() {
+            builder = builder.header(name, value);
+        }
+        let _ = terminal.complete(
+            if status.is_success() {
+                "ok"
+            } else {
+                "upstream_error"
+            },
+            Some(status_u16),
+            None,
+            1,
+        );
+        builder
+            .body(Body::from_stream(stream))
+            .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+    } else {
+        let body_bytes = upstream.bytes().await.unwrap_or_default();
+        let mut parsed: Option<Value> = serde_json::from_slice(&body_bytes).ok();
+        if let Some(body) = parsed.as_mut() {
+            if !plan.public_model.is_empty() {
+                let table = state
+                    .control
+                    .routes
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone();
+                if let Some(route) = table
+                    .routes()
+                    .iter()
+                    .find(|route| route.prefix == plan.pool_prefix)
+                {
+                    table.rewrite_response_model(body, route);
+                }
+            }
+            if !status.is_success() {
+                annotate_error_body(body, upstream_error_code(status_u16), &request_id);
+            }
+        }
+        let output = parsed
+            .as_ref()
+            .map(|value| serde_json::to_vec(value).unwrap_or_else(|_| body_bytes.to_vec()))
+            .unwrap_or_else(|| body_bytes.to_vec());
+        let ledger_status = if status.is_success() {
+            "completed"
+        } else {
+            "failed"
+        };
+        let error_code = if status.is_success() {
+            None
+        } else {
+            Some(upstream_error_code(status_u16))
+        };
+        record_ledger(
+            &state,
+            &usage_ledger::LedgerInput {
+                request_id: &request_id,
+                model: &plan.public_model,
+                pool_id: &plan.pool_id,
+                account_id: ledger_account,
+                protocol,
+                status: ledger_status,
+                body: parsed.as_ref(),
+                elapsed_ms: elapsed,
+                error_code,
+            },
+        );
+        let _ = terminal.complete(
+            if status.is_success() {
+                "ok"
+            } else {
+                "upstream_error"
+            },
+            Some(status_u16),
+            error_code,
+            1,
+        );
+        let mut builder = Response::builder().status(status);
+        for (name, value) in response_headers.iter() {
+            builder = builder.header(name, value);
+        }
+        builder
+            .body(Body::from(output))
+            .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+    }
+}
+
+type SseContext = (HostState, String, String, String, String, u16, Option<i64>);
+
+fn wrap_sse_stream(
+    upstream: impl futures_util::Stream<Item = std::result::Result<axum::body::Bytes, reqwest::Error>>
+        + Send
+        + Unpin
+        + 'static,
+    rewriter: SseRewriter,
+    context: SseContext,
+    started: Instant,
+) -> impl futures_util::Stream<Item = std::result::Result<axum::body::Bytes, std::io::Error>>
+       + Send
+       + 'static {
+    use futures_util::StreamExt;
+    futures_util::stream::unfold(
+        (upstream, rewriter, context, started, false),
+        |(mut upstream, mut rewriter, context, started, terminated)| async move {
+            if terminated {
+                return None;
+            }
+            loop {
+                match upstream.next().await {
+                    Some(Ok(chunk)) => {
+                        let out = rewriter.feed(&chunk);
+                        if out.is_empty() {
+                            continue;
+                        }
+                        return Some((
+                            Ok(axum::body::Bytes::from(out)),
+                            (upstream, rewriter, context, started, false),
+                        ));
+                    }
+                    Some(Err(_)) => {
+                        let (state, request_id, public_model, pool_id, protocol, _, account_id) =
+                            &context;
+                        let out = rewriter.finish();
+                        record_ledger(
+                            state,
+                            &usage_ledger::LedgerInput {
+                                request_id,
+                                model: public_model,
+                                pool_id,
+                                protocol,
+                                status: "failed",
+                                account_id: *account_id,
+                                elapsed_ms: started.elapsed().as_millis() as i64,
+                                error_code: Some("CR-UP-0014"),
+                                ..Default::default()
+                            },
+                        );
+                        let _ = out;
+                        let state_tuple = (upstream, rewriter, context, started, true);
+                        return Some((
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe,
+                                "upstream stream error",
+                            )),
+                            state_tuple,
+                        ));
+                    }
+                    None => {
+                        let (
+                            state,
+                            request_id,
+                            public_model,
+                            pool_id,
+                            protocol,
+                            status_u16,
+                            account_id,
+                        ) = &context;
+                        let out = rewriter.finish();
+                        let usage_body = rewriter
+                            .usage
+                            .as_ref()
+                            .map(|usage| serde_json::json!({"usage": usage}));
+                        let ok = (200..300).contains(status_u16);
+                        let status = if ok { "completed" } else { "failed" };
+                        let error_code = if ok {
+                            None
+                        } else {
+                            Some(upstream_error_code(*status_u16))
+                        };
+                        record_ledger(
+                            state,
+                            &usage_ledger::LedgerInput {
+                                request_id,
+                                model: public_model,
+                                pool_id,
+                                protocol,
+                                status,
+                                account_id: *account_id,
+                                body: usage_body.as_ref(),
+                                elapsed_ms: started.elapsed().as_millis() as i64,
+                                error_code,
+                            },
+                        );
+                        if out.is_empty() {
+                            return None;
+                        }
+                        return Some((
+                            Ok(axum::body::Bytes::from(out)),
+                            (upstream, rewriter, context, started, true),
+                        ));
+                    }
+                }
+            }
+        },
+    )
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let root = router_root();
+    let public_port = argument_value("--host-port=")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_PUBLIC_PORT);
+    let private_port = argument_value("--cli-port=")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_PRIVATE_PORT);
+    let no_cli = std::env::args().any(|argument| argument == "--no-cli");
+    std::fs::create_dir_all(root.join("logs"))?;
+    let auth_dir = root.join("data").join("cli-proxy").join("auth");
+    std::fs::create_dir_all(&auth_dir)?;
+    std::fs::create_dir_all(
+        root.join("app")
+            .join("plugins")
+            .join("windows")
+            .join("amd64"),
+    )?;
+    let local_key = ensure_local_api_key()?;
+    let management_secret = ensure_management_secret()?;
+    let config_path = root.join("data").join("cli-proxy").join("config.yaml");
+    if !config_path.is_file() {
+        let runtime_config =
+            default_runtime_config(&local_key, &management_secret, private_port, &auth_dir);
+        write_runtime_config(&config_path, &runtime_config)?;
+    }
+    let store = StateStore::open(root.join("data").join("router-state.sqlite3"))?;
+    let logger = Arc::new(StructuredLogger::open(
+        root.join("logs").join("router-events.jsonl"),
+    )?);
+    let cli = CliProxyManagementClient::new(
+        format!("http://127.0.0.1:{private_port}"),
+        management_secret.as_str(),
+    )?;
+    let control = ControlState {
+        store: Arc::new(store),
+        cli: cli.clone(),
+        logger: logger.clone(),
+        routes: Arc::new(RwLock::new(RouteTable::new(Vec::new())?)),
+        cli_index_map: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        backend: Some(Arc::new(compat::BackendPaths {
+            config_path: config_path.clone(),
+            auth_dir: auth_dir.clone(),
+            downstream_key: local_key.to_string(),
+            management_secret: management_secret.to_string(),
+            cli_port: private_port,
+        })),
+    };
+    // Compile state-derived routing and configuration before traffic arrives.
+    if let Err(error) = compat::sync_backend(&control).await {
+        let _ = logger.write(serde_json::json!({"level":"ERROR","event":"backend.initial_sync_failed","error_description":error.to_string()}));
+    }
+    let mut child = None;
+    if !no_cli {
+        let spawned = start_cli(&root, &config_path).await?;
+        child = Some(spawned);
+        if let Err(error) = wait_cli_ready(&cli).await {
+            let _ = logger.write(serde_json::json!({"level":"ERROR","event":"backend.cli_health_timeout","error_description":error.to_string()}));
+            return Err(error);
+        }
+    }
+    let state = HostState {
+        control,
+        local_key: Arc::new(local_key),
+        bindings: Arc::new(Mutex::new(ContinuationBindings::new())),
+        cli_base: Arc::new(format!("http://127.0.0.1:{private_port}")),
+        cli_child: Arc::new(Mutex::new(child)),
+        cli_data: reqwest::Client::builder().no_proxy().build()?,
+    };
+    let app = public_router(state.clone());
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", public_port)).await?;
+    println!("CodexRouter Host listening on http://127.0.0.1:{public_port}");
+    let shutdown_child = state.cli_child.clone();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            let child = shutdown_child
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+            if let Some(mut child) = child {
+                let _ = child.kill().await;
+            }
+        })
+        .await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Legacy data adapters: usage, billing, embeddings, async images and batches
+// ---------------------------------------------------------------------------
+
+fn json_data_response(status: StatusCode, body: Value, request_id: &str) -> Response {
+    let mut response = (status, Json(body)).into_response();
+    if let Ok(value) = HeaderValue::from_str(request_id) {
+        response.headers_mut().insert("x-request-id", value);
+    }
+    response
+}
+
+fn authorize_data_request(
+    state: &HostState,
+    request: &Request,
+    request_id: &str,
+) -> Option<Response> {
+    if data_plane_authorized(state, request) {
+        None
+    } else {
+        Some(error_response(
+            StatusCode::UNAUTHORIZED,
+            "CR-AUT-0001",
+            "missing valid Router API key",
+            request_id,
+        ))
+    }
+}
+
+async fn read_json_body(
+    request: Request,
+    request_id: &str,
+) -> std::result::Result<Value, Response> {
+    let bytes = match axum::body::to_bytes(request.into_body(), MAX_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return Err(error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "CR-REQ-0004",
+                "request body is too large",
+                request_id,
+            ));
+        }
+    };
+    serde_json::from_slice(&bytes).map_err(|_| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "CR-REQ-0006",
+            "request body is not valid JSON",
+            request_id,
+        )
+    })
+}
+
+/// Pick an available pool for a public model. These legacy adapters carry no
+/// conversation continuation, so selection is stateless; availability still
+/// distinguishes "no route" (CR-RTE-0001) from "all credentials paused"
+/// (CR-RTE-0002).
+fn select_available_pool(
+    state: &HostState,
+    model: &str,
+) -> std::result::Result<PoolRoute, (StatusCode, &'static str, String)> {
+    let table = state
+        .control
+        .routes
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    if table.pools(model).is_empty() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "CR-RTE-0001",
+            format!("no route for model {model}"),
+        ));
+    }
+    let bindings = state
+        .bindings
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    codex_router::routing::select_pool(&table, model, None, &bindings)
+        .cloned()
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "CR-RTE-0002",
+                "route exists but every credential is paused".to_owned(),
+            )
+        })
+}
+
+async fn data_usage(State(state): State<HostState>, request: Request) -> Response {
+    let request_id = crate_request_id(&request);
+    if let Some(denied) = authorize_data_request(&state, &request, &request_id) {
+        return denied;
+    }
+    match data_ops::usage_by_model(&state.control.store) {
+        Ok(body) => json_data_response(StatusCode::OK, body, &request_id),
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CR-STO-0003",
+            "usage aggregation failed",
+            &request_id,
+        ),
+    }
+}
+
+async fn data_billing(State(state): State<HostState>, request: Request) -> Response {
+    let request_id = crate_request_id(&request);
+    if let Some(denied) = authorize_data_request(&state, &request, &request_id) {
+        return denied;
+    }
+    json_data_response(StatusCode::OK, data_ops::key_billing_info(), &request_id)
+}
+async fn data_embeddings(State(state): State<HostState>, request: Request) -> Response {
+    let started = Instant::now();
+    let request_id = crate_request_id(&request);
+    let terminal = TerminalSpanGuard::new(
+        state.control.logger.clone(),
+        request_id.clone(),
+        format!("{} {}", request.method(), request.uri().path()),
+    );
+    if let Some(denied) = authorize_data_request(&state, &request, &request_id) {
+        let _ = terminal.complete("unauthorized", Some(401), Some("CR-AUT-0001"), 1);
+        return denied;
+    }
+    let mut parsed = match read_json_body(request, &request_id).await {
+        Ok(value) => value,
+        Err(response) => {
+            let _ = terminal.complete("rejected", Some(400), Some("CR-REQ-0006"), 1);
+            return response;
+        }
+    };
+    let Some(model) = parsed
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        let _ = terminal.complete("rejected", Some(400), Some("CR-VAL-0001"), 1);
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "CR-VAL-0001",
+            "model is required",
+            &request_id,
+        );
+    };
+    let selected = match select_available_pool(&state, &model) {
+        Ok(route) => route,
+        Err((status, code, message)) => {
+            let _ = terminal.complete("rejected", Some(status.as_u16()), Some(code), 1);
+            return error_response(status, code, &message, &request_id);
+        }
+    };
+    let channel =
+        match data_ops::resolve_pool_direct_channel(&state.control.store, &selected.pool_id) {
+            Ok(Some(channel)) => channel,
+            _ => {
+                let _ = terminal.complete("rejected", Some(422), Some("CR-VAL-0004"), 1);
+                return error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "CR-VAL-0004",
+                    "embeddings requires an API-key backed channel for this model",
+                    &request_id,
+                );
+            }
+        };
+    parsed["model"] = Value::String(selected.upstream_model.clone());
+    let url = format!("{}/embeddings", channel.base_url.trim_end_matches('/'));
+    let upstream = state
+        .cli_data
+        .post(&url)
+        .bearer_auth(channel.api_key.trim())
+        .header("x-request-id", &request_id)
+        .json(&parsed)
+        .send()
+        .await;
+    let elapsed = started.elapsed().as_millis() as i64;
+    let upstream = match upstream {
+        Ok(upstream) => upstream,
+        Err(_) => {
+            record_ledger(
+                &state,
+                &usage_ledger::LedgerInput {
+                    request_id: &request_id,
+                    model: &model,
+                    pool_id: &selected.pool_id,
+                    account_id: Some(channel.account_id),
+                    protocol: "embeddings",
+                    status: "failed",
+                    elapsed_ms: elapsed,
+                    error_code: Some("CR-UP-0010"),
+                    ..Default::default()
+                },
+            );
+            let _ = terminal.complete("upstream_error", Some(502), Some("CR-UP-0010"), 1);
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                "CR-UP-0010",
+                "embedding upstream is unreachable",
+                &request_id,
+            );
+        }
+    };
+    let status_u16 = upstream.status().as_u16();
+    let body_bytes = upstream.bytes().await.unwrap_or_default();
+    let mut body: Value = serde_json::from_slice(&body_bytes)
+        .unwrap_or_else(|_| serde_json::json!({"raw": String::from_utf8_lossy(&body_bytes)}));
+    let succeeded = (200..300).contains(&status_u16);
+    if succeeded {
+        body["model"] = Value::String(model.clone());
+    }
+    record_ledger(
+        &state,
+        &usage_ledger::LedgerInput {
+            request_id: &request_id,
+            model: &model,
+            pool_id: &selected.pool_id,
+            account_id: Some(channel.account_id),
+            protocol: "embeddings",
+            status: if succeeded { "completed" } else { "failed" },
+            body: Some(&body),
+            elapsed_ms: elapsed,
+            error_code: if succeeded {
+                None
+            } else {
+                Some(upstream_error_code(status_u16))
+            },
+        },
+    );
+    let _ = terminal.complete(
+        if succeeded { "ok" } else { "upstream_error" },
+        Some(status_u16),
+        if succeeded {
+            None
+        } else {
+            Some(upstream_error_code(status_u16))
+        },
+        1,
+    );
+    let status = StatusCode::from_u16(status_u16).unwrap_or(StatusCode::BAD_GATEWAY);
+    json_data_response(status, body, &request_id)
+}
+// ---------------------------------------------------------------------------
+// Async image tasks
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+enum ImageJobKind {
+    Generation,
+    Edit,
+}
+
+impl ImageJobKind {
+    fn task_kind(self) -> &'static str {
+        match self {
+            Self::Generation => "generation",
+            Self::Edit => "edit",
+        }
+    }
+
+    fn cli_path(self) -> &'static str {
+        match self {
+            Self::Generation => "/v1/images/generations",
+            Self::Edit => "/v1/images/edits",
+        }
+    }
+}
+
+async fn image_async_generate(State(state): State<HostState>, request: Request) -> Response {
+    image_async_submit(state, request, ImageJobKind::Generation).await
+}
+
+async fn image_async_edit(State(state): State<HostState>, request: Request) -> Response {
+    image_async_submit(state, request, ImageJobKind::Edit).await
+}
+
+async fn image_async_submit(state: HostState, request: Request, kind: ImageJobKind) -> Response {
+    let request_id = crate_request_id(&request);
+    let terminal = TerminalSpanGuard::new(
+        state.control.logger.clone(),
+        request_id.clone(),
+        format!("{} {}", request.method(), request.uri().path()),
+    );
+    if let Some(denied) = authorize_data_request(&state, &request, &request_id) {
+        let _ = terminal.complete("unauthorized", Some(401), Some("CR-AUT-0001"), 1);
+        return denied;
+    }
+    let mut parsed = match read_json_body(request, &request_id).await {
+        Ok(value) => value,
+        Err(response) => {
+            let _ = terminal.complete("rejected", Some(400), Some("CR-REQ-0006"), 1);
+            return response;
+        }
+    };
+    let Some(model) = parsed
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        let _ = terminal.complete("rejected", Some(400), Some("CR-VAL-0001"), 1);
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "CR-VAL-0001",
+            "model is required",
+            &request_id,
+        );
+    };
+    let selected = match select_available_pool(&state, &model) {
+        Ok(route) => route,
+        Err((status, code, message)) => {
+            let _ = terminal.complete("rejected", Some(status.as_u16()), Some(code), 1);
+            return error_response(status, code, &message, &request_id);
+        }
+    };
+    let rewritten = {
+        let table = state
+            .control
+            .routes
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        table.rewrite_request_model(&model, &selected)
+    };
+    parsed["model"] = Value::String(rewritten);
+    let body = match serde_json::to_vec(&parsed) {
+        Ok(body) => body,
+        Err(_) => {
+            let _ = terminal.complete("rejected", Some(400), Some("CR-REQ-0006"), 1);
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "CR-REQ-0006",
+                "could not encode request",
+                &request_id,
+            );
+        }
+    };
+    let task_id = match data_ops::image_task_create(&state.control.store, kind.task_kind(), &model)
+    {
+        Ok(task_id) => task_id,
+        Err(_) => {
+            let _ = terminal.complete("failed", Some(500), Some("CR-STO-0004"), 1);
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "CR-STO-0004",
+                "could not create image task",
+                &request_id,
+            );
+        }
+    };
+    let output_name = format!("{task_id}.json");
+    let job = ImageJob {
+        state: state.clone(),
+        job_id: task_id.clone(),
+        request_id: format!("task-{task_id}"),
+        cli_path: kind.cli_path(),
+        public_model: model.clone(),
+        pool_id: selected.pool_id.clone(),
+        pool_prefix: selected.prefix.clone(),
+        upstream_model: selected.upstream_model.clone(),
+    };
+    tokio::spawn(async move {
+        run_image_job(job, body, output_name).await;
+    });
+    let _ = terminal.complete("accepted", Some(202), None, 1);
+    json_data_response(
+        StatusCode::ACCEPTED,
+        serde_json::json!({
+            "id": task_id,
+            "object": "image_task",
+            "kind": kind.task_kind(),
+            "status": "queued",
+            "model": model,
+        }),
+        &request_id,
+    )
+}
+struct ImageJob {
+    state: HostState,
+    job_id: String,
+    request_id: String,
+    cli_path: &'static str,
+    public_model: String,
+    pool_id: String,
+    pool_prefix: String,
+    upstream_model: String,
+}
+
+impl ImageJob {
+    fn ledger(
+        &self,
+        status: &'static str,
+        body: Option<&Value>,
+        error_code: Option<&'static str>,
+        account_id: Option<i64>,
+    ) {
+        record_ledger(
+            &self.state,
+            &usage_ledger::LedgerInput {
+                request_id: &self.request_id,
+                model: &self.public_model,
+                pool_id: &self.pool_id,
+                account_id,
+                protocol: "images",
+                status,
+                body,
+                elapsed_ms: 0,
+                error_code,
+            },
+        );
+    }
+}
+
+/// Replace internal/upstream model strings inside an upstream payload with
+/// the public model, mirroring the SSE rewriter semantics for JSON bodies.
+fn rewrite_model_strings(
+    value: &mut Value,
+    pool_prefix: &str,
+    public_model: &str,
+    upstream_model: &str,
+) {
+    let internal = format!("{pool_prefix}/{public_model}");
+    match value {
+        Value::String(text) => {
+            if *text == internal
+                || *text == upstream_model
+                || text.starts_with(&format!("{internal}/"))
+            {
+                *text = public_model.to_owned();
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(|item| {
+            rewrite_model_strings(item, pool_prefix, public_model, upstream_model)
+        }),
+        Value::Object(object) => object.values_mut().for_each(|item| {
+            rewrite_model_strings(item, pool_prefix, public_model, upstream_model)
+        }),
+        _ => {}
+    }
+}
+
+/// Persist an upstream payload as the task output file under the task dir.
+fn store_job_output(output_name: &str, parsed: &Value) -> std::result::Result<(), anyhow::Error> {
+    let path = data_ops::task_output_path(&router_root(), output_name)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    std::fs::write(&path, serde_json::to_vec_pretty(parsed).unwrap_or_default())
+        .with_context(|| format!("write {}", path.display()))
+}
+
+async fn run_image_job(job: ImageJob, body: Vec<u8>, output_name: String) {
+    let store = &job.state.control.store;
+    let _ = data_ops::image_task_status(store, &job.job_id, "running", None, None);
+    let upstream = job
+        .state
+        .cli_data
+        .post(format!("{}{}", job.state.cli_base, job.cli_path))
+        .header(
+            "authorization",
+            format!("Bearer {}", job.state.local_key.as_str()),
+        )
+        .header("content-type", "application/json")
+        .header("x-request-id", &job.request_id)
+        .body(body)
+        .send()
+        .await;
+    let upstream = match upstream {
+        Ok(upstream) => upstream,
+        Err(_) => {
+            let _ = data_ops::image_task_status(
+                store,
+                &job.job_id,
+                "failed",
+                None,
+                Some("CR-CLI-0004"),
+            );
+            job.ledger("failed", None, Some("CR-CLI-0004"), None);
+            return;
+        }
+    };
+    let status = upstream.status().as_u16();
+    let account = attribute_account(&job.state, upstream.headers());
+    let bytes = upstream.bytes().await.unwrap_or_default();
+    let mut parsed: Value =
+        serde_json::from_slice(&bytes).unwrap_or_else(|_| serde_json::json!({}));
+    if !(200..300).contains(&status) {
+        let code = upstream_error_code(status);
+        let _ = data_ops::image_task_status(store, &job.job_id, "failed", None, Some(code));
+        job.ledger("failed", Some(&parsed), Some(code), account);
+        return;
+    }
+    rewrite_model_strings(
+        &mut parsed,
+        &job.pool_prefix,
+        &job.public_model,
+        &job.upstream_model,
+    );
+    let (final_status, output_ref, error_code) = match store_job_output(&output_name, &parsed) {
+        Ok(()) => ("completed", Some(output_name.as_str()), None),
+        Err(_) => ("failed", None, Some("CR-STO-0011")),
+    };
+    let _ = data_ops::image_task_status(store, &job.job_id, final_status, output_ref, error_code);
+    job.ledger(final_status, Some(&parsed), error_code, account);
+}
+
+async fn image_task_show(
+    State(state): State<HostState>,
+    AxumPath(task_id): AxumPath<String>,
+    request: Request,
+) -> Response {
+    let request_id = crate_request_id(&request);
+    if let Some(denied) = authorize_data_request(&state, &request, &request_id) {
+        return denied;
+    }
+    if data_ops::safe_task_id(&task_id).is_err() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "CR-VAL-0006",
+            "unsafe task id",
+            &request_id,
+        );
+    }
+    let mut task = match data_ops::image_task_get(&state.control.store, &task_id) {
+        Ok(Some(task)) => task,
+        Ok(None) => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "CR-REQ-0009",
+                "image task not found",
+                &request_id,
+            );
+        }
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "CR-STO-0003",
+                "task lookup failed",
+                &request_id,
+            );
+        }
+    };
+    if task["status"] == "completed" {
+        if let Some(output_ref) = task["output_ref"].as_str() {
+            if let Ok(path) = data_ops::task_output_path(&router_root(), output_ref) {
+                if let Ok(bytes) = std::fs::read(&path) {
+                    if let Ok(result) = serde_json::from_slice::<Value>(&bytes) {
+                        task["result"] = result;
+                    }
+                }
+            }
+        }
+    }
+    json_data_response(StatusCode::OK, task, &request_id)
+}
+// ---------------------------------------------------------------------------
+// Image batches
+// ---------------------------------------------------------------------------
+
+async fn image_batches_list(State(state): State<HostState>, request: Request) -> Response {
+    let request_id = crate_request_id(&request);
+    if let Some(denied) = authorize_data_request(&state, &request, &request_id) {
+        return denied;
+    }
+    match data_ops::image_batch_list(&state.control.store) {
+        Ok(body) => json_data_response(StatusCode::OK, body, &request_id),
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CR-STO-0003",
+            "batch list failed",
+            &request_id,
+        ),
+    }
+}
+
+async fn image_batch_models(State(state): State<HostState>, request: Request) -> Response {
+    let request_id = crate_request_id(&request);
+    if let Some(denied) = authorize_data_request(&state, &request, &request_id) {
+        return denied;
+    }
+    let table = state
+        .control
+        .routes
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    let mut models = std::collections::BTreeSet::new();
+    for route in table.routes() {
+        if config_compiler::is_image_model(&route.upstream_model) {
+            models.insert(route.public_model.clone());
+        }
+    }
+    let data: Vec<Value> = models
+        .into_iter()
+        .map(|model| {
+            serde_json::json!({"id": model, "object": "model", "created": 0, "owned_by": "codex-router"})
+        })
+        .collect();
+    json_data_response(
+        StatusCode::OK,
+        serde_json::json!({"object": "list", "data": data}),
+        &request_id,
+    )
+}
+
+async fn image_batch_submit(State(state): State<HostState>, request: Request) -> Response {
+    let request_id = crate_request_id(&request);
+    let terminal = TerminalSpanGuard::new(
+        state.control.logger.clone(),
+        request_id.clone(),
+        format!("{} {}", request.method(), request.uri().path()),
+    );
+    if let Some(denied) = authorize_data_request(&state, &request, &request_id) {
+        let _ = terminal.complete("unauthorized", Some(401), Some("CR-AUT-0001"), 1);
+        return denied;
+    }
+    let parsed = match read_json_body(request, &request_id).await {
+        Ok(value) => value,
+        Err(response) => {
+            let _ = terminal.complete("rejected", Some(400), Some("CR-REQ-0006"), 1);
+            return response;
+        }
+    };
+    let Some(model) = parsed
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        let _ = terminal.complete("rejected", Some(400), Some("CR-VAL-0001"), 1);
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "CR-VAL-0001",
+            "model is required",
+            &request_id,
+        );
+    };
+    let empty = Vec::new();
+    let items = parsed
+        .get("items")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
+    if items.is_empty() {
+        let _ = terminal.complete("rejected", Some(400), Some("CR-VAL-0003"), 1);
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "CR-VAL-0003",
+            "items must be a non-empty array",
+            &request_id,
+        );
+    }
+    let selected = match select_available_pool(&state, &model) {
+        Ok(route) => route,
+        Err((status, code, message)) => {
+            let _ = terminal.complete("rejected", Some(status.as_u16()), Some(code), 1);
+            return error_response(status, code, &message, &request_id);
+        }
+    };
+    let rewritten = {
+        let table = state
+            .control
+            .routes
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        table.rewrite_request_model(&model, &selected)
+    };
+    let mut custom_ids = Vec::with_capacity(items.len());
+    let mut jobs = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(custom_id) = item.get("custom_id").and_then(Value::as_str) else {
+            let _ = terminal.complete("rejected", Some(400), Some("CR-VAL-0003"), 1);
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "CR-VAL-0003",
+                "each item requires a string custom_id",
+                &request_id,
+            );
+        };
+        if data_ops::safe_task_id(custom_id).is_err() {
+            let _ = terminal.complete("rejected", Some(400), Some("CR-VAL-0006"), 1);
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "CR-VAL-0006",
+                "unsafe custom_id",
+                &request_id,
+            );
+        }
+        let mut payload = item.clone();
+        if let Some(object) = payload.as_object_mut() {
+            object.remove("custom_id");
+            object.insert("model".to_owned(), Value::String(rewritten.clone()));
+        }
+        let Ok(body) = serde_json::to_vec(&payload) else {
+            let _ = terminal.complete("rejected", Some(400), Some("CR-REQ-0006"), 1);
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "CR-REQ-0006",
+                "could not encode batch item",
+                &request_id,
+            );
+        };
+        custom_ids.push(custom_id.to_owned());
+        jobs.push((custom_id.to_owned(), body));
+    }
+    let batch_id = match data_ops::image_batch_create(&state.control.store, &model, &custom_ids) {
+        Ok(batch_id) => batch_id,
+        Err(_) => {
+            let _ = terminal.complete("failed", Some(500), Some("CR-STO-0004"), 1);
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "CR-STO-0004",
+                "could not create image batch",
+                &request_id,
+            );
+        }
+    };
+    let job = ImageBatchJob {
+        state: state.clone(),
+        batch_id: batch_id.clone(),
+        public_model: model.clone(),
+        pool_id: selected.pool_id.clone(),
+        pool_prefix: selected.prefix.clone(),
+        upstream_model: selected.upstream_model.clone(),
+    };
+    tokio::spawn(async move {
+        run_image_batch(job, jobs).await;
+    });
+    let _ = terminal.complete("accepted", Some(202), None, 1);
+    json_data_response(
+        StatusCode::ACCEPTED,
+        serde_json::json!({
+            "id": batch_id,
+            "object": "image_batch",
+            "status": "queued",
+            "model": model,
+        }),
+        &request_id,
+    )
+}
+
+struct ImageBatchJob {
+    state: HostState,
+    batch_id: String,
+    public_model: String,
+    pool_id: String,
+    pool_prefix: String,
+    upstream_model: String,
+}
+
+fn batch_item_state(batch: &Value, custom_id: &str) -> Option<String> {
+    batch["items"].as_array()?.iter().find_map(|row| {
+        if row["custom_id"].as_str() == Some(custom_id) {
+            row["status"].as_str().map(str::to_owned)
+        } else {
+            None
+        }
+    })
+}
+async fn run_image_batch(job: ImageBatchJob, items: Vec<(String, Vec<u8>)>) {
+    let store = &job.state.control.store;
+    let _ = data_ops::image_batch_start(store, &job.batch_id);
+    for (custom_id, body) in &items {
+        let still_queued = data_ops::image_batch_get(store, &job.batch_id)
+            .ok()
+            .flatten()
+            .and_then(|batch| batch_item_state(&batch, custom_id))
+            .is_some_and(|status| status == "queued");
+        if !still_queued {
+            // Cancelled (or deleted) while earlier items were running.
+            continue;
+        }
+        let _ = data_ops::image_batch_item_update(
+            store,
+            &job.batch_id,
+            custom_id,
+            "running",
+            None,
+            None,
+        );
+        let request_id = format!("batch-{}-{custom_id}", job.batch_id);
+        let upstream = job
+            .state
+            .cli_data
+            .post(format!("{}/v1/images/generations", job.state.cli_base))
+            .header(
+                "authorization",
+                format!("Bearer {}", job.state.local_key.as_str()),
+            )
+            .header("content-type", "application/json")
+            .header("x-request-id", &request_id)
+            .body(body.clone())
+            .send()
+            .await;
+        let upstream = match upstream {
+            Ok(upstream) => upstream,
+            Err(_) => {
+                let _ = data_ops::image_batch_item_update(
+                    store,
+                    &job.batch_id,
+                    custom_id,
+                    "failed",
+                    None,
+                    Some("CR-CLI-0004"),
+                );
+                record_ledger(
+                    &job.state,
+                    &usage_ledger::LedgerInput {
+                        request_id: &request_id,
+                        model: &job.public_model,
+                        pool_id: &job.pool_id,
+                        protocol: "images",
+                        status: "failed",
+                        error_code: Some("CR-CLI-0004"),
+                        ..Default::default()
+                    },
+                );
+                continue;
+            }
+        };
+        let status = upstream.status().as_u16();
+        let account = attribute_account(&job.state, upstream.headers());
+        let bytes = upstream.bytes().await.unwrap_or_default();
+        let mut parsed: Value =
+            serde_json::from_slice(&bytes).unwrap_or_else(|_| serde_json::json!({}));
+        if !(200..300).contains(&status) {
+            let code = upstream_error_code(status);
+            let _ = data_ops::image_batch_item_update(
+                store,
+                &job.batch_id,
+                custom_id,
+                "failed",
+                None,
+                Some(code),
+            );
+            record_ledger(
+                &job.state,
+                &usage_ledger::LedgerInput {
+                    request_id: &request_id,
+                    model: &job.public_model,
+                    pool_id: &job.pool_id,
+                    account_id: account,
+                    protocol: "images",
+                    status: "failed",
+                    body: Some(&parsed),
+                    error_code: Some(code),
+                    ..Default::default()
+                },
+            );
+            continue;
+        }
+        rewrite_model_strings(
+            &mut parsed,
+            &job.pool_prefix,
+            &job.public_model,
+            &job.upstream_model,
+        );
+        let output_name = format!("{}__{custom_id}.json", job.batch_id);
+        let (final_status, output_ref, error_code) = match store_job_output(&output_name, &parsed) {
+            Ok(()) => ("completed", Some(output_name.as_str()), None),
+            Err(_) => ("failed", None, Some("CR-STO-0011")),
+        };
+        let _ = data_ops::image_batch_item_update(
+            store,
+            &job.batch_id,
+            custom_id,
+            final_status,
+            output_ref,
+            error_code,
+        );
+        record_ledger(
+            &job.state,
+            &usage_ledger::LedgerInput {
+                request_id: &request_id,
+                model: &job.public_model,
+                pool_id: &job.pool_id,
+                account_id: account,
+                protocol: "images",
+                status: final_status,
+                body: Some(&parsed),
+                error_code,
+                ..Default::default()
+            },
+        );
+    }
+    let final_status = data_ops::image_batch_get(store, &job.batch_id)
+        .ok()
+        .flatten()
+        .map(|batch| {
+            let rows = batch["items"].as_array().cloned().unwrap_or_default();
+            let total = rows.len();
+            let cancelled = rows
+                .iter()
+                .filter(|row| row["status"] == "cancelled")
+                .count();
+            let failed = rows.iter().filter(|row| row["status"] == "failed").count();
+            if total > 0 && cancelled == total {
+                "cancelled"
+            } else if total > 0 && failed == total {
+                "failed"
+            } else {
+                "completed"
+            }
+        })
+        .unwrap_or("completed");
+    let _ = data_ops::image_batch_finish(store, &job.batch_id, final_status);
+}
+
+// The Err payload is an already-built axum response; boxing it through every
+// batch call site adds noise without changing behavior, so allow the lint.
+#[allow(clippy::result_large_err)]
+fn load_batch(
+    state: &HostState,
+    id: &str,
+    request_id: &str,
+) -> std::result::Result<Value, Response> {
+    if data_ops::safe_task_id(id).is_err() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "CR-VAL-0006",
+            "unsafe batch id",
+            request_id,
+        ));
+    }
+    match data_ops::image_batch_get(&state.control.store, id) {
+        Ok(Some(batch)) => Ok(batch),
+        Ok(None) => Err(error_response(
+            StatusCode::NOT_FOUND,
+            "CR-REQ-0009",
+            "image batch not found",
+            request_id,
+        )),
+        Err(_) => Err(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CR-STO-0003",
+            "batch lookup failed",
+            request_id,
+        )),
+    }
+}
+
+async fn image_batch_show(
+    State(state): State<HostState>,
+    AxumPath(id): AxumPath<String>,
+    request: Request,
+) -> Response {
+    let request_id = crate_request_id(&request);
+    if let Some(denied) = authorize_data_request(&state, &request, &request_id) {
+        return denied;
+    }
+    match load_batch(&state, &id, &request_id) {
+        Ok(batch) => json_data_response(StatusCode::OK, batch, &request_id),
+        Err(response) => response,
+    }
+}
+
+async fn image_batch_items(
+    State(state): State<HostState>,
+    AxumPath(id): AxumPath<String>,
+    request: Request,
+) -> Response {
+    let request_id = crate_request_id(&request);
+    if let Some(denied) = authorize_data_request(&state, &request, &request_id) {
+        return denied;
+    }
+    match load_batch(&state, &id, &request_id) {
+        Ok(batch) => {
+            let items = batch["items"].clone();
+            json_data_response(
+                StatusCode::OK,
+                serde_json::json!({"object": "list", "data": items}),
+                &request_id,
+            )
+        }
+        Err(response) => response,
+    }
+}
+async fn image_batch_item_content(
+    State(state): State<HostState>,
+    AxumPath((id, custom_id)): AxumPath<(String, String)>,
+    request: Request,
+) -> Response {
+    let request_id = crate_request_id(&request);
+    if let Some(denied) = authorize_data_request(&state, &request, &request_id) {
+        return denied;
+    }
+    if data_ops::safe_task_id(&custom_id).is_err() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "CR-VAL-0006",
+            "unsafe custom_id",
+            &request_id,
+        );
+    }
+    let batch = match load_batch(&state, &id, &request_id) {
+        Ok(batch) => batch,
+        Err(response) => return response,
+    };
+    let item = batch["items"].as_array().and_then(|rows| {
+        rows.iter()
+            .find(|row| row["custom_id"].as_str() == Some(custom_id.as_str()))
+            .cloned()
+    });
+    let Some(item) = item else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "CR-REQ-0009",
+            "batch item not found",
+            &request_id,
+        );
+    };
+    let Some(output_ref) = item["output_ref"].as_str() else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "CR-REQ-0009",
+            "batch item has no stored output",
+            &request_id,
+        );
+    };
+    let Ok(path) = data_ops::task_output_path(&router_root(), output_ref) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "CR-VAL-0006",
+            "unsafe output reference",
+            &request_id,
+        );
+    };
+    match std::fs::read(&path) {
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(body) => json_data_response(StatusCode::OK, body, &request_id),
+            Err(_) => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "CR-STO-0011",
+                "stored output is not valid JSON",
+                &request_id,
+            ),
+        },
+        Err(_) => error_response(
+            StatusCode::NOT_FOUND,
+            "CR-REQ-0009",
+            "stored output file is missing",
+            &request_id,
+        ),
+    }
+}
+
+async fn image_batch_download(
+    State(state): State<HostState>,
+    AxumPath(id): AxumPath<String>,
+    request: Request,
+) -> Response {
+    let request_id = crate_request_id(&request);
+    if let Some(denied) = authorize_data_request(&state, &request, &request_id) {
+        return denied;
+    }
+    let batch = match load_batch(&state, &id, &request_id) {
+        Ok(batch) => batch,
+        Err(response) => return response,
+    };
+    let mut lines = Vec::new();
+    if let Some(rows) = batch["items"].as_array() {
+        for row in rows {
+            if row["status"] != "completed" {
+                continue;
+            }
+            let Some(output_ref) = row["output_ref"].as_str() else {
+                continue;
+            };
+            let Ok(path) = data_ops::task_output_path(&router_root(), output_ref) else {
+                continue;
+            };
+            if let Ok(bytes) = std::fs::read(&path) {
+                if let Ok(output) = serde_json::from_slice::<Value>(&bytes) {
+                    lines.push(
+                        serde_json::json!({"custom_id": row["custom_id"], "output": output})
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+    let mut body = lines.join("\n");
+    body.push('\n');
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/x-ndjson")
+        .header("x-request-id", &request_id)
+        .body(Body::from(body))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+async fn image_batch_cancel(
+    State(state): State<HostState>,
+    AxumPath(id): AxumPath<String>,
+    request: Request,
+) -> Response {
+    let request_id = crate_request_id(&request);
+    if let Some(denied) = authorize_data_request(&state, &request, &request_id) {
+        return denied;
+    }
+    if let Err(response) = load_batch(&state, &id, &request_id) {
+        return response;
+    }
+    let _ = data_ops::image_batch_cancel_pending(&state.control.store, &id);
+    // When nothing is left running the worker will not finalize the batch, so
+    // the cancel call itself settles the terminal state.
+    if let Ok(batch) = load_batch(&state, &id, &request_id) {
+        let rows = batch["items"].as_array().cloned().unwrap_or_default();
+        let active = rows
+            .iter()
+            .any(|row| row["status"] == "queued" || row["status"] == "running");
+        if !active {
+            let any_completed = rows.iter().any(|row| row["status"] == "completed");
+            let status = if any_completed {
+                "completed"
+            } else {
+                "cancelled"
+            };
+            let _ = data_ops::image_batch_finish(&state.control.store, &id, status);
+        }
+    }
+    match load_batch(&state, &id, &request_id) {
+        Ok(batch) => json_data_response(StatusCode::OK, batch, &request_id),
+        Err(response) => response,
+    }
+}
+
+async fn image_batch_remove(
+    State(state): State<HostState>,
+    AxumPath(id): AxumPath<String>,
+    request: Request,
+) -> Response {
+    let request_id = crate_request_id(&request);
+    if let Some(denied) = authorize_data_request(&state, &request, &request_id) {
+        return denied;
+    }
+    if data_ops::safe_task_id(&id).is_err() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "CR-VAL-0006",
+            "unsafe batch id",
+            &request_id,
+        );
+    }
+    if let Ok(Some(batch)) = data_ops::image_batch_get(&state.control.store, &id) {
+        remove_batch_files(&batch);
+    }
+    match data_ops::image_batch_delete(&state.control.store, &id) {
+        Ok(0) => error_response(
+            StatusCode::NOT_FOUND,
+            "CR-REQ-0009",
+            "image batch not found",
+            &request_id,
+        ),
+        Ok(_) => json_data_response(
+            StatusCode::OK,
+            serde_json::json!({"id": id, "deleted": true}),
+            &request_id,
+        ),
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CR-STO-0004",
+            "batch delete failed",
+            &request_id,
+        ),
+    }
+}
+
+fn remove_batch_files(batch: &Value) {
+    if let Some(rows) = batch["items"].as_array() {
+        for row in rows {
+            if let Some(output_ref) = row["output_ref"].as_str() {
+                if let Ok(path) = data_ops::task_output_path(&router_root(), output_ref) {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+    }
+}
+
+async fn image_batch_outputs_clear(
+    State(state): State<HostState>,
+    AxumPath(id): AxumPath<String>,
+    request: Request,
+) -> Response {
+    let request_id = crate_request_id(&request);
+    if let Some(denied) = authorize_data_request(&state, &request, &request_id) {
+        return denied;
+    }
+    let batch = match load_batch(&state, &id, &request_id) {
+        Ok(batch) => batch,
+        Err(response) => return response,
+    };
+    remove_batch_files(&batch);
+    match data_ops::image_batch_clear_outputs(&state.control.store, &id) {
+        Ok(cleared) => json_data_response(
+            StatusCode::OK,
+            serde_json::json!({"id": id, "cleared": cleared}),
+            &request_id,
+        ),
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CR-STO-0004",
+            "clearing batch outputs failed",
+            &request_id,
+        ),
+    }
+}
