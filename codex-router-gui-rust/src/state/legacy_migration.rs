@@ -454,6 +454,21 @@ pub fn parse_legacy_export(json: &str) -> Result<LegacyExport> {
     serde_json::from_str(json).context("CR-MIG-0002: cannot parse the legacy export payload")
 }
 
+/// Import a JSON export from disk. The raw export is parsed and consumed in
+/// memory; the importer persists only redacted metadata and HMACs, never the
+/// source API key or OAuth material.
+pub fn import_legacy_export_file(
+    store: &StateStore,
+    path: impl AsRef<std::path::Path>,
+    hmac_secret: &[u8],
+) -> Result<MigrationSummary> {
+    let path = path.as_ref();
+    let json = std::fs::read_to_string(path)
+        .with_context(|| format!("CR-MIG-0002: cannot read legacy export {}", path.display()))?;
+    let export = parse_legacy_export(&json)?;
+    import_legacy_export(store, &export, hmac_secret)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

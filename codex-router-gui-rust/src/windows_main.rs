@@ -7334,6 +7334,9 @@ fn try_cli_mode() -> Option<anyhow::Result<()>> {
     let apply_staged_update = args
         .iter()
         .any(|argument| argument == "--apply-staged-update");
+    let import_legacy_export = args
+        .iter()
+        .any(|argument| argument.starts_with("--import-legacy-export="));
     let install_portable = args.iter().any(|argument| argument == "--install-portable");
     if !write_codex_config
         && !routing_priorities
@@ -7344,6 +7347,7 @@ fn try_cli_mode() -> Option<anyhow::Result<()>> {
         && !refresh_codex_binding
         && !prepare_provider_oauth
         && !apply_staged_update
+        && !import_legacy_export
         && !install_portable
     {
         return None;
@@ -7398,6 +7402,53 @@ fn try_cli_mode() -> Option<anyhow::Result<()>> {
                 args.iter().any(|argument| argument == "--no-shortcut"),
             )?;
             write_cli_result(&serde_json::to_string(&result)?)?;
+            return Ok(());
+        }
+
+        if import_legacy_export {
+            let router_root = argument_value("--router-root=")
+                .map(PathBuf::from)
+                .unwrap_or_else(RouterConfig::find_router_root);
+            let export_path = argument_value("--import-legacy-export=")
+                .map(PathBuf::from)
+                .context("--import-legacy-export requires a JSON export path")?;
+            let store = codex_router_lib::state::StateStore::open(
+                user_data::data_root(&router_root).join("router-state.sqlite3"),
+            )?;
+            let migration_secret = match codex_router_lib::credentials::read_text(
+                "MigrationHmacSecret",
+            )? {
+                Some(secret) if !secret.trim().is_empty() => secret,
+                _ => {
+                    let secret = zeroize::Zeroizing::new(
+                        format!("cr-migration-{}", uuid::Uuid::now_v7().simple()),
+                    );
+                    codex_router_lib::credentials::write_text(
+                        "MigrationHmacSecret",
+                        secret.as_str(),
+                    )?;
+                    secret
+                }
+            };
+            let summary = codex_router_lib::state::legacy_migration::import_legacy_export_file(
+                &store,
+                &export_path,
+                migration_secret.as_bytes(),
+            )?;
+            write_cli_result(&serde_json::to_string(&serde_json::json!({
+                "status": "imported",
+                "source": export_path.file_name().and_then(|name| name.to_str()).unwrap_or("export.json"),
+                "groupsImported": summary.groups_imported,
+                "groupsSkipped": summary.groups_skipped,
+                "routesImported": summary.routes_imported,
+                "routesSkipped": summary.routes_skipped,
+                "proxiesImported": summary.proxies_imported,
+                "proxiesSkipped": summary.proxies_skipped,
+                "keysImported": summary.keys_imported,
+                "keysSkipped": summary.keys_skipped,
+                "accountsImported": summary.accounts_imported,
+                "accountsSkipped": summary.accounts_skipped,
+            }))?)?;
             return Ok(());
         }
 
