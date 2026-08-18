@@ -162,6 +162,8 @@ pub struct PluginConfig {
 pub struct CliProxyConfig {
     pub host: String,
     pub port: u16,
+    #[serde(rename = "proxy-url", skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
     #[serde(rename = "remote-management")]
     pub remote_management: RemoteManagement,
     #[serde(rename = "auth-dir")]
@@ -197,6 +199,7 @@ impl Default for CliProxyConfig {
         Self {
             host: "127.0.0.1".to_owned(),
             port: 18081,
+            proxy_url: None,
             remote_management: RemoteManagement {
                 allow_remote: false,
                 secret_key: String::new(),

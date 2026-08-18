@@ -465,7 +465,11 @@ fn ensure_directories(router_root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn start_router_host(router_root: &Path, ports: LifecyclePorts) -> anyhow::Result<u32> {
+fn start_router_host(
+    router_root: &Path,
+    ports: LifecyclePorts,
+    proxy_url: Option<&str>,
+) -> anyhow::Result<u32> {
     let data_root = user_data::data_root(router_root);
     let logs = router_root.join("logs");
     let stdout_path = logs.join("router-host-stdout.log");
@@ -485,6 +489,11 @@ fn start_router_host(router_root: &Path, ports: LifecyclePorts) -> anyhow::Resul
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    if let Some(proxy_url) = proxy_url.filter(|value| !value.trim().is_empty()) {
+        command.env("CODEX_ROUTER_PROXY_URL", proxy_url);
+    } else {
+        command.env_remove("CODEX_ROUTER_PROXY_URL");
+    }
     let child = command.spawn().context("could not start Router Host")?;
     let process_id = child.id();
     drop(child);
@@ -635,7 +644,11 @@ pub fn ensure_services_with_config(
     }
     let existing = inspect_existing_host(router_root, ports, &base_uri, repair)?;
     if existing.is_none() {
-        let process_id = start_router_host(router_root, ports)?;
+        let process_id = start_router_host(
+            router_root,
+            ports,
+            proxy_runtime.settings.proxy_url.as_deref(),
+        )?;
         if let Err(error) = wait_host_ready(router_root, ports, &base_uri, process_id, cancel) {
             let expected = host_executable(router_root);
             let _ = terminate_verified_process(process_id, &expected);

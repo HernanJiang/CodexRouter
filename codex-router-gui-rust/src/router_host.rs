@@ -122,8 +122,29 @@ fn default_runtime_config(
         },
         ..Default::default()
     };
+    config.proxy_url = inherited_proxy_url();
     config.api_keys.push(local_key.to_owned());
     config
+}
+
+fn inherited_proxy_url() -> Option<String> {
+    std::env::var("CODEX_ROUTER_PROXY_URL")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn reconcile_runtime_proxy(path: &Path) -> Result<()> {
+    let Some(proxy_url) = inherited_proxy_url() else {
+        return Ok(());
+    };
+    let text = std::fs::read_to_string(path)?;
+    let mut config: CliProxyConfig = serde_yaml::from_str(&text)?;
+    if config.proxy_url.as_deref() == Some(proxy_url.as_str()) {
+        return Ok(());
+    }
+    config.proxy_url = Some(proxy_url);
+    write_runtime_config(path, &config)
 }
 
 fn write_runtime_config(path: &Path, config: &CliProxyConfig) -> Result<()> {
@@ -1551,6 +1572,8 @@ async fn main() -> Result<()> {
         let runtime_config =
             default_runtime_config(&local_key, &management_secret, private_port, &auth_dir);
         write_runtime_config(&config_path, &runtime_config)?;
+    } else {
+        reconcile_runtime_proxy(&config_path)?;
     }
     let store = StateStore::open(root.join("data").join("router-state.sqlite3"))?;
     let logger = Arc::new(StructuredLogger::open(
