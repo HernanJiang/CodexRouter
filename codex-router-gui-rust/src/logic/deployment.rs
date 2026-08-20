@@ -507,7 +507,6 @@ where
                 priorities.prefer_oauth,
             );
         }
-        priority = priority.saturating_add(1000 * super::api_channel_tier(model));
         let mut credentials = json!({
             "base_url": target,
             "api_key": api_key.as_str(),
@@ -2072,6 +2071,7 @@ mod tests {
                 .as_ref()
                 .context("Kimi account body is missing")?;
             assert_eq!(body["group_ids"], json!([7]));
+            assert_eq!(body["priority"], 10);
             assert_eq!(body["credentials"]["model_mapping"]["k3-256k"], "k3-256k");
             assert_eq!(
                 body["extra"]["openai_responses_mode"],

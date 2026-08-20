@@ -551,7 +551,7 @@ fn fallback_transition_notification(
                         && logic::same_model_identity(&oauth_model.model, &candidate.model)
                         && logic::is_eligible_oauth_api_fallback(config, oauth_model, candidate)
                 })
-                .min_by_key(|candidate| (logic::api_channel_tier(candidate), candidate.priority))
+                .min_by_key(|candidate| candidate.priority)
             {
                 let source = if subscription.name.trim().is_empty() {
                     logic::recommended_model_display_name(&oauth_model.model)
@@ -600,7 +600,7 @@ fn fallback_names_for_account(
                 && logic::same_model_identity(&oauth_model.model, &candidate.model)
                 && logic::is_eligible_oauth_api_fallback(config, oauth_model, candidate)
         })
-        .min_by_key(|candidate| (logic::api_channel_tier(candidate), candidate.priority))?;
+        .min_by_key(|candidate| candidate.priority)?;
     let source = oauth_accounts
         .iter()
         .find(|account| account.id == account_id)

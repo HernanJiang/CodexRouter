@@ -1200,14 +1200,6 @@ pub fn is_eligible_oauth_api_fallback(
     !is_same_vendor_payg_fallback(source, candidate)
 }
 
-pub fn api_channel_tier(model: &ModelConfig) -> i32 {
-    match classify_channel_route(model).source_type {
-        ChannelSourceType::Subscription => 0,
-        ChannelSourceType::CodingPlan => 1,
-        ChannelSourceType::OfficialApi | ChannelSourceType::Relay => 2,
-    }
-}
-
 pub fn model_routing_explanation(cfg: &RouterConfig, model: &ModelConfig, zh: bool) -> String {
     let matched = cfg.models.iter().any(|candidate| {
         !std::ptr::eq(candidate, model)
@@ -3907,8 +3899,7 @@ base_url = "https://api.430123.xyz/v1"
             assert!(apply_channel_preset(&mut model, id));
             assert_eq!(model.model, "ark-code-latest");
             assert_eq!(model.base_url, expected_url);
-            // Subscription plans outrank pay-as-you-go third-party APIs.
-            assert_eq!(api_channel_tier(&model), 1);
+            assert_eq!(classify_channel_route(&model).source_type, ChannelSourceType::CodingPlan);
         }
 
         assert_eq!(
