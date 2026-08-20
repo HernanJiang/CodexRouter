@@ -1257,6 +1257,18 @@ fn persist_api_credential(account_id: i64, body: &Value) -> Result<()> {
     Ok(())
 }
 
+fn account_identity_source<'a>(account_type: &str, body: &'a Value) -> &'a str {
+    if account_type == "apikey" {
+        body.get("name")
+    } else {
+        body.pointer("/credentials/access_token")
+            .or_else(|| body.pointer("/credentials/refresh_token"))
+            .or_else(|| body.get("name"))
+    }
+    .and_then(Value::as_str)
+    .unwrap_or_default()
+}
+
 pub async fn create_account(
     State(state): State<ControlState>,
     headers: HeaderMap,
@@ -1283,13 +1295,10 @@ pub async fn create_account(
             "valid platform and account type are required",
         );
     }
-    let identity_source = body
-        .pointer("/credentials/api_key")
-        .or_else(|| body.pointer("/credentials/access_token"))
-        .or_else(|| body.pointer("/credentials/refresh_token"))
-        .or_else(|| body.get("name"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    // API keys are often shared by several models on the same gateway. The
+    // managed channel name is stable and non-secret, while using the key here
+    // incorrectly collapses every model/channel that shares one credential.
+    let identity_source = account_identity_source(&account_type, &body);
     if identity_source.trim().is_empty() {
         return failure(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -4240,6 +4249,25 @@ mod tests {
         let second = stable_identity_hmac("anthropic", "identity");
         assert_ne!(first, second);
         assert!(!first.contains("identity"));
+    }
+
+    #[test]
+    fn api_accounts_with_one_key_keep_distinct_channel_identities() {
+        let first = json!({
+            "name": "Codex-Router / model / relay-a",
+            "credentials": {"api_key": "shared-secret"}
+        });
+        let second = json!({
+            "name": "Codex-Router / model / relay-b",
+            "credentials": {"api_key": "shared-secret"}
+        });
+        let first_identity =
+            stable_identity_hmac("openai", account_identity_source("apikey", &first));
+        let second_identity =
+            stable_identity_hmac("openai", account_identity_source("apikey", &second));
+        assert_ne!(first_identity, second_identity);
+        assert!(!first_identity.contains("shared-secret"));
+        assert!(!second_identity.contains("shared-secret"));
     }
 
     #[test]
