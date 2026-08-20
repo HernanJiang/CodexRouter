@@ -241,6 +241,9 @@ pub fn select_pool<'a>(
                 // Bound pool still exists but every credential is paused:
                 // fall through to exactly one explainable rebind below.
                 Some(_) => {}
+                // Same thread switched public model. The owner is still in the
+                // table, just not for this model — rebind instead of 409.
+                None if table.routes().iter().any(|route| route.pool_id == pool_id) => {}
                 None => bail!("continuation owner {pool_id} was removed"),
             }
         }
@@ -250,6 +253,25 @@ pub fn select_pool<'a>(
         .find(|route| route.available)
         .copied()
         .ok_or_else(|| anyhow::anyhow!("no available credential pool for {public_model}"))
+}
+
+pub fn should_drop_previous_response(
+    table: &RouteTable,
+    bindings: &ContinuationBindings,
+    key: Option<&str>,
+    selected: &PoolRoute,
+) -> bool {
+    let Some(key) = key else {
+        return false;
+    };
+    let Some(previous_pool) = bindings.pool(key) else {
+        return false;
+    };
+    table
+        .routes()
+        .iter()
+        .find(|route| route.pool_id == previous_pool)
+        .is_some_and(|previous| previous.provider != selected.provider)
 }
 
 pub fn persist_binding(store: &StateStore, key: &str, pool_id: &str, ttl: Duration) -> Result<()> {
@@ -332,6 +354,86 @@ mod tests {
                 .provider,
             "openai"
         );
+    }
+
+    fn named_route(public: &str, provider: &str) -> PoolRoute {
+        PoolRoute {
+            pool_id: format!("cr/{public}/{provider}"),
+            prefix: format!("cr_{public}_{provider}"),
+            public_model: public.into(),
+            upstream_model: "upstream".into(),
+            provider: provider.into(),
+            priority: 1,
+            enabled: true,
+            available: true,
+        }
+    }
+
+    #[test]
+    fn continuation_rebinds_when_the_same_thread_switches_public_model() {
+        let chatgpt = named_route("gpt-5.6-sol", "openai");
+        let deepseek = named_route("deepseek-v4-flash", "deepseek");
+        let table = RouteTable::new(vec![chatgpt, deepseek]).unwrap();
+        let mut bindings = ContinuationBindings::new();
+        let key = table
+            .continuation_key(None, Some("resp-chatgpt"), None, None)
+            .unwrap();
+        bindings.bind(
+            key.clone(),
+            "cr/gpt-5.6-sol/openai".into(),
+            Duration::from_secs(60),
+        );
+        let selected = select_pool(&table, "deepseek-v4-flash", Some(&key), &bindings).unwrap();
+        assert_eq!(selected.provider, "deepseek");
+        assert!(should_drop_previous_response(
+            &table,
+            &bindings,
+            Some(&key),
+            selected
+        ));
+    }
+
+    #[test]
+    fn continuation_keeps_previous_response_for_same_provider_subagent() {
+        let sol = named_route("gpt-5.6-sol", "openai");
+        let luna = named_route("gpt-5.6-luna", "openai");
+        let table = RouteTable::new(vec![sol, luna]).unwrap();
+        let mut bindings = ContinuationBindings::new();
+        let key = table
+            .continuation_key(None, Some("resp-sol"), None, None)
+            .unwrap();
+        bindings.bind(
+            key.clone(),
+            "cr/gpt-5.6-sol/openai".into(),
+            Duration::from_secs(60),
+        );
+        let selected = select_pool(&table, "gpt-5.6-luna", Some(&key), &bindings).unwrap();
+        assert_eq!(selected.provider, "openai");
+        assert!(!should_drop_previous_response(
+            &table,
+            &bindings,
+            Some(&key),
+            selected
+        ));
+    }
+
+    #[test]
+    fn continuation_still_errors_when_the_owner_pool_is_gone() {
+        let deepseek = named_route("deepseek-v4-flash", "deepseek");
+        let table = RouteTable::new(vec![deepseek]).unwrap();
+        let mut bindings = ContinuationBindings::new();
+        let key = table
+            .continuation_key(None, Some("resp-gone"), None, None)
+            .unwrap();
+        bindings.bind(
+            key.clone(),
+            "cr/gone/openai".into(),
+            Duration::from_secs(60),
+        );
+        let error = select_pool(&table, "deepseek-v4-flash", Some(&key), &bindings)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("continuation owner"), "{error}");
     }
 
     #[test]

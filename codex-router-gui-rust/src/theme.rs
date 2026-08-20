@@ -14,14 +14,13 @@ pub struct Palette {
     pub action: egui::Color32,
     pub accent: egui::Color32,
     pub glass: egui::Color32,
-    pub glass_dark: egui::Color32,
     pub success: egui::Color32,
     pub danger: egui::Color32,
 }
 
 pub fn palette(name: &str) -> Palette {
     if name == "sky" {
-        // Clearer sky blue with soft acrylic glass layers.
+        // Clear sky blue with opaque dialog surfaces.
         Palette {
             background: egui::Color32::from_rgb(142, 186, 214),
             background_dark: egui::Color32::from_rgb(78, 128, 162),
@@ -34,13 +33,12 @@ pub fn palette(name: &str) -> Palette {
             line: egui::Color32::from_rgb(196, 218, 232),
             action: egui::Color32::from_rgb(28, 72, 108),
             accent: egui::Color32::from_rgb(46, 118, 158),
-            glass: egui::Color32::from_rgba_unmultiplied(244, 250, 255, 168),
-            glass_dark: egui::Color32::from_rgba_unmultiplied(42, 78, 104, 176),
+            glass: egui::Color32::from_rgb(248, 252, 255),
             success: egui::Color32::from_rgb(29, 130, 89),
             danger: egui::Color32::from_rgb(190, 54, 51),
         }
     } else {
-        // Coffee theme with the same acrylic translucency treatment.
+        // Coffee theme with the same opaque dialog treatment.
         Palette {
             background: egui::Color32::from_rgb(168, 136, 114),
             background_dark: egui::Color32::from_rgb(102, 74, 58),
@@ -53,8 +51,7 @@ pub fn palette(name: &str) -> Palette {
             line: egui::Color32::from_rgb(220, 200, 178),
             action: egui::Color32::from_rgb(61, 39, 27),
             accent: egui::Color32::from_rgb(82, 91, 67),
-            glass: egui::Color32::from_rgba_unmultiplied(250, 242, 228, 168),
-            glass_dark: egui::Color32::from_rgba_unmultiplied(70, 52, 42, 176),
+            glass: egui::Color32::from_rgb(252, 246, 236),
             success: egui::Color32::from_rgb(58, 119, 83),
             danger: egui::Color32::from_rgb(166, 66, 52),
         }
@@ -75,6 +72,9 @@ pub fn install(ctx: &egui::Context, palette: &Palette) {
     style.visuals = egui::Visuals::light();
     style.visuals.panel_fill = egui::Color32::TRANSPARENT;
     style.visuals.window_fill = palette.paper;
+    style.visuals.window_stroke = egui::Stroke::new(1.0, palette.line);
+    style.visuals.window_corner_radius = egui::CornerRadius::same(14);
+    style.visuals.window_shadow = soft_card_shadow();
     style.visuals.extreme_bg_color = egui::Color32::WHITE;
     style.visuals.faint_bg_color = palette.paper_alt;
     style.visuals.override_text_color = Some(palette.ink);
@@ -189,24 +189,76 @@ pub fn paper_frame(palette: &Palette) -> egui::Frame {
 
 pub fn glass_frame(palette: &Palette) -> egui::Frame {
     egui::Frame::new()
-        .fill(palette.glass)
-        .stroke(egui::Stroke::new(
-            1.0_f32,
-            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 210),
-        ))
-        .corner_radius(egui::CornerRadius::same(16))
+        .fill(palette.paper)
+        .stroke(egui::Stroke::new(1.0_f32, palette.line))
+        .corner_radius(egui::CornerRadius::same(14))
         .inner_margin(egui::Margin::same(26))
-        .shadow(egui::epaint::Shadow {
-            offset: [0, 14],
-            blur: 48,
-            spread: 0,
-            color: egui::Color32::from_rgba_unmultiplied(18, 26, 36, 58),
-        })
+        .shadow(soft_card_shadow())
+}
+
+pub fn dialog_window_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(egui::Color32::TRANSPARENT)
+        .inner_margin(egui::Margin::ZERO)
+}
+
+pub fn dialog_shell<R>(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    header: impl FnOnce(&mut egui::Ui),
+    body: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let mut body_result = None;
+    egui::Frame::new()
+        .fill(palette.paper)
+        .stroke(egui::Stroke::new(1.0, palette.line))
+        .corner_radius(egui::CornerRadius::same(14))
+        .inner_margin(egui::Margin::ZERO)
+        .shadow(soft_card_shadow())
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            egui::Frame::new()
+                .fill(palette.background_dark)
+                .corner_radius(egui::CornerRadius {
+                    nw: 13,
+                    ne: 13,
+                    sw: 0,
+                    se: 0,
+                })
+                .inner_margin(egui::Margin::symmetric(22, 14))
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    header(ui);
+                });
+            egui::Frame::new()
+                .fill(palette.paper)
+                .corner_radius(egui::CornerRadius {
+                    nw: 0,
+                    ne: 0,
+                    sw: 13,
+                    se: 13,
+                })
+                .inner_margin(egui::Margin::same(22))
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    body_result = Some(body(ui));
+                });
+        });
+    body_result.expect("dialog body should be rendered")
+}
+
+pub fn dialog_title(ui: &mut egui::Ui, title: &str) {
+    ui.label(
+        egui::RichText::new(title)
+            .font(egui::FontId::new(22.0, display_family()))
+            .strong()
+            .color(egui::Color32::WHITE),
+    );
 }
 
 pub fn dark_glass_frame(palette: &Palette) -> egui::Frame {
     egui::Frame::new()
-        .fill(palette.glass_dark)
+        .fill(palette.background_dark)
         .stroke(egui::Stroke::new(
             1.0_f32,
             egui::Color32::from_rgba_unmultiplied(255, 255, 255, 58),

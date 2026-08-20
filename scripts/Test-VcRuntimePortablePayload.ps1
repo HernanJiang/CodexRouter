@@ -19,11 +19,10 @@ if (-not (Test-Path -LiteralPath $BuilderPath -PathType Leaf)) {
 
 $validation = @(& $BuilderPath -ValidateStage $stageRoot)
 
-# 2.0.0 deploys one app-local VC runtime copy beside Codex-Router.exe; both
-# the Router GUI and the Router Host / CLIProxyAPI services live under app/ and
-# resolve it from the application root.
+# Keep an app-local VC runtime beside each executable location so a clean
+# Windows machine does not depend on the system-wide redistributable search.
 $runtimeNames = @('VCRUNTIME140.dll', 'VCRUNTIME140_1.dll', 'MSVCP140.dll')
-$destinationDirectories = @('')
+$destinationDirectories = @('', 'app')
 $expectedPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 $versions = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 

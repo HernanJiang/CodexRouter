@@ -13,7 +13,22 @@ fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+fn environment_override(name: &str) -> Option<&'static str> {
+    match name {
+        "AdminPassword" => Some("CODEX_ROUTER_ADMIN_PASSWORD"),
+        "LocalApiKey" => Some("CODEX_ROUTER_LOCAL_API_KEY"),
+        "CliManagementSecret" => Some("CODEX_ROUTER_CLI_MANAGEMENT_SECRET"),
+        _ => None,
+    }
+}
+
 pub fn read_text(name: &str) -> Result<Option<Zeroizing<String>>> {
+    if let Some(value) = environment_override(name)
+        .and_then(|variable| std::env::var(variable).ok())
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Ok(Some(Zeroizing::new(value)));
+    }
     let target = wide(&format!("CodexRouter/{name}"));
     let mut credential: *mut CREDENTIALW = null_mut();
     let found = unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) };
@@ -50,6 +65,9 @@ pub fn read_text(name: &str) -> Result<Option<Zeroizing<String>>> {
 }
 
 pub fn write_text(name: &str, secret: &str) -> Result<()> {
+    if environment_override(name).is_some_and(|variable| std::env::var_os(variable).is_some()) {
+        bail!("environment-overridden credential is read-only");
+    }
     if name.trim().is_empty() || name.contains('\0') {
         bail!("Windows credential name is invalid");
     }
@@ -78,6 +96,7 @@ pub fn write_text(name: &str, secret: &str) -> Result<()> {
     }
     Ok(())
 }
+
 pub fn delete_text(name: &str) -> Result<()> {
     let target = wide(&format!("CodexRouter/{name}"));
     let deleted = unsafe { CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0) } != 0;
@@ -89,4 +108,26 @@ pub fn delete_text(name: &str) -> Result<()> {
         return Err(error).context("Windows Credential Manager delete failed");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_host_runtime_credentials_have_environment_overrides() {
+        assert_eq!(
+            environment_override("AdminPassword"),
+            Some("CODEX_ROUTER_ADMIN_PASSWORD")
+        );
+        assert_eq!(
+            environment_override("LocalApiKey"),
+            Some("CODEX_ROUTER_LOCAL_API_KEY")
+        );
+        assert_eq!(
+            environment_override("CliManagementSecret"),
+            Some("CODEX_ROUTER_CLI_MANAGEMENT_SECRET")
+        );
+        assert_eq!(environment_override("AccountKey-1"), None);
+    }
 }

@@ -67,7 +67,8 @@ $vcRuntimeFiles = @(
 )
 
 $vcRuntimeDestinationDirectories = @(
-    ''
+    '',
+    'app'
 )
 
 $releaseScanRules = @(
@@ -320,6 +321,7 @@ function Assert-ReleaseLayout {
     foreach ($path in @(
         'Codex-Router.exe',
         'Start-Codex-Router.cmd',
+        'Start-FreshTest.bat',
         'LICENSE',
         'CHANGELOG.md',
         'README.md',
@@ -341,7 +343,12 @@ function Assert-ReleaseLayout {
     foreach ($name in $runtimeScripts) { [void]$allowedExact.Add("scripts/$name") }
     foreach ($name in $configFiles) { [void]$allowedExact.Add("config/$name") }
     foreach ($name in $staticLicenseFiles + $generatedLicenseFiles) { [void]$allowedExact.Add("licenses/$name") }
-    foreach ($name in $vcRuntimeFiles) { [void]$allowedExact.Add($name) }
+    foreach ($destinationDirectory in $vcRuntimeDestinationDirectories) {
+        foreach ($name in $vcRuntimeFiles) {
+            $relative = if ([string]::IsNullOrEmpty($destinationDirectory)) { $name } else { "$destinationDirectory/$name" }
+            [void]$allowedExact.Add($relative)
+        }
+    }
 
     foreach ($file in Get-ChildItem -LiteralPath $rootPath -Recurse -File -Force) {
         $relative = Get-NormalizedRelativePath -Root $rootPath -Path $file.FullName
@@ -357,6 +364,7 @@ function Assert-ReleaseLayout {
     $required = @(
         'Codex-Router.exe',
         'Start-Codex-Router.cmd',
+        'Start-FreshTest.bat',
         'CHANGELOG.md',
         'README.md',
         'README.zh-CN.md',
@@ -1216,6 +1224,7 @@ try {
     [IO.Directory]::CreateDirectory((Join-Path $staging 'app')) | Out-Null
     Copy-Item -LiteralPath $routerHostExe -Destination (Join-Path $staging 'app\codex-router-host.exe')
     Copy-ReleaseItem -RelativePath 'Start-Codex-Router.cmd'
+    Copy-ReleaseItem -RelativePath 'Start-FreshTest.bat'
     foreach ($relative in @(
         'app\cli-proxy-api.exe',
         $geminiCliPluginRelativePath,

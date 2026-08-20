@@ -166,7 +166,7 @@ impl LogSource {
     fn new(root: &Path, label: &'static str, relative: &'static str, kind: LogKind) -> Self {
         Self {
             label,
-            path: root.join("logs").join(relative),
+            path: crate::user_data::logs_root(root).join(relative),
             kind,
             offset: 0,
             pending: Vec::new(),
@@ -393,6 +393,18 @@ pub(crate) fn spawn(
     });
 }
 
+pub(crate) fn runtime_record_is_actionable(record: &str) -> bool {
+    let lower = record.to_ascii_lowercase();
+    if lower.contains("class=unclassified_error")
+        && !lower.contains("code=")
+        && !lower.contains("marker=")
+        && !lower.contains("status=")
+    {
+        return false;
+    }
+    true
+}
+
 pub(crate) fn signals_router_health_failure(record: &str) -> bool {
     let normalized = record.to_ascii_lowercase();
     if normalized.contains("class=upstream") && !normalized.contains("sqlite") {
@@ -426,7 +438,10 @@ fn format_diagnostic_line(label: &str, kind: LogKind, line: &str) -> Option<Stri
         LogKind::CliProxyApi => {
             is_cli_proxy_diagnostic(line).then(|| format_plain_diagnostic(label, line))
         }
-        LogKind::Stderr => Some(format_plain_diagnostic(label, line)),
+        LogKind::Stderr => {
+            let record = format_plain_diagnostic(label, line);
+            runtime_record_is_actionable(&record).then_some(record)
+        }
     }
 }
 
@@ -574,6 +589,14 @@ const STABLE_ERROR_MARKERS: &[&str] = &[
     "ROUTER_PORT_CONFLICT",
     "ROUTER_DEPLOY_NO_MODELS",
     "ROUTER_DEPLOY_NO_SERVABLE_MODEL",
+    "ROUTER_DEPLOY_COMPLIANCE_REQUIRED",
+    "ROUTER_DEPLOY_COMPLIANCE_ACCEPT_FAILED",
+    "ROUTER_DEPLOY_ADMIN_ACCOUNTS_FAILED",
+    "ROUTER_DEPLOY_GROUP_SYNC_FAILED",
+    "ROUTER_DEPLOY_API_CHANNELS_FAILED",
+    "ROUTER_DEPLOY_OAUTH_SYNC_FAILED",
+    "ROUTER_DEPLOY_COMPOSITE_FAILED",
+    "ROUTER_CONFIG_SAVE_NATIVE_APPLY_FAILED",
     "ROUTER_PROFILE_CREDENTIAL_MISSING",
     "ROUTER_PROFILE_CREDENTIAL_READ_FAILED",
     "ROUTER_PROFILE_CREDENTIAL_WRITE_FAILED",
@@ -972,6 +995,19 @@ mod tests {
         )
         .expect("error line is diagnostic");
         assert!(safe.contains("[CLIProxyAPI]"));
+    }
+
+    #[test]
+    fn unclassified_host_noise_is_not_actionable() {
+        assert!(!runtime_record_is_actionable(
+            "[Router Host] class=unclassified_error"
+        ));
+        assert!(runtime_record_is_actionable(
+            "[Router events] class=configuration | code=CR-CFG-0005"
+        ));
+        assert!(runtime_record_is_actionable(
+            "本机 Router 健康探测失败（1/3）：class=connection_refused"
+        ));
     }
 
     #[test]

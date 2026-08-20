@@ -6,7 +6,8 @@
 //! loop or a router-wide 502.
 
 use super::responses_compat::{
-    is_compact_path, is_exhausted_account_status, is_openai_family_model, is_responses_path,
+    is_chat_completions_path, is_compact_path, is_exhausted_account_status, is_openai_family_model,
+    is_responses_path,
     rewrite_poisoned_upstream_status, is_unsupported_image_error, rewrite_provider_json,
     rewrite_sse_text, sanitize_responses_request, sanitize_responses_request_aggressive,
     should_retry_after_upstream_error, sanitize_responses_request_without_images,
@@ -50,6 +51,7 @@ const STREAM_MAX_SILENCE: Duration = Duration::from_secs(1800);
 
 struct GatewayState {
     stop: std::sync::Arc<AtomicBool>,
+    thread: thread::JoinHandle<()>,
     listen: String,
     upstream: String,
     rate_limit_retries: u32,
@@ -95,22 +97,32 @@ pub fn ensure_responses_gateway(
         {
             return Ok(listen);
         }
-        state.stop.store(true, Ordering::Relaxed);
-        poke_listener(&state.listen);
+        let old = slot.take().expect("gateway state should still exist");
+        stop_gateway(old)?;
     }
     let stop = std::sync::Arc::new(AtomicBool::new(false));
     let listener_url = listen.clone();
     let upstream_url = upstream.clone();
     let thread_stop = stop.clone();
-    thread::Builder::new()
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let thread = thread::Builder::new()
         .name("codex-responses-gateway".to_owned())
         .spawn(move || {
-            run_gateway(listener_url, upstream_url, thread_stop, rate_limit_max_retries)
+            run_gateway(
+                listener_url,
+                upstream_url,
+                thread_stop,
+                rate_limit_max_retries,
+                ready_tx,
+            )
         })
         .context("failed to start the responses compatibility gateway")?;
-    wait_for_listen(&listen)?;
+    ready_rx
+        .recv_timeout(Duration::from_secs(3))
+        .context("responses compatibility gateway did not report readiness")??;
     *slot = Some(GatewayState {
         stop,
+        thread,
         listen: listen.clone(),
         upstream,
         rate_limit_retries: rate_limit_max_retries,
@@ -118,14 +130,23 @@ pub fn ensure_responses_gateway(
     Ok(listen)
 }
 
-pub fn stop_responses_gateway() {
+pub fn stop_responses_gateway() -> anyhow::Result<()> {
     let mut slot = gateway_slot()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     if let Some(state) = slot.take() {
-        state.stop.store(true, Ordering::Relaxed);
-        poke_listener(&state.listen);
+        stop_gateway(state)?;
     }
+    Ok(())
+}
+
+fn stop_gateway(state: GatewayState) -> anyhow::Result<()> {
+    state.stop.store(true, Ordering::Relaxed);
+    poke_listener(&state.listen);
+    state
+        .thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("responses compatibility gateway thread panicked"))
 }
 
 fn poke_listener(base: &str) {
@@ -148,30 +169,31 @@ fn socket_addr(base: &str) -> anyhow::Result<SocketAddr> {
         .with_context(|| format!("invalid address {host}:{port}"))
 }
 
-fn wait_for_listen(base: &str) -> anyhow::Result<()> {
-    let address = socket_addr(base)?;
-    for _ in 0..40 {
-        if TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    bail!("responses compatibility gateway did not start on {address}")
-}
-
 fn run_gateway(
     listen: String,
     upstream: String,
     stop: std::sync::Arc<AtomicBool>,
     rate_limit_max_retries: u32,
+    ready: std::sync::mpsc::SyncSender<anyhow::Result<()>>,
 ) {
-    let Ok(address) = socket_addr(&listen) else {
-        return;
+    let address = match socket_addr(&listen) {
+        Ok(address) => address,
+        Err(error) => {
+            let _ = ready.send(Err(error));
+            return;
+        }
     };
-    let Ok(listener) = TcpListener::bind(address) else {
-        return;
+    let listener = match TcpListener::bind(address) {
+        Ok(listener) => listener,
+        Err(error) => {
+            let _ = ready.send(Err(error).context(format!(
+                "responses compatibility gateway could not bind {address}"
+            )));
+            return;
+        }
     };
     let _ = listener.set_nonblocking(true);
+    let _ = ready.send(Ok(()));
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {
@@ -245,7 +267,7 @@ fn handle_client(
 
     let mut request_body = body;
     let mut openai_family = false;
-    if method == "POST" && is_responses_path(&path) {
+    if method == "POST" && (is_responses_path(&path) || is_chat_completions_path(&path)) {
         if let Ok(mut json_body) = serde_json::from_slice::<Value>(&request_body) {
             openai_family = json_body
                 .get("model")
@@ -919,6 +941,7 @@ fn forward_rewritten_json(
     }
     if let Ok(mut json) = serde_json::from_slice::<Value>(&body) {
         rewrite_provider_json(&mut json);
+        crate::logic::responses_compat::strip_think_tags_from_value(&mut json);
         body = serde_json::to_vec(&json)?;
     }
     send_raw(client, &rebuild_response(200, headers, &body))?;
@@ -958,6 +981,23 @@ fn send_raw(stream: &mut TcpStream, payload: &[u8]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn stop_waits_until_the_gateway_port_can_be_rebound() {
+        static GATEWAY_TEST: Mutex<()> = Mutex::new(());
+        let _guard = GATEWAY_TEST.lock().unwrap();
+        stop_responses_gateway().unwrap();
+        let reserved = TcpListener::bind("127.0.0.1:0").unwrap();
+        let gateway_port = reserved.local_addr().unwrap().port();
+        assert!(gateway_port > 2);
+        drop(reserved);
+        let host = format!("http://127.0.0.1:{}", gateway_port - 2);
+        ensure_responses_gateway(&host, DEFAULT_RATE_LIMIT_RETRIES).unwrap();
+        stop_responses_gateway().unwrap();
+        TcpListener::bind((Ipv4Addr::LOCALHOST, gateway_port))
+            .expect("gateway stop returned before releasing its listener");
+    }
     use std::io::Write;
     use std::net::TcpListener;
 

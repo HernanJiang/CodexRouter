@@ -1,8 +1,8 @@
 use crate::config::{ModelConfig, RouterConfig};
 use crate::logic::{
-    canonical_route_model_id, is_eligible_oauth_api_fallback, model_identity,
+    canonical_route_model_id, is_eligible_oauth_api_fallback, model_identity, model_route_policy,
     recommended_model_display_name, resolve_context_window, resolve_multimodal, resolve_reasoning,
-    same_model_identity, slugify,
+    same_model_identity, slugify, ModelRoutePolicy,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -88,7 +88,7 @@ fn oauth_platform_for_catalog(model: &ModelConfig) -> String {
     }
     let id = model.model.trim().to_ascii_lowercase();
     if id.contains("gemini") {
-        return "antigravity".to_owned();
+        return "gemini".to_owned();
     }
     if id.contains("grok") {
         return "grok".to_owned();
@@ -129,8 +129,10 @@ fn is_restricted_oauth_model(model: &ModelConfig) -> bool {
 }
 
 fn is_openai_catalog_model(model: &ModelConfig) -> bool {
-    matches!(oauth_platform_for_catalog(model).as_str(), "openai")
-        || crate::logic::responses_compat::is_openai_family_model(&model.model)
+    matches!(
+        oauth_platform_for_catalog(model).as_str(),
+        "openai" | "chatgpt"
+    ) && is_oauth(model)
 }
 
 /// Build the route plan that determines which model entries appear in the Codex
@@ -175,13 +177,15 @@ pub fn build_route_plan(cfg: &RouterConfig) -> Vec<ModelRoute> {
     descriptors
         .iter()
         .map(|d| {
+            let policy_allows_fallback = fallback_enabled
+                && model_route_policy(cfg, &d.model_id) != ModelRoutePolicy::SubscriptionOnly;
             let matching_oauth: Vec<RouteDescriptor> = selected_oauth
                 .iter()
                 .filter(|o| same_model_identity(&o.model_id, &d.model_id))
                 .cloned()
                 .collect();
             let is_oauth = d.source == "oauth";
-            let matching_api_fallbacks: Vec<RouteDescriptor> = if is_oauth && fallback_enabled {
+            let matching_api_fallbacks: Vec<RouteDescriptor> = if is_oauth && policy_allows_fallback {
                 descriptors
                     .iter()
                     .filter(|x| {
@@ -204,7 +208,7 @@ pub fn build_route_plan(cfg: &RouterConfig) -> Vec<ModelRoute> {
 
             if is_oauth {
                 include_in_catalog = d.selected && catalog_ids.insert(public_model_id.clone());
-            } else if fallback_enabled && !matching_oauth.is_empty() {
+            } else if policy_allows_fallback && !matching_oauth.is_empty() {
                 is_fallback = matching_oauth
                     .iter()
                     .any(|oauth| is_eligible_oauth_api_fallback(cfg, &oauth.model, &d.model));
@@ -224,7 +228,7 @@ pub fn build_route_plan(cfg: &RouterConfig) -> Vec<ModelRoute> {
                         .into_iter()
                         .collect();
                 }
-            } else if !fallback_enabled {
+            } else if !policy_allows_fallback {
                 let same_count = descriptors
                     .iter()
                     .filter(|x| x.selected && same_model_identity(&x.model_id, &d.model_id))
@@ -237,7 +241,7 @@ pub fn build_route_plan(cfg: &RouterConfig) -> Vec<ModelRoute> {
                 include_in_catalog = catalog_ids.insert(public_model_id.clone());
             }
 
-            if is_oauth && fallback_enabled && !matching_api_fallbacks.is_empty() {
+            if is_oauth && policy_allows_fallback && !matching_api_fallbacks.is_empty() {
                 is_merged_oauth_route = true;
             }
 
@@ -580,6 +584,42 @@ mod tests {
     }
 
     #[test]
+    fn subscription_only_policy_keeps_oauth_and_api_as_separate_routes() {
+        let mut cfg = crate::config::RouterConfig {
+            oauth_account_ids: Some(vec![1]),
+            oauth_fallback: OAuthFallback {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cfg.models.push(ModelConfig {
+            model: "grok-4.5".to_owned(),
+            source: "oauth".to_owned(),
+            oauth_account_id: 1,
+            ..Default::default()
+        });
+        cfg.models.push(ModelConfig {
+            model: "x-ai/grok-4.5".to_owned(),
+            source: "apikey".to_owned(),
+            base_url: "https://api.example.com/v1".to_owned(),
+            credential_name: "key".to_owned(),
+            ..Default::default()
+        });
+        crate::logic::set_model_route_policy(
+            &mut cfg,
+            "grok-4.5",
+            crate::logic::ModelRoutePolicy::SubscriptionOnly,
+        );
+
+        let plan = build_route_plan(&cfg);
+        let oauth = plan.iter().find(|route| route.source == "oauth").unwrap();
+        let api = plan.iter().find(|route| route.source != "oauth").unwrap();
+        assert!(!oauth.is_merged_oauth_route);
+        assert!(!api.is_oauth_fallback);
+    }
+
+    #[test]
     fn split_public_model_id_is_stable_for_same_inputs() {
         let model = ModelConfig {
             model: "gpt-5.6-sol".to_owned(),
@@ -712,7 +752,54 @@ mod tests {
             .unwrap()
             .contains("GPT-5"));
         assert!(catalog[0].get("apply_patch_tool_type").is_none());
-        let _ = catalog_requires_chatgpt_allowlist(&cfg);
+        let chatgpt_api = catalog
+            .iter()
+            .find(|entry| entry["slug"] == "gpt-5.6-sol")
+            .unwrap();
+        assert_eq!(chatgpt_api["supports_search_tool"], false);
+        assert_eq!(chatgpt_api["multi_agent_version"], "v1");
+        assert!(chatgpt_api["additional_speed_tiers"]
+            .as_array()
+            .is_some_and(|tiers| tiers.iter().any(|tier| tier == "fast")));
+        assert!(!catalog_requires_chatgpt_allowlist(&cfg));
+    }
+
+    #[test]
+    fn official_search_and_v2_stay_on_chatgpt_oauth_only() {
+        let oauth_cfg = crate::config::RouterConfig {
+            models: vec![ModelConfig {
+                model: "gpt-5.6-sol".to_owned(),
+                source: "oauth".to_owned(),
+                oauth_platform: "openai".to_owned(),
+                oauth_account_id: 1,
+                ..Default::default()
+            }],
+            oauth_account_ids: Some(vec![1]),
+            ..Default::default()
+        };
+        let relay_cfg = crate::config::RouterConfig {
+            models: vec![ModelConfig {
+                model: "openai/gpt-5.6-sol".to_owned(),
+                source: "apikey".to_owned(),
+                base_url: "https://openrouter.ai/api/v1".to_owned(),
+                credential_name: "or".to_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let gemini = ModelConfig {
+            model: "gemini-3.1-pro-high".to_owned(),
+            source: "oauth".to_owned(),
+            oauth_account_id: 2,
+            ..Default::default()
+        };
+        let oauth = &build_model_catalog(&oauth_cfg)[0];
+        let relay = &build_model_catalog(&relay_cfg)[0];
+        assert_eq!(oauth["supports_search_tool"], true);
+        assert_eq!(oauth["multi_agent_version"], "v2");
+        assert_eq!(relay["supports_search_tool"], false);
+        assert_eq!(relay["multi_agent_version"], "v1");
+        assert_eq!(oauth_platform_for_catalog(&gemini), "gemini");
     }
 
     #[test]

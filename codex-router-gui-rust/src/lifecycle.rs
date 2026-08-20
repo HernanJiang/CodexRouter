@@ -41,13 +41,36 @@ pub struct LifecyclePorts {
     pub cli: u16,
 }
 
+pub fn adopt_isolated_host_if_foreign(
+    router_root: &Path,
+    config: &mut RouterConfig,
+) -> Option<String> {
+    let Ok(ports) = LifecyclePorts::from_config(config) else {
+        return None;
+    };
+    let expected = host_executable(router_root);
+    match listener_process_id(ports.host, &expected, ServiceKind::RouterHost) {
+        Err(error) => {
+            let text = error.to_string();
+            if text.contains("ROUTER_INSTALL_ROOT_CONFLICT") || text.contains("ROUTER_PORT_CONFLICT")
+            {
+                config.deploy.sub2api_host = "http://127.0.0.1:28080".to_owned();
+                Some(config.deploy.sub2api_host.clone())
+            } else {
+                None
+            }
+        }
+        Ok(_) => None,
+    }
+}
+
 impl LifecyclePorts {
     fn from_config(config: &RouterConfig) -> anyhow::Result<Self> {
-        let host = loopback_base_uri(&config.deploy.sub2api_host)?
+        let configured = loopback_base_uri(&config.deploy.sub2api_host)?
             .port_or_known_default()
             .context("ROUTER_CONFIG_INVALID_BASE_URI: Router Host port is missing")?;
         Ok(Self {
-            host,
+            host: environment_port("CODEX_ROUTER_HOST_PORT", configured)?,
             cli: environment_port("CODEX_ROUTER_CLI_PORT", DEFAULT_CLI_PORT)?,
         })
     }
@@ -344,7 +367,11 @@ fn assert_interruption_allowed(process_id: u32, port: u16, operation: &str) -> a
 }
 
 fn terminate_verified_process(process_id: u32, expected_path: &Path) -> anyhow::Result<()> {
-    let actual = process_path(process_id)?;
+    let actual = match process_path(process_id) {
+        Ok(path) => path,
+        Err(_) if !process_exists(process_id) => return Ok(()),
+        Err(error) => return Err(error),
+    };
     if !paths_equal(&actual, expected_path) {
         bail!("refusing to terminate an unverified process");
     }
@@ -458,7 +485,7 @@ fn ensure_directories(router_root: &Path) -> anyhow::Result<()> {
         data_root.clone(),
         data_root.join("pids"),
         data_root.join("locks"),
-        router_root.join("logs"),
+        user_data::logs_root(router_root),
     ] {
         std::fs::create_dir_all(directory)?;
     }
@@ -471,7 +498,7 @@ fn start_router_host(
     proxy_url: Option<&str>,
 ) -> anyhow::Result<u32> {
     let data_root = user_data::data_root(router_root);
-    let logs = router_root.join("logs");
+    let logs = user_data::logs_root(router_root);
     let stdout_path = logs.join("router-host-stdout.log");
     let stderr_path = logs.join("router-host-stderr.log");
     rotate_log(&stdout_path);
@@ -703,12 +730,26 @@ pub fn stop_services_with_config(
             "Stop Router",
         )?
     };
-    logic::responses_gateway::stop_responses_gateway();
+    logic::responses_gateway::stop_responses_gateway()
+        .context("failed to stop the responses compatibility gateway")?;
     let ports = LifecyclePorts::from_config(config)?;
     let data_root = user_data::data_root(router_root);
     let host_path = host_executable(router_root);
-    let host = listener_process_id(ports.host, &host_path, ServiceKind::RouterHost)?;
-    if let Some(process_id) = host {
+    let pid_file = data_root.join(r"pids\router-host.pid");
+    let saved_host = read_pid_file(&pid_file).filter(|process_id| {
+        process_path(*process_id)
+            .is_ok_and(|path| paths_equal(&path, &host_path))
+    });
+    let listening_host = listener_process_id(ports.host, &host_path, ServiceKind::RouterHost)?;
+    if saved_host.is_some()
+        && listening_host.is_some()
+        && saved_host != listening_host
+    {
+        bail!("Router Host PID file and listener refer to different processes");
+    }
+    let cli_path = cli_executable(router_root);
+    let listening_cli = listener_process_id(ports.cli, &cli_path, ServiceKind::CliProxyApi)?;
+    if let Some(process_id) = saved_host.or(listening_host) {
         if !force {
             assert_interruption_allowed(process_id, ports.host, "Stop Router")?;
         }
@@ -717,15 +758,32 @@ pub fn stop_services_with_config(
     // The CLI is bound to the host through a kill-on-close Job Object and
     // normally dies with it; sweep the private port anyway in case the job
     // assignment failed or an older build left an orphan behind.
-    let cli_path = cli_executable(router_root);
-    if let Some(process_id) = listener_process_id(ports.cli, &cli_path, ServiceKind::CliProxyApi)? {
-        terminate_verified_process(process_id, &cli_path)?;
+    if let Some(captured_process_id) = listening_cli {
+        match listener_process_id(ports.cli, &cli_path, ServiceKind::CliProxyApi)? {
+            Some(current_process_id) if current_process_id == captured_process_id => {
+                terminate_verified_process(current_process_id, &cli_path)?;
+            }
+            Some(_) => bail!("CLIProxyAPI listener owner changed during shutdown"),
+            None => {}
+        }
     }
-    let _ = std::fs::remove_file(data_root.join(r"pids\router-host.pid"));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let status = loop {
+        let status = status_services_with_config(router_root, config)?;
+        let host_alive = saved_host.is_some_and(process_exists);
+        if !host_alive && status.services.iter().all(|service| !service.running) {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            bail!("ROUTER_SHUTDOWN_INCOMPLETE: managed processes or listeners are still active");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let _ = std::fs::remove_file(pid_file);
     // Drop stale pre-2.0 bookkeeping left behind by an upgraded installation.
     let _ = std::fs::remove_file(data_root.join(r"pids\sub2api.pid"));
     let _ = std::fs::remove_file(data_root.join(r"pids\sub2api-network.hmac"));
-    status_services_with_config(router_root, config)
+    Ok(status)
 }
 
 pub fn status_services(router_root: &Path) -> anyhow::Result<LifecycleStatus> {

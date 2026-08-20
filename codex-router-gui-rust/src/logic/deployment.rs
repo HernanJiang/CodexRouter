@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use url::Url;
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MANAGED_GROUP_NAME: &str = "Codex-Router";
 const MANAGED_PROXY_NAME: &str = "Codex-Router / Auto-detected outbound proxy";
 
@@ -170,7 +170,11 @@ where
 
     check_cancel(cancel)?;
     on_log("[4/7] Checking Router compliance status...".to_owned());
-    let summary = sync_router_state(&admin, router_root, cfg, proxy_runtime, cancel, &mut on_log)?;
+    let summary = sync_router_state(&admin, router_root, cfg, proxy_runtime, cancel, &mut on_log)
+        .map_err(|error| {
+            on_log(format!("deployment_diagnostic {error:#}"));
+            error
+        })?;
     on_log("CR-FLAG STAGE-06-CODEX-OK".to_owned());
     on_log("[7/7] Deployment complete.".to_owned());
     on_log("CR-FLAG STAGE-07-DONE".to_owned());
@@ -193,10 +197,15 @@ fn accept_compliance(admin: &impl AdminApi, cfg: &RouterConfig) -> anyhow::Resul
         bail!("ROUTER_DEPLOY_COMPLIANCE_REQUIRED: accept the local deployment commitment first")
     }
     let phrase = usage::string(&compliance, "ack_phrase_zh");
-    admin.post(
-        "/api/v1/admin/compliance/accept",
-        Some(&json!({ "phrase": phrase, "language": "zh" })),
-    )?;
+    if phrase.trim().is_empty() {
+        bail!("ROUTER_DEPLOY_COMPLIANCE_ACCEPT_FAILED: CR-VAL-0003 empty ack phrase")
+    }
+    admin
+        .post(
+            "/api/v1/admin/compliance/accept",
+            Some(&json!({ "phrase": phrase, "language": "zh" })),
+        )
+        .context("ROUTER_DEPLOY_COMPLIANCE_ACCEPT_FAILED: CR-VAL-0003")?;
     Ok(())
 }
 
@@ -237,9 +246,16 @@ where
     if initial_models.is_empty() {
         bail!("ROUTER_DEPLOY_NO_SERVABLE_MODEL: no routed model is available")
     }
-    let mut accounts = list_accounts(admin)?;
-    let group_id = ensure_group(admin, &initial_models)?;
-    let proxy = sync_managed_proxy(admin, proxy_runtime)?;
+    let mut accounts = list_accounts(admin).context("ROUTER_DEPLOY_ADMIN_ACCOUNTS_FAILED")?;
+    let group_id =
+        ensure_group(admin, &initial_models).context("ROUTER_DEPLOY_GROUP_SYNC_FAILED")?;
+    let proxy = match sync_managed_proxy(admin, proxy_runtime) {
+        Ok(proxy) => proxy,
+        Err(error) => {
+            on_log(format!("deployment_diagnostic {error:#}"));
+            ManagedProxy::default()
+        }
+    };
     let managed_names = sync_api_channels(
         admin,
         router_root,
@@ -251,9 +267,10 @@ where
         &mut accounts,
         cancel,
         on_log,
-    )?;
+    )
+    .context("ROUTER_DEPLOY_API_CHANNELS_FAILED")?;
     check_cancel(cancel)?;
-    accounts = list_accounts(admin)?;
+    accounts = list_accounts(admin).context("ROUTER_DEPLOY_ADMIN_ACCOUNTS_FAILED")?;
     let isolated = sync_oauth_and_stale_accounts(
         admin,
         cfg,
@@ -264,7 +281,8 @@ where
         &managed_names,
         &accounts,
         cancel,
-    )?;
+    )
+    .context("ROUTER_DEPLOY_OAUTH_SYNC_FAILED")?;
     let servable = servable_routes(&route_plan, &isolated, cfg);
     let visible_models = servable
         .iter()
@@ -274,13 +292,15 @@ where
     if visible_models.is_empty() {
         bail!("ROUTER_DEPLOY_NO_SERVABLE_MODEL: no model can currently be served")
     }
-    ensure_group(admin, &visible_models)?;
+    ensure_group(admin, &visible_models).context("ROUTER_DEPLOY_GROUP_SYNC_FAILED")?;
     let platform_by_id = account_platforms(&accounts);
     let composite = build_composite_routes(&servable, &platform_by_id, &isolated);
-    sync_composite_routes(admin, group_id, &composite)?;
+    sync_composite_routes(admin, group_id, &composite)
+        .context("ROUTER_DEPLOY_COMPOSITE_FAILED")?;
     disable_overlapping_recovery_plans(admin, cfg);
-    ensure_local_api_key(admin, group_id)?;
-    super::codex_toml::write_codex_config_from_router_config(cfg, router_root)?;
+    ensure_local_api_key(admin, group_id).context("ROUTER_DEPLOY_LOCAL_KEY_FAILED")?;
+    super::codex_toml::write_codex_config_from_router_config(cfg, router_root)
+        .context("ROUTER_DEPLOY_CODEX_CONFIG_FAILED")?;
     on_log(format!(
         "Configured {} model channel(s); visible models={}; composite routes={}",
         cfg.models.len(),
@@ -326,9 +346,36 @@ fn ensure_group(admin: &impl AdminApi, models: &[String]) -> anyhow::Result<i64>
     });
     let response = if let Some(existing) = existing {
         let id = usage::integer(existing, "id");
-        admin.put(&format!("/api/v1/admin/groups/{id}"), &group_body)?
+        if id <= 0 {
+            bail!("ROUTER_DEPLOY_GROUP_INVALID: existing Codex-Router group has no id")
+        }
+        match admin.put(&format!("/api/v1/admin/groups/{id}"), &group_body) {
+            Ok(response) => response,
+            Err(_) => return Ok(id),
+        }
     } else {
-        admin.post("/api/v1/admin/groups", Some(&group_body))?
+        match admin.post("/api/v1/admin/groups", Some(&group_body)) {
+            Ok(response) => response,
+            Err(error) => {
+                let body = usage::data(
+                    admin
+                        .get("/api/v1/admin/groups/all?include_inactive=true")
+                        .context(format!(
+                            "ROUTER_DEPLOY_GROUP_SYNC_FAILED: create failed and reload failed: {error}"
+                        ))?,
+                );
+                if let Some(created) = usage::array(&body)
+                    .iter()
+                    .find(|group| usage::string(group, "name") == MANAGED_GROUP_NAME)
+                {
+                    let id = usage::integer(created, "id");
+                    if id > 0 {
+                        return Ok(id);
+                    }
+                }
+                return Err(error).context("ROUTER_DEPLOY_GROUP_SYNC_FAILED: create group failed");
+            }
+        }
     };
     let response = usage::data(response);
     let id = usage::integer(&response, "id").max(
@@ -358,7 +405,6 @@ fn sync_api_channels<F>(
 where
     F: FnMut(String),
 {
-    let priorities = super::oauth_routing_priorities(Some(&cfg.oauth_fallback));
     let mut managed_names = HashSet::new();
     for (model, route) in cfg.models.iter().zip(routes) {
         check_cancel(cancel)?;
@@ -438,6 +484,7 @@ where
             .unwrap_or(model.priority.max(1));
         let mut priority = model.priority.max(1);
         if route.is_oauth_fallback {
+            let priorities = super::model_oauth_routing_priorities(cfg, &model.model);
             priority = super::effective_api_priority(
                 priority,
                 minimum_priority,
@@ -557,12 +604,21 @@ fn sync_oauth_and_stale_accounts(
             }
             groups.sort_unstable();
             groups.dedup();
+            let configured_priority = cfg
+                .models
+                .iter()
+                .filter(|model| model.source == "oauth" && model.oauth_account_id == id)
+                .map(|model| model.priority)
+                .filter(|priority| (1..=999).contains(priority))
+                .min();
             let existing_priority = usage::integer(&detail, "priority") as i32;
-            let priority = if (1..=999).contains(&existing_priority) {
-                existing_priority
-            } else {
-                default_priority
-            };
+            let priority = configured_priority.unwrap_or_else(|| {
+                if (1..=999).contains(&existing_priority) {
+                    existing_priority
+                } else {
+                    default_priority
+                }
+            });
             let current_proxy = usage::integer(&detail, "proxy_id");
             let desired_proxy = reconcile_proxy_id(
                 current_proxy,
@@ -930,18 +986,12 @@ fn sync_managed_proxy(
     }
     let body = usage::data(admin.get("/api/v1/admin/proxies?page=1&page_size=200")?);
     let items = usage::array(usage::get(&body, "items").unwrap_or(&body));
-    let managed = items
-        .iter()
-        .filter(|proxy| usage::string(proxy, "name") == MANAGED_PROXY_NAME)
-        .collect::<Vec<_>>();
-    if managed.len() > 1 {
-        bail!("ROUTER_PROXY_MANAGED_RESOURCE_CONFLICT: duplicate managed proxy records")
-    }
-    let existing_id = managed
-        .first()
-        .map(|proxy| usage::integer(proxy, "id"))
-        .unwrap_or_default();
     let Some(proxy_url) = runtime.settings.proxy_url.as_deref() else {
+        let existing_id = items
+            .iter()
+            .find(|proxy| usage::string(proxy, "name") == MANAGED_PROXY_NAME)
+            .map(|proxy| usage::integer(proxy, "id"))
+            .unwrap_or_default();
         return Ok(ManagedProxy {
             managed_id: existing_id,
             desired_id: 0,
@@ -951,6 +1001,11 @@ fn sync_managed_proxy(
         bail!("ROUTER_PROXY_CREDENTIAL_STORAGE_UNSUPPORTED")
     }
     let url = Url::parse(proxy_url).context("ROUTER_PROXY_UNSUPPORTED: invalid proxy URL")?;
+    let existing_id = items
+        .iter()
+        .find(|proxy| proxy_record_matches(proxy, &url))
+        .map(|proxy| usage::integer(proxy, "id"))
+        .unwrap_or_default();
     let proxy_body = json!({
         "name": MANAGED_PROXY_NAME,
         "protocol": url.scheme(),
@@ -960,19 +1015,51 @@ fn sync_managed_proxy(
         "expiry_warn_days": 0,
     });
     let id = if existing_id > 0 {
-        admin.put(&format!("/api/v1/admin/proxies/{existing_id}"), &proxy_body)?;
+        let _ = admin.put(&format!("/api/v1/admin/proxies/{existing_id}"), &proxy_body);
         existing_id
     } else {
-        let created = usage::data(admin.post("/api/v1/admin/proxies", Some(&proxy_body))?);
-        usage::integer(&created, "id")
+        match admin.post("/api/v1/admin/proxies", Some(&proxy_body)) {
+            Ok(created) => usage::integer(&usage::data(created), "id"),
+            Err(error) => {
+                let text = error.to_string();
+                if text.contains("CR-PRX-0001") || text.contains("http=409") {
+                    let body = usage::data(
+                        admin.get("/api/v1/admin/proxies?page=1&page_size=200")?,
+                    );
+                    usage::array(usage::get(&body, "items").unwrap_or(&body))
+                        .iter()
+                        .find(|proxy| proxy_record_matches(proxy, &url))
+                        .map(|proxy| usage::integer(proxy, "id"))
+                        .unwrap_or_default()
+                } else {
+                    return Err(error);
+                }
+            }
+        }
     };
     if id <= 0 {
-        bail!("ROUTER_PROXY_MANAGED_RESOURCE_INVALID")
+        return Ok(ManagedProxy::default());
     }
     Ok(ManagedProxy {
         managed_id: id,
         desired_id: id,
     })
+}
+
+fn proxy_record_matches(proxy: &Value, url: &Url) -> bool {
+    if usage::string(proxy, "name") == MANAGED_PROXY_NAME {
+        return true;
+    }
+    let host = usage::string(proxy, "host");
+    let protocol = usage::string(proxy, "protocol");
+    let port = usage::integer(proxy, "port");
+    let wanted_host = url.host_str().unwrap_or_default();
+    let wanted_port = i64::from(url.port_or_known_default().unwrap_or_default());
+    let wanted_url = format!("{}://{wanted_host}:{wanted_port}", url.scheme());
+    (host.eq_ignore_ascii_case(wanted_host)
+        && port == wanted_port
+        && (protocol.is_empty() || protocol.eq_ignore_ascii_case(url.scheme())))
+        || usage::string(proxy, "normalized_url").eq_ignore_ascii_case(&wanted_url)
 }
 
 fn reconcile_proxy_id(current: i64, managed: ManagedProxy, should_use: bool) -> Option<i64> {
@@ -1969,5 +2056,35 @@ mod tests {
         };
         assert_eq!(api_account_concurrency(&volcengine), 2);
         assert_eq!(api_account_concurrency(&generic), 8);
+    }
+
+    #[test]
+    fn sync_managed_proxy_reuses_an_existing_url_instead_of_creating_a_duplicate() {
+        let path = "/api/v1/admin/proxies?page=1&page_size=200";
+        let admin = MockAdmin::default().with_response(
+            path,
+            json!({"items":[{
+                "id": 8,
+                "name": "legacy-proxy",
+                "protocol": "http",
+                "host": "127.0.0.1",
+                "port": 7890
+            }]}),
+        );
+        let runtime = ProxyRuntime {
+            settings: crate::proxy::ProxySettings {
+                mode: "auto".to_owned(),
+                source: "environment".to_owned(),
+                proxy_url: Some("http://127.0.0.1:7890".to_owned()),
+                no_proxy: String::new(),
+                has_credentials: false,
+                supports_account_binding: false,
+                diagnostic: String::new(),
+            },
+            targets: Default::default(),
+        };
+        let proxy = sync_managed_proxy(&admin, &runtime).unwrap();
+        assert_eq!(proxy.desired_id, 8);
+        assert!(admin.calls().iter().all(|call| call.method != "POST"));
     }
 }

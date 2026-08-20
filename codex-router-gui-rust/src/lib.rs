@@ -3,6 +3,11 @@ pub mod control_plane;
 pub mod credentials;
 pub mod data_ops;
 pub mod error_codes;
+pub mod oauth_credentials;
+#[path = "logic/responses_compat.rs"]
+pub mod responses_compat;
+#[path = "logic/usage/router_control.rs"]
+pub(crate) mod router_usage;
 pub mod routing;
 pub mod state;
 pub mod telemetry;

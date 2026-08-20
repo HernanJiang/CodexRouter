@@ -8,6 +8,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use url::Url;
 use zeroize::Zeroizing;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +46,10 @@ impl Provider {
         matches!(self, Self::OpenAi | Self::Antigravity | Self::Grok)
     }
 
+    fn router_owns_callback(self) -> bool {
+        matches!(self, Self::Grok)
+    }
+
     fn callback_port(self) -> Option<u16> {
         match self {
             Self::OpenAi => Some(1455),
@@ -77,7 +82,7 @@ impl Provider {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Prompt {
     GeminiConfiguration { detected_project_id: String },
-    AuthorizationCode { provider: Provider },
+    AuthorizationCode { provider: Provider, manual: bool },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,17 +118,24 @@ struct CallbackListeners {
 impl CallbackListeners {
     fn bind(port: u16) -> anyhow::Result<Self> {
         let mut listeners = Vec::new();
+        let mut failures = Vec::new();
         for address in [
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port),
             SocketAddr::new(Ipv6Addr::LOCALHOST.into(), port),
         ] {
-            if let Ok(listener) = TcpListener::bind(address) {
-                listener.set_nonblocking(true)?;
-                listeners.push(listener);
+            match TcpListener::bind(address) {
+                Ok(listener) => {
+                    listener.set_nonblocking(true)?;
+                    listeners.push(listener);
+                }
+                Err(error) => failures.push(format!("{address}: {error}")),
             }
         }
-        if listeners.is_empty() {
-            bail!("ROUTER_OAUTH_PORT_IN_USE: class=configuration")
+        if listeners.len() != 2 {
+            bail!(
+                "ROUTER_OAUTH_PORT_IN_USE: callback port {port} is not exclusively available ({}); use the manual callback URL flow; class=configuration",
+                failures.join("; ")
+            )
         }
         Ok(Self { listeners })
     }
@@ -180,6 +192,19 @@ pub fn prepare(
         .context("ROUTER_OAUTH_PREPARE_ADMIN_LOGIN")?;
     usage::retry_account_read(|| admin.get("/api/v1/admin/compliance", Duration::from_secs(10)))
         .context("ROUTER_OAUTH_PREPARE_COMPLIANCE")?;
+    let capabilities = usage::data(usage::retry_account_read(|| {
+        admin.get(
+            "/api/v1/admin/oauth/capabilities",
+            Duration::from_secs(10),
+        )
+    })?);
+    if usage::get(&capabilities, "ready").and_then(Value::as_bool) != Some(true)
+        || !usage::array(usage::get(&capabilities, "providers").unwrap_or(&Value::Null))
+            .iter()
+            .any(|item| item.as_str() == Some(provider))
+    {
+        bail!("ROUTER_OAUTH_PREPARE_PROVIDER_ADAPTER: class=invalid_response")
+    }
     Ok(())
 }
 
@@ -224,9 +249,15 @@ where
     }
 
     let listeners = provider
-        .callback_port()
-        .map(CallbackListeners::bind)
-        .transpose()?;
+        .router_owns_callback()
+        .then(|| provider.callback_port())
+        .flatten()
+        .and_then(|port| CallbackListeners::bind(port).ok());
+    let cli_callback_unavailable = provider.automatic_callback()
+        && !provider.router_owns_callback()
+        && provider
+            .callback_port()
+            .is_some_and(|port| CallbackListeners::bind(port).is_err());
     let auth = create_authorization(&admin, provider, &gemini)?;
     let mut auth_url = usage::string(&auth, "auth_url");
     let session_id = usage::string(&auth, "session_id");
@@ -239,18 +270,29 @@ where
     }
     open_authorization_url(&auth_url)?;
 
-    let (code, state) = if provider.automatic_callback() {
-        listeners.as_ref().context("class=configuration")?.receive(
+    let automatic_listener = if provider.router_owns_callback() {
+        listeners.as_ref()
+    } else {
+        None
+    };
+    let (code, state) = if let Some(listener) = automatic_listener {
+        listener.receive(
             &expected_state,
             Duration::from_secs(300),
             cancel,
         )?
+    } else if provider.automatic_callback()
+        && !provider.router_owns_callback()
+        && !cli_callback_unavailable
+    {
+        (Zeroizing::new(String::new()), expected_state.clone())
     } else {
-        match prompt(Prompt::AuthorizationCode { provider })? {
-            PromptResponse::AuthorizationCode(code) if !code.trim().is_empty() => (
-                Zeroizing::new(code.trim().to_owned()),
-                expected_state.clone(),
-            ),
+        let manual = provider.automatic_callback()
+            && (listeners.is_none() || cli_callback_unavailable);
+        match prompt(Prompt::AuthorizationCode { provider, manual })? {
+            PromptResponse::AuthorizationCode(code) if !code.trim().is_empty() => {
+                parse_manual_authorization(code.trim(), &expected_state)?
+            }
             PromptResponse::Cancelled => bail!("ROUTER_OAUTH_CANCELLED: class=cancelled"),
             PromptResponse::AuthorizationCode(_) => bail!("class=configuration"),
             PromptResponse::GeminiConfiguration { .. } => bail!("class=configuration"),
@@ -272,8 +314,48 @@ where
         &gemini,
     )?;
     let result = reconcile_new_account(&admin, provider, created, &existing, group_id)?;
+    let models = super::load_live_oauth_models(&admin, result.account_id, provider.as_str())
+        .context("ROUTER_OAUTH_MODEL_REGISTRY_NOT_READY")?;
+    if models.is_empty() {
+        bail!("ROUTER_OAUTH_MODEL_REGISTRY_EMPTY: class=invalid_response")
+    }
     let _ = ensure_scheduled_recovery(&admin, result.account_id, provider.recovery_model());
     Ok(result)
+}
+
+fn parse_manual_authorization(
+    input: &str,
+    expected_state: &str,
+) -> anyhow::Result<(Zeroizing<String>, String)> {
+    let trimmed = input.trim();
+    if let Ok(url) = Url::parse(trimmed) {
+        let mut code = None;
+        let mut state = None;
+        let mut callback_error = None;
+        for (name, value) in url.query_pairs() {
+            match name.as_ref() {
+                "code" => code = Some(value.into_owned()),
+                "state" => state = Some(value.into_owned()),
+                "error" => callback_error = Some(value.into_owned()),
+                _ => {}
+            }
+        }
+        if callback_error.is_some() {
+            bail!("ROUTER_OAUTH_CALLBACK_REJECTED: class=authentication")
+        }
+        let state = state.context("ROUTER_OAUTH_STATE_MISSING: class=configuration")?;
+        if state != expected_state {
+            bail!("ROUTER_OAUTH_STATE_MISMATCH: class=authentication")
+        }
+        let code = code
+            .filter(|value| !value.trim().is_empty())
+            .context("ROUTER_OAUTH_CODE_MISSING: class=configuration")?;
+        return Ok((Zeroizing::new(code), state));
+    }
+    Ok((
+        Zeroizing::new(trimmed.to_owned()),
+        expected_state.to_owned(),
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -566,7 +648,7 @@ fn create_account(
         )?));
     }
 
-    let (path, exchange_body) = match provider {
+    let (path, mut exchange_body) = match provider {
         Provider::Anthropic => (
             "/api/v1/admin/accounts/exchange-code",
             json!({ "session_id": session_id, "code": code }),
@@ -594,7 +676,32 @@ fn create_account(
         ),
         Provider::OpenAi => unreachable!(),
     };
-    let tokens = usage::data(admin.post(path, Some(&exchange_body), Duration::from_secs(90))?);
+    if let Some(object) = exchange_body.as_object_mut() {
+        object.insert(
+            "name".to_owned(),
+            Value::String(unique_name(provider.display_name(), existing)),
+        );
+        object.insert("priority".to_owned(), Value::Number(priority.into()));
+        object.insert(
+            "group_ids".to_owned(),
+            json!([group_id]),
+        );
+    }
+    let exchanged = usage::data(admin.post(
+        path,
+        Some(&exchange_body),
+        Duration::from_secs(90),
+    )?);
+    // Router Host 2.0 materializes the CLI auth file into the local SQLite
+    // account during exchange. Keep accepting the old token-shaped response
+    // for older hosts, but do not submit an empty credential object as a new
+    // account when the host already returned a real account row.
+    if usage::integer(&exchanged, "id") > 0
+        && usage::string(&exchanged, "type").eq_ignore_ascii_case("oauth")
+    {
+        return Ok(exchanged);
+    }
+    let tokens = exchanged;
     let (credentials, extra) = split_credentials(provider, &tokens);
     let email = first_string(&credentials, &["email", "email_address"])
         .or_else(|| first_string(&extra, &["email", "email_address"]));
@@ -1058,6 +1165,25 @@ mod tests {
         let (mut stream, _) = listener.accept().unwrap();
         assert!(read_callback(&mut stream, "right").is_err());
         sender.join().unwrap();
+    }
+
+    #[test]
+    fn manual_callback_accepts_full_url_and_rejects_wrong_state() {
+        let (code, state) = parse_manual_authorization(
+            "http://localhost:1455/auth/callback?code=secret%2Dcode&state=right",
+            "right",
+        )
+        .unwrap();
+        assert_eq!(code.as_str(), "secret-code");
+        assert_eq!(state, "right");
+        assert!(parse_manual_authorization(
+            "http://localhost:1455/auth/callback?code=secret&state=wrong",
+            "right"
+        )
+        .is_err());
+        let (code, state) = parse_manual_authorization("plain-code", "right").unwrap();
+        assert_eq!(code.as_str(), "plain-code");
+        assert_eq!(state, "right");
     }
 
     #[test]

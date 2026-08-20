@@ -2,6 +2,69 @@
 
 本文件记录面向用户的重要变化。完整技术细节以对应版本的源码和 GitHub Release 为准。
 
+## 2.0.7 - 2026-08-21
+
+### 修复
+
+- 修复独立安装向导未初始化中文字体、中文标题和按钮显示为方框的问题；安装向导现在与主界面共用完整 CJK 字体配置。
+- 字体发现改为使用 Windows 实际安装目录，不再固定假设系统安装在 `C:\Windows`。
+- 修复同名模型优先级拖拽结果只存在于释放当帧、点击保存时恢复旧顺序的问题；拖拽顺序现在跨帧保留，保存会原子校验同名模型集合并同步配置顺序、P 值和订阅/API 路由策略。
+- 修复归档兼容问题：Apply 不再无条件重启 Codex，启动时仅规范化普通路径文件确实存在的 `\\?\` rollout 路径，避免 active thread 关闭后因路径不一致而无法继续归档。
+
+## 2.0.6 - 2026-08-21
+
+### 修复
+
+- 修复 DeepSeek/Kimi/Grok 子 Agent 只返回空闲问候：Codex multi-agent v2 的任务正文位于 `agent_message.content[].encrypted_content`，Router 现在将其转换为标准 `message/user + input_text` 并逐字保留任务，不再改成 omitted 占位文本。
+- 修复 Apply 后对话无法归档：Router 不再在每次 Apply 后无条件关闭并重启 Codex，避免全部线程被重新加载为 active、`thread/archive` 只完成 shutdown 而不执行归档移动；需要冷重载时由成功弹窗提示手动重开。
+- 同名模型优先级弹窗改为单行自适应：只保留左侧拖拽手柄，移除重复上下箭头；显示 `来源类型 · 厂商 · 邮箱/账号或 Base URL`，空间不足时自动换到第二行，悬停显示完整账号 ID/登录账号或完整 URL。
+- 优先级保存同步模型 P 值、订阅账号后端优先级和订阅/API 优先策略，确保弹窗顺序就是实际调度顺序。
+
+升级后请完全重启 CodexRouter；需要加载新目录时再手动重启 Codex。
+
+## 2.0.5 - 2026-08-21
+
+### 修复
+
+- 修复使用中突然跳回登录：选择“保持覆写配置”时仍刷新系统层绑定，保留 DACL 的原子写入并重试 sharing violation，避免 Codex Desktop 重写用户配置后路由丢失、鉴权失败导致的登录页；首个健康与 OAuth 恢复探测延后至 60s/300s，避免打开后几秒即触发刷新；ChatGPT 探活改用 `api.openai.com/v1/models` 消除 400 误判；DeepSeek 默认子 Agent 配置写入与 1800s 空闲超时已校正。
+- DeepSeek 等模型不再明文透出 `<think>` 思考过程：Router 在 Gateway 与 Host 对流式与非流式响应双向剥离 `<think>` / `<thinking>` 标签（大小写不敏感、支持截断流）。
+- 修复子 Agent `spawn_agent` 超时：非 OpenAI 家族模型现在也会写入 `default_subagent_model` 与推理档位，子 Agent 按当前模型正确路由；DeepSeek/Coding Plan 的长推理静默不再在 5 分钟内中断。
+- 修复“保存并应用”后无法归档对话：原子写入改用 `ReplaceFileW` 保留文件权限并自动重试占用冲突，避免回滚后 `model_catalog_json` 指向被删除的临时文件。
+- 路由配置模型卡片新增【优先级】按钮：当存在多条同名模型（多 API/订阅）时，在“设为默认”与“编辑”之间显示；弹窗支持拖动（≡）或 ↑↓ 调整调用顺序，默认订阅靠前，可自主编排，保存后生效。
+- 降低日志噪音：`ChatGPT` 探活改 `api.openai.com`、`account_recovery_probe_failed`/`scheduler.probe_failed` 改 INFO，`think` 标签剥离减少上游 400 误报。
+
+### 说明
+
+- `Gemini` 当前仍不支持 Codex 子 Agent 与部分 web_search：属上游模型/协议限制，不是 Router 缺陷。
+- DeepSeek 官方 `<think>` 透出属模型原生行为，已由 Router 统一隐藏；如需保留思考过程可后续提供开关。
+
+升级后请完全重启 CodexRouter 和 Codex。
+
+## 2.0.4 - 2026-08-20
+
+### 修复
+
+- 首次条款弹窗按可视区域自适应，固定标题和操作区，不再遮挡顶部或底部按钮。
+- 弹窗统一为主题色标题栏、浅色正文、圆角边框和实体背景，移除半透明毛玻璃弹窗。
+- 首次 OAuth 只有在账号、模型注册和 Router 验证完成后才结束，并自动启用第一个可用模型。
+- 原生运行时补齐首次管理员凭据初始化，修复干净机器上开发环境历史状态掩盖的 OAuth 失败。
+- 完全退出会等待 Gateway、Router Host 和 CLIProxyAPI 退出并验证监听端口释放。
+- 显式 UserData 隔离优先于便携状态，运行日志移出发布目录，CLI 端口和认证目录每次启动都会校准。
+- VC++ Runtime 同时放置在主程序和 Router Host 目录，保证未安装系统运行库的干净机器也能启动子进程。
+
+升级后请完全重启 CodexRouter 和 Codex。
+
+## 2.0.3 - 2026-08-20
+
+### 修复
+
+- ChatGPT OAuth 回调只由 CodexRouter 监听，避免与 CLI 本地登录服务器争抢固定端口；端口被占用时明确切换为粘贴完整回调 URL。
+- 实时用量按提供商合并账号卡；Grok、xAI、x-ai 账号统一使用同一套实时额度查询、凭据索引与错误展示逻辑。
+- 当前订阅卡不再重复显示“共享配置”；共享开关仅保留在配置分组切换区。
+- 配置加载后同步记录当前软件版本；升级和 Apply 继续保持 Codex 登录状态、聊天目录及模型目录绑定。
+
+升级后请完全重启 CodexRouter 和 Codex。
+
 ## 2.0.0 - 2026-08-18
 
 ### 变更

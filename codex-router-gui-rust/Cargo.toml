@@ -1,6 +1,6 @@
 [package]
 name = "codex-router"
-version = "2.0.0"
+version = "2.0.7"
 edition = "2021"
 
 [target.'cfg(windows)'.dependencies]
@@ -13,6 +13,7 @@ tray-icon = "0.19"
 anyhow = "1.0"
 arboard = "3.6"
 chrono = "0.4"
+cron = "0.15"
 dirs = "5.0"
 rfd = "0.15"
 regex = "1.11"

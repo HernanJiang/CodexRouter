@@ -42,6 +42,9 @@ $nativeMain = $nativeMain -join "`n"
 if (-not $nativeMain.Contains('installer_wizard')) {
     throw 'Native installer must expose the interactive installer wizard entry point.'
 }
+if (-not $nativeMain.Contains('install_app_fonts(&cc.egui_ctx)')) {
+    throw 'Native installer wizard must initialize the full CJK font set.'
+}
 $nativeUpdater = Get-Content -LiteralPath (Join-Path $routerRoot 'codex-router-gui-rust\src\updater.rs') -Raw
 if (-not $nativeUpdater.Contains('create_desktop_shortcut')) {
     throw 'Installer must create a desktop shortcut when the user selects that option.'
@@ -155,7 +158,7 @@ if (-not [string]::IsNullOrWhiteSpace($ArchivePath)) {
             [string]$exe.VersionInfo.CompanyName -ne 'Hernan_JIANG') {
             throw 'Real installer returned invalid version or publisher metadata.'
         }
-        foreach ($relativePath in @('Start-Codex-Router.cmd', 'app\cli-proxy-api.exe')) {
+        foreach ($relativePath in @('Start-Codex-Router.cmd', 'Start-FreshTest.bat', 'app\cli-proxy-api.exe')) {
             if (-not (Test-Path -LiteralPath (Join-Path $realInstallRoot $relativePath) -PathType Leaf)) {
                 throw "Real installer did not copy required payload: $relativePath"
             }

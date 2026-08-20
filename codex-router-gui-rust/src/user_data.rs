@@ -4,11 +4,13 @@ const LAYOUT_MARKER: &str = ".codex-router-user-data-v1";
 const PACKAGE_VERSION_MARKER: &str = ".codex-router-package-version";
 
 fn stable_state_enabled(router_root: &Path) -> bool {
+    if std::env::var_os("CODEX_ROUTER_USER_DATA_ROOT").is_some() {
+        return true;
+    }
     if std::env::var_os("CODEX_ROUTER_PORTABLE_STATE").is_some_and(|value| value == "1") {
         return false;
     }
-    std::env::var_os("CODEX_ROUTER_USER_DATA_ROOT").is_some()
-        || router_root.join("release-manifest.json").is_file()
+    router_root.join("release-manifest.json").is_file()
 }
 
 pub fn state_root(router_root: &Path) -> PathBuf {
@@ -41,6 +43,10 @@ pub fn data_root(router_root: &Path) -> PathBuf {
 
 pub fn backups_root(router_root: &Path) -> PathBuf {
     state_root(router_root).join("backups")
+}
+
+pub fn logs_root(router_root: &Path) -> PathBuf {
+    state_root(router_root).join("logs")
 }
 
 fn package_version(router_root: &Path) -> Option<String> {
@@ -110,9 +116,7 @@ fn write_layout_marker(root: &Path, source: Option<&Path>) -> anyhow::Result<()>
 /// True when the saved config represents a finished first-run setup, not a
 /// leftover empty/partial JSON that should still show the welcome wizard.
 pub fn config_looks_configured(config: &crate::config::RouterConfig) -> bool {
-    !config.accepted_terms_version.trim().is_empty()
-        && config.accept_compliance
-        && !config.models.is_empty()
+    !config.models.is_empty()
 }
 
 pub fn prepare(router_root: &Path) -> anyhow::Result<PathBuf> {

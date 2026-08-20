@@ -313,7 +313,7 @@ impl AdminClient {
             .send()
             .map_err(classify_request_error)?;
         if !response.status().is_success() {
-            return Err(anyhow!(classify_status(response.status().as_u16())));
+            return Err(classify_admin_response(path, response));
         }
         response
             .json()
@@ -337,7 +337,7 @@ impl AdminClient {
         }
         let response = request.send().map_err(classify_request_error)?;
         if !response.status().is_success() {
-            return Err(anyhow!(classify_status(response.status().as_u16())));
+            return Err(classify_admin_response(path, response));
         }
         let text = response
             .text()
@@ -359,7 +359,7 @@ impl AdminClient {
             .send()
             .map_err(classify_request_error)?;
         if !response.status().is_success() {
-            return Err(anyhow!(classify_status(response.status().as_u16())));
+            return Err(classify_admin_response(path, response));
         }
         let text = response
             .text()
@@ -380,7 +380,7 @@ impl AdminClient {
             .send()
             .map_err(classify_request_error)?;
         if !response.status().is_success() {
-            return Err(anyhow!(classify_status(response.status().as_u16())));
+            return Err(classify_admin_response(path, response));
         }
         let text = response
             .text()
@@ -470,14 +470,7 @@ pub(super) fn query_usage(
                 oauth_ids.push(model.oauth_account_id);
             }
         } else {
-            let alias = if model.alias.trim().is_empty() {
-                model.model.trim()
-            } else {
-                model.alias.trim()
-            };
-            if !alias.is_empty() {
-                api_channels.insert(format!("Codex-Router / {alias}"), model.clone());
-            }
+            register_api_channel(&mut api_channels, model);
         }
     }
 
@@ -489,13 +482,13 @@ pub(super) fn query_usage(
         let name = string(account, "name");
         let selected_oauth = kind == "oauth" && oauth_ids.contains(&id);
         let selected_api = kind == "apikey"
-            && api_channels.contains_key(&name)
+            && api_channel_for_account(&api_channels, &name).is_some()
             && (group_id <= 0
                 || array(get(account, "group_ids").unwrap_or(&Value::Null))
                     .iter()
                     .any(|value| value.as_i64() == Some(group_id)));
         if selected_oauth || selected_api {
-            let channel = api_channels.get(&name).cloned();
+            let channel = api_channel_for_account(&api_channels, &name).cloned();
             let query_provider_usage = selected_api
                 && channel
                     .as_ref()
@@ -512,6 +505,34 @@ pub(super) fn query_usage(
     let cache_path = usage_cache_path(router_root);
     let cache = Arc::new(Mutex::new(read_usage_cache(&cache_path)));
     let mut records = query_accounts_bounded(tasks, admin.clone(), cache.clone(), deadline);
+    let seen_api_names = records
+        .iter()
+        .filter(|record| record.account.kind != "oauth")
+        .map(|record| record.account.name.clone())
+        .collect::<HashSet<_>>();
+    let mut next_local_id = -1_i64;
+    for (name, channel) in &api_channels {
+        if seen_api_names
+            .iter()
+            .any(|seen| seen.eq_ignore_ascii_case(name))
+            || records.iter().any(|record| {
+                record.account.kind != "oauth"
+                    && api_channel_for_account(&api_channels, &record.account.name)
+                        .is_some_and(|existing| {
+                            api_quota_pool_key(existing) == api_quota_pool_key(channel)
+                        })
+            })
+        {
+            continue;
+        }
+        records.push(local_config_api_record(
+            next_local_id,
+            name,
+            channel,
+            &cache,
+        ));
+        next_local_id -= 1;
+    }
     let routing_changed = reconcile_oauth_recovery_observations(
         router_root,
         &admin,
@@ -595,11 +616,11 @@ fn query_account(
 ) -> anyhow::Result<AccountRecord> {
     let id = integer(&task.account, "id");
     let kind = string(&task.account, "type");
-    let platform = task
+    let platform = normalize_usage_provider(&task
         .channel
         .as_ref()
         .map(api_quota_pool_provider)
-        .unwrap_or_else(|| string(&task.account, "platform"));
+        .unwrap_or_else(|| string(&task.account, "platform")));
     let mut query_note = String::new();
     let stats = match retry_account_read(|| {
         admin.get(
@@ -616,12 +637,16 @@ fn query_account(
     let mut usage = Value::Null;
     let mut grok_quota = Value::Null;
     if kind == "oauth" {
-        let path = if platform == "grok" {
+        let path = if matches!(platform.as_str(), "grok" | "xai" | "x-ai") {
             format!("/api/v1/admin/grok/accounts/{id}/quota")
         } else {
             format!("/api/v1/admin/accounts/{id}/usage?force=true")
         };
-        let timeout = if platform == "grok" { 30 } else { 10 };
+        let timeout = if matches!(platform.as_str(), "grok" | "xai" | "x-ai") {
+            30
+        } else {
+            10
+        };
         match retry_account_read(|| {
             admin.get(&path, remaining(deadline, Duration::from_secs(timeout))?)
         }) {
@@ -654,7 +679,7 @@ fn query_account(
     add_standard_window(&mut windows, "weekly", get(&usage, "seven_day"), "");
     add_standard_window(&mut windows, "monthly", get(&usage, "monthly"), "");
     let mut fresh = kind == "oauth" && !usage.is_null() && !windows.is_empty();
-    if kind == "oauth" && platform == "openai" {
+    if kind == "oauth" && matches!(platform.as_str(), "openai" | "chatgpt") {
         if let Ok(quota) = retry_account_read(|| {
             admin.get(
                 &format!("/api/v1/admin/openai/accounts/{id}/quota"),
@@ -679,7 +704,7 @@ fn query_account(
             query_note = "OpenAI quota refresh unavailable; showing cached usage.".to_owned();
         }
     }
-    if kind == "oauth" && platform == "grok" {
+    if kind == "oauth" && matches!(platform.as_str(), "grok" | "xai" | "x-ai") {
         let parsed = normalize_grok(if grok_quota.is_null() {
             &usage
         } else {
@@ -705,6 +730,51 @@ fn query_account(
                 _ => "",
             };
             append_note(&mut query_note, error_class);
+        }
+    }
+    if kind == "oauth" && matches!(platform.as_str(), "openai" | "chatgpt") {
+        let error_code = string(&usage, "error_code");
+        if windows.is_empty() && !error_code.is_empty() {
+            append_note(
+                &mut query_note,
+                match error_code.as_str() {
+                    "unauthenticated" => "class=authentication",
+                    "forbidden" => "class=permission",
+                    "rate_limited" => "class=rate_limit",
+                    "network_error" => "class=network",
+                    _ => "ChatGPT quota refresh unavailable.",
+                },
+            );
+        }
+    }
+    if kind == "oauth" && windows.is_empty() {
+        match platform.as_str() {
+            "gemini" | "google" | "google_one" | "google-one" => {
+                append_note(
+                    &mut query_note,
+                    "Gemini CLI has no official quota window API; showing local request/token ledger.",
+                );
+            }
+            "anthropic" | "claude" => {
+                append_note(
+                    &mut query_note,
+                    "Anthropic OAuth has no dedicated quota window; showing local ledger.",
+                );
+            }
+            "grok" | "xai" | "x-ai" => {
+                let error_code = string(&usage, "error_code");
+                append_note(
+                    &mut query_note,
+                    match error_code.as_str() {
+                        "unauthenticated" => "class=authentication",
+                        "forbidden" => "class=permission",
+                        "rate_limited" => "class=rate_limit",
+                        "network_error" => "class=network",
+                        _ => "Grok billing quota is unavailable.",
+                    },
+                );
+            }
+            _ => {}
         }
     }
     if let Some(provider) = provider_usage {
@@ -787,6 +857,15 @@ fn query_account(
         auto_isolate_on_exhaustion: task.auto_isolate_on_exhaustion,
         routing_changed: recovered || (isolated && !was_unschedulable),
     })
+}
+
+fn normalize_usage_provider(platform: &str) -> String {
+    match platform.trim().to_ascii_lowercase().as_str() {
+        "chatgpt" => "openai".to_owned(),
+        "xai" | "x-ai" => "grok".to_owned(),
+        "claude" => "anthropic".to_owned(),
+        value => value.to_owned(),
+    }
 }
 
 fn failed_account_record(task: &AccountTask, timed_out: bool) -> AccountRecord {
@@ -1117,7 +1196,7 @@ fn query_volcengine(key: &str, cache: &Arc<Mutex<UsageCache>>) -> ProviderUsage 
     let request = provider_client()
         .post("https://open.volcengineapi.com/?Action=GetCodingPlanUsage&Version=2024-01-01")
         .headers(headers)
-        .body(payload);
+        .body(payload.to_owned());
     match send_json_with_retry(request) {
         Ok(body) => {
             let mut windows = normalize_volcengine(&body);
@@ -1463,19 +1542,65 @@ fn normalize_zenmux(body: &Value) -> Vec<UsageWindow> {
         .collect()
 }
 
+fn volcengine_window_kind(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "session" | "5h" | "5-hour" | "fivehour" | "five_hour" | "rolling_5h" | "hour5" => {
+            Some("fiveHour")
+        }
+        "weekly" | "week" | "7d" | "7day" => Some("weekly"),
+        "monthly" | "month" | "30d" => Some("monthly"),
+        _ => None,
+    }
+}
+
+fn volcengine_percent(quota: &Value) -> Option<f64> {
+    if let Some(percent) = first(
+        quota,
+        &[
+            "Percent",
+            "percent",
+            "UsedPercent",
+            "used_percent",
+            "UsagePercent",
+        ],
+    )
+    .and_then(number)
+    {
+        return Some(percent);
+    }
+    let used = first(quota, &["Used", "used", "UsedTokens", "used_tokens"]).and_then(number);
+    let total = first(
+        quota,
+        &["Total", "total", "Limit", "limit", "Quota", "quota"],
+    )
+    .and_then(number);
+    match (used, total) {
+        (Some(used), Some(total)) if total > 0.0 => Some((used / total * 100.0).clamp(0.0, 100.0)),
+        _ => None,
+    }
+}
+
 fn normalize_volcengine(body: &Value) -> Vec<UsageWindow> {
     let result = get(body, "Result").unwrap_or(body);
-    let rows = first(result, &["QuotaUsage", "quotaUsage"]);
+    let rows = first(
+        result,
+        &[
+            "QuotaUsage",
+            "quotaUsage",
+            "UsageList",
+            "usage_list",
+            "Usages",
+            "usages",
+        ],
+    );
     array(rows.unwrap_or(&Value::Null))
         .iter()
         .filter_map(|quota| {
-            let percent = get(quota, "Percent").and_then(number)?;
-            let kind = match string(quota, "Level").trim().to_ascii_lowercase().as_str() {
-                "session" | "5h" | "5-hour" | "fivehour" | "five_hour" | "rolling_5h" => "fiveHour",
-                "weekly" | "week" | "7d" => "weekly",
-                "monthly" | "month" => "monthly",
-                _ => return None,
-            };
+            let percent = volcengine_percent(quota)?;
+            let kind = volcengine_window_kind(&string(quota, "Level"))
+                .or_else(|| volcengine_window_kind(&string(quota, "Type")))
+                .or_else(|| volcengine_window_kind(&string(quota, "Period")))
+                .or_else(|| volcengine_window_kind(&string(quota, "Window")))?;
             let display = match kind {
                 "fiveHour" => "Volcengine 5-hour quota",
                 "weekly" => "Volcengine weekly quota",
@@ -1484,7 +1609,7 @@ fn normalize_volcengine(body: &Value) -> Vec<UsageWindow> {
             Some(coding_window(
                 kind,
                 percent,
-                get(quota, "ResetTimestamp"),
+                first(quota, &["ResetTimestamp", "ResetTime", "reset_at", "ResetAt"]),
                 display,
             ))
         })
@@ -1784,6 +1909,58 @@ fn normalize_stats(stats: &Value) -> UsageTotals {
         total_tokens: integer(summary, "total_tokens"),
         cost: number(get(summary, "total_cost").unwrap_or(&Value::Null)).unwrap_or_default(),
         models,
+    }
+}
+
+fn register_api_channel(map: &mut HashMap<String, ModelConfig>, model: &ModelConfig) {
+    for label in [model.alias.trim(), model.model.trim()] {
+        if label.is_empty() {
+            continue;
+        }
+        map.entry(format!("Codex-Router / {label}"))
+            .or_insert_with(|| model.clone());
+    }
+}
+
+fn api_channel_for_account<'a>(
+    map: &'a HashMap<String, ModelConfig>,
+    name: &str,
+) -> Option<&'a ModelConfig> {
+    if let Some(channel) = map.get(name) {
+        return Some(channel);
+    }
+    map.iter()
+        .find(|(key, _)| name.eq_ignore_ascii_case(key))
+        .map(|(_, channel)| channel)
+}
+
+fn local_config_api_record(
+    id: i64,
+    name: &str,
+    channel: &ModelConfig,
+    cache: &Arc<Mutex<UsageCache>>,
+) -> AccountRecord {
+    let provider = query_provider(channel, cache);
+    AccountRecord {
+        account: UsageAccount {
+            id,
+            name: name.to_owned(),
+            kind: "apikey".to_owned(),
+            platform: api_quota_pool_provider(channel),
+            status: "active".to_owned(),
+            health: if provider.windows.is_empty() && !provider.note.is_empty() {
+                "upstreamError".to_owned()
+            } else {
+                "healthy".to_owned()
+            },
+            query_note: provider.note,
+            windows: provider.windows,
+            ..UsageAccount::default()
+        },
+        configured_model: channel.model.clone(),
+        quota_evidence: OAuthQuotaEvidence::Unknown,
+        auto_isolate_on_exhaustion: false,
+        routing_changed: false,
     }
 }
 
@@ -2256,6 +2433,10 @@ fn provider_from_channel(base_url: &str) -> String {
         "api.openai.com" => "openai-api",
         "api.anthropic.com" => "anthropic-api",
         "api.moonshot.ai" | "api.moonshot.cn" => "moonshot",
+        "api.kimi.com" => "kimi",
+        "api.430123.xyz" => "chiral",
+        host if host.ends_with(".430123.xyz") => "chiral",
+        host if host.ends_with(".volces.com") => "volcengine",
         _ => "thirdparty",
     }
     .to_owned()
@@ -2764,21 +2945,69 @@ fn remaining(deadline: Instant, maximum: Duration) -> anyhow::Result<Duration> {
 
 fn classify_request_error(error: reqwest::Error) -> anyhow::Error {
     if error.is_timeout() {
-        anyhow!("class=timeout")
+        anyhow!("class=timeout | code=CR-LFC-0006")
     } else if error.is_connect() {
-        anyhow!("class=connection_refused")
+        anyhow!("class=connection_refused | code=CR-LFC-0004")
     } else {
-        anyhow!("class=request_failure")
+        anyhow!("class=request_failure | code=CR-LFC-0006")
     }
 }
 
-fn classify_status(status: u16) -> &'static str {
-    match status {
-        401 => "class=authentication",
-        403 => "class=quota_denied",
-        429 => "class=rate_limit",
-        500..=599 => "class=upstream",
+fn classify_admin_response(path: &str, response: reqwest::blocking::Response) -> anyhow::Error {
+    let status = response.status().as_u16();
+    let body = response.text().unwrap_or_default();
+    anyhow!(classify_admin_http(path, status, &body))
+}
+
+fn classify_admin_http(path: &str, status: u16, body: &str) -> String {
+    let code = extract_admin_error_code(body);
+    let class = match (status, code.as_deref()) {
+        (401, _) => "class=authentication",
+        (403, _) => "class=quota_denied",
+        (429, _) => "class=rate_limit",
+        (_, Some(code)) if code.contains("VAL-0003") => "class=compliance_required",
+        (400 | 409 | 422, _) => "class=config_invalid",
+        (500..=599, _) => "class=upstream",
         _ => "class=request_failure",
+    };
+    let path = path.split('?').next().unwrap_or(path);
+    match code {
+        Some(code) => format!("{class} code={code} http={status} path={path}"),
+        None => format!("{class} http={status} path={path}"),
+    }
+}
+
+fn extract_admin_error_code(body: &str) -> Option<String> {
+    if let Ok(value) = serde_json::from_str::<Value>(body) {
+        for key in ["error_code", "code"] {
+            if let Some(code) = value.get(key).and_then(Value::as_str) {
+                if let Some(extracted) = extract_cr_code(code) {
+                    return Some(extracted);
+                }
+            }
+        }
+        if let Some(message) = value.get("message").and_then(Value::as_str) {
+            if let Some(extracted) = extract_cr_code(message) {
+                return Some(extracted);
+            }
+        }
+    }
+    extract_cr_code(body)
+}
+
+fn extract_cr_code(text: &str) -> Option<String> {
+    let start = text.find("CR-")?;
+    let rest = &text[start..];
+    let end = rest
+        .find(|character: char| {
+            !(character.is_ascii_uppercase() || character.is_ascii_digit() || character == '-')
+        })
+        .unwrap_or(rest.len());
+    let code = &rest[..end];
+    if code.len() >= 10 && code.bytes().filter(|byte| *byte == b'-').count() == 2 {
+        Some(code.to_owned())
+    } else {
+        None
     }
 }
 
@@ -2792,8 +3021,10 @@ fn status_label(status: i32) -> String {
 
 fn safe_error(error: &anyhow::Error) -> String {
     let message = error.to_string();
-    if message.starts_with("class=") {
+    if message.contains("class=") {
         message
+    } else if let Some(code) = extract_cr_code(&message) {
+        format!("class=request_failure | code={code}")
     } else {
         "class=request_failure".to_owned()
     }
@@ -3166,6 +3397,24 @@ mod tests {
             api_quota_pool_key(&relay("team-a")),
             api_quota_pool_key(&relay("team-b"))
         );
+    }
+
+    #[test]
+    fn volcengine_usage_list_with_used_total_is_normalized() {
+        let body = json!({
+            "Result": {
+                "UsageList": [
+                    {"Type": "5h", "Used": 10, "Total": 100, "ResetTime": "2026-08-20T12:00:00Z"},
+                    {"Type": "weekly", "UsedPercent": 25.0, "ResetAt": "2026-08-24T00:00:00Z"}
+                ]
+            }
+        });
+        let windows = normalize_volcengine(&body);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].kind, "fiveHour");
+        assert_eq!(windows[0].used_percent, Some(10.0));
+        assert_eq!(windows[1].kind, "weekly");
+        assert_eq!(windows[1].used_percent, Some(25.0));
     }
 
     #[test]
@@ -4029,6 +4278,34 @@ mod tests {
     }
 
     #[test]
+    fn admin_http_errors_keep_host_codes_and_split_classes() {
+        assert_eq!(
+            classify_admin_http(
+                "/api/v1/admin/groups",
+                502,
+                r#"{"success":false,"error_code":"CR-CFG-0005","message":"cli push failed"}"#
+            ),
+            "class=upstream code=CR-CFG-0005 http=502 path=/api/v1/admin/groups"
+        );
+        assert_eq!(
+            classify_admin_http(
+                "/api/v1/admin/compliance/accept",
+                400,
+                r#"{"success":false,"error_code":"CR-VAL-0003","message":"phrase mismatch"}"#
+            ),
+            "class=compliance_required code=CR-VAL-0003 http=400 path=/api/v1/admin/compliance/accept"
+        );
+        assert_eq!(
+            classify_admin_http(
+                "/api/v1/admin/users/1",
+                401,
+                r#"{"success":false,"message":"no token"}"#
+            ),
+            "class=authentication http=401 path=/api/v1/admin/users/1"
+        );
+    }
+
+    #[test]
     fn credential_endpoints_reject_host_and_scheme_confusion() {
         assert!(coding_plan_endpoint("https://api.zenmux.ai/api/v1").is_some());
         for url in [
@@ -4091,5 +4368,13 @@ mod tests {
             snapshot.subscriptions.len(),
             snapshot.api_channels.len()
         );
+    }
+
+    #[test]
+    fn oauth_provider_aliases_share_the_same_live_usage_query() {
+        assert_eq!(normalize_usage_provider("grok"), "grok");
+        assert_eq!(normalize_usage_provider("xAI"), "grok");
+        assert_eq!(normalize_usage_provider("x-ai"), "grok");
+        assert_eq!(normalize_usage_provider("ChatGPT"), "openai");
     }
 }

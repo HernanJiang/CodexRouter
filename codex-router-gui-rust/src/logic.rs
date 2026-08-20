@@ -48,6 +48,68 @@ pub struct OAuthRoutingPriorities {
     pub api_priority: i32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelRoutePolicy {
+    SubscriptionFirst,
+    ApiFirst,
+    SubscriptionOnly,
+}
+
+impl ModelRoutePolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SubscriptionFirst => "subscription_first",
+            Self::ApiFirst => "api_first",
+            Self::SubscriptionOnly => "subscription_only",
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value.trim() {
+            "api_first" => Self::ApiFirst,
+            "subscription_only" => Self::SubscriptionOnly,
+            _ => Self::SubscriptionFirst,
+        }
+    }
+}
+
+pub fn model_identity_key(model_id: &str) -> String {
+    let identity = model_identity(model_id);
+    format!("{}:{}", identity.provider, identity.real_id)
+}
+
+pub fn model_route_policy(cfg: &RouterConfig, model_id: &str) -> ModelRoutePolicy {
+    cfg.model_route_policies
+        .get(&model_identity_key(model_id))
+        .map(|value| ModelRoutePolicy::parse(value))
+        .unwrap_or(ModelRoutePolicy::SubscriptionFirst)
+}
+
+pub fn set_model_route_policy(cfg: &mut RouterConfig, model_id: &str, policy: ModelRoutePolicy) {
+    let key = model_identity_key(model_id);
+    match policy {
+        ModelRoutePolicy::SubscriptionFirst => {
+            cfg.model_route_policies.remove(&key);
+        }
+        ModelRoutePolicy::ApiFirst | ModelRoutePolicy::SubscriptionOnly => {
+            cfg.model_route_policies
+                .insert(key, policy.as_str().to_owned());
+        }
+    }
+}
+
+pub fn matching_api_fallback_models<'a>(
+    cfg: &'a RouterConfig,
+    oauth_model_id: &str,
+) -> Vec<&'a ModelConfig> {
+    cfg.models
+        .iter()
+        .filter(|candidate| {
+            candidate.source != "oauth" && same_model_identity(&candidate.model, oauth_model_id)
+        })
+        .collect()
+}
+
 pub fn oauth_routing_priorities(
     fallback: Option<&crate::config::OAuthFallback>,
 ) -> OAuthRoutingPriorities {
@@ -68,6 +130,29 @@ pub fn oauth_routing_priorities(
         prefer_oauth: fallback.prefer_oauth,
         oauth_priority: if fallback.prefer_oauth { official } else { api },
         api_priority: if fallback.prefer_oauth { api } else { official },
+    }
+}
+
+pub fn model_oauth_routing_priorities(
+    cfg: &RouterConfig,
+    model_id: &str,
+) -> OAuthRoutingPriorities {
+    match model_route_policy(cfg, model_id) {
+        ModelRoutePolicy::SubscriptionOnly => OAuthRoutingPriorities {
+            enabled: false,
+            prefer_oauth: true,
+            oauth_priority: 1,
+            api_priority: 10,
+        },
+        policy => {
+            let fallback = crate::config::OAuthFallback {
+                enabled: true,
+                prefer_oauth: policy == ModelRoutePolicy::SubscriptionFirst,
+                official_priority: cfg.oauth_fallback.official_priority,
+                fallback_priority: cfg.oauth_fallback.fallback_priority,
+            };
+            oauth_routing_priorities(Some(&fallback))
+        }
     }
 }
 
@@ -766,34 +851,30 @@ pub struct DashboardModelRow {
 
 pub fn dashboard_model_rows(models: &[ModelConfig]) -> Vec<DashboardModelRow> {
     let mut rows = Vec::new();
-    let mut seen_oauth = HashSet::new();
+    let mut seen = HashSet::new();
     for (index, model) in models.iter().enumerate() {
-        if model.source == "oauth" {
-            let key = format!(
-                "{}|{}",
-                model_identity(&model.model).provider,
-                model_identity(&model.model).real_id
-            );
-            if !seen_oauth.insert(key) {
-                continue;
-            }
-            let account_count = models
-                .iter()
-                .filter(|candidate| {
-                    candidate.source == "oauth"
-                        && same_model_identity(&candidate.model, &model.model)
-                })
-                .count()
-                .max(1);
-            rows.push(DashboardModelRow {
-                index,
-                account_count,
-            });
+        let identity = model_identity(&model.model);
+        let key = format!("{}|{}", identity.provider, identity.real_id);
+        if !seen.insert(key) {
             continue;
         }
+        let representative = models
+            .iter()
+            .enumerate()
+            .find(|(_, candidate)| {
+                candidate.source == "oauth"
+                    && same_model_identity(&candidate.model, &model.model)
+            })
+            .map(|(candidate_index, _)| candidate_index)
+            .unwrap_or(index);
+        let account_count = models
+            .iter()
+            .filter(|candidate| same_model_identity(&candidate.model, &model.model))
+            .count()
+            .max(1);
         rows.push(DashboardModelRow {
-            index,
-            account_count: 1,
+            index: representative,
+            account_count,
         });
     }
     rows
@@ -1103,6 +1184,11 @@ pub fn is_eligible_oauth_api_fallback(
     source: &ModelConfig,
     candidate: &ModelConfig,
 ) -> bool {
+    if model_route_policy(cfg, &source.model) == ModelRoutePolicy::SubscriptionOnly
+        || model_route_policy(cfg, &candidate.model) == ModelRoutePolicy::SubscriptionOnly
+    {
+        return false;
+    }
     if candidate.source == "oauth" || !is_fallback_channel_selected(cfg, candidate) {
         return false;
     }
@@ -1149,7 +1235,12 @@ pub fn model_routing_explanation(cfg: &RouterConfig, model: &ModelConfig, zh: bo
     }
 }
 
-pub fn model_route_badge(cfg: &RouterConfig, model: &ModelConfig, zh: bool) -> String {
+pub fn model_route_chip(
+    cfg: &RouterConfig,
+    model: &ModelConfig,
+    channel_count: usize,
+    zh: bool,
+) -> String {
     let matched = if model.source == "oauth" {
         cfg.models.iter().any(|candidate| {
             is_oauth_fallback_model(cfg, candidate)
@@ -1158,17 +1249,28 @@ pub fn model_route_badge(cfg: &RouterConfig, model: &ModelConfig, zh: bool) -> S
     } else {
         is_oauth_fallback_model(cfg, model)
     };
-    match (model.source == "oauth", matched, zh) {
-        (true, true, true) => "OAuth · 订阅优先",
-        (true, true, false) => "OAuth · subscription first",
-        (true, false, true) => "OAuth · 独立路由",
-        (true, false, false) => "OAuth · standalone",
-        (false, true, true) => "API · 自动兜底",
-        (false, true, false) => "API · automatic fallback",
-        (false, false, true) => "API · 独立渠道",
-        (false, false, false) => "API · standalone",
+    let policy = model_route_policy(cfg, &model.model);
+    let label = match (model.source == "oauth", matched, policy, zh) {
+        (true, _, ModelRoutePolicy::SubscriptionOnly, true) => "仅订阅",
+        (true, _, ModelRoutePolicy::SubscriptionOnly, false) => "sub only",
+        (true, true, ModelRoutePolicy::ApiFirst, true) => "API优先",
+        (true, true, ModelRoutePolicy::ApiFirst, false) => "API first",
+        (true, true, _, true) => "订阅优先",
+        (true, true, _, false) => "sub first",
+        (true, false, _, true) => "独立订阅",
+        (true, false, _, false) => "subscription",
+        (false, true, ModelRoutePolicy::ApiFirst, true) => "API优先",
+        (false, true, ModelRoutePolicy::ApiFirst, false) => "API first",
+        (false, true, _, true) => "API兜底",
+        (false, true, _, false) => "API fallback",
+        (false, false, _, true) => "独立API",
+        (false, false, _, false) => "API",
+    };
+    if channel_count > 1 {
+        format!("{channel_count} · {label}")
+    } else {
+        label.to_owned()
     }
-    .to_owned()
 }
 
 pub fn recommended_model_display_name(model_id: &str) -> String {
@@ -1655,8 +1757,24 @@ fn router_credential_target(name: &str) -> Vec<u16> {
         .collect()
 }
 
+fn router_credential_environment(name: &str) -> Option<&'static str> {
+    match name {
+        "AdminPassword" => Some("CODEX_ROUTER_ADMIN_PASSWORD"),
+        "LocalApiKey" => Some("CODEX_ROUTER_LOCAL_API_KEY"),
+        "CliManagementSecret" => Some("CODEX_ROUTER_CLI_MANAGEMENT_SECRET"),
+        _ => None,
+    }
+}
+
 fn read_router_credential(name: &str) -> anyhow::Result<Option<SecretWide>> {
     const ERROR_NOT_FOUND: i32 = 1168;
+
+    if let Some(value) = router_credential_environment(name)
+        .and_then(|variable| std::env::var(variable).ok())
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Ok(Some(SecretWide(value.encode_utf16().collect())));
+    }
 
     let target = router_credential_target(name);
     let mut credential: *mut CREDENTIALW = std::ptr::null_mut();
@@ -1695,6 +1813,11 @@ fn read_router_credential(name: &str) -> anyhow::Result<Option<SecretWide>> {
 }
 
 fn write_router_credential(name: &str, secret: &[u16]) -> anyhow::Result<()> {
+    if router_credential_environment(name)
+        .is_some_and(|variable| std::env::var_os(variable).is_some())
+    {
+        bail!("environment-overridden credential is read-only");
+    }
     if name.trim().is_empty() || name.contains('\0') {
         bail!("Windows credential name is invalid");
     }
@@ -2808,10 +2931,43 @@ fn ensure_router_healthy_with_config(router_root: &Path, config: &RouterConfig) 
 
 fn native_admin_error(error: &anyhow::Error) -> String {
     let message = error.to_string();
-    if message.starts_with("class=") {
-        message
+    if message.contains("class=") {
+        return message;
+    }
+    if let Some(code) = extract_router_error_code(&message) {
+        let class = if code.contains("VAL-0003") || message.contains("COMPLIANCE") {
+            "compliance_required"
+        } else if code.contains("AUT-") || message.contains("admin_session") {
+            "admin_session"
+        } else if code.starts_with("CR-CFG-") || message.contains("ROUTER_DEPLOY_") {
+            "config_invalid"
+        } else {
+            "request_failure"
+        };
+        return format!("class={class} | code={code}");
+    }
+    if message.contains("COMPLIANCE") {
+        return "class=compliance_required | code=CR-VAL-0003".to_owned();
+    }
+    if message.contains("ROUTER_DEPLOY_") {
+        return format!("class=config_invalid | {message}");
+    }
+    "class=request_failure".to_owned()
+}
+
+fn extract_router_error_code(text: &str) -> Option<String> {
+    let start = text.find("CR-")?;
+    let rest = &text[start..];
+    let end = rest
+        .find(|character: char| {
+            !(character.is_ascii_uppercase() || character.is_ascii_digit() || character == '-')
+        })
+        .unwrap_or(rest.len());
+    let code = &rest[..end];
+    if code.len() >= 10 && code.bytes().filter(|byte| *byte == b'-').count() == 2 {
+        Some(code.to_owned())
     } else {
-        "class=request_failure".to_owned()
+        None
     }
 }
 
@@ -2826,6 +2982,9 @@ fn oauth_accounts_failure_is_retryable(summary: &str) -> bool {
         "class=process_failure",
         "class=empty_response",
         "class=authentication",
+        "class=admin_session",
+        "class=health_http",
+        "class=config_invalid",
         "router_oauth_accounts_unavailable",
         "admin session",
         "health check failed",
@@ -2981,6 +3140,8 @@ fn usage_failure_is_locally_retryable(summary: &str) -> bool {
         "class=process_failure",
         "class=empty_response",
         "class=authentication",
+        "class=admin_session",
+        "class=timeout",
         "class=rate_limit",
         "class=lifecycle_busy",
         "class=lifecycle_deferred",
@@ -3373,7 +3534,7 @@ mod tests {
             model: "grok-4.6".into(),
             source: "oauth".into(),
             oauth_platform: "grok".into(),
-            base_url: "Sub2API OAuth / grok".into(),
+            base_url: "Router OAuth / grok".into(),
             ..Default::default()
         };
         let grok_profile = classify_channel_route(&grok);
@@ -3433,7 +3594,7 @@ mod tests {
             model: "gpt-5.6-sol".into(),
             source: "oauth".into(),
             oauth_platform: "openai".into(),
-            base_url: "Sub2API OAuth / openai".into(),
+            base_url: "Router OAuth / openai".into(),
             ..Default::default()
         };
         let openai_payg = ModelConfig {
@@ -3531,7 +3692,7 @@ base_url = "https://api.430123.xyz/v1"
     #[test]
     fn credential_storage_is_native_and_reports_only_actual_model_key_updates() {
         let root = temporary_test_dir("credential-update-count");
-        let nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+        let nonce = uuid::Uuid::now_v7().simple();
         let updated_credential = format!("Test-Store-Credential-{nonce}");
         let mut config = RouterConfig {
             models: vec![
@@ -4051,7 +4212,7 @@ base_url = "https://api.430123.xyz/v1"
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             let mut requests = Vec::new();
-            let deadline = Instant::now() + Duration::from_secs(3);
+            let deadline = Instant::now() + Duration::from_secs(10);
             while requests.len() < 2 && Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
@@ -4398,6 +4559,33 @@ base_url = "https://api.430123.xyz/v1"
     }
 
     #[test]
+    fn dashboard_folds_oauth_accounts_and_api_channels_for_the_same_model() {
+        let models = vec![
+            ModelConfig {
+                model: "grok-4.6".into(),
+                source: "oauth".into(),
+                oauth_account_id: 1,
+                ..Default::default()
+            },
+            ModelConfig {
+                model: "x-ai/grok-4.6".into(),
+                source: "apikey".into(),
+                ..Default::default()
+            },
+            ModelConfig {
+                model: "grok-4.6".into(),
+                source: "oauth".into(),
+                oauth_account_id: 2,
+                ..Default::default()
+            },
+        ];
+        let rows = dashboard_model_rows(&models);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].index, 0);
+        assert_eq!(rows[0].account_count, 3);
+    }
+
+    #[test]
     fn chatgpt_branded_api_channel_becomes_oauth_fallback_for_every_variant() {
         let mut config = RouterConfig {
             oauth_account_ids: Some(vec![7]),
@@ -4465,6 +4653,77 @@ base_url = "https://api.430123.xyz/v1"
             .insert("gpt-5.6-sol".into(), Vec::new());
         assert!(!is_fallback_channel_selected(&config, &first));
         assert!(!is_fallback_channel_selected(&config, &second));
+    }
+
+    #[test]
+    fn model_route_policy_defaults_to_subscription_first_and_can_disable_api() {
+        let mut config = RouterConfig {
+            oauth_account_ids: Some(vec![7]),
+            ..Default::default()
+        };
+        let grok_api = ModelConfig {
+            model: "x-ai/grok-4.5".into(),
+            ..Default::default()
+        };
+        config.models = vec![
+            grok_api.clone(),
+            ModelConfig {
+                model: "grok-4.5".into(),
+                source: "oauth".into(),
+                oauth_account_id: 7,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            model_route_policy(&config, "grok-4.5"),
+            ModelRoutePolicy::SubscriptionFirst
+        );
+        assert!(is_oauth_fallback_model(&config, &grok_api));
+
+        set_model_route_policy(&mut config, "grok-4.5", ModelRoutePolicy::SubscriptionOnly);
+        assert_eq!(
+            model_route_policy(&config, "x-ai/grok-4.5"),
+            ModelRoutePolicy::SubscriptionOnly
+        );
+        assert!(!is_oauth_fallback_model(&config, &grok_api));
+        assert!(!model_oauth_routing_priorities(&config, "grok-4.5").enabled);
+
+        set_model_route_policy(&mut config, "grok-4.5", ModelRoutePolicy::ApiFirst);
+        let priorities = model_oauth_routing_priorities(&config, "grok-4.5");
+        assert!(priorities.enabled);
+        assert!(!priorities.prefer_oauth);
+        assert!(is_oauth_fallback_model(&config, &grok_api));
+        let oauth = config
+            .models
+            .iter()
+            .find(|model| model.source == "oauth")
+            .cloned()
+            .unwrap();
+        assert_eq!(model_route_chip(&config, &oauth, 2, true), "2 · API优先");
+        set_model_route_policy(
+            &mut config,
+            "grok-4.5",
+            ModelRoutePolicy::SubscriptionFirst,
+        );
+        assert_eq!(model_route_chip(&config, &oauth, 2, true), "2 · 订阅优先");
+    }
+
+    #[test]
+    fn native_admin_error_keeps_host_codes_instead_of_collapsing() {
+        assert_eq!(
+            native_admin_error(&anyhow::anyhow!("class=timeout | code=CR-LFC-0006")),
+            "class=timeout | code=CR-LFC-0006"
+        );
+        let classified = native_admin_error(&anyhow::anyhow!(
+            "ROUTER_DEPLOY_COMPLIANCE_ACCEPT_FAILED: CR-VAL-0003"
+        ));
+        assert!(classified.contains("class=compliance_required"));
+        assert!(classified.contains("CR-VAL-0003"));
+        let cfg = native_admin_error(&anyhow::anyhow!(
+            "class=request_failure | code=CR-CFG-0005 | http=502"
+        ));
+        assert!(cfg.contains("CR-CFG-0005"));
+        assert!(!cfg.eq("class=request_failure"));
     }
 
     #[test]
@@ -4797,7 +5056,7 @@ Write-Output '[7/7] Deployment complete.'
 
     #[test]
     fn profile_isolation_copies_an_existing_windows_credential_without_powershell() {
-        let nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+        let nonce = uuid::Uuid::now_v7().simple();
         let source_name = format!("Test-Profile-Source-{nonce}");
         let profile_id = format!("test-profile-{nonce}");
         let mut source_secret = SecretWide("not-a-real-key".encode_utf16().collect());

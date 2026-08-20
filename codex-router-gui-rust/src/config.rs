@@ -38,6 +38,14 @@ fn replace_file(source: &std::path::Path, destination: &std::path::Path) -> std:
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
+        fn ReplaceFileW(
+            replaced: *const u16,
+            replacement: *const u16,
+            backup: *const u16,
+            flags: u32,
+            reserved1: *mut std::ffi::c_void,
+            reserved2: *mut std::ffi::c_void,
+        ) -> i32;
         fn MoveFileExW(
             existing_file_name: *const u16,
             new_file_name: *const u16,
@@ -45,25 +53,59 @@ fn replace_file(source: &std::path::Path, destination: &std::path::Path) -> std:
         ) -> i32;
     }
 
+    const REPLACEFILE_WRITE_THROUGH: u32 = 0x0000_0001;
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
     const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
-    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-    let destination: Vec<u16> = destination
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_FILE_NOT_FOUND: i32 = 2;
+    let source_w: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let dest_w: Vec<u16> = destination
         .as_os_str()
         .encode_wide()
         .chain(Some(0))
         .collect();
-    let moved = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if moved == 0 {
-        return Err(std::io::Error::last_os_error());
+    for attempt in 0..5 {
+        let replaced = unsafe {
+            ReplaceFileW(
+                dest_w.as_ptr(),
+                source_w.as_ptr(),
+                std::ptr::null(),
+                REPLACEFILE_WRITE_THROUGH,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if replaced != 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        let code = err.raw_os_error().unwrap_or(-1);
+        if code == ERROR_FILE_NOT_FOUND {
+            // Destination missing — fallback to MoveFileExW which preserves DACL on first create via inherited ACL.
+            let moved = unsafe {
+                MoveFileExW(
+                    source_w.as_ptr(),
+                    dest_w.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            };
+            if moved != 0 {
+                return Ok(());
+            }
+            let move_err = std::io::Error::last_os_error();
+            if move_err.raw_os_error() == Some(ERROR_SHARING_VIOLATION) && attempt < 4 {
+                std::thread::sleep(std::time::Duration::from_millis(75));
+                continue;
+            }
+            return Err(move_err);
+        }
+        if code == ERROR_SHARING_VIOLATION && attempt < 4 {
+            std::thread::sleep(std::time::Duration::from_millis(75));
+            continue;
+        }
+        return Err(err);
     }
-    Ok(())
+    Err(std::io::Error::from_raw_os_error(ERROR_SHARING_VIOLATION))
 }
 
 #[cfg(not(windows))]
@@ -162,8 +204,21 @@ pub struct DeployConfig {
     pub start_with_windows: bool,
 }
 
+pub fn default_router_host() -> String {
+    match std::env::var("CODEX_ROUTER_HOST_PORT") {
+        Ok(value) => value
+            .trim()
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port > 0)
+            .map(|port| format!("http://127.0.0.1:{port}"))
+            .unwrap_or_else(|| "http://127.0.0.1:18080".to_string()),
+        _ => "http://127.0.0.1:18080".to_string(),
+    }
+}
+
 fn default_sub2api_host() -> String {
-    "http://127.0.0.1:18080".to_string()
+    default_router_host()
 }
 
 fn default_true() -> bool {
@@ -449,6 +504,10 @@ pub struct RouterConfig {
     /// an explicit empty list disables API fallback for that model.
     #[serde(default)]
     pub fallback_channel_selections: BTreeMap<String, Vec<String>>,
+    /// Per model-identity key (`provider:real_id`): `subscription_first`,
+    /// `api_first`, or `subscription_only`. Missing keys keep subscription first.
+    #[serde(default)]
+    pub model_route_policies: BTreeMap<String, String>,
     #[serde(default)]
     pub reasoning: ReasoningConfig,
     /// Maximum automatic retries when an upstream answers 429, a transient
@@ -497,6 +556,7 @@ impl Default for RouterConfig {
             oauth_account_ids: None,
             oauth_seen_account_ids: Vec::new(),
             fallback_channel_selections: BTreeMap::new(),
+            model_route_policies: BTreeMap::new(),
             reasoning: ReasoningConfig::default(),
             rate_limit_max_retries: default_rate_limit_max_retries(),
             proxy: ProxyConfig::default(),
@@ -534,6 +594,7 @@ impl RouterConfig {
         if migrate_legacy_bulk_oauth_catalog(&mut cfg) {
             crate::logic::normalize_default_model(&mut cfg);
         }
+        cfg.version = env!("CARGO_PKG_VERSION").to_owned();
         Ok(cfg)
     }
 
@@ -741,6 +802,20 @@ mod tests {
     }
 
     #[test]
+    fn model_route_policies_round_trip_and_default_empty() {
+        let legacy: RouterConfig = serde_json::from_str("{}").unwrap();
+        assert!(legacy.model_route_policies.is_empty());
+        let configured: RouterConfig = serde_json::from_str(
+            r#"{"modelRoutePolicies":{"x-ai:grok-4.5":"api_first"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            configured.model_route_policies.get("x-ai:grok-4.5"),
+            Some(&"api_first".to_owned())
+        );
+    }
+
+    #[test]
     fn legacy_model_gets_conservative_compaction_defaults() {
         let model: ModelConfig = serde_json::from_str(r#"{"model":"legacy"}"#).unwrap();
         assert_eq!(model.context_window, 0);
@@ -760,6 +835,7 @@ mod tests {
         )
         .unwrap();
         let config = RouterConfig::load(&path).unwrap();
+        assert_eq!(config.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(config.models[0].model, "gpt-5.6-sol");
         assert_eq!(config.models[0].alias, "ChatGPT-5.6-Sol");
         assert_eq!(config.default_model, "gpt-5.6-sol");

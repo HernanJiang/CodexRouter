@@ -48,10 +48,7 @@ pub fn is_chat_completions_agent_model(model: &str) -> bool {
 }
 
 pub fn third_party_identity(model: &str) -> Option<(&'static str, &'static str)> {
-    let id = model
-        .trim()
-        .trim_start_matches('~')
-        .to_ascii_lowercase();
+    let id = model.trim().trim_start_matches('~').to_ascii_lowercase();
     if id.contains("grok") {
         Some(("Grok", "grok"))
     } else if id.contains("gemini") {
@@ -70,7 +67,8 @@ pub fn third_party_identity(model: &str) -> Option<(&'static str, &'static str)>
 pub fn third_party_identity_clause(model: &str) -> Option<String> {
     let (name, short) = third_party_identity(model)?;
     Some(format!(
-        "# 模型身份\n你是{name}，通过 Codex-Router 接入。不要自称 GPT、ChatGPT 或 Codex 官方模型。写测试报告必须写入 D:\\\\Work\\\\CodexRouter\\\\Test\\\\Agent_Test_1.7.10_{short}.md，禁止使用 chatgpt 或 unknown 作为文件名。调用工具时使用系统声明的工具名 exec_command，参数字段为 cmd。若工具列表没有 exec_command，仍然调用 exec_command，参数用 cmd。\n"
+        "# 模型身份\n你是{name}，通过 Codex-Router 接入。不要自称 GPT、ChatGPT 或 Codex 官方模型。写测试报告必须写入 D:\\\\Work\\\\CodexRouter\\\\Test\\\\Agent_Test_{}_{short}.md，禁止使用 chatgpt 或 unknown 作为文件名。调用工具时使用系统声明的工具名 exec_command，参数字段为 cmd。若工具列表没有 exec_command，仍然调用 exec_command，参数用 cmd。\n",
+        env!("CARGO_PKG_VERSION")
     ))
 }
 
@@ -84,8 +82,7 @@ pub fn looks_like_encrypted_token(value: &str) -> bool {
     }
     token.len() >= 80
         && token.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || matches!(byte, b'+' | b'/' | b'=' | b'-' | b'_')
+            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'-' | b'_')
         })
 }
 
@@ -95,6 +92,13 @@ pub fn is_responses_path(path: &str) -> bool {
         || path.starts_with("/v1/responses/")
         || path == "/responses"
         || path.starts_with("/responses/")
+}
+
+pub fn is_chat_completions_path(path: &str) -> bool {
+    let path = path.split('?').next().unwrap_or(path);
+    path == "/v1/chat/completions"
+        || path == "/chat/completions"
+        || path.starts_with("/v1/chat/completions/")
 }
 
 pub fn is_compact_path(path: &str) -> bool {
@@ -239,15 +243,43 @@ fn sanitize_content_parts(item: &mut Map<String, Value>) -> usize {
     converted
 }
 
+/// Convert Codex multi-agent v2 `agent_message` into a regular user message
+/// before third-party sanitization. Codex stores the delegated task text in an
+/// `encrypted_content` content part; for non-OpenAI providers it is plaintext
+/// compatibility content, not an OpenAI encrypted reasoning token.
+fn convert_agent_message(item: &mut Map<String, Value>) -> bool {
+    if item_type(&Value::Object(item.clone())) != "agent_message" {
+        return false;
+    }
+    item.insert("type".to_owned(), Value::String("message".to_owned()));
+    item.insert("role".to_owned(), Value::String("user".to_owned()));
+    if let Some(parts) = item.get_mut("content").and_then(Value::as_array_mut) {
+        for part in parts.iter_mut().filter_map(Value::as_object_mut) {
+            if part.get("type").and_then(Value::as_str) != Some("encrypted_content") {
+                continue;
+            }
+            let task = part
+                .get("encrypted_content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            part.clear();
+            part.insert("type".to_owned(), Value::String("input_text".to_owned()));
+            part.insert("text".to_owned(), Value::String(task));
+        }
+    }
+    true
+}
+
 fn remove_image_content_parts(item: &mut Map<String, Value>) -> usize {
     const NOTICE: &str = "[Image input omitted because the selected upstream route rejected image input. Inform the user that the image was not read, then continue the remaining task using the available text and tool history.]";
     let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) else {
         return 0;
     };
     let mut removed = 0;
-    let mut notice_present = content.iter().any(|part| {
-        part.get("text").and_then(Value::as_str) == Some(NOTICE)
-    });
+    let mut notice_present = content
+        .iter()
+        .any(|part| part.get("text").and_then(Value::as_str) == Some(NOTICE));
     let mut replacement = Vec::with_capacity(content.len());
     for part in content.drain(..) {
         let kind = part
@@ -331,8 +363,6 @@ fn unsupported_third_party_item(kind: &str) -> bool {
             | "file_search_call"
             | "code_interpreter_call"
             | "image_generation_call"
-            | "local_shell_call"
-            | "apply_patch_call"
     )
 }
 
@@ -365,8 +395,247 @@ fn item_text(item: &Value) -> String {
 fn is_function_output_item(item: &Value) -> bool {
     matches!(
         item_type(item).as_str(),
-        "function_call_output" | "custom_tool_call_output" | "computer_call_output"
+        "function_call_output"
+            | "custom_tool_call_output"
+            | "computer_call_output"
+            | "local_shell_call_output"
+            | "apply_patch_call_output"
     )
+}
+
+fn is_function_call_item(item: &Value) -> bool {
+    matches!(
+        item_type(item).as_str(),
+        "function_call" | "custom_tool_call" | "local_shell_call" | "apply_patch_call"
+    )
+}
+
+fn item_call_id(item: &Value) -> String {
+    item.get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned()
+}
+
+fn shell_cmd_from(map: &Map<String, Value>) -> String {
+    if let Some(cmd) = map.get("cmd").and_then(Value::as_str) {
+        return cmd.to_owned();
+    }
+    if let Some(command) = map.get("command") {
+        if let Some(text) = command.as_str() {
+            return text.to_owned();
+        }
+        if let Some(parts) = command.as_array() {
+            return parts
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ");
+        }
+    }
+    if let Some(action) = map.get("action") {
+        if let Some(cmd) = action.get("cmd").and_then(Value::as_str) {
+            return cmd.to_owned();
+        }
+        if let Some(command) = action.get("command") {
+            if let Some(text) = command.as_str() {
+                return text.to_owned();
+            }
+            if let Some(parts) = command.as_array() {
+                return parts
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+            }
+        }
+    }
+    if let Some(arguments) = map.get("arguments").and_then(Value::as_str) {
+        if let Ok(parsed) = serde_json::from_str::<Value>(arguments) {
+            if let Some(cmd) = parsed.get("cmd").and_then(Value::as_str) {
+                return cmd.to_owned();
+            }
+        }
+    }
+    String::new()
+}
+
+fn convert_shell_protocol_item(map: &mut Map<String, Value>) -> bool {
+    match item_type(&Value::Object(map.clone())).as_str() {
+        "local_shell_call" => {
+            let call_id = item_call_id(&Value::Object(map.clone()));
+            let cmd = shell_cmd_from(map);
+            map.insert("type".to_owned(), Value::String("function_call".to_owned()));
+            map.insert("name".to_owned(), Value::String("exec_command".to_owned()));
+            if !call_id.is_empty() {
+                map.insert("call_id".to_owned(), Value::String(call_id));
+            }
+            let needs_args = map
+                .get("arguments")
+                .and_then(Value::as_str)
+                .map(str::is_empty)
+                .unwrap_or(true);
+            if needs_args {
+                map.insert(
+                    "arguments".to_owned(),
+                    Value::String(json!({ "cmd": cmd }).to_string()),
+                );
+            }
+            true
+        }
+        "local_shell_call_output" => {
+            map.insert(
+                "type".to_owned(),
+                Value::String("function_call_output".to_owned()),
+            );
+            match map.get("output") {
+                Some(output) if output.is_string() => {}
+                Some(output) => {
+                    map.insert("output".to_owned(), Value::String(output.to_string()));
+                }
+                None => {
+                    map.insert("output".to_owned(), Value::String(String::new()));
+                }
+            }
+            true
+        }
+        "apply_patch_call" => {
+            map.insert("type".to_owned(), Value::String("function_call".to_owned()));
+            if map
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .is_empty()
+            {
+                map.insert("name".to_owned(), Value::String("apply_patch".to_owned()));
+            }
+            true
+        }
+        "apply_patch_call_output" => {
+            map.insert(
+                "type".to_owned(),
+                Value::String("function_call_output".to_owned()),
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
+fn synthetic_tool_output(call_id: &str) -> Value {
+    json!({
+        "type": "function_call_output",
+        "call_id": call_id,
+        "output": "[tool result missing from history; continue the user task]",
+    })
+}
+
+fn chat_tool_call_ids(message: &Value) -> Vec<String> {
+    message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .map(|calls| {
+            calls
+                .iter()
+                .filter_map(|call| call.get("id").and_then(Value::as_str))
+                .filter(|id| !id.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn ensure_chat_tool_messages(body: &mut Map<String, Value>) -> usize {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    let mut inserted = 0;
+    let mut index = 0;
+    let mut pending = Vec::new();
+    while index < messages.len() {
+        let role = messages[index]
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if role == "assistant" {
+            let ids = chat_tool_call_ids(&messages[index]);
+            if !ids.is_empty() {
+                pending = ids;
+            }
+            index += 1;
+            continue;
+        }
+        if role == "tool" {
+            let id = messages[index]
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            pending.retain(|seen| seen != &id);
+            index += 1;
+            continue;
+        }
+        if !pending.is_empty() {
+            for call_id in pending.drain(..) {
+                messages.insert(
+                    index,
+                    json!({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": "[tool result missing from history; continue the user task]",
+                    }),
+                );
+                inserted += 1;
+                index += 1;
+            }
+        }
+        index += 1;
+    }
+    for call_id in pending {
+        messages.push(json!({
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": "[tool result missing from history; continue the user task]",
+        }));
+        inserted += 1;
+    }
+    inserted
+}
+
+fn ensure_tool_call_outputs(items: &mut Vec<Value>) -> usize {
+    let mut inserted = 0;
+    let mut index = 0;
+    let mut pending = Vec::new();
+    while index < items.len() {
+        if is_function_call_item(&items[index]) {
+            let call_id = item_call_id(&items[index]);
+            if !call_id.is_empty() {
+                pending.push(call_id);
+            }
+            index += 1;
+            continue;
+        }
+        if is_function_output_item(&items[index]) {
+            let call_id = item_call_id(&items[index]);
+            pending.retain(|seen| seen != &call_id);
+            index += 1;
+            continue;
+        }
+        if !pending.is_empty() {
+            for call_id in pending.drain(..) {
+                items.insert(index, synthetic_tool_output(&call_id));
+                inserted += 1;
+                index += 1;
+            }
+        }
+        index += 1;
+    }
+    for call_id in pending {
+        items.push(synthetic_tool_output(&call_id));
+        inserted += 1;
+    }
+    inserted
 }
 
 fn compact_split_at(items: &[Value], keep_last: usize) -> usize {
@@ -387,7 +656,10 @@ fn snippet(text: &str, limit: usize) -> String {
     } else {
         format!(
             "{}…",
-            trimmed.chars().take(limit.saturating_sub(1)).collect::<String>()
+            trimmed
+                .chars()
+                .take(limit.saturating_sub(1))
+                .collect::<String>()
         )
     }
 }
@@ -480,6 +752,46 @@ fn looks_like_compact_request(path: &str, body: &Value) -> bool {
             .is_some_and(|items| items.iter().any(|item| item_type(item) == "compaction"))
 }
 
+fn is_local_compact_id(value: &str) -> bool {
+    value.trim().starts_with("cmp_local_")
+}
+
+fn input_looks_like_post_compact_replay(items: &[Value]) -> bool {
+    items.iter().any(|item| {
+        let kind = item_type(item);
+        if matches!(kind.as_str(), "compaction" | "compact") {
+            return true;
+        }
+        let text = item_text(item);
+        text.contains("【本地压缩摘要】")
+            || text.contains(
+                "Another language model started to solve this problem and produced a summary",
+            )
+    })
+}
+
+fn strip_unusable_third_party_continuation(object: &mut Map<String, Value>) -> bool {
+    let previous = object
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let conversation = object
+        .get("conversation_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let replay = object
+        .get("input")
+        .and_then(Value::as_array)
+        .is_some_and(|items| input_looks_like_post_compact_replay(items));
+    if !is_local_compact_id(previous) && !is_local_compact_id(conversation) && !replay {
+        return false;
+    }
+    object.remove("previous_response_id");
+    object.remove("conversation_id");
+    object.remove("conversation");
+    true
+}
+
 pub fn sanitize_responses_request(path: &str, body: &mut Value) -> SanitizeStats {
     let mut stats = SanitizeStats {
         model: body
@@ -497,6 +809,9 @@ pub fn sanitize_responses_request(path: &str, body: &mut Value) -> SanitizeStats
 
     if !stats.openai_family && strip_include_encrypted(object) {
         stats.stripped_encrypted += 1;
+    }
+    if !stats.openai_family && strip_unusable_third_party_continuation(object) {
+        stats.converted_items += 1;
     }
     if !stats.openai_family {
         stats.rewritten_tool_calls += inject_third_party_identity(object);
@@ -517,10 +832,15 @@ pub fn sanitize_responses_request(path: &str, body: &mut Value) -> SanitizeStats
                 replacement.push(item);
                 continue;
             };
-            let kind = item_type(&Value::Object(map.clone()));
             stats.stripped_encrypted += sanitize_function_output(&mut map, stats.openai_family);
             stats.stripped_encrypted += sanitize_reasoning(&mut map, stats.openai_family);
             if !stats.openai_family {
+                if convert_agent_message(&mut map) {
+                    stats.converted_items += 1;
+                }
+                if convert_shell_protocol_item(&mut map) {
+                    stats.converted_items += 1;
+                }
                 if grok {
                     let (item, converted) = sanitize_grok_item(map);
                     stats.converted_items += converted;
@@ -528,6 +848,7 @@ pub fn sanitize_responses_request(path: &str, body: &mut Value) -> SanitizeStats
                     continue;
                 }
                 stats.converted_items += sanitize_content_parts(&mut map);
+                let kind = item_type(&Value::Object(map.clone()));
                 if unsupported_third_party_item(&kind) {
                     replacement.push(message_from_text(summarize_item(&Value::Object(map))));
                     stats.converted_items += 1;
@@ -544,7 +865,13 @@ pub fn sanitize_responses_request(path: &str, body: &mut Value) -> SanitizeStats
         if !stats.openai_family && compact_request {
             stats.locally_compacted = compact_input(&mut replacement, LOCAL_COMPACT_KEEP_LAST);
         }
+        if !stats.openai_family {
+            stats.rewritten_tool_calls += ensure_tool_call_outputs(&mut replacement);
+        }
         object.insert("input".to_owned(), Value::Array(replacement));
+    }
+    if !stats.openai_family {
+        stats.rewritten_tool_calls += ensure_chat_tool_messages(object);
     }
 
     stats
@@ -575,12 +902,14 @@ pub fn synthetic_compact_response(model: &str, compacted_input: &[Value]) -> Val
                 .and_then(Value::as_array)
                 .and_then(|parts| {
                     parts.iter().find_map(|part| {
-                        part.get("text")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned)
+                        part.get("text").and_then(Value::as_str).map(str::to_owned)
                     })
                 })
-                .or_else(|| item.get("output").and_then(Value::as_str).map(str::to_owned))
+                .or_else(|| {
+                    item.get("output")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
         })
         .take(6)
         .collect::<Vec<_>>()
@@ -924,6 +1253,16 @@ fn rewrite_text_value(value: &mut Value, tools: &mut Vec<Value>) -> bool {
 }
 
 fn rewrite_leaked_tools_in_item(item: &mut Map<String, Value>) -> Vec<Value> {
+    let kind = item_type(&Value::Object(item.clone()));
+    if is_function_call_item(&Value::Object(item.clone()))
+        || is_function_output_item(&Value::Object(item.clone()))
+        || matches!(
+            kind.as_str(),
+            "local_shell_call" | "local_shell_call_output"
+        )
+    {
+        return Vec::new();
+    }
     let mut tools = Vec::new();
     if let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) {
         for part in content.iter_mut() {
@@ -998,7 +1337,10 @@ pub fn rewrite_sse_text(chunk: &str) -> String {
 
 #[allow(dead_code)]
 fn rewrite_sse_event(event: &str) -> String {
-    if find_leaked_tool_start(event).is_none() {
+    let has_leak = find_leaked_tool_start(event).is_some();
+    let has_think = event.to_ascii_lowercase().contains("<think>")
+        || event.to_ascii_lowercase().contains("<thinking>");
+    if !has_leak && !has_think {
         return event.to_owned();
     }
     let mut out = String::new();
@@ -1009,6 +1351,7 @@ fn rewrite_sse_event(event: &str) -> String {
             if let Ok(mut json) = serde_json::from_str::<Value>(trimmed) {
                 rewrite_provider_json(&mut json);
                 rewrite_tool_names_in_json(&mut json);
+                strip_think_tags_from_value(&mut json);
                 if let Some(delta) = json.pointer_mut("/delta") {
                     rewrite_text_value(delta, &mut extracted_tools);
                 }
@@ -1022,7 +1365,8 @@ fn rewrite_sse_event(event: &str) -> String {
                 }
                 continue;
             }
-            let (cleaned, tools) = extract_leaked_tool_calls(data);
+            let (mut cleaned, tools) = extract_leaked_tool_calls(data);
+            cleaned = strip_think_tags(&cleaned);
             extracted_tools.extend(tools);
             out.push_str("data:");
             out.push_str(&cleaned);
@@ -1062,6 +1406,81 @@ pub fn continue_after_local_compact_instructions() -> &'static str {
     "压缩已完成。请立即继续执行压缩前未完成的用户任务，不要停止。默认使用简体中文。只使用当前对话工作目录，不要读取 CodexRouter 源码目录，除非它就是当前 cwd。"
 }
 
+pub fn strip_think_tags(text: &str) -> String {
+    // Remove <think>...</think> and <thinking>...</thinking> blocks case-insensitively.
+    // If opening tag has no closing tag, strip to end (truncated stream).
+    let lower = text.to_ascii_lowercase();
+    let mut out = String::with_capacity(text.len());
+    let mut pos = 0;
+    while pos < text.len() {
+        let rem_lower = &lower[pos..];
+        let think_pos = rem_lower.find("<think>");
+        let thinking_pos = rem_lower.find("<thinking>");
+        let (rel, open_len, close_tag) = match (think_pos, thinking_pos) {
+            (Some(a), Some(b)) => {
+                if a < b {
+                    (a, 7, "</think>")
+                } else {
+                    (b, 10, "</thinking>")
+                }
+            }
+            (Some(a), None) => (a, 7, "</think>"),
+            (None, Some(b)) => (b, 10, "</thinking>"),
+            (None, None) => {
+                out.push_str(&text[pos..]);
+                break;
+            }
+        };
+        let abs_start = pos + rel;
+        out.push_str(&text[pos..abs_start]);
+        let after_open = abs_start + open_len;
+        if after_open > text.len() {
+            break;
+        }
+        let after_lower = &lower[after_open..];
+        if let Some(end_rel) = after_lower.find(close_tag) {
+            pos = after_open + end_rel + close_tag.len();
+        } else {
+            // No closing tag — truncated stream, drop remainder.
+            break;
+        }
+    }
+    out
+}
+
+pub fn strip_think_tags_from_value(value: &mut Value) -> bool {
+    match value {
+        Value::String(s) => {
+            let stripped = strip_think_tags(s);
+            if stripped != *s {
+                *s = stripped;
+                true
+            } else {
+                false
+            }
+        }
+        Value::Array(arr) => {
+            let mut changed = false;
+            for v in arr.iter_mut() {
+                if strip_think_tags_from_value(v) {
+                    changed = true;
+                }
+            }
+            changed
+        }
+        Value::Object(map) => {
+            let mut changed = false;
+            for v in map.values_mut() {
+                if strip_think_tags_from_value(v) {
+                    changed = true;
+                }
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
 pub fn should_retry_after_upstream_error(status: u16, body: &str) -> bool {
     if !matches!(status, 400 | 422 | 500 | 502 | 503) {
         return false;
@@ -1072,13 +1491,15 @@ pub fn should_retry_after_upstream_error(status: u16, body: &str) -> bool {
         || lower.contains("encrypted content")
         || lower.contains("invalid_encrypted_content")
         || lower.contains("could not be decrypted")
+        || lower.contains("invalid-argument")
+        || lower.contains("invalid_argument")
+        || lower.contains("previous_response")
         || is_unsupported_image_error(body)
 }
 
 pub fn is_unsupported_image_error(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
-    lower.contains("does not support image input")
-        || lower.contains("unsupported image input")
+    lower.contains("does not support image input") || lower.contains("unsupported image input")
 }
 
 pub fn rewrite_poisoned_upstream_status(status: u16, body: &str) -> u16 {
@@ -1106,6 +1527,8 @@ pub fn is_exhausted_account_status(status: u16, body: &str) -> bool {
     }
     let lower = body.to_ascii_lowercase();
     lower.contains("no available accounts")
+        || lower.contains("auth_unavailable")
+        || lower.contains("no auth available")
         || lower.contains("too many requests")
         || lower.contains("rate_limit")
         || lower.contains("rate limit")
@@ -1312,11 +1735,67 @@ mod tests {
     }
 
     #[test]
+    fn grok_reconnect_after_local_compact_drops_synthetic_continuation() {
+        let mut body = json!({
+            "model": "grok-4.6",
+            "previous_response_id": "cmp_local_1710000000",
+            "conversation_id": "cmp_local_1710000000",
+            "conversation": {"id": "cmp_local_1710000000"},
+            "input": [
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"继续"}]}
+            ]
+        });
+        sanitize_responses_request("/v1/responses", &mut body);
+        assert!(body.get("previous_response_id").is_none());
+        assert!(body.get("conversation_id").is_none());
+        assert!(body.get("conversation").is_none());
+        assert_eq!(body["input"][0]["role"], "user");
+    }
+
+    #[test]
+    fn grok_post_compact_transcript_drops_real_previous_response() {
+        let mut body = json!({
+            "model": "grok-4.6",
+            "previous_response_id": "resp_grok_real",
+            "input": [
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"【本地压缩摘要】已折叠 80 条较早记录。"}]},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"继续"}]}
+            ]
+        });
+        sanitize_responses_request("/v1/responses", &mut body);
+        assert!(body.get("previous_response_id").is_none());
+        assert_eq!(body["input"].as_array().unwrap().len(), 2);
+        assert!(body["input"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("本地压缩摘要"));
+    }
+
+    #[test]
+    fn grok_keeps_same_thread_previous_response_without_compact() {
+        let mut body = json!({
+            "model": "grok-4.6",
+            "previous_response_id": "resp_grok_real",
+            "input": [
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"下一问"}]}
+            ]
+        });
+        sanitize_responses_request("/v1/responses", &mut body);
+        assert_eq!(body["previous_response_id"], "resp_grok_real");
+    }
+
+    #[test]
     fn compact_keeps_function_output_paired_with_its_call() {
-        let mut items = vec![json!({"type":"message","role":"user","content":[{"type":"input_text","text":"old"}]})];
+        let mut items = vec![
+            json!({"type":"message","role":"user","content":[{"type":"input_text","text":"old"}]}),
+        ];
         for index in 0..20 {
-            items.push(json!({"type":"function_call","name":"exec_command","call_id":format!("c{index}")}));
-            items.push(json!({"type":"function_call_output","call_id":format!("c{index}"),"output":"ok"}));
+            items.push(
+                json!({"type":"function_call","name":"exec_command","call_id":format!("c{index}")}),
+            );
+            items.push(
+                json!({"type":"function_call_output","call_id":format!("c{index}"),"output":"ok"}),
+            );
         }
         assert!(compact_input(&mut items, 5));
         assert!(!is_function_output_item(&items[1]));
@@ -1334,7 +1813,10 @@ mod tests {
         assert_eq!(remap_tool_name("_command"), "exec_command");
         assert_eq!(tools[0]["name"], "exec_command");
         assert!(tools[0]["arguments"].as_str().unwrap().contains("\"cmd\""));
-        assert!(tools[0]["arguments"].as_str().unwrap().contains("Get-Location"));
+        assert!(tools[0]["arguments"]
+            .as_str()
+            .unwrap()
+            .contains("Get-Location"));
     }
 
     #[test]
@@ -1360,7 +1842,7 @@ mod tests {
         assert!(body["instructions"]
             .as_str()
             .unwrap()
-            .contains("Agent_Test_1.7.10_kimi.md"));
+            .contains(&format!("Agent_Test_{}_kimi.md", env!("CARGO_PKG_VERSION"))));
     }
 
     #[test]
@@ -1374,7 +1856,10 @@ mod tests {
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["name"], "exec_command");
         assert!(body["instructions"].as_str().unwrap().contains("你是Kimi"));
-        assert!(!body["instructions"].as_str().unwrap().starts_with("You are Codex"));
+        assert!(!body["instructions"]
+            .as_str()
+            .unwrap()
+            .starts_with("You are Codex"));
     }
 
     #[test]
@@ -1387,7 +1872,10 @@ mod tests {
             }]
         });
         assert_eq!(rewrite_provider_json(&mut body), 1);
-        assert_eq!(body["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "exec_command");
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "exec_command"
+        );
         let sse = rewrite_sse_text(
             "data: {\"delta\":\"functions__exec:1{\\\"command\\\":\\\"pwd\\\"}\"}\n\n",
         );
@@ -1396,6 +1884,96 @@ mod tests {
         assert!(sse.contains("response.output_item.done"));
         assert!(sse.contains("exec_command"));
         assert!(sse.contains("\\\"cmd\\\":\\\"pwd\\\""));
+    }
+
+    #[test]
+    fn local_shell_history_becomes_paired_exec_command() {
+        let mut body = json!({
+            "model": "grok-4.6",
+            "input": [
+                {
+                    "type": "local_shell_call",
+                    "call_id": "exec_command:0",
+                    "action": {"type": "exec", "command": ["Get-Location"]}
+                },
+                {
+                    "type": "local_shell_call_output",
+                    "call_id": "exec_command:0",
+                    "output": "D:\\temp"
+                }
+            ]
+        });
+        sanitize_responses_request("/v1/responses", &mut body);
+        assert_eq!(body["input"][0]["type"], "function_call");
+        assert_eq!(body["input"][0]["name"], "exec_command");
+        assert_eq!(body["input"][0]["call_id"], "exec_command:0");
+        assert!(body["input"][0]["arguments"]
+            .as_str()
+            .unwrap()
+            .contains("Get-Location"));
+        assert_eq!(body["input"][1]["type"], "function_call_output");
+        assert_eq!(body["input"][1]["call_id"], "exec_command:0");
+        assert_eq!(body["input"][1]["output"], "D:\\temp");
+    }
+
+    #[test]
+    fn unpaired_exec_command_call_gets_synthetic_output_before_next_user() {
+        let mut body = json!({
+            "model": "k3-256k",
+            "input": [
+                {"type":"function_call","name":"exec_command","call_id":"exec_command:0","arguments":"{\"cmd\":\"ls\"}"},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"继续"}]}
+            ]
+        });
+        sanitize_responses_request("/v1/responses", &mut body);
+        let items = body["input"].as_array().unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0]["call_id"], "exec_command:0");
+        assert_eq!(items[1]["type"], "function_call_output");
+        assert_eq!(items[1]["call_id"], "exec_command:0");
+        assert_eq!(items[2]["role"], "user");
+    }
+
+    #[test]
+    fn chat_tool_calls_without_tool_message_are_paired() {
+        let mut body = json!({
+            "model": "glm-latest",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "exec_command:0",
+                        "type": "function",
+                        "function": {"name": "exec_command", "arguments": "{\"cmd\":\"ls\"}"}
+                    }]
+                },
+                {"role": "user", "content": "继续"}
+            ]
+        });
+        sanitize_responses_request("/v1/chat/completions", &mut body);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "exec_command:0");
+        assert_eq!(messages[2]["role"], "user");
+    }
+
+    #[test]
+    fn leaked_tool_text_inside_function_output_does_not_create_unpaired_call() {
+        let mut body = json!({
+            "model": "kimi-for-coding",
+            "input": [
+                {"type":"function_call","name":"exec_command","call_id":"exec_command:0","arguments":"{\"cmd\":\"ls\"}"},
+                {"type":"function_call_output","call_id":"exec_command:0","output":"functions__exec:8{\"command\":\"pwd\"}"}
+            ]
+        });
+        sanitize_responses_request("/v1/responses", &mut body);
+        let items = body["input"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["type"], "function_call");
+        assert_eq!(items[1]["type"], "function_call_output");
+        assert_eq!(items[1]["call_id"], "exec_command:0");
     }
 
     #[test]
@@ -1412,7 +1990,96 @@ mod tests {
     }
 
     #[test]
+    fn think_tags_are_stripped_from_deepseek_text() {
+        assert_eq!(
+            strip_think_tags("hello <think>internal reasoning</think> world"),
+            "hello  world"
+        );
+        assert_eq!(
+            strip_think_tags("start <THINK>Using direct collaboration tool</THINK> end"),
+            "start  end"
+        );
+        assert_eq!(strip_think_tags("prefix <think>truncated"), "prefix ");
+        assert_eq!(strip_think_tags("no tags here"), "no tags here");
+        let mut v = json!({"delta": "<think>secret</think> hello"});
+        assert!(strip_think_tags_from_value(&mut v));
+        assert_eq!(v["delta"], " hello");
+    }
+
+    #[test]
+    fn deepseek_v2_agent_message_preserves_delegated_task() {
+        let task = "调用 exec_command 运行 Get-Date，然后逐字返回结果。";
+        let mut body = json!({
+            "model": "deepseek-v4-flash",
+            "instructions": "instruction sentinel",
+            "previous_response_id": "resp_parent",
+            "input": [{
+                "type": "agent_message",
+                "id": "amsg_1",
+                "author": "/root",
+                "recipient": "/root/worker",
+                "content": [
+                    {"type":"input_text","text":"Message Type: NEW_TASK\nTask name: /root/worker\nPayload:\n"},
+                    {"type":"encrypted_content","encrypted_content":task}
+                ],
+                "internal_chat_message_metadata_passthrough": {"turn_id":"turn_child"}
+            }]
+        });
+        let stats = sanitize_responses_request("/v1/responses", &mut body);
+        assert!(stats.converted_items >= 1);
+        let item = &body["input"][0];
+        assert_eq!(item["type"], "message");
+        assert_eq!(item["role"], "user");
+        assert_eq!(item["id"], "amsg_1");
+        assert_eq!(item["author"], "/root");
+        assert_eq!(item["recipient"], "/root/worker");
+        assert_eq!(
+            item["internal_chat_message_metadata_passthrough"]["turn_id"],
+            "turn_child"
+        );
+        assert_eq!(item["content"][1]["type"], "input_text");
+        assert_eq!(item["content"][1]["text"], task);
+        assert!(item["content"][1].get("encrypted_content").is_none());
+        let encoded = body.to_string();
+        assert!(!encoded.contains("[agent_message"));
+        assert!(!encoded.contains("[encrypted_content omitted]"));
+        assert!(body["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("instruction sentinel"));
+    }
+
+    #[test]
+    fn third_party_agent_message_matrix_keeps_task() {
+        for model in ["deepseek-v4-flash", "kimi-for-coding", "grok-4.6"] {
+            let mut body = json!({
+                "model": model,
+                "input": [{
+                    "type":"agent_message",
+                    "author":"/root",
+                    "recipient":"/root/child",
+                    "content":[
+                        {"type":"input_text","text":"Message Type: NEW_TASK\nPayload:\n"},
+                        {"type":"encrypted_content","encrypted_content":"TASK-SENTINEL"}
+                    ]
+                }]
+            });
+            sanitize_responses_request("/v1/responses", &mut body);
+            assert_eq!(body["input"][0]["type"], "message", "{model}");
+            assert_eq!(body["input"][0]["role"], "user", "{model}");
+            assert_eq!(
+                body["input"][0]["content"][1]["text"], "TASK-SENTINEL",
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
     fn modelinput_502_is_rewritten_to_client_error() {
+        assert!(should_retry_after_upstream_error(
+            400,
+            r#"{"code":"invalid-argument","type":"error"}"#
+        ));
         assert!(should_retry_after_upstream_error(
             422,
             r#"{"error":"data did not match any variant of untagged enum ModelInput"}"#
@@ -1436,5 +2103,9 @@ mod tests {
             rewrite_poisoned_upstream_status(503, "Service temporarily unavailable"),
             429
         );
+        assert!(is_exhausted_account_status(
+            503,
+            "auth_unavailable: no auth available (providers=openai-compatible-cr_r1_openai)"
+        ));
     }
 }

@@ -9,6 +9,46 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use toml_edit::{DocumentMut, Item, Table};
 
+/// Repair a Codex thread-store inconsistency produced by older maintenance
+/// tools that rewrote rollout paths with the Windows `\\?\` prefix. Codex's
+/// archive mover compares those paths with ordinary `C:\...` destinations and
+/// can stop after shutting down the active thread without moving the rollout.
+/// Only normalize rows whose ordinary path already exists; never guess or move
+/// conversation files.
+pub fn repair_codex_thread_store_paths(cfg: &RouterConfig) -> anyhow::Result<usize> {
+    let database = logic::resolve_codex_home(cfg).join("state_5.sqlite");
+    if !database.is_file() {
+        return Ok(0);
+    }
+    let mut connection = rusqlite::Connection::open(&database)
+        .context("failed to open the Codex thread store for path repair")?;
+    let candidates = {
+        let mut statement = connection.prepare(
+            "SELECT id, rollout_path FROM threads WHERE archived=0 AND rollout_path LIKE '\\\\?\\%'",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.filter_map(Result::ok).collect::<Vec<_>>()
+    };
+    let transaction = connection.transaction()?;
+    let mut repaired = 0;
+    for (thread_id, current) in candidates {
+        let Some(normalized) = current.strip_prefix(r"\\?\") else {
+            continue;
+        };
+        if !Path::new(normalized).is_file() {
+            continue;
+        }
+        repaired += transaction.execute(
+            "UPDATE threads SET rollout_path=?1 WHERE id=?2 AND rollout_path=?3",
+            rusqlite::params![normalized, thread_id, current],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(repaired)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IsolationKind {
@@ -1665,6 +1705,52 @@ pub fn purge_oauth_account_references(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thread_store_repair_only_normalizes_existing_extended_rollout_paths() {
+        let root = temporary_test_dir("thread-store-path-repair");
+        let codex_home = root.join("codex-home");
+        let sessions = codex_home.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let rollout = sessions.join("rollout-test.jsonl");
+        std::fs::write(&rollout, "fixture").unwrap();
+        let database = codex_home.join("state_5.sqlite");
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, archived INTEGER NOT NULL);",
+            )
+            .unwrap();
+        let normal = rollout.to_string_lossy().to_string();
+        let extended = format!(r"\\?\{normal}");
+        connection
+            .execute(
+                "INSERT INTO threads(id,rollout_path,archived) VALUES('repair',?1,0)",
+                rusqlite::params![extended],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads(id,rollout_path,archived) VALUES('missing',?1,0)",
+                rusqlite::params![format!(r"\\?\{}", sessions.join("missing.jsonl").display())],
+            )
+            .unwrap();
+        drop(connection);
+        let mut cfg = RouterConfig::default();
+        cfg.deploy.codex_home = codex_home.to_string_lossy().to_string();
+        assert_eq!(repair_codex_thread_store_paths(&cfg).unwrap(), 1);
+        let connection = rusqlite::Connection::open(database).unwrap();
+        let repaired: String = connection
+            .query_row("SELECT rollout_path FROM threads WHERE id='repair'", [], |row| row.get(0))
+            .unwrap();
+        let missing: String = connection
+            .query_row("SELECT rollout_path FROM threads WHERE id='missing'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(repaired, normal);
+        assert!(missing.starts_with(r"\\?\"));
+        drop(connection);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn temporary_test_dir(label: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(

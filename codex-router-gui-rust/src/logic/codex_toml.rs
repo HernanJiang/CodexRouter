@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use toml_edit::{DocumentMut, Item};
 
 const CODEX_ROUTER_REQUEST_MAX_RETRIES: i64 = 1;
-const CODEX_ROUTER_STREAM_MAX_RETRIES: i64 = 6;
+// The local gateway owns retry classification and staged backoff. A second
+// Codex retry loop would replay the same request with a fixed UI cadence.
+const CODEX_ROUTER_STREAM_MAX_RETRIES: i64 = 0;
 
 const REASONING_LEVELS: &[&str] = &[
     "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
@@ -106,10 +108,11 @@ pub fn generate_codex_router_config(
         toml_edit::value(&reasoning_effort),
     );
     // `authMode` describes which upstream routes the local Router may use. It
-    // must not restrict Codex's own sign-in method. Older Router releases wrote
-    // this key for OAuth-labelled profiles, so remove that legacy value while
-    // leaving any unrelated restriction untouched.
-    if doc.get("forced_login_method").and_then(Item::as_str) == Some("chatgpt") {
+    // must not restrict Codex's own sign-in method. Strip a leftover ChatGPT
+    // lock only when this machine is using API-key login.
+    if !require_openai_auth
+        && doc.get("forced_login_method").and_then(Item::as_str) == Some("chatgpt")
+    {
         doc.remove("forced_login_method");
     }
     // features.apps = false
@@ -131,10 +134,10 @@ pub fn generate_codex_router_config(
         doc.insert("service_tier", toml_edit::value("fast"));
         new_thread.insert("service_tier", toml_edit::value("fast"));
     }
-    // This is Codex's feature-visibility gate, not the selected service tier.
-    // Per-model catalog capabilities decide whether Fast is offered, while
-    // `service_tier = "fast"` above decides whether it is currently active.
-    features.insert("fast_mode", toml_edit::value(true));
+    // Keep the feature-visibility gate aligned with the requested mode. The
+    // service tier and the feature flag must be cleared together when Fast is
+    // disabled, otherwise a later Codex reload resurrects the old Fast state.
+    features.insert("fast_mode", toml_edit::value(fast_mode));
 
     // Copy permission-related settings from a source document.
     let mut windows = doc
@@ -193,6 +196,27 @@ pub fn generate_codex_router_config(
             .unwrap_or_default();
         models.insert("new_thread", toml_edit::Item::Table(new_thread));
         doc["models"] = toml_edit::Item::Table(models);
+    }
+    let mut agents = doc
+        .remove("agents")
+        .and_then(|item| item.into_table().ok())
+        .unwrap_or_default();
+    if super::responses_compat::is_openai_family_model(model) {
+        agents.insert("default_subagent_model", toml_edit::value(model));
+        agents.insert(
+            "default_subagent_reasoning_effort",
+            toml_edit::value(&reasoning_effort),
+        );
+    } else {
+        // The two defaults are Router-managed. Leaving an OpenAI v2 default in
+        // place while the selected model is DeepSeek/Gemini/Kimi/Grok makes
+        // Codex emit v2 agent_message payloads even though their catalog entry
+        // deliberately advertises multi-agent v1.
+        agents.remove("default_subagent_model");
+        agents.remove("default_subagent_reasoning_effort");
+    }
+    if !agents.is_empty() {
+        doc["agents"] = toml_edit::Item::Table(agents);
     }
     doc["features"] = toml_edit::Item::Table(features);
     doc["windows"] = toml_edit::Item::Table(windows);
@@ -258,7 +282,7 @@ fn build_codex_router_provider(
         "stream_max_retries",
         toml_edit::value(CODEX_ROUTER_STREAM_MAX_RETRIES),
     );
-    provider.insert("stream_idle_timeout_ms", toml_edit::value(300_000_i64));
+    provider.insert("stream_idle_timeout_ms", toml_edit::value(1_800_000_i64));
     provider.insert("supports_websockets", toml_edit::value(false));
     provider
 }
@@ -537,7 +561,7 @@ pub(crate) fn write_codex_config_from_router_config_impl(
 ) -> anyhow::Result<()> {
     let codex_home = resolve_codex_home(cfg);
     let existing = std::fs::read_to_string(codex_home.join("config.toml")).unwrap_or_default();
-    let settings = if existing.trim().is_empty() {
+    let mut settings = if existing.trim().is_empty() {
         codex_router_settings(cfg)
     } else {
         // Keep the model and reasoning already shown in Desktop. Saving Router
@@ -545,6 +569,7 @@ pub(crate) fn write_codex_config_from_router_config_impl(
         // Router's default_model.
         codex_router_repair_settings(cfg, &existing)
     };
+    settings.require_openai_auth = login_requires_openai_auth(&codex_home, cfg, &existing);
     let catalog_path = crate::user_data::state_root(router_root).join("model-catalog.json");
     let local_api_key = super::ensure_local_api_key()?;
     persist_desktop_overlay_file(&desktop_overlay_path(router_root), &existing);
@@ -602,9 +627,7 @@ fn codex_router_settings(cfg: &RouterConfig) -> CodexRouterSettings {
         model,
         reasoning_effort,
         fast_mode: supports_fast,
-        // Keep Codex's ChatGPT login contract for the local Responses provider;
-        // Sub2API still owns the selected upstream OAuth/API route.
-        require_openai_auth: true,
+        require_openai_auth: !cfg.auth_mode.trim().eq_ignore_ascii_case("local_api_key"),
         display_openai_provider: false,
     }
 }
@@ -642,6 +665,65 @@ fn codex_router_repair_settings(cfg: &RouterConfig, existing: &str) -> CodexRout
     settings
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodexLoginKind {
+    Chatgpt,
+    ApiKey,
+    Unknown,
+}
+
+fn read_codex_login_kind(codex_home: &Path) -> CodexLoginKind {
+    let Ok(text) = std::fs::read_to_string(codex_home.join("auth.json")) else {
+        return CodexLoginKind::Unknown;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return CodexLoginKind::Unknown;
+    };
+    match value.get("auth_mode").and_then(|item| item.as_str()) {
+        Some("chatgpt") if value.get("tokens").is_some_and(serde_json::Value::is_object) => {
+            CodexLoginKind::Chatgpt
+        }
+        Some("apikey") => CodexLoginKind::ApiKey,
+        _ => {
+            if value
+                .get("OPENAI_API_KEY")
+                .and_then(|item| item.as_str())
+                .is_some_and(|key| !key.trim().is_empty())
+            {
+                CodexLoginKind::ApiKey
+            } else {
+                CodexLoginKind::Unknown
+            }
+        }
+    }
+}
+
+fn existing_provider_requires_openai_auth(existing: &str) -> Option<bool> {
+    existing
+        .parse::<DocumentMut>()
+        .ok()?
+        .get("model_providers")?
+        .as_table_like()?
+        .get("codex_router")?
+        .as_table_like()?
+        .get("requires_openai_auth")?
+        .as_bool()
+}
+
+fn login_requires_openai_auth(codex_home: &Path, cfg: &RouterConfig, existing: &str) -> bool {
+    match read_codex_login_kind(codex_home) {
+        CodexLoginKind::Chatgpt => true,
+        CodexLoginKind::ApiKey => false,
+        CodexLoginKind::Unknown => {
+            if cfg.auth_mode.trim().eq_ignore_ascii_case("local_api_key") {
+                false
+            } else {
+                existing_provider_requires_openai_auth(existing).unwrap_or(true)
+            }
+        }
+    }
+}
+
 fn codex_router_binding_matches(
     cfg: &RouterConfig,
     router_root: &Path,
@@ -656,9 +738,7 @@ fn codex_router_binding_matches(
     let Ok(document) = existing.parse::<DocumentMut>() else {
         return false;
     };
-    if document.get("model_provider").and_then(Item::as_str) != Some("codex_router")
-        || document.get("forced_login_method").and_then(Item::as_str) == Some("chatgpt")
-    {
+    if document.get("model_provider").and_then(Item::as_str) != Some("codex_router") {
         return false;
     }
     let Some(provider) = document
@@ -677,16 +757,11 @@ fn codex_router_binding_matches(
         || provider
             .get("requires_openai_auth")
             .and_then(Item::as_bool)
-            != Some(true)
-    {
-        return false;
-    }
-    if document
-        .get("features")
-        .and_then(Item::as_table_like)
-        .and_then(|features| features.get("fast_mode"))
-        .and_then(Item::as_bool)
-        != Some(true)
+            != Some(login_requires_openai_auth(
+                &resolve_codex_home(cfg),
+                cfg,
+                existing,
+            ))
     {
         return false;
     }
@@ -702,24 +777,11 @@ fn codex_router_binding_matches(
     else {
         return false;
     };
-    let catalog_matches = if cfg!(windows) {
+    if cfg!(windows) {
         actual_catalog.eq_ignore_ascii_case(&expected_catalog)
     } else {
         actual_catalog == expected_catalog
-    };
-    if !catalog_matches {
-        return false;
     }
-
-    let Some(selected_model) = document.get("model").and_then(Item::as_str) else {
-        return false;
-    };
-    super::catalog::build_route_plan(cfg)
-        .into_iter()
-        .any(|route| {
-            route.include_in_catalog
-                && (route.public_model_id == selected_model || route.model.model == selected_model)
-        })
 }
 
 pub(crate) fn repair_codex_router_binding_with_key(
@@ -752,13 +814,14 @@ pub(crate) fn repair_codex_router_binding_impl(
             &catalog_path,
             local_api_key,
             &codex_public_base_url(cfg),
-            true,
+            login_requires_openai_auth(&codex_home, cfg, &existing),
             false,
         )?;
         return Ok(false);
     }
 
-    let settings = codex_router_repair_settings(cfg, &existing);
+    let mut settings = codex_router_repair_settings(cfg, &existing);
+    settings.require_openai_auth = login_requires_openai_auth(&codex_home, cfg, &existing);
     write_codex_router_config(
         &codex_home,
         &settings.model,
@@ -808,8 +871,8 @@ pub fn probe_codex_router_binding_overwrite(
 
 pub(crate) fn probe_codex_router_binding_overwrite_with_key(
     cfg: &RouterConfig,
-    router_root: &Path,
-    local_api_key: &str,
+    _router_root: &Path,
+    _local_api_key: &str,
 ) -> anyhow::Result<Option<String>> {
     let codex_home = resolve_codex_home(cfg);
     let config_path = codex_home.join("config.toml");
@@ -820,7 +883,9 @@ pub(crate) fn probe_codex_router_binding_overwrite_with_key(
             return Err(error).context("failed to read Codex config for overwrite detection")
         }
     };
-    if codex_router_binding_matches(cfg, router_root, &existing, local_api_key) {
+    if !existing.trim().is_empty()
+        && super::codex_config_uses_router(&existing, &codex_public_base_url(cfg))
+    {
         return Ok(None);
     }
     Ok(Some(codex_config_fingerprint(&existing)))
@@ -1125,7 +1190,7 @@ mod tests {
         assert!(generated.contains("name = \"Codex-Router\""));
         assert!(generated.contains("requires_openai_auth = true"));
         assert!(generated.contains("request_max_retries = 1"));
-        assert!(generated.contains("stream_max_retries = 6"));
+        assert!(generated.contains("stream_max_retries = 0"));
         assert!(!generated.contains("forced_login_method"));
         assert!(generated.contains("model_catalog_json = \"C:/isolated/model-catalog.json\""));
         assert_eq!(
@@ -1185,7 +1250,28 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(!codex_router_settings(&cfg).display_openai_provider);
+        let settings = codex_router_settings(&cfg);
+        assert!(!settings.display_openai_provider);
+        assert!(!settings.require_openai_auth);
+    }
+
+    #[test]
+    fn generate_keeps_chatgpt_forced_login_when_openai_auth_is_required() {
+        let text = generate_codex_router_config(
+            "forced_login_method = \"chatgpt\"\nmodel = \"gpt-5.6-sol\"\n",
+            "gpt-5.6-sol",
+            "C:/catalog.json",
+            "sk-local-key",
+            "http://127.0.0.1:18082",
+            "medium",
+            false,
+            true,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(text.contains("forced_login_method = \"chatgpt\""));
+        assert!(text.contains("requires_openai_auth = true"));
     }
 
     #[test]
@@ -1237,7 +1323,7 @@ mod tests {
         assert!(text.contains("[desktop]"));
         assert!(text.contains("enabled-reasoning-efforts = [\"low\", \"medium\", \"high\", \"xhigh\", \"ultra\", \"max\"]"));
         assert!(!text.contains("service_tier"));
-        assert!(text.contains("fast_mode = true"));
+        assert!(text.contains("fast_mode = false"));
     }
 
     #[test]
@@ -1288,9 +1374,36 @@ custom_agent_setting = "preserve-me"
         )
         .unwrap();
         assert!(text.contains("[agents]"));
-        assert!(text.contains("default_subagent_model = \"gpt-5.6-luna\""));
-        assert!(text.contains("default_subagent_reasoning_effort = \"max\""));
+        assert!(text.contains("default_subagent_model = \"gpt-5.6-sol\""));
+        assert!(text.contains("default_subagent_reasoning_effort = \"medium\""));
         assert!(text.contains("custom_agent_setting = \"preserve-me\""));
+        assert!(!text.contains("gpt-5.6-luna"));
+    }
+
+    #[test]
+    fn deepseek_removes_openai_subagent_defaults_but_preserves_custom_agent_settings() {
+        let existing = r#"
+[agents]
+default_subagent_model = "gpt-5.6-sol"
+default_subagent_reasoning_effort = "max"
+custom_agent_setting = "preserve-me"
+"#;
+        let text = generate_codex_router_config(
+            existing,
+            "deepseek-v4-flash",
+            "C:/catalog.json",
+            "sk-local-key",
+            "http://127.0.0.1:18082",
+            "high",
+            false,
+            true,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(text.contains("custom_agent_setting = \"preserve-me\""));
+        assert!(!text.contains("default_subagent_model"));
+        assert!(!text.contains("default_subagent_reasoning_effort"));
     }
 
     #[test]
@@ -1668,6 +1781,66 @@ sandbox = "unelevated"
             Some(codex_config_fingerprint(overwritten_again).as_str())
         );
         assert_ne!(detected, detected_again);
+
+        assert!(
+            repair_codex_router_binding_impl(&cfg, &tmp, "fixture-local-router-key", &system_config)
+                .unwrap()
+        );
+        let mut desktop_owned: DocumentMut = std::fs::read_to_string(codex_home.join("config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        desktop_owned["forced_login_method"] = toml_edit::value("chatgpt");
+        let desktop_text = desktop_owned.to_string();
+        std::fs::write(codex_home.join("config.toml"), &desktop_text).unwrap();
+        assert!(
+            probe_codex_router_binding_overwrite_with_key(&cfg, &tmp, "fixture-local-router-key")
+                .unwrap()
+                .is_none(),
+            "Desktop writing forced_login_method back is not an external overwrite"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn apply_reuses_existing_apikey_login_instead_of_forcing_openai_auth() {
+        let tmp = std::env::temp_dir().join(format!(
+            "codex-router-apikey-login-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let router_root = tmp.join("router-root");
+        let codex_home = tmp.join("codex-home");
+        std::fs::create_dir_all(&router_root).unwrap();
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let auth = br#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-user-fixture"}"#;
+        std::fs::write(codex_home.join("auth.json"), auth).unwrap();
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "model = \"deepseek-v4-flash\"\nmodel_provider = \"codex_router\"\n",
+        )
+        .unwrap();
+        let cfg = RouterConfig {
+            auth_mode: "chatgpt_oauth".to_owned(),
+            default_model: "deepseek-v4-flash".to_owned(),
+            models: vec![ModelConfig {
+                source: "apikey".to_owned(),
+                model: "deepseek-v4-flash".to_owned(),
+                ..Default::default()
+            }],
+            deploy: crate::config::DeployConfig {
+                codex_home: codex_home.to_string_lossy().into_owned(),
+                sub2api_host: "http://127.0.0.1:18082".to_owned(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        write_codex_config_from_router_config_impl(&cfg, &router_root, &tmp.join("system.toml"))
+            .unwrap();
+        let written = std::fs::read_to_string(codex_home.join("config.toml")).unwrap();
+        assert!(written.contains("requires_openai_auth = false"));
+        assert!(!written.contains("forced_login_method"));
+        assert_eq!(std::fs::read(codex_home.join("auth.json")).unwrap(), auth);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

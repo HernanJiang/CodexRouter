@@ -40,7 +40,14 @@ $stdoutFile = Join-Path $env:TEMP ("codex-router-start-" + [Guid]::NewGuid().ToS
 $stderrFile = Join-Path $env:TEMP ("codex-router-start-" + [Guid]::NewGuid().ToString('N') + '.err.log')
 $process = $null
 try {
-    $process = Start-Process -FilePath $native -ArgumentList $arguments -NoNewWindow -PassThru -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $native
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    foreach ($argument in $arguments) { [void]$startInfo.ArgumentList.Add($argument) }
+    $process = [Diagnostics.Process]::Start($startInfo)
     # The release GUI binary is a windows-subsystem executable. When the native
     # ensure command starts the Router Host it spawns a long-lived child, and
     # Start-Process -Wait never returns for such a parent (PowerShell waits on
@@ -55,9 +62,8 @@ try {
         Start-Sleep -Milliseconds 250
         $process.Refresh()
     }
-    Start-Sleep -Milliseconds 300
-    $stdout = Read-SharedText -Path $stdoutFile
-    $stderr = Read-SharedText -Path $stderrFile
+    $stdout = $process.StandardOutput.ReadToEnd()
+    $stderr = $process.StandardError.ReadToEnd()
 } finally {
     Remove-Item -LiteralPath $stdoutFile, $stderrFile -Force -ErrorAction SilentlyContinue
 }

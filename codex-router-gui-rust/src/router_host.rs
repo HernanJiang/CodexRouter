@@ -14,6 +14,7 @@ use axum::{Json, Router};
 use codex_router_lib::backend::cli_proxy::CliProxyManagementClient;
 use codex_router_lib::backend::config_compiler::{self, CliProxyConfig};
 use codex_router_lib::control_plane::http_compat as compat;
+use codex_router_lib::control_plane::scheduler;
 use codex_router_lib::control_plane::ControlState;
 use codex_router_lib::data_ops;
 use codex_router_lib::routing::{ContinuationBindings, PoolRoute, RouteTable};
@@ -68,6 +69,27 @@ fn router_root() -> PathBuf {
         })
 }
 
+fn router_state_root() -> PathBuf {
+    let root = router_root();
+    if let Some(override_root) = std::env::var_os("CODEX_ROUTER_USER_DATA_ROOT") {
+        let override_root = PathBuf::from(override_root);
+        if override_root.is_absolute() {
+            return override_root;
+        }
+    }
+    if std::env::var_os("CODEX_ROUTER_PORTABLE_STATE").is_some_and(|value| value == "1") {
+        return root;
+    }
+    if root.join("release-manifest.json").is_file() {
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            return PathBuf::from(local_app_data)
+                .join("Codex-Router")
+                .join("UserData");
+        }
+    }
+    root
+}
+
 fn sha256_file(path: &Path) -> Result<String> {
     use sha2::{Digest, Sha256};
     let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
@@ -94,6 +116,21 @@ fn ensure_management_secret() -> Result<Zeroizing<String>> {
     }
     let secret = Zeroizing::new(format!("cr-mgmt-{}", uuid::Uuid::now_v7().simple()));
     codex_router_lib::credentials::write_text("CliManagementSecret", &secret)?;
+    Ok(secret)
+}
+
+fn ensure_admin_password() -> Result<Zeroizing<String>> {
+    if let Some(secret) = codex_router_lib::credentials::read_text("AdminPassword")? {
+        if !secret.trim().is_empty() {
+            return Ok(secret);
+        }
+    }
+    let secret = Zeroizing::new(format!(
+        "{}{}",
+        uuid::Uuid::now_v7().simple(),
+        uuid::Uuid::now_v7().simple()
+    ));
+    codex_router_lib::credentials::write_text("AdminPassword", &secret)?;
     Ok(secret)
 }
 
@@ -134,16 +171,30 @@ fn inherited_proxy_url() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn reconcile_runtime_proxy(path: &Path) -> Result<()> {
-    let Some(proxy_url) = inherited_proxy_url() else {
-        return Ok(());
-    };
+fn reconcile_runtime_config(
+    path: &Path,
+    local_key: &str,
+    management_secret: &str,
+    port: u16,
+    auth_dir: &Path,
+) -> Result<()> {
     let text = std::fs::read_to_string(path)?;
     let mut config: CliProxyConfig = serde_yaml::from_str(&text)?;
-    if config.proxy_url.as_deref() == Some(proxy_url.as_str()) {
+    let proxy_url = inherited_proxy_url();
+    let auth_dir = auth_dir.to_string_lossy().to_string();
+    let unchanged = config.port == port
+        && config.auth_dir == auth_dir
+        && config.remote_management.secret_key == management_secret
+        && config.api_keys == [local_key]
+        && config.proxy_url == proxy_url;
+    if unchanged {
         return Ok(());
     }
-    config.proxy_url = Some(proxy_url);
+    config.port = port;
+    config.auth_dir = auth_dir;
+    config.remote_management.secret_key = management_secret.to_owned();
+    config.api_keys = vec![local_key.to_owned()];
+    config.proxy_url = proxy_url;
     write_runtime_config(path, &config)
 }
 
@@ -177,21 +228,52 @@ async fn start_cli(root: &Path, config_path: &Path) -> Result<Child> {
     if !plugin_hash.eq_ignore_ascii_case(config_compiler::GEMINI_PLUGIN_SHA256) {
         bail!("CR-CLI-0001: Gemini CLI plugin hash mismatch");
     }
-    let stdout = std::fs::File::create(root.join(r"logs\cli-proxy-stdout.log"))?;
-    let stderr = std::fs::File::create(root.join(r"logs\cli-proxy-stderr.log"))?;
-    let child = Command::new(&executable)
+    let logs = router_state_root().join("logs");
+    std::fs::create_dir_all(&logs)?;
+    let stdout_path = logs.join("cli-proxy-stdout.log");
+    let stderr_path = logs.join("cli-proxy-stderr.log");
+    let mut child = Command::new(&executable)
         .arg("-config")
         .arg(config_path)
         .arg("-local-model")
         .current_dir(root.join("app"))
-        .stdout(stdout)
-        .stderr(stderr)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .with_context(|| format!("CR-CLI-0002: spawn {}", executable.display()))?;
+    if let Some(stdout) = child.stdout.take() {
+        relay_cli_output(stdout, stdout_path);
+    }
+    if let Some(stderr) = child.stderr.take() {
+        relay_cli_output(stderr, stderr_path);
+    }
     if let Err(err) = assign_kill_on_close_job(&child) {
         eprintln!("[router-host] warn: {err:#}");
     }
     Ok(child)
+}
+
+fn relay_cli_output<R>(reader: R, path: PathBuf)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        use tokio::io::AsyncBufReadExt;
+
+        let Ok(mut output) = tokio::fs::File::create(path).await else {
+            return;
+        };
+        let mut lines = tokio::io::BufReader::new(reader).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let redacted = structured_log::redact_text(&line);
+            if tokio::io::AsyncWriteExt::write_all(&mut output, format!("{redacted}\n").as_bytes())
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
 }
 
 /// Bind the CLI child to a kill-on-close Job Object so the CLI cannot outlive
@@ -268,6 +350,10 @@ pub fn public_router(state: HostState) -> Router {
             post(compat::accept_compliance),
         )
         .route(
+            "/api/v1/admin/oauth/capabilities",
+            get(compat::oauth_capabilities),
+        )
+        .route(
             "/api/v1/admin/users/1",
             get(compat::user_detail).put(compat::update_user),
         )
@@ -307,6 +393,14 @@ pub fn public_router(state: HostState) -> Router {
         .route(
             "/api/v1/admin/accounts/{id}/scheduled-test-plans",
             get(compat::list_account_plans),
+        )
+        .route(
+            "/api/v1/admin/accounts/{id}/models",
+            get(compat::account_models),
+        )
+        .route(
+            "/api/v1/admin/accounts/{id}/models/sync-upstream",
+            post(compat::account_models_sync_upstream),
         )
         .route(
             "/api/v1/admin/accounts/{id}/{action}",
@@ -355,6 +449,10 @@ pub fn public_router(state: HostState) -> Router {
         .route(
             "/api/v1/admin/scheduled-test-plans/{id}",
             put(compat::update_plan).delete(compat::delete_plan),
+        )
+        .route(
+            "/api/v1/admin/scheduled-test-plans/{id}/results",
+            get(compat::list_plan_results),
         )
         .route(
             "/api/v1/keys",
@@ -690,6 +788,7 @@ fn plan_request(
     session_header: Option<&str>,
     path_model: Option<&str>,
     provider_constraint: Option<&str>,
+    request_path: &str,
 ) -> std::result::Result<PlanResult, Value> {
     let mut parsed: Value = match serde_json::from_slice(bytes) {
         Ok(value) => value,
@@ -751,14 +850,18 @@ fn plan_request(
         Err(_) => {
             // Distinguish "continuation owner was deleted" (409, caller must
             // start a new session) from "route exists but every credential is
-            // paused" (503, retry after recovery).
+            // paused" (503, retry after recovery). Only treat the owner as
+            // gone when it is missing from the entire table, not just this
+            // public model.
             let owner_removed = continuation_key
                 .as_deref()
                 .and_then(|key| bindings.pool(key))
-                .is_some_and(|pool_id| !pools.iter().any(|route| route.pool_id == pool_id));
+                .is_some_and(|pool_id| {
+                    !table.routes().iter().any(|route| route.pool_id == pool_id)
+                });
             if owner_removed {
                 return Err(
-                    serde_json::json!({"status": 409, "code": "CR-RTE-0005", "message": "continuation owner is no longer available"}),
+                    serde_json::json!({"status": 409, "code": "CR-RTE-0006", "message": "continuation owner is no longer available"}),
                 );
             }
             return Err(
@@ -766,6 +869,18 @@ fn plan_request(
             );
         }
     };
+    if codex_router_lib::routing::should_drop_previous_response(
+        &table,
+        &bindings,
+        continuation_key.as_deref(),
+        &selected,
+    ) {
+        if let Some(object) = parsed.as_object_mut() {
+            object.remove("previous_response_id");
+            object.remove("conversation_id");
+            object.remove("conversation");
+        }
+    }
     if let Some(key) = continuation_key {
         state
             .bindings
@@ -783,7 +898,18 @@ fn plan_request(
     if body_model.is_some() {
         parsed["model"] = Value::String(internal_model.clone());
     }
-    let body = serde_json::to_vec(&parsed).map_err(|_| serde_json::json!({"status": 400, "code": "CR-REQ-0006", "message": "could not encode request"}))?;
+    if !codex_router_lib::responses_compat::is_openai_family_model(&model) {
+        let _ = codex_router_lib::responses_compat::sanitize_responses_request(
+            request_path,
+            &mut parsed,
+        );
+        if body_model.is_some() {
+            parsed["model"] = Value::String(internal_model.clone());
+        }
+    }
+    let body = serde_json::to_vec(&parsed).map_err(|_| {
+        serde_json::json!({"status": 400, "code": "CR-REQ-0006", "message": "could not encode request"})
+    })?;
     Ok(PlanResult {
         body,
         public_model: model,
@@ -886,11 +1012,36 @@ impl SseRewriter {
             if event_type.ends_with(".completed")
                 || event_type.ends_with(".failed")
                 || event_type.ends_with(".cancelled")
+                || event_type == "message_stop"
             {
                 self.terminal_seen = Some(event_type.to_owned());
             }
+            if event_type.ends_with(".failed") || event_type.ends_with(".cancelled") {
+                if let Some(response) = payload.get_mut("response").and_then(Value::as_object_mut) {
+                    let error = response
+                        .entry("error")
+                        .or_insert_with(|| serde_json::json!({}));
+                    if let Some(error) = error.as_object_mut() {
+                        error
+                            .entry("code")
+                            .or_insert_with(|| Value::String("CR-UP-0014".to_owned()));
+                    }
+                } else if let Some(error) = payload.get_mut("error").and_then(Value::as_object_mut)
+                {
+                    error
+                        .entry("code")
+                        .or_insert_with(|| Value::String("CR-UP-0014".to_owned()));
+                }
+            }
+        }
+        if payload
+            .pointer("/candidates/0/finishReason")
+            .is_some_and(|value| !value.is_null())
+        {
+            self.terminal_seen = Some("gemini.finished".to_owned());
         }
         self.rewrite_model_value(&mut payload);
+        codex_router_lib::responses_compat::strip_think_tags_from_value(&mut payload);
         let mut rewritten = b"data: ".to_vec();
         rewritten.extend_from_slice(
             &serde_json::to_vec(&payload).unwrap_or_else(|_| json_text.as_bytes().to_vec()),
@@ -1244,6 +1395,7 @@ async fn data_plane(State(state): State<HostState>, request: Request) -> Respons
             session_header.as_deref(),
             extract_v1beta_model(&mapped),
             provider_constraint,
+            &mapped,
         ) {
             Ok(plan) => plan,
             Err(error) => {
@@ -1282,6 +1434,42 @@ async fn data_plane(State(state): State<HostState>, request: Request) -> Respons
         mapped
     };
     let protocol = protocol_of(&mapped);
+    if codex_router_lib::responses_compat::is_compact_path(&mapped)
+        && !codex_router_lib::responses_compat::is_openai_family_model(&plan.public_model)
+    {
+        if let Ok(json_body) = serde_json::from_slice::<Value>(&plan.body) {
+            let output = json_body
+                .get("input")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let payload = codex_router_lib::responses_compat::synthetic_compact_response(
+                &plan.public_model,
+                &output,
+            );
+            record_ledger(
+                &state,
+                &usage_ledger::LedgerInput {
+                    request_id: &request_id,
+                    model: &plan.public_model,
+                    pool_id: &plan.pool_id,
+                    protocol: "responses",
+                    status: "completed",
+                    elapsed_ms: started.elapsed().as_millis() as i64,
+                    ..Default::default()
+                },
+            );
+            let _ = terminal.complete("completed", Some(200), None, 1);
+            let json_bytes = serde_json::to_vec(&payload).unwrap_or_default();
+            let res = axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header("x-request-id", &request_id)
+                .body(axum::body::Body::from(json_bytes))
+                .unwrap_or_else(|_| (StatusCode::OK, "{}").into_response());
+            return res;
+        }
+    }
     let url = format!("{}{}", state.cli_base, mapped);
     let upstream_response = state
         .cli_data
@@ -1338,30 +1526,21 @@ async fn data_plane(State(state): State<HostState>, request: Request) -> Respons
     if is_sse {
         let rewriter =
             SseRewriter::new(&plan.pool_prefix, &plan.public_model, &plan.upstream_model);
-        let context = (
-            state.clone(),
-            request_id.clone(),
-            plan.public_model.clone(),
-            plan.pool_id.clone(),
-            protocol.to_owned(),
+        let context = SseContext {
+            state: state.clone(),
+            request_id: request_id.clone(),
+            public_model: plan.public_model.clone(),
+            pool_id: plan.pool_id.clone(),
+            protocol: protocol.to_owned(),
             status_u16,
-            ledger_account,
-        );
+            account_id: ledger_account,
+            terminal: Some(terminal),
+        };
         let stream = wrap_sse_stream(upstream.bytes_stream(), rewriter, context, started);
         let mut builder = Response::builder().status(status);
         for (name, value) in response_headers.iter() {
             builder = builder.header(name, value);
         }
-        let _ = terminal.complete(
-            if status.is_success() {
-                "ok"
-            } else {
-                "upstream_error"
-            },
-            Some(status_u16),
-            None,
-            1,
-        );
         builder
             .body(Body::from_stream(stream))
             .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
@@ -1436,10 +1615,65 @@ async fn data_plane(State(state): State<HostState>, request: Request) -> Respons
     }
 }
 
-type SseContext = (HostState, String, String, String, String, u16, Option<i64>);
+struct SseContext {
+    state: HostState,
+    request_id: String,
+    public_model: String,
+    pool_id: String,
+    protocol: String,
+    status_u16: u16,
+    account_id: Option<i64>,
+    terminal: Option<TerminalSpanGuard>,
+}
 
-fn wrap_sse_stream(
-    upstream: impl futures_util::Stream<Item = std::result::Result<axum::body::Bytes, reqwest::Error>>
+fn failed_sse_event(protocol: &str, request_id: &str, code: &str, message: &str) -> Vec<u8> {
+    let payload = match protocol {
+        "responses" => serde_json::json!({
+            "type": "response.failed",
+            "response": {
+                "status": "failed",
+                "error": {"code": code, "message": message},
+            },
+            "request_id": request_id,
+        }),
+        "anthropic" => serde_json::json!({
+            "type": "error",
+            "error": {"type": "api_error", "message": message, "code": code},
+            "request_id": request_id,
+        }),
+        "gemini" => serde_json::json!({
+            "error": {
+                "code": 502,
+                "status": "UNAVAILABLE",
+                "message": message,
+                "details": [{"error_code": code}],
+            },
+            "request_id": request_id,
+        }),
+        _ => serde_json::json!({
+            "error": {
+                "message": message,
+                "type": "codex_router_error",
+                "param": null,
+                "code": code,
+            },
+            "request_id": request_id,
+        }),
+    };
+    let event_name = match protocol {
+        "responses" => "event: response.failed\n",
+        "anthropic" => "event: error\n",
+        _ => "",
+    };
+    format!(
+        "{event_name}data: {}\n\n",
+        serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_owned())
+    )
+    .into_bytes()
+}
+
+fn wrap_sse_stream<E>(
+    upstream: impl futures_util::Stream<Item = std::result::Result<axum::body::Bytes, E>>
         + Send
         + Unpin
         + 'static,
@@ -1448,11 +1682,14 @@ fn wrap_sse_stream(
     started: Instant,
 ) -> impl futures_util::Stream<Item = std::result::Result<axum::body::Bytes, std::io::Error>>
        + Send
-       + 'static {
+       + 'static
+where
+    E: Send + 'static,
+{
     use futures_util::StreamExt;
     futures_util::stream::unfold(
         (upstream, rewriter, context, started, false),
-        |(mut upstream, mut rewriter, context, started, terminated)| async move {
+        |(mut upstream, mut rewriter, mut context, started, terminated)| async move {
             if terminated {
                 return None;
             }
@@ -1469,69 +1706,91 @@ fn wrap_sse_stream(
                         ));
                     }
                     Some(Err(_)) => {
-                        let (state, request_id, public_model, pool_id, protocol, _, account_id) =
-                            &context;
-                        let out = rewriter.finish();
+                        let mut out = rewriter.finish();
+                        out.extend_from_slice(&failed_sse_event(
+                            &context.protocol,
+                            &context.request_id,
+                            "CR-UP-0014",
+                            "upstream stream failed before a terminal event",
+                        ));
                         record_ledger(
-                            state,
+                            &context.state,
                             &usage_ledger::LedgerInput {
-                                request_id,
-                                model: public_model,
-                                pool_id,
-                                protocol,
+                                request_id: &context.request_id,
+                                model: &context.public_model,
+                                pool_id: &context.pool_id,
+                                protocol: &context.protocol,
                                 status: "failed",
-                                account_id: *account_id,
+                                account_id: context.account_id,
                                 elapsed_ms: started.elapsed().as_millis() as i64,
                                 error_code: Some("CR-UP-0014"),
                                 ..Default::default()
                             },
                         );
-                        let _ = out;
+                        if let Some(terminal) = context.terminal.take() {
+                            let _ = terminal.complete(
+                                "upstream_error",
+                                Some(context.status_u16),
+                                Some("CR-UP-0014"),
+                                1,
+                            );
+                        }
                         let state_tuple = (upstream, rewriter, context, started, true);
-                        return Some((
-                            Err(std::io::Error::new(
-                                std::io::ErrorKind::BrokenPipe,
-                                "upstream stream error",
-                            )),
-                            state_tuple,
-                        ));
+                        return Some((Ok(axum::body::Bytes::from(out)), state_tuple));
                     }
                     None => {
-                        let (
-                            state,
-                            request_id,
-                            public_model,
-                            pool_id,
-                            protocol,
-                            status_u16,
-                            account_id,
-                        ) = &context;
-                        let out = rewriter.finish();
+                        let mut out = rewriter.finish();
+                        let terminal_seen = rewriter.terminal_seen.as_deref();
                         let usage_body = rewriter
                             .usage
                             .as_ref()
                             .map(|usage| serde_json::json!({"usage": usage}));
-                        let ok = (200..300).contains(status_u16);
+                        let http_ok = (200..300).contains(&context.status_u16);
+                        let terminal_ok = terminal_seen.is_some_and(|terminal| {
+                            terminal == "done"
+                                || terminal == "message_stop"
+                                || terminal == "gemini.finished"
+                                || terminal.ends_with(".completed")
+                        });
+                        let ok = http_ok && terminal_ok;
                         let status = if ok { "completed" } else { "failed" };
                         let error_code = if ok {
                             None
+                        } else if http_ok {
+                            Some("CR-UP-0014")
                         } else {
-                            Some(upstream_error_code(*status_u16))
+                            Some(upstream_error_code(context.status_u16))
                         };
+                        if terminal_seen.is_none() {
+                            out.extend_from_slice(&failed_sse_event(
+                                &context.protocol,
+                                &context.request_id,
+                                error_code.unwrap_or("CR-UP-0014"),
+                                "upstream stream ended before a terminal event",
+                            ));
+                        }
                         record_ledger(
-                            state,
+                            &context.state,
                             &usage_ledger::LedgerInput {
-                                request_id,
-                                model: public_model,
-                                pool_id,
-                                protocol,
+                                request_id: &context.request_id,
+                                model: &context.public_model,
+                                pool_id: &context.pool_id,
+                                protocol: &context.protocol,
                                 status,
-                                account_id: *account_id,
+                                account_id: context.account_id,
                                 body: usage_body.as_ref(),
                                 elapsed_ms: started.elapsed().as_millis() as i64,
                                 error_code,
                             },
                         );
+                        if let Some(terminal) = context.terminal.take() {
+                            let _ = terminal.complete(
+                                if ok { "ok" } else { "upstream_error" },
+                                Some(context.status_u16),
+                                error_code,
+                                1,
+                            );
+                        }
                         if out.is_empty() {
                             return None;
                         }
@@ -1549,6 +1808,8 @@ fn wrap_sse_stream(
 #[tokio::main]
 async fn main() -> Result<()> {
     let root = router_root();
+    let state_root = router_state_root();
+    let data_root = state_root.join("data");
     let public_port = argument_value("--host-port=")
         .and_then(|value| value.parse().ok())
         .unwrap_or(DEFAULT_PUBLIC_PORT);
@@ -1556,8 +1817,9 @@ async fn main() -> Result<()> {
         .and_then(|value| value.parse().ok())
         .unwrap_or(DEFAULT_PRIVATE_PORT);
     let no_cli = std::env::args().any(|argument| argument == "--no-cli");
-    std::fs::create_dir_all(root.join("logs"))?;
-    let auth_dir = root.join("data").join("cli-proxy").join("auth");
+    let logs = state_root.join("logs");
+    std::fs::create_dir_all(&logs)?;
+    let auth_dir = data_root.join("cli-proxy").join("auth");
     std::fs::create_dir_all(&auth_dir)?;
     std::fs::create_dir_all(
         root.join("app")
@@ -1567,18 +1829,23 @@ async fn main() -> Result<()> {
     )?;
     let local_key = ensure_local_api_key()?;
     let management_secret = ensure_management_secret()?;
-    let config_path = root.join("data").join("cli-proxy").join("config.yaml");
+    let _admin_password = ensure_admin_password()?;
+    let config_path = data_root.join("cli-proxy").join("config.yaml");
     if !config_path.is_file() {
         let runtime_config =
             default_runtime_config(&local_key, &management_secret, private_port, &auth_dir);
         write_runtime_config(&config_path, &runtime_config)?;
     } else {
-        reconcile_runtime_proxy(&config_path)?;
+        reconcile_runtime_config(
+            &config_path,
+            &local_key,
+            &management_secret,
+            private_port,
+            &auth_dir,
+        )?;
     }
-    let store = StateStore::open(root.join("data").join("router-state.sqlite3"))?;
-    let logger = Arc::new(StructuredLogger::open(
-        root.join("logs").join("router-events.jsonl"),
-    )?);
+    let store = StateStore::open(data_root.join("router-state.sqlite3"))?;
+    let logger = Arc::new(StructuredLogger::open(logs.join("router-events.jsonl"))?);
     let cli = CliProxyManagementClient::new(
         format!("http://127.0.0.1:{private_port}"),
         management_secret.as_str(),
@@ -1609,7 +1876,10 @@ async fn main() -> Result<()> {
             let _ = logger.write(serde_json::json!({"level":"ERROR","event":"backend.cli_health_timeout","error_description":error.to_string()}));
             return Err(error);
         }
+        // Re-sync after CLI is healthy so live file indexes and watcher registries attach immediately.
+        let _ = compat::sync_backend(&control).await;
     }
+    tokio::spawn(scheduler::run(control.clone()));
     let state = HostState {
         control,
         local_key: Arc::new(local_key),
@@ -2079,7 +2349,7 @@ fn rewrite_model_strings(
 
 /// Persist an upstream payload as the task output file under the task dir.
 fn store_job_output(output_name: &str, parsed: &Value) -> std::result::Result<(), anyhow::Error> {
-    let path = data_ops::task_output_path(&router_root(), output_name)?;
+    let path = data_ops::task_output_path(&router_state_root(), output_name)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
@@ -2180,7 +2450,7 @@ async fn image_task_show(
     };
     if task["status"] == "completed" {
         if let Some(output_ref) = task["output_ref"].as_str() {
-            if let Ok(path) = data_ops::task_output_path(&router_root(), output_ref) {
+            if let Ok(path) = data_ops::task_output_path(&router_state_root(), output_ref) {
                 if let Ok(bytes) = std::fs::read(&path) {
                     if let Ok(result) = serde_json::from_slice::<Value>(&bytes) {
                         task["result"] = result;
@@ -2654,7 +2924,7 @@ async fn image_batch_item_content(
             &request_id,
         );
     };
-    let Ok(path) = data_ops::task_output_path(&router_root(), output_ref) else {
+    let Ok(path) = data_ops::task_output_path(&router_state_root(), output_ref) else {
         return error_response(
             StatusCode::BAD_REQUEST,
             "CR-VAL-0006",
@@ -2734,7 +3004,7 @@ async fn image_batch_download(
             let Some(output_ref) = row["output_ref"].as_str() else {
                 continue;
             };
-            let Ok(path) = data_ops::task_output_path(&router_root(), output_ref) else {
+            let Ok(path) = data_ops::task_output_path(&router_state_root(), output_ref) else {
                 continue;
             };
             let Ok(bytes) = std::fs::read(&path) else {
@@ -2866,7 +3136,7 @@ fn remove_batch_files(batch: &Value) {
     if let Some(rows) = batch["items"].as_array() {
         for row in rows {
             if let Some(output_ref) = row["output_ref"].as_str() {
-                if let Ok(path) = data_ops::task_output_path(&router_root(), output_ref) {
+                if let Ok(path) = data_ops::task_output_path(&router_state_root(), output_ref) {
                     let _ = std::fs::remove_file(path);
                 }
             }
@@ -2958,6 +3228,7 @@ mod tests {
     use codex_router_lib::control_plane::http_compat::BackendPaths;
     use codex_router_lib::control_plane::ControlState as TestControlState;
     use codex_router_lib::state::StateStore as TestStateStore;
+    use futures_util::TryStreamExt;
     use std::collections::HashMap as StdHashMap;
     use tower::ServiceExt;
 
@@ -2976,10 +3247,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "codex-router-routetest-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            uuid::Uuid::now_v7().simple()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let store = TestStateStore::open(dir.join("router-state.sqlite3")).unwrap();
@@ -3011,6 +3279,153 @@ mod tests {
             cli_child: Arc::new(Mutex::new(None)),
             cli_data: reqwest::Client::builder().no_proxy().build().unwrap(),
         }
+    }
+
+    #[tokio::test]
+    async fn sse_eof_without_terminal_emits_failed_event() {
+        let state = test_host_state();
+        let upstream =
+            futures_util::stream::iter([Ok::<_, reqwest::Error>(axum::body::Bytes::from_static(
+                b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+            ))]);
+        let context = SseContext {
+            terminal: Some(TerminalSpanGuard::new(
+                state.control.logger.clone(),
+                "req-missing-terminal",
+                "POST /v1/responses",
+            )),
+            state,
+            request_id: "req-missing-terminal".to_owned(),
+            public_model: "public-model".to_owned(),
+            pool_id: "pool-1".to_owned(),
+            protocol: "responses".to_owned(),
+            status_u16: 200,
+            account_id: None,
+        };
+        let chunks: Vec<axum::body::Bytes> = wrap_sse_stream(
+            upstream,
+            SseRewriter::new("pool-prefix", "public-model", "upstream-model"),
+            context,
+            Instant::now(),
+        )
+        .try_collect()
+        .await
+        .unwrap();
+        let output = chunks.concat();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.contains("response.failed"));
+        assert!(output.contains("CR-UP-0014"));
+        assert!(output.contains("req-missing-terminal"));
+    }
+
+    #[tokio::test]
+    async fn sse_read_error_emits_failed_event_and_closes_normally() {
+        let state = test_host_state();
+        let store = state.control.store.clone();
+        let log_path = state.control.logger.path().to_path_buf();
+        let upstream = futures_util::stream::iter([
+            Ok(axum::body::Bytes::from_static(
+                b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+            )),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "synthetic upstream reset",
+            )),
+        ]);
+        let context = SseContext {
+            terminal: Some(TerminalSpanGuard::new(
+                state.control.logger.clone(),
+                "req-stream-reset",
+                "POST /v1/responses",
+            )),
+            state,
+            request_id: "req-stream-reset".to_owned(),
+            public_model: "public-model".to_owned(),
+            pool_id: "pool-1".to_owned(),
+            protocol: "responses".to_owned(),
+            status_u16: 200,
+            account_id: None,
+        };
+        let chunks: Vec<axum::body::Bytes> = wrap_sse_stream(
+            upstream,
+            SseRewriter::new("pool-prefix", "public-model", "upstream-model"),
+            context,
+            Instant::now(),
+        )
+        .try_collect()
+        .await
+        .unwrap();
+        let output = String::from_utf8(chunks.concat()).unwrap();
+
+        assert!(output.contains("response.failed"));
+        assert!(output.contains("CR-UP-0014"));
+        assert!(output.contains("req-stream-reset"));
+        let ledger = store
+            .with_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT status,error_code FROM request_ledger WHERE request_id=?1",
+                        rusqlite::params!["req-stream-reset"],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(ledger, ("failed".to_owned(), "CR-UP-0014".to_owned()));
+        let terminal_events = std::fs::read_to_string(log_path)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|event| {
+                event["request_id"] == "req-stream-reset" && event["event"] == "request.completed"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(terminal_events.len(), 1);
+        assert_eq!(terminal_events[0]["status"], "upstream_error");
+        assert_eq!(terminal_events[0]["error_code"], "CR-UP-0014");
+    }
+
+    #[tokio::test]
+    async fn upstream_failed_sse_terminal_exposes_router_error_code() {
+        let state = test_host_state();
+        let upstream = futures_util::stream::iter([Ok::<_, std::io::Error>(
+            axum::body::Bytes::from_static(
+                b"data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"message\":\"upstream failed\"}}}\n\n",
+            ),
+        )]);
+        let context = SseContext {
+            terminal: Some(TerminalSpanGuard::new(
+                state.control.logger.clone(),
+                "req-upstream-failed",
+                "POST /v1/responses",
+            )),
+            state,
+            request_id: "req-upstream-failed".to_owned(),
+            public_model: "public-model".to_owned(),
+            pool_id: "pool-1".to_owned(),
+            protocol: "responses".to_owned(),
+            status_u16: 200,
+            account_id: None,
+        };
+        let chunks: Vec<axum::body::Bytes> = wrap_sse_stream(
+            upstream,
+            SseRewriter::new("pool-prefix", "public-model", "upstream-model"),
+            context,
+            Instant::now(),
+        )
+        .try_collect()
+        .await
+        .unwrap();
+        let output = String::from_utf8(chunks.concat()).unwrap();
+        let payload = output
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .and_then(|line| serde_json::from_str::<Value>(line).ok())
+            .unwrap();
+
+        assert_eq!(payload["type"], "response.failed");
+        assert_eq!(payload["response"]["error"]["code"], "CR-UP-0014");
     }
 
     /// Manager doc 11.1 S03: every section-7 static interface must be

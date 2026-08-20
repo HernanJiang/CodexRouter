@@ -307,6 +307,11 @@ pub fn redact_text(text: &str) -> String {
     let email =
         regex::Regex::new(r"(?i)[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}").expect("valid email regex");
     output = email.replace_all(&output, "[REDACTED_EMAIL]").into_owned();
+    let oauth_query =
+        regex::Regex::new(r#"(?i)([?&](?:code|state)=)[^&\s"]+"#).expect("valid OAuth query regex");
+    output = oauth_query
+        .replace_all(&output, "$1[REDACTED]")
+        .into_owned();
     output
 }
 
@@ -337,6 +342,16 @@ mod tests {
             event["input_summary"]["nested"]["email"],
             "[REDACTED_EMAIL]"
         );
+    }
+
+    #[test]
+    fn oauth_callback_query_and_account_email_are_redacted() {
+        let redacted =
+            redact_text("GET /callback?code=one-time-code&state=session-state user@example.com");
+        assert!(!redacted.contains("one-time-code"));
+        assert!(!redacted.contains("session-state"));
+        assert!(!redacted.contains("user@example.com"));
+        assert!(redacted.contains("code=[REDACTED]"));
     }
 
     #[test]
