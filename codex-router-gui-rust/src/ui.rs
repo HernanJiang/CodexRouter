@@ -438,6 +438,56 @@ mod ordering_tests {
     }
 
     #[test]
+    fn priority_drag_source_carries_payload_over_target() {
+        fn render(
+            context: &egui::Context,
+            input: egui::RawInput,
+        ) -> (egui::Rect, egui::Rect, Option<usize>) {
+            let mut result = None;
+            let output = context.run_ui(input, |ui| {
+                let source = ui.dnd_drag_source(
+                    egui::Id::new("priority-drag-test-source"),
+                    super::ModelOrderDrag { source_index: 7 },
+                    |ui| ui.allocate_response(egui::vec2(80.0, 32.0), egui::Sense::hover()),
+                );
+                ui.add_space(40.0);
+                let target = ui.allocate_response(egui::vec2(180.0, 48.0), egui::Sense::hover());
+                let payload = target
+                    .dnd_hover_payload::<super::ModelOrderDrag>()
+                    .map(|payload| payload.source_index);
+                result = Some((source.response.rect, target.rect, payload));
+            });
+            drop(output);
+            result.expect("drag test should render")
+        }
+
+        let context = egui::Context::default();
+        let (source, target, _) = render(&context, egui::RawInput::default());
+        let source_pos = source.center();
+        let target_pos = target.center();
+        let pressed = egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(source_pos),
+                egui::Event::PointerButton {
+                    pos: source_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        };
+        render(&context, pressed);
+        let moved = egui::RawInput {
+            events: vec![egui::Event::PointerMoved(target_pos)],
+            ..Default::default()
+        };
+        let (_, _, payload) = render(&context, moved);
+
+        assert_eq!(payload, Some(7));
+    }
+
+    #[test]
     fn short_screen_shell_never_reserves_more_height_than_it_has() {
         let metrics = shell_metrics(654.0);
         assert_eq!(metrics.topbar_height, 80.0);
@@ -7986,22 +8036,41 @@ impl CodexRouterApp {
                                         .show(ui, |ui| {
                                             ui.set_min_width(ui.available_width());
                                             ui.horizontal_wrapped(|ui| {
-                                                let handle = ui
-                                                    .add(
-                                                        egui::Button::new(
-                                                            egui::RichText::new("≡")
-                                                                .size(16.0)
-                                                                .color(palette.ink_soft),
-                                                        )
-                                                        .fill(palette.paper)
-                                                        .stroke(egui::Stroke::new(1.0, palette.line))
-                                                        .corner_radius(egui::CornerRadius::same(4))
-                                                        .sense(egui::Sense::drag()),
-                                                    )
-                                                    .on_hover_text(t(zh, "拖动排序", "Drag to reorder"));
-                                                handle.dnd_set_drag_payload(ModelOrderDrag {
-                                                    source_index: idx,
-                                                });
+                                                let drag_id = ui.make_persistent_id((
+                                                    "model-priority-drag",
+                                                    &route_id,
+                                                    idx,
+                                                ));
+                                                let drag_source = ui.dnd_drag_source(
+                                                    drag_id,
+                                                    ModelOrderDrag { source_index: idx },
+                                                    |ui| {
+                                                        egui::Frame::new()
+                                                            .fill(palette.paper)
+                                                            .stroke(egui::Stroke::new(
+                                                                1.0,
+                                                                palette.line,
+                                                            ))
+                                                            .corner_radius(
+                                                                egui::CornerRadius::same(4),
+                                                            )
+                                                            .inner_margin(egui::Margin::symmetric(
+                                                                8, 3,
+                                                            ))
+                                                            .show(ui, |ui| {
+                                                                ui.label(
+                                                                    egui::RichText::new("≡")
+                                                                        .size(16.0)
+                                                                        .color(palette.ink_soft),
+                                                                );
+                                                            });
+                                                    },
+                                                );
+                                                drag_source.response.on_hover_text(t(
+                                                    zh,
+                                                    "按住并拖到另一条渠道上排序",
+                                                    "Hold and drag onto another channel to reorder",
+                                                ));
                                                 ui.label(
                                                     egui::RichText::new(format!("{:02}", pos + 1))
                                                         .strong()
@@ -8043,12 +8112,13 @@ impl CodexRouterApp {
                                                 egui::Stroke::new(2.0, palette.action),
                                                 egui::StrokeKind::Outside,
                                             );
-                                        }
-                                    }
-                                    if let Some(payload) = response.dnd_release_payload::<ModelOrderDrag>() {
-                                        if let Some(source_pos) = new_order.iter().position(|&i| i == payload.source_index) {
-                                            if source_pos != pos {
-                                                reorder = Some((source_pos, pos));
+                                            if let Some(source_pos) = new_order
+                                                .iter()
+                                                .position(|&i| i == payload.source_index)
+                                            {
+                                                if source_pos != pos {
+                                                    reorder = Some((source_pos, pos));
+                                                }
                                             }
                                         }
                                     }
