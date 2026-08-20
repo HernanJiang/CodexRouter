@@ -3480,6 +3480,55 @@ impl CodexRouterApp {
         );
     }
 
+    pub(crate) fn commit_model_draft(
+        &mut self,
+        mut model: ModelConfig,
+        editing_model: Option<usize>,
+        model_from_wizard: bool,
+    ) {
+        let zh = self.ui_language == "zh";
+        if model.source == "oauth" {
+            model.user_selected = true;
+        }
+        let key_update_pending = !model.api_key.trim().is_empty();
+        if model_from_wizard {
+            self.config.models = vec![model];
+            super::logic::normalize_default_model(&mut self.config);
+            self.proxy_from_wizard = true;
+            self.page = Page::Proxy;
+            return;
+        }
+        match editing_model {
+            Some(index) if index < self.config.models.len() => {
+                let was_default = self.config.default_model == self.config.models[index].model;
+                self.config.models[index] = model.clone();
+                if was_default {
+                    self.config.default_model = model.model.clone();
+                }
+            }
+            Some(_) => {
+                self.status_text = t(
+                    zh,
+                    "模型列表已变化，请重新打开模型后再保存",
+                    "The model list changed. Reopen the model before saving.",
+                )
+                .to_owned();
+                return;
+            }
+            None => self.config.models.push(model),
+        }
+        super::logic::normalize_default_model(&mut self.config);
+        if key_update_pending {
+            self.status_text = t(
+                zh,
+                "API 渠道已验证并暂存；点击“保存并应用”后将安全写入 Windows 凭据",
+                "The API channel was verified and staged. Save & apply to store the key securely.",
+            )
+            .to_owned();
+        }
+        self.page = Page::Dashboard;
+    }
+
     fn show_model(&mut self, ui: &mut egui::Ui, palette: &theme::Palette) {
         let zh = self.ui_language == "zh";
         let title = if self.model_from_wizard {
@@ -3515,7 +3564,8 @@ impl CodexRouterApp {
                             let oauth_model = this.temp_model.source == "oauth";
                             let volcengine_coding_plan =
                                 super::logic::is_volcengine_plan_url(&this.temp_model.base_url);
-                            let valid = !this.temp_model.model.trim().is_empty()
+                            let valid = !this.api_model_validation_running
+                                && !this.temp_model.model.trim().is_empty()
                                 && json_valid
                                 && (oauth_model
                                     || (!this.temp_model.base_url.trim().is_empty()
@@ -3542,7 +3592,9 @@ impl CodexRouterApp {
                                     |ui| {
                                         let key_update_pending =
                                             !this.temp_model.api_key.trim().is_empty();
-                                        let next_label = if this.model_from_wizard {
+                                        let next_label = if this.api_model_validation_running {
+                                            t(zh, "正在测试连接…", "Testing connection…")
+                                        } else if this.model_from_wizard {
                                             t(zh, "网络代理 →", "Network proxy →")
                                         } else if key_update_pending {
                                             t(zh, "保存新 Key 与模型", "Save new key & model")
@@ -4076,39 +4128,38 @@ impl CodexRouterApp {
                                 };
                             }
                             if next && !open_oauth_models {
-                                if this.temp_model.source == "oauth" {
-                                    this.temp_model.user_selected = true;
-                                }
-                                let key_update_pending =
-                                    !this.temp_model.api_key.trim().is_empty();
-                                if this.model_from_wizard {
-                                    this.config.models = vec![this.temp_model.clone()];
-                                    super::logic::normalize_default_model(&mut this.config);
-                                    this.proxy_from_wizard = true;
-                                    this.page = Page::Proxy;
+                                if this.temp_model.source != "oauth"
+                                    && this.editing_model.is_none()
+                                {
+                                    this.api_model_validation_running = true;
+                                    this.status_text = t(
+                                        zh,
+                                        "正在测试 API 渠道和模型可用性，通过后才会正式添加",
+                                        "Testing the API channel and model before adding it",
+                                    )
+                                    .to_owned();
+                                    let config = this.config.clone();
+                                    let model = this.temp_model.clone();
+                                    let model_from_wizard = this.model_from_wizard;
+                                    let tx = this.event_tx.clone();
+                                    std::thread::spawn(move || {
+                                        let result = super::validate_api_model_connection(
+                                            &config, &model,
+                                        );
+                                        tx.send(super::AppEvent::ApiModelValidationFinished {
+                                            model: Box::new(model),
+                                            editing_model: None,
+                                            model_from_wizard,
+                                            result,
+                                        })
+                                        .ok();
+                                    });
                                 } else {
-                                    match this.editing_model {
-                                        Some(index) => {
-                                            let was_default = this.config.default_model
-                                                == this.config.models[index].model;
-                                            this.config.models[index] = this.temp_model.clone();
-                                            if was_default {
-                                                this.config.default_model =
-                                                    this.temp_model.model.clone();
-                                            }
-                                        }
-                                        None => this.config.models.push(this.temp_model.clone()),
-                                    }
-                                    super::logic::normalize_default_model(&mut this.config);
-                                    if key_update_pending {
-                                        this.status_text = t(
-                                            zh,
-                                            "新 API Key 已暂存；点击“保存并应用”后将安全覆写 Windows 凭据",
-                                            "The new API key is staged. Save & apply to overwrite the Windows credential securely.",
-                                        )
-                                        .to_owned();
-                                    }
-                                    this.page = Page::Dashboard;
+                                    this.commit_model_draft(
+                                        this.temp_model.clone(),
+                                        this.editing_model,
+                                        this.model_from_wizard,
+                                    );
                                 }
                             }
                             ui.add_space(8.0);

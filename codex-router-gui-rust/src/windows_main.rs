@@ -30,6 +30,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
 use updater::UpdateInfo as GitHubUpdateInfo;
 
@@ -62,6 +63,7 @@ const OAUTH_RECOVERY_MAX_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(5 * 60 * 60);
 const DEFAULT_ROUTER_REQUIRES_OPENAI_AUTH: bool = true;
 const HEALTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+const API_MODEL_VALIDATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 const EXIT_CONFIG_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 const EXIT_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 #[cfg(test)]
@@ -808,6 +810,12 @@ enum AppEvent {
         priority: i32,
     },
     OAuthAccountPriorityError(String),
+    ApiModelValidationFinished {
+        model: Box<ModelConfig>,
+        editing_model: Option<usize>,
+        model_from_wizard: bool,
+        result: Result<(), String>,
+    },
     UpdateProgress(updater::DownloadProgress),
     UpdateResult(Box<GitHubUpdateInfo>),
     UpdateError(String),
@@ -840,6 +848,179 @@ enum TrayAction {
     Exit,
 }
 
+fn validate_api_model_connection(cfg: &RouterConfig, model: &ModelConfig) -> Result<(), String> {
+    let base = reqwest::Url::parse(model.base_url.trim()).map_err(|_| "invalid_url".to_owned())?;
+    if !matches!(base.scheme(), "http" | "https") || base.host_str().is_none() {
+        return Err("invalid_url".to_owned());
+    }
+    let mut models_url = base.clone();
+    models_url.set_path(&format!("{}/models", base.path().trim_end_matches('/')));
+    models_url.set_query(None);
+    models_url.set_fragment(None);
+
+    let api_key = if !model.api_key.trim().is_empty() {
+        Zeroizing::new(model.api_key.trim().to_owned())
+    } else if !model.credential_name.trim().is_empty() {
+        logic::read_router_credential_text(&model.credential_name)
+            .map_err(|_| "credential_read".to_owned())?
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "credential_missing".to_owned())?
+    } else {
+        return Err("credential_missing".to_owned());
+    };
+
+    let runtime = logic::resolve_proxy_runtime(cfg).map_err(|_| "proxy_config".to_owned())?;
+    let target = model.base_url.trim().trim_end_matches('/');
+    let policy = runtime.targets.get(target);
+    let mut builder = reqwest::blocking::Client::builder()
+        .timeout(API_MODEL_VALIDATION_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none());
+    if policy.is_some_and(|policy| policy.bypass) || runtime.settings.proxy_url.is_none() {
+        builder = builder.no_proxy();
+    } else if let Some(proxy_url) = runtime.settings.proxy_url.as_deref() {
+        builder = builder.proxy(
+            reqwest::Proxy::all(proxy_url).map_err(|_| "proxy_config".to_owned())?,
+        );
+    }
+    let client = builder.build().map_err(|_| "client_build".to_owned())?;
+    let response = client
+        .get(models_url)
+        .bearer_auth(api_key.as_str())
+        .send()
+        .map_err(|error| {
+            if error.is_timeout() {
+                "timeout".to_owned()
+            } else if error.is_connect() {
+                "network".to_owned()
+            } else {
+                "request".to_owned()
+            }
+        })?;
+    match response.status().as_u16() {
+        200..=299 => {}
+        401 => return Err("unauthorized".to_owned()),
+        403 => return Err("forbidden".to_owned()),
+        404 => return Err("models_not_found".to_owned()),
+        429 => return Err("rate_limited".to_owned()),
+        500..=599 => return Err("upstream".to_owned()),
+        _ => return Err("http".to_owned()),
+    }
+    let payload = response
+        .json::<serde_json::Value>()
+        .map_err(|_| "invalid_response".to_owned())?;
+    let ids = payload
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| payload.get("models").and_then(serde_json::Value::as_array))
+        .or_else(|| payload.as_array())
+        .ok_or_else(|| "invalid_response".to_owned())?;
+    let expected = logic::canonical_route_model_id(&model.model);
+    if !ids.iter().any(|entry| {
+        entry
+            .get("id")
+            .or_else(|| entry.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| logic::canonical_route_model_id(id) == expected)
+    }) {
+        return Err("model_missing".to_owned());
+    }
+
+    let profile = logic::classify_channel_route(model);
+    let (probe_path, probe_body) = match profile.upstream_protocol {
+        logic::UpstreamProtocol::Responses => (
+            "responses",
+            serde_json::json!({
+                "model": model.model.trim(),
+                "input": "ping",
+                "max_output_tokens": 1,
+                "stream": false,
+            }),
+        ),
+        logic::UpstreamProtocol::ChatCompletions | logic::UpstreamProtocol::Anthropic => (
+            "chat/completions",
+            serde_json::json!({
+                "model": model.model.trim(),
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 1,
+                "stream": false,
+            }),
+        ),
+    };
+    let mut probe_url = base;
+    probe_url.set_path(&format!(
+        "{}/{probe_path}",
+        probe_url.path().trim_end_matches('/')
+    ));
+    probe_url.set_query(None);
+    probe_url.set_fragment(None);
+    let response = client
+        .post(probe_url)
+        .bearer_auth(api_key.as_str())
+        .json(&probe_body)
+        .send()
+        .map_err(|error| {
+            if error.is_timeout() {
+                "timeout".to_owned()
+            } else if error.is_connect() {
+                "network".to_owned()
+            } else {
+                "request".to_owned()
+            }
+        })?;
+    match response.status().as_u16() {
+        200..=299 => Ok(()),
+        401 => Err("unauthorized".to_owned()),
+        403 => Err("forbidden".to_owned()),
+        404 => Err("probe_not_found".to_owned()),
+        429 => Err("rate_limited".to_owned()),
+        500..=599 => Err("probe_upstream".to_owned()),
+        _ => Err("probe_http".to_owned()),
+    }
+}
+
+fn api_model_validation_message(code: &str, zh: bool) -> &'static str {
+    match (code, zh) {
+        ("invalid_url", true) => "Base URL 无效，请填写完整的 http/https 地址",
+        ("invalid_url", false) => "The Base URL is not a valid HTTP/HTTPS address",
+        ("credential_missing" | "credential_read", true) => {
+            "API Key 不存在或无法从 Windows 凭据管理器读取"
+        }
+        ("credential_missing" | "credential_read", false) => {
+            "The API key is missing or could not be read from Credential Manager"
+        }
+        ("unauthorized", true) => "API Key 验证失败（HTTP 401）",
+        ("unauthorized", false) => "The API key was rejected (HTTP 401)",
+        ("forbidden", true) => "该账号无权访问模型接口（HTTP 403）",
+        ("forbidden", false) => "The account cannot access the models endpoint (HTTP 403)",
+        ("models_not_found", true) => "Base URL 没有提供 /models 接口（HTTP 404）",
+        ("models_not_found", false) => "The Base URL has no /models endpoint (HTTP 404)",
+        ("probe_not_found", true) => "模型已列出，但实际生成接口不存在（HTTP 404）",
+        ("probe_not_found", false) => {
+            "The model was listed, but its generation endpoint returned HTTP 404"
+        }
+        ("probe_upstream", true) => "模型已列出，但实际调用时上游返回 HTTP 5xx",
+        ("probe_upstream", false) => {
+            "The model was listed, but an actual request returned HTTP 5xx"
+        }
+        ("model_missing", true) => "连接成功，但模型列表中没有填写的模型 ID",
+        ("model_missing", false) => "Connected, but the configured model ID was not listed",
+        ("rate_limited", true) => "接口当前被限流（HTTP 429），请稍后重试",
+        ("rate_limited", false) => "The endpoint is rate limited (HTTP 429); try again later",
+        ("upstream", true) => "上游服务当前不可用（HTTP 5xx）",
+        ("upstream", false) => "The upstream service is unavailable (HTTP 5xx)",
+        ("timeout", true) => "连接测试超时，请检查网络、VPN 或代理",
+        ("timeout", false) => "The connection test timed out; check the network, VPN, or proxy",
+        ("network", true) => "无法连接或解析 Base URL，请检查校园网、VPN、DNS 或代理",
+        ("network", false) => {
+            "Could not resolve or connect to the Base URL; check VPN, DNS, or proxy"
+        }
+        ("proxy_config", true) => "代理配置无效，无法执行连接测试",
+        ("proxy_config", false) => "The proxy configuration is invalid",
+        (_, true) => "API 返回格式不兼容或连接测试失败",
+        (_, false) => "The API response is incompatible or the connection test failed",
+    }
+}
+
 struct CodexRouterApp {
     ui_audit_mode: bool,
     ui_audit_screenshot_path: Option<PathBuf>,
@@ -852,6 +1033,7 @@ struct CodexRouterApp {
     temp_model: ModelConfig,
     editing_model: Option<usize>,
     model_from_wizard: bool,
+    api_model_validation_running: bool,
     proxy_from_wizard: bool,
     status_text: String,
     status_expires_at: Option<std::time::Instant>,
@@ -2737,6 +2919,7 @@ impl CodexRouterApp {
             temp_model: ModelConfig::default(),
             editing_model: None,
             model_from_wizard: true,
+            api_model_validation_running: false,
             proxy_from_wizard: true,
             status_text: String::new(),
             status_expires_at: None,
@@ -3196,6 +3379,7 @@ impl CodexRouterApp {
             config,
             editing_model: None,
             model_from_wizard: true,
+            api_model_validation_running: false,
             proxy_from_wizard: true,
             status_text: "UI audit mode: no system configuration will be changed.".to_owned(),
             status_expires_at: None,
@@ -5107,6 +5291,48 @@ impl CodexRouterApp {
                         format!("Could not update OAuth priority: {detail}")
                     };
                     self.log(self.oauth_error.clone());
+                }
+                AppEvent::ApiModelValidationFinished {
+                    model,
+                    editing_model,
+                    model_from_wizard,
+                    result,
+                } => {
+                    self.api_model_validation_running = false;
+                    let draft_unchanged = self.page == Page::Model
+                        && self.temp_model.model == model.model
+                        && self.temp_model.base_url == model.base_url
+                        && self.temp_model.api_key == model.api_key
+                        && self.editing_model == editing_model;
+                    if !draft_unchanged {
+                        self.status_text = if zh {
+                            "API 渠道内容已变化，已忽略过期的连接测试结果，请重新保存".to_owned()
+                        } else {
+                            "The API channel changed; the stale connection result was ignored. Save again."
+                                .to_owned()
+                        };
+                        continue;
+                    }
+                    match result {
+                        Ok(()) => {
+                            self.temp_model = (*model).clone();
+                            self.commit_model_draft(*model, editing_model, model_from_wizard);
+                        }
+                        Err(code) => {
+                            self.temp_model = *model;
+                            self.status_text = format!(
+                                "{}：{}",
+                                if zh {
+                                    "API 渠道不可用，未添加"
+                                } else {
+                                    "API channel unavailable; not added"
+                                },
+                                api_model_validation_message(&code, zh)
+                            );
+                            self.status_expires_at = None;
+                            self.log(self.status_text.clone());
+                        }
+                    }
                 }
                 AppEvent::UpdateProgress(progress) => {
                     self.update_downloaded_bytes = progress.downloaded_bytes;
@@ -8284,6 +8510,8 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod main_tests {
+    use std::io::{Read, Write};
+
     use super::{
         append_bounded_log, auto_enable_first_oauth_model, classify_router_health_error,
         clear_stale_oauth_account_errors, decode_icon,
@@ -8308,6 +8536,96 @@ mod main_tests {
         MIN_WINDOW_LOGICAL_SIZE, RETAIN_LOG_BYTES, WINDOWS_1080P_200_WORK_AREA_LOGICAL_SIZE,
         WINDOWS_NON_CLIENT_LOGICAL_ALLOWANCE,
     };
+
+    fn api_validation_fixture(
+        status: &str,
+        body: &str,
+        probe_status: Option<&str>,
+    ) -> (RouterConfig, ModelConfig) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let probe_status = probe_status.map(str::to_owned);
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let count = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..count]);
+            assert!(request.starts_with("GET /v1/models HTTP/1.1"));
+            assert!(request.contains("authorization: Bearer fixture-api-key"));
+            stream.write_all(response.as_bytes()).unwrap();
+            if let Some(status) = probe_status {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 4096];
+                let count = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..count]);
+                assert!(request.starts_with("POST /v1/responses HTTP/1.1"));
+                assert!(request.contains("authorization: Bearer fixture-api-key"));
+                let body = r#"{"status":"completed","output":[]}"#;
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        let cfg = RouterConfig {
+            proxy: crate::config::ProxyConfig {
+                auto_detect: false,
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let model = ModelConfig {
+            model: "DeepSeek-V4-Flash".to_owned(),
+            base_url: format!("http://{address}/v1"),
+            api_key: "fixture-api-key".to_owned(),
+            ..Default::default()
+        };
+        (cfg, model)
+    }
+
+    #[test]
+    fn api_model_validation_accepts_case_insensitive_catalog_match() {
+        let (cfg, model) =
+            api_validation_fixture(
+                "200 OK",
+                r#"{"data":[{"id":"deepseek-v4-flash"}]}"#,
+                Some("200 OK"),
+            );
+        assert_eq!(super::validate_api_model_connection(&cfg, &model), Ok(()));
+    }
+
+    #[test]
+    fn api_model_validation_rejects_auth_and_missing_model() {
+        let (cfg, model) =
+            api_validation_fixture("401 Unauthorized", r#"{"error":"secret"}"#, None);
+        assert_eq!(
+            super::validate_api_model_connection(&cfg, &model),
+            Err("unauthorized".to_owned())
+        );
+        let (cfg, model) =
+            api_validation_fixture("200 OK", r#"{"data":[{"id":"another-model"}]}"#, None);
+        assert_eq!(
+            super::validate_api_model_connection(&cfg, &model),
+            Err("model_missing".to_owned())
+        );
+        assert!(!super::api_model_validation_message("unauthorized", true).contains("secret"));
+
+        let (cfg, model) = api_validation_fixture(
+            "200 OK",
+            r#"{"data":[{"id":"deepseek-v4-flash"}]}"#,
+            Some("500 Internal Server Error"),
+        );
+        assert_eq!(
+            super::validate_api_model_connection(&cfg, &model),
+            Err("probe_upstream".to_owned())
+        );
+    }
 
     #[test]
     fn first_oauth_account_enables_exactly_one_model_only_for_empty_configs() {

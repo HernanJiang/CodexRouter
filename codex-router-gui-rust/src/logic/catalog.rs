@@ -61,6 +61,15 @@ fn is_oauth(model: &ModelConfig) -> bool {
     model_source(model) == "oauth"
 }
 
+fn canonical_public_model_id(model_id: &str) -> String {
+    let identity = model_identity(model_id);
+    if identity.provider.starts_with("unknown") {
+        model_id.trim().to_owned()
+    } else {
+        identity.real_id
+    }
+}
+
 fn split_public_model_id(model: &ModelConfig) -> String {
     let canonical = canonical_route_model_id(&model.model);
     let slug = slugify(&canonical);
@@ -201,24 +210,28 @@ pub fn build_route_plan(cfg: &RouterConfig) -> Vec<ModelRoute> {
 
             let mut is_fallback = false;
             let mut join_router = d.selected;
-            let mut public_model_id = d.model_id.clone();
-            let mut request_model_ids = vec![d.model_id.clone()];
+            let mut public_model_id = canonical_public_model_id(&d.model_id);
+            let mut request_model_ids = vec![public_model_id.clone(), d.model_id.clone()];
+            request_model_ids.sort();
+            request_model_ids.dedup();
             let include_in_catalog;
             let mut is_merged_oauth_route = false;
 
             if is_oauth {
-                include_in_catalog = d.selected && catalog_ids.insert(public_model_id.clone());
+                include_in_catalog =
+                    d.selected && catalog_ids.insert(public_model_id.to_ascii_lowercase());
             } else if policy_allows_fallback && !matching_oauth.is_empty() {
                 is_fallback = matching_oauth
                     .iter()
                     .any(|oauth| is_eligible_oauth_api_fallback(cfg, &oauth.model, &d.model));
                 join_router = is_fallback;
-                public_model_id = matching_oauth[0].model_id.clone();
+                public_model_id = canonical_public_model_id(&matching_oauth[0].model_id);
                 let has_explicit_matching_oauth = matching_oauth.iter().any(|o| !o.discovered);
                 if has_explicit_matching_oauth {
                     include_in_catalog = false;
                 } else {
-                    include_in_catalog = catalog_ids.insert(public_model_id.clone());
+                    include_in_catalog =
+                        catalog_ids.insert(public_model_id.to_ascii_lowercase());
                 }
                 if is_fallback {
                     request_model_ids = matching_oauth
@@ -236,9 +249,9 @@ pub fn build_route_plan(cfg: &RouterConfig) -> Vec<ModelRoute> {
                 if same_count > 1 {
                     public_model_id = split_public_model_id(&d.model);
                 }
-                include_in_catalog = catalog_ids.insert(public_model_id.clone());
+                include_in_catalog = catalog_ids.insert(public_model_id.to_ascii_lowercase());
             } else {
-                include_in_catalog = catalog_ids.insert(public_model_id.clone());
+                include_in_catalog = catalog_ids.insert(public_model_id.to_ascii_lowercase());
             }
 
             if is_oauth && policy_allows_fallback && !matching_api_fallbacks.is_empty() {
@@ -762,6 +775,56 @@ mod tests {
             .as_array()
             .is_some_and(|tiers| tiers.iter().any(|tier| tier == "fast")));
         assert!(!catalog_requires_chatgpt_allowlist(&cfg));
+    }
+
+    #[test]
+    fn case_variants_share_one_catalog_row_in_config_order() {
+        let cfg = crate::config::RouterConfig {
+            models: vec![
+                ModelConfig {
+                    model: "grok-4.6".to_owned(),
+                    ..Default::default()
+                },
+                ModelConfig {
+                    model: "DeepSeek-V4-Flash".to_owned(),
+                    base_url: "https://school.example/v1".to_owned(),
+                    credential_name: "school".to_owned(),
+                    ..Default::default()
+                },
+                ModelConfig {
+                    model: "deepseek-v4-flash".to_owned(),
+                    base_url: "https://plan.example/v1".to_owned(),
+                    credential_name: "plan".to_owned(),
+                    ..Default::default()
+                },
+                ModelConfig {
+                    model: "gpt-5.6-sol".to_owned(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let plan = build_route_plan(&cfg);
+        let catalog = build_model_catalog(&cfg);
+        assert_eq!(catalog.len(), 3);
+        assert_eq!(catalog[0]["slug"], "grok-4.6");
+        assert_eq!(catalog[1]["slug"], "deepseek-v4-flash");
+        assert_eq!(catalog[2]["slug"], "gpt-5.6-sol");
+        let deepseek_routes = plan
+            .iter()
+            .filter(|route| route.canonical_model_id == "deepseek-v4-flash")
+            .collect::<Vec<_>>();
+        assert_eq!(deepseek_routes.len(), 2);
+        assert!(deepseek_routes[0].include_in_catalog);
+        assert!(!deepseek_routes[1].include_in_catalog);
+        assert!(deepseek_routes.iter().all(|route| {
+            route.public_model_id == "deepseek-v4-flash"
+                && route
+                    .request_model_ids
+                    .iter()
+                    .any(|id| id == "deepseek-v4-flash")
+        }));
     }
 
     #[test]

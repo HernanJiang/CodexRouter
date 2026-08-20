@@ -4,6 +4,7 @@ use crate::config::{ModelConfig, RouterConfig};
 use crate::proxy::ProxyRuntime;
 use anyhow::{bail, Context};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,6 +14,26 @@ use url::Url;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MANAGED_GROUP_NAME: &str = "Codex-Router";
 const MANAGED_PROXY_NAME: &str = "Codex-Router / Auto-detected outbound proxy";
+
+fn api_account_name(model: &ModelConfig) -> String {
+    let label = if model.alias.trim().is_empty() {
+        model.model.trim()
+    } else {
+        model.alias.trim()
+    };
+    let vendor = super::classify_channel_route(model).vendor;
+    let seed = format!(
+        "{}\n{}",
+        model.credential_name.trim().to_ascii_lowercase(),
+        model.base_url.trim().trim_end_matches('/').to_ascii_lowercase()
+    );
+    let digest = Sha256::digest(seed.as_bytes());
+    let token = digest[..4]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("Codex-Router / {label} / {vendor}-{token}")
+}
 
 trait AdminApi {
     fn get(&self, path: &str) -> anyhow::Result<Value>;
@@ -419,14 +440,7 @@ where
         }
         let api_key = super::read_router_credential_text(&model.credential_name)?
             .with_context(|| format!("Missing API Key for model '{}'", model.model))?;
-        let account_name = format!(
-            "Codex-Router / {}",
-            if model.alias.trim().is_empty() {
-                model.model.trim()
-            } else {
-                model.alias.trim()
-            }
-        );
+        let account_name = api_account_name(model);
         managed_names.insert(account_name.clone());
         let existing = accounts
             .iter()
@@ -1253,6 +1267,35 @@ mod tests {
     use super::*;
     use crate::config::OAuthFallback;
     use std::sync::Mutex;
+
+    #[test]
+    fn api_account_names_are_stable_distinct_and_secret_free() {
+        let school = ModelConfig {
+            model: "deepseek-v4-flash".to_owned(),
+            alias: "DeepSeek-V4-Flash".to_owned(),
+            base_url: "https://school.example/v1".to_owned(),
+            credential_name: "SchoolCredential".to_owned(),
+            api_key: "must-not-appear".to_owned(),
+            ..Default::default()
+        };
+        let plan = ModelConfig {
+            base_url: "https://plan.example/v1".to_owned(),
+            credential_name: "PlanCredential".to_owned(),
+            ..school.clone()
+        };
+
+        let school_name = api_account_name(&school);
+        let plan_name = api_account_name(&plan);
+        assert_eq!(school_name, api_account_name(&school));
+        assert_ne!(school_name, plan_name);
+        for secret in [
+            school.api_key.as_str(),
+            school.base_url.as_str(),
+            school.credential_name.as_str(),
+        ] {
+            assert!(!school_name.contains(secret));
+        }
+    }
 
     #[derive(Clone, Debug)]
     struct AdminCall {
