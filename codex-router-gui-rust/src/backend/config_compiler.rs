@@ -25,6 +25,7 @@ pub struct RouteTarget {
     pub priority: i32,
     pub weight: i32,
     pub proxy_url: Option<String>,
+    pub openai_capabilities: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -135,6 +136,12 @@ pub struct OpenAiCompatibility {
     #[serde(rename = "api-key-entries")]
     pub api_key_entries: Vec<OpenAiCompatKeyEntry>,
     pub priority: Option<i32>,
+    #[serde(
+        rename = "openai-capabilities",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub openai_capabilities: Vec<String>,
     pub models: Vec<ModelMapping>,
 }
 
@@ -407,6 +414,7 @@ pub fn compile(
                         proxy_url: target.proxy_url.clone(),
                     }],
                     priority,
+                    openai_capabilities: target.openai_capabilities.clone(),
                     models: vec![mapping],
                 });
             }
@@ -553,6 +561,27 @@ mod tests {
         let yaml = to_yaml(&config).unwrap();
         assert!(yaml.contains("gpt-public"));
         assert!(yaml.contains("claude-public"));
+    }
+
+    #[test]
+    fn openai_compatible_capabilities_reach_yaml() {
+        let target = RouteTarget {
+            route_id: "deepseek".into(),
+            public_model: "deepseek-v4-pro".into(),
+            upstream_model: "DeepSeek-V4-Pro".into(),
+            platform: "openai".into(),
+            base_url: Some("https://school.example/v1".into()),
+            credential_ref: "credential".into(),
+            openai_capabilities: vec!["chat_completions".into()],
+            ..Default::default()
+        };
+        let config = compile(&[target], "downstream", "management", "./auth").unwrap();
+        assert_eq!(
+            config.openai_compatibility[0].openai_capabilities,
+            ["chat_completions"]
+        );
+        let yaml = to_yaml(&config).unwrap();
+        assert!(yaml.contains("openai-capabilities:\n  - chat_completions"));
     }
 
     #[test]

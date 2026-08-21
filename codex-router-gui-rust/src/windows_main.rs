@@ -848,7 +848,26 @@ enum TrayAction {
     Exit,
 }
 
-fn validate_api_model_connection(cfg: &RouterConfig, model: &ModelConfig) -> Result<(), String> {
+fn set_api_model_protocol(model: &mut ModelConfig, protocol: logic::UpstreamProtocol) {
+    let mut extra = serde_json::from_str::<serde_json::Value>(&model.extra)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    extra.insert(
+        "openai_responses_mode".to_owned(),
+        serde_json::Value::String(protocol.responses_mode().to_owned()),
+    );
+    extra.insert(
+        "codex_router_upstream_protocol".to_owned(),
+        serde_json::Value::String(protocol.as_str().to_owned()),
+    );
+    model.extra = serde_json::to_string(&extra).unwrap_or_else(|_| "{}".to_owned());
+}
+
+fn validate_api_model_connection(
+    cfg: &RouterConfig,
+    model: &mut ModelConfig,
+) -> Result<(), String> {
     let base = reqwest::Url::parse(model.base_url.trim()).map_err(|_| "invalid_url".to_owned())?;
     if !matches!(base.scheme(), "http" | "https") || base.host_str().is_none() {
         return Err("invalid_url".to_owned());
@@ -925,9 +944,9 @@ fn validate_api_model_connection(cfg: &RouterConfig, model: &ModelConfig) -> Res
         return Err("model_missing".to_owned());
     }
 
-    let profile = logic::classify_channel_route(model);
-    let (probe_path, probe_body) = match profile.upstream_protocol {
-        logic::UpstreamProtocol::Responses => (
+    let probe = |protocol: logic::UpstreamProtocol| -> Result<(), String> {
+        let (probe_path, probe_body) = match protocol {
+            logic::UpstreamProtocol::Responses => (
             "responses",
             serde_json::json!({
                 "model": model.model.trim(),
@@ -936,7 +955,7 @@ fn validate_api_model_connection(cfg: &RouterConfig, model: &ModelConfig) -> Res
                 "stream": false,
             }),
         ),
-        logic::UpstreamProtocol::ChatCompletions | logic::UpstreamProtocol::Anthropic => (
+            logic::UpstreamProtocol::ChatCompletions | logic::UpstreamProtocol::Anthropic => (
             "chat/completions",
             serde_json::json!({
                 "model": model.model.trim(),
@@ -944,37 +963,59 @@ fn validate_api_model_connection(cfg: &RouterConfig, model: &ModelConfig) -> Res
                 "max_tokens": 1,
                 "stream": false,
             }),
-        ),
+            ),
+        };
+        let mut probe_url = base.clone();
+        probe_url.set_path(&format!(
+            "{}/{probe_path}",
+            probe_url.path().trim_end_matches('/')
+        ));
+        probe_url.set_query(None);
+        probe_url.set_fragment(None);
+        let response = client
+            .post(probe_url)
+            .bearer_auth(api_key.as_str())
+            .json(&probe_body)
+            .send()
+            .map_err(|error| {
+                if error.is_timeout() {
+                    "timeout".to_owned()
+                } else if error.is_connect() {
+                    "network".to_owned()
+                } else {
+                    "request".to_owned()
+                }
+            })?;
+        match response.status().as_u16() {
+            200..=299 => Ok(()),
+            401 => Err("unauthorized".to_owned()),
+            403 => Err("forbidden".to_owned()),
+            404 => Err("probe_not_found".to_owned()),
+            429 => Err("rate_limited".to_owned()),
+            500..=599 => Err("probe_upstream".to_owned()),
+            _ => Err("probe_http".to_owned()),
+        }
     };
-    let mut probe_url = base;
-    probe_url.set_path(&format!(
-        "{}/{probe_path}",
-        probe_url.path().trim_end_matches('/')
-    ));
-    probe_url.set_query(None);
-    probe_url.set_fragment(None);
-    let response = client
-        .post(probe_url)
-        .bearer_auth(api_key.as_str())
-        .json(&probe_body)
-        .send()
-        .map_err(|error| {
-            if error.is_timeout() {
-                "timeout".to_owned()
-            } else if error.is_connect() {
-                "network".to_owned()
-            } else {
-                "request".to_owned()
-            }
-        })?;
-    match response.status().as_u16() {
-        200..=299 => Ok(()),
-        401 => Err("unauthorized".to_owned()),
-        403 => Err("forbidden".to_owned()),
-        404 => Err("probe_not_found".to_owned()),
-        429 => Err("rate_limited".to_owned()),
-        500..=599 => Err("probe_upstream".to_owned()),
-        _ => Err("probe_http".to_owned()),
+    let preferred = logic::classify_channel_route(model).upstream_protocol;
+    match probe(preferred) {
+        Ok(()) => Ok(()),
+        Err(first_error)
+            if matches!(
+                first_error.as_str(),
+                "probe_not_found" | "probe_upstream" | "probe_http"
+            ) =>
+        {
+            let alternative = match preferred {
+                logic::UpstreamProtocol::Responses => logic::UpstreamProtocol::ChatCompletions,
+                logic::UpstreamProtocol::ChatCompletions | logic::UpstreamProtocol::Anthropic => {
+                    logic::UpstreamProtocol::Responses
+                }
+            };
+            probe(alternative)?;
+            set_api_model_protocol(model, alternative);
+            Ok(())
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -8540,7 +8581,7 @@ mod main_tests {
     fn api_validation_fixture(
         status: &str,
         body: &str,
-        probe_status: Option<&str>,
+        probe_statuses: &[&str],
     ) -> (RouterConfig, ModelConfig) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -8548,7 +8589,10 @@ mod main_tests {
             "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
-        let probe_status = probe_status.map(str::to_owned);
+        let probe_statuses = probe_statuses
+            .iter()
+            .map(|status| (*status).to_owned())
+            .collect::<Vec<_>>();
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0u8; 4096];
@@ -8557,12 +8601,16 @@ mod main_tests {
             assert!(request.starts_with("GET /v1/models HTTP/1.1"));
             assert!(request.contains("authorization: Bearer fixture-api-key"));
             stream.write_all(response.as_bytes()).unwrap();
-            if let Some(status) = probe_status {
+            for (index, status) in probe_statuses.into_iter().enumerate() {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = [0u8; 4096];
                 let count = stream.read(&mut request).unwrap();
                 let request = String::from_utf8_lossy(&request[..count]);
-                assert!(request.starts_with("POST /v1/responses HTTP/1.1"));
+                if index == 0 {
+                    assert!(request.starts_with("POST /v1/responses HTTP/1.1"));
+                } else {
+                    assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
+                }
                 assert!(request.contains("authorization: Bearer fixture-api-key"));
                 let body = r#"{"status":"completed","output":[]}"#;
                 let response = format!(
@@ -8591,40 +8639,42 @@ mod main_tests {
 
     #[test]
     fn api_model_validation_accepts_case_insensitive_catalog_match() {
-        let (cfg, model) =
+        let (cfg, mut model) =
             api_validation_fixture(
                 "200 OK",
                 r#"{"data":[{"id":"deepseek-v4-flash"}]}"#,
-                Some("200 OK"),
+                &["200 OK"],
             );
-        assert_eq!(super::validate_api_model_connection(&cfg, &model), Ok(()));
+        assert_eq!(super::validate_api_model_connection(&cfg, &mut model), Ok(()));
     }
 
     #[test]
     fn api_model_validation_rejects_auth_and_missing_model() {
-        let (cfg, model) =
-            api_validation_fixture("401 Unauthorized", r#"{"error":"secret"}"#, None);
+        let (cfg, mut model) =
+            api_validation_fixture("401 Unauthorized", r#"{"error":"secret"}"#, &[]);
         assert_eq!(
-            super::validate_api_model_connection(&cfg, &model),
+            super::validate_api_model_connection(&cfg, &mut model),
             Err("unauthorized".to_owned())
         );
-        let (cfg, model) =
-            api_validation_fixture("200 OK", r#"{"data":[{"id":"another-model"}]}"#, None);
+        let (cfg, mut model) =
+            api_validation_fixture("200 OK", r#"{"data":[{"id":"another-model"}]}"#, &[]);
         assert_eq!(
-            super::validate_api_model_connection(&cfg, &model),
+            super::validate_api_model_connection(&cfg, &mut model),
             Err("model_missing".to_owned())
         );
         assert!(!super::api_model_validation_message("unauthorized", true).contains("secret"));
 
-        let (cfg, model) = api_validation_fixture(
+        let (cfg, mut model) = api_validation_fixture(
             "200 OK",
             r#"{"data":[{"id":"deepseek-v4-flash"}]}"#,
-            Some("500 Internal Server Error"),
+            &["500 Internal Server Error", "200 OK"],
         );
         assert_eq!(
-            super::validate_api_model_connection(&cfg, &model),
-            Err("probe_upstream".to_owned())
+            super::validate_api_model_connection(&cfg, &mut model),
+            Ok(())
         );
+        let extra: serde_json::Value = serde_json::from_str(&model.extra).unwrap();
+        assert_eq!(extra["openai_responses_mode"], "force_chat_completions");
     }
 
     #[test]

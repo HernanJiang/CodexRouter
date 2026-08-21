@@ -2,6 +2,16 @@
 
 本文件记录面向用户的重要变化。完整技术细节以对应版本的源码和 GitHub Release 为准。
 
+## 2.0.8 - 2026-08-21
+
+### 修复
+
+- 同模型不同渠道严格按用户 P 值调度，移除 Relay、Coding Plan、API 类型的隐藏 tier；学校 P10 会先于火山 P20。
+- 同一个 API Key可服务多个模型和渠道，不再因 API Key被误用为账号唯一身份而导致第二条渠道写入失败。
+- 新增 API 保存前同时验证模型列表和最小生成；若 Responses 不兼容但 Chat Completions 可用，会自动保存正确协议。
+- OpenAI 兼容渠道的 `openai-capabilities` 现在完整传递到 CLIProxyAPI配置，并兼容缺少该字段的旧配置。
+- Codex公开模型 ID保持 canonical 小写去重，渠道上游模型 ID保留服务端声明的原始大小写；学校 DeepSeek Pro现使用 `DeepSeek-V4-Pro` 和 Chat Completions。
+
 ## 2.0.7 - 2026-08-21
 
 ### 修复

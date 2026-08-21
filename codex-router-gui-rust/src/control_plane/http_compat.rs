@@ -388,6 +388,17 @@ pub async fn sync_backend(state: &ControlState) -> Result<usize> {
         if account_available {
             pool_available.insert(pool_route_id.clone(), true);
         }
+        let openai_capabilities = payload
+            .pointer("/credentials/openai_capabilities")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
         targets.push(RouteTarget {
             route_id: pool_route_id,
             public_model,
@@ -398,6 +409,7 @@ pub async fn sync_backend(state: &ControlState) -> Result<usize> {
             priority: account_priority as i32,
             weight: weight as i32,
             proxy_url,
+            openai_capabilities,
         });
     }
     if let Ok(entries) = std::fs::read_dir(&backend.auth_dir) {

@@ -4139,12 +4139,12 @@ impl CodexRouterApp {
                                     )
                                     .to_owned();
                                     let config = this.config.clone();
-                                    let model = this.temp_model.clone();
+                                    let mut model = this.temp_model.clone();
                                     let model_from_wizard = this.model_from_wizard;
                                     let tx = this.event_tx.clone();
                                     std::thread::spawn(move || {
                                         let result = super::validate_api_model_connection(
-                                            &config, &model,
+                                            &config, &mut model,
                                         );
                                         tx.send(super::AppEvent::ApiModelValidationFinished {
                                             model: Box::new(model),
