@@ -13,6 +13,7 @@
 - Codex公开模型 ID保持 canonical 小写去重，渠道上游模型 ID保留服务端声明的原始大小写；学校 DeepSeek Pro现使用 `DeepSeek-V4-Pro` 和 Chat Completions。
 - 归档修复改为离线协调：Codex运行时绝不再修改 `state_5.sqlite`；检测到 Codex连续完全退出后，先做完整性检查和备份，再根据 Codex自己的 `thread/archive` 日志完成停在 active-thread shutdown阶段的归档。
 - 离线协调器仅规范化真实文件存在的扩展路径，不会归档用户未请求归档的对话；支持文件已移动但数据库尚未提交的中断恢复，并在失败时回滚文件移动。
+- 升级启动时若整个 Codex应用包已经完全退出，会立即执行一次离线协调；若仍有 Codex/ChatGPT主进程或子进程存活则严格跳过，避免内存状态覆盖数据库修复。
 
 ## 2.0.7 - 2026-08-21
 

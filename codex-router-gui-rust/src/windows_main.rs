@@ -2789,6 +2789,12 @@ impl CodexRouterApp {
             config.ui_theme = "sky".to_owned();
         }
         logic::normalize_default_model(&mut config);
+        // Upgrade/startup is the safest repair window: reconcile immediately
+        // only when the entire Codex package is already stopped. If Codex is
+        // running, the background reconciler waits for a later clean exit.
+        if configured && !platform::codex_desktop_running() {
+            let _ = profiles::reconcile_codex_archives_offline(&config);
+        }
         if !configured {
             // Fresh installs always start on 雾蓝 unless the user toggles later.
             config.ui_theme = "sky".to_owned();
