@@ -1,7 +1,7 @@
 # CodexRouter 条款与合规说明
 
 软件版本：v2.0.9
-发布日期：2026-08-21
+发布日期：2026-08-22
 承诺修订：v1.3（2026-08-18）
 版权所有：Hernan_Jiang
 官方发布地址：https://github.com/HernanJiang/CodexRouter
