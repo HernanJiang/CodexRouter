@@ -11,6 +11,8 @@
 - 新增 API 保存前同时验证模型列表和最小生成；若 Responses 不兼容但 Chat Completions 可用，会自动保存正确协议。
 - OpenAI 兼容渠道的 `openai-capabilities` 现在完整传递到 CLIProxyAPI配置，并兼容缺少该字段的旧配置。
 - Codex公开模型 ID保持 canonical 小写去重，渠道上游模型 ID保留服务端声明的原始大小写；学校 DeepSeek Pro现使用 `DeepSeek-V4-Pro` 和 Chat Completions。
+- 归档修复改为离线协调：Codex运行时绝不再修改 `state_5.sqlite`；检测到 Codex连续完全退出后，先做完整性检查和备份，再根据 Codex自己的 `thread/archive` 日志完成停在 active-thread shutdown阶段的归档。
+- 离线协调器仅规范化真实文件存在的扩展路径，不会归档用户未请求归档的对话；支持文件已移动但数据库尚未提交的中断恢复，并在失败时回滚文件移动。
 
 ## 2.0.7 - 2026-08-21
 

@@ -124,6 +124,10 @@ pub fn restart_codex_desktop() -> anyhow::Result<CodexRestartOutcome> {
     bail!("Codex / ChatGPT desktop did not start within 10 seconds")
 }
 
+pub fn codex_desktop_running() -> bool {
+    codex_desktop_processes().is_ok_and(|processes| !processes.is_empty())
+}
+
 fn codex_desktop_processes() -> anyhow::Result<Vec<DesktopProcess>> {
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snapshot == INVALID_HANDLE_VALUE {

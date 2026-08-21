@@ -4,49 +4,206 @@ use crate::user_data;
 use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{atomic::AtomicBool, Arc};
 use std::time::{Duration, Instant};
 use toml_edit::{DocumentMut, Item, Table};
 
-/// Repair a Codex thread-store inconsistency produced by older maintenance
-/// tools that rewrote rollout paths with the Windows `\\?\` prefix. Codex's
-/// archive mover compares those paths with ordinary `C:\...` destinations and
-/// can stop after shutting down the active thread without moving the rollout.
-/// Only normalize rows whose ordinary path already exists; never guess or move
-/// conversation files.
-pub fn repair_codex_thread_store_paths(cfg: &RouterConfig) -> anyhow::Result<usize> {
-    let database = logic::resolve_codex_home(cfg).join("state_5.sqlite");
-    if !database.is_file() {
-        return Ok(0);
-    }
-    let mut connection = rusqlite::Connection::open(&database)
-        .context("failed to open the Codex thread store for path repair")?;
-    let candidates = {
-        let mut statement = connection.prepare(
-            "SELECT id, rollout_path FROM threads WHERE archived=0 AND rollout_path LIKE '\\\\?\\%'",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        rows.filter_map(Result::ok).collect::<Vec<_>>()
-    };
-    let transaction = connection.transaction()?;
-    let mut repaired = 0;
-    for (thread_id, current) in candidates {
-        let Some(normalized) = current.strip_prefix(r"\\?\") else {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CodexArchiveRepairSummary {
+    pub normalized_paths: usize,
+    pub archived_threads: usize,
+}
+
+fn thread_id_from_archive_log(text: &str) -> Option<String> {
+    for marker in ["thread_id=", "thread "] {
+        let Some(start) = text.find(marker).map(|start| start + marker.len()) else {
             continue;
         };
-        if !Path::new(normalized).is_file() {
-            continue;
+        let id = text[start..]
+            .chars()
+            .take_while(|character| character.is_ascii_hexdigit() || *character == '-')
+            .collect::<String>();
+        if id.len() == 36 {
+            return Some(id);
         }
-        repaired += transaction.execute(
-            "UPDATE threads SET rollout_path=?1 WHERE id=?2 AND rollout_path=?3",
-            rusqlite::params![normalized, thread_id, current],
-        )?;
     }
-    transaction.commit()?;
-    Ok(repaired)
+    None
+}
+
+fn attempted_archive_threads(logs_database: &Path) -> anyhow::Result<HashSet<String>> {
+    if !logs_database.is_file() {
+        return Ok(HashSet::new());
+    }
+    let connection = rusqlite::Connection::open_with_flags(
+        logs_database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let mut statement = connection.prepare(
+        "SELECT feedback_log_body FROM logs WHERE feedback_log_body LIKE '%thread/archive%' \
+         AND (feedback_log_body LIKE '%clearing thread listener%' \
+         OR feedback_log_body LIKE '%was active; shutting down%')",
+    )?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    Ok(rows
+        .filter_map(Result::ok)
+        .filter_map(|text| thread_id_from_archive_log(&text))
+        .collect())
+}
+
+fn backup_thread_store(connection: &rusqlite::Connection, codex_home: &Path) -> anyhow::Result<()> {
+    connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    let backup_root = codex_home.join("backups");
+    std::fs::create_dir_all(&backup_root)?;
+    let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S-%3f");
+    let source = codex_home.join("state_5.sqlite");
+    std::fs::copy(
+        source,
+        backup_root.join(format!("state_5-before-offline-archive-repair-{stamp}.sqlite")),
+    )?;
+    Ok(())
+}
+
+/// Reconcile Codex's thread store only while Codex Desktop is fully stopped.
+/// Paths are normalized conservatively, and a thread is archived only when
+/// Codex's own logs prove that the user requested `thread/archive` but the row
+/// remains unarchived after the active-thread shutdown phase.
+pub fn reconcile_codex_archives_offline(
+    cfg: &RouterConfig,
+) -> anyhow::Result<CodexArchiveRepairSummary> {
+    if crate::platform::codex_desktop_running() {
+        bail!("Codex Desktop is running; offline archive repair was skipped");
+    }
+    let codex_home = logic::resolve_codex_home(cfg);
+    reconcile_codex_archives_at(&codex_home)
+}
+
+fn reconcile_codex_archives_at(codex_home: &Path) -> anyhow::Result<CodexArchiveRepairSummary> {
+    let database = codex_home.join("state_5.sqlite");
+    if !database.is_file() {
+        return Ok(CodexArchiveRepairSummary::default());
+    }
+    let attempted = attempted_archive_threads(&codex_home.join("logs_2.sqlite"))?;
+    let mut connection = rusqlite::Connection::open(&database)?;
+    if connection.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))? != "ok" {
+        bail!("Codex thread store failed quick_check");
+    }
+    let rows = {
+        let mut statement = connection.prepare(
+            "SELECT id,rollout_path FROM threads WHERE archived=0 ORDER BY created_at,id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        rows
+    };
+    let archive_root = codex_home.join("archived_sessions");
+    let mut normalizations = Vec::new();
+    let mut archives = Vec::new();
+    let mut moved_only = Vec::new();
+    for (thread_id, current) in rows {
+        let normalized = current
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&current)
+            .to_owned();
+        let source = PathBuf::from(&normalized);
+        if normalized != current && source.is_file() {
+            normalizations.push((thread_id.clone(), current.clone(), normalized.clone()));
+        }
+        if attempted.contains(&thread_id) {
+            let Some(file_name) = source.file_name() else {
+                continue;
+            };
+            let destination = archive_root.join(file_name);
+            if source.is_file() && !destination.exists() {
+                archives.push((thread_id, current, source, destination));
+            } else if !source.exists() && destination.is_file() {
+                moved_only.push((thread_id, current, normalized, destination));
+            }
+        }
+    }
+    if normalizations.is_empty() && archives.is_empty() && moved_only.is_empty() {
+        return Ok(CodexArchiveRepairSummary::default());
+    }
+    backup_thread_store(&connection, codex_home)?;
+    std::fs::create_dir_all(&archive_root)?;
+    let transaction = connection.transaction()?;
+    let mut moved = Vec::new();
+    let result = (|| -> anyhow::Result<CodexArchiveRepairSummary> {
+        let mut summary = CodexArchiveRepairSummary::default();
+        for (thread_id, current, normalized) in &normalizations {
+            summary.normalized_paths += transaction.execute(
+                "UPDATE threads SET rollout_path=?1 WHERE id=?2 AND archived=0 AND rollout_path=?3",
+                rusqlite::params![normalized, thread_id, current],
+            )?;
+        }
+        let archived_at = chrono::Utc::now().timestamp();
+        for (thread_id, current, source, destination) in &archives {
+            std::fs::rename(source, destination)?;
+            moved.push((source.clone(), destination.clone()));
+            let current_normalized = current.strip_prefix(r"\\?\").unwrap_or(current);
+            let changed = transaction.execute(
+                "UPDATE threads SET rollout_path=?1,archived=1,archived_at=?2 \
+                 WHERE id=?3 AND archived=0 AND (rollout_path=?4 OR rollout_path=?5)",
+                rusqlite::params![destination.to_string_lossy(), archived_at, thread_id, current, current_normalized],
+            )?;
+            if changed != 1 {
+                bail!("Codex thread state changed during offline archive repair");
+            }
+            summary.archived_threads += 1;
+        }
+        for (thread_id, current, normalized, destination) in &moved_only {
+            let changed = transaction.execute(
+                "UPDATE threads SET rollout_path=?1,archived=1,archived_at=?2 \
+                 WHERE id=?3 AND archived=0 AND (rollout_path=?4 OR rollout_path=?5)",
+                rusqlite::params![destination.to_string_lossy(), archived_at, thread_id, current, normalized],
+            )?;
+            if changed == 1 {
+                summary.archived_threads += 1;
+            }
+        }
+        Ok(summary)
+    })();
+    match result {
+        Ok(summary) => {
+            transaction.commit()?;
+            Ok(summary)
+        }
+        Err(error) => {
+            drop(transaction);
+            for (source, destination) in moved.into_iter().rev() {
+                if destination.is_file() && !source.exists() {
+                    let _ = std::fs::rename(destination, source);
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+pub fn spawn_codex_archive_reconciler(cfg: RouterConfig, stop: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        let mut stopped_since = None;
+        let mut reconciled_for_stop = false;
+        while !stop.load(Ordering::Relaxed) {
+            if crate::platform::codex_desktop_running() {
+                stopped_since = None;
+                reconciled_for_stop = false;
+            } else {
+                let since = stopped_since.get_or_insert_with(Instant::now);
+                if !reconciled_for_stop && since.elapsed() >= Duration::from_secs(30) {
+                    let _ = reconcile_codex_archives_offline(&cfg);
+                    reconciled_for_stop = true;
+                }
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    });
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1707,48 +1864,103 @@ mod tests {
     use super::*;
 
     #[test]
-    fn thread_store_repair_only_normalizes_existing_extended_rollout_paths() {
-        let root = temporary_test_dir("thread-store-path-repair");
+    fn offline_archive_repair_honors_user_intent_and_normalizes_other_paths() {
+        let root = temporary_test_dir("offline-archive-repair");
         let codex_home = root.join("codex-home");
         let sessions = codex_home.join("sessions");
         std::fs::create_dir_all(&sessions).unwrap();
-        let rollout = sessions.join("rollout-test.jsonl");
-        std::fs::write(&rollout, "fixture").unwrap();
+        let requested_id = "01a02047-8db2-7181-a61a-dc9ac28e3501";
+        let untouched_id = "01a02047-8db2-7181-a61a-dc9ac28e3502";
+        let moved_id = "01a02047-8db2-7181-a61a-dc9ac28e3503";
+        let requested = sessions.join(format!("rollout-{requested_id}.jsonl"));
+        let untouched = sessions.join(format!("rollout-{untouched_id}.jsonl"));
+        std::fs::write(&requested, "requested").unwrap();
+        std::fs::write(&untouched, "untouched").unwrap();
+        let archive_root = codex_home.join("archived_sessions");
+        std::fs::create_dir_all(&archive_root).unwrap();
+        let moved_source = sessions.join(format!("rollout-{moved_id}.jsonl"));
+        let moved_destination = archive_root.join(format!("rollout-{moved_id}.jsonl"));
+        std::fs::write(&moved_destination, "already moved").unwrap();
         let database = codex_home.join("state_5.sqlite");
         let connection = rusqlite::Connection::open(&database).unwrap();
         connection
             .execute_batch(
-                "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, archived INTEGER NOT NULL);",
-            )
-            .unwrap();
-        let normal = rollout.to_string_lossy().to_string();
-        let extended = format!(r"\\?\{normal}");
-        connection
-            .execute(
-                "INSERT INTO threads(id,rollout_path,archived) VALUES('repair',?1,0)",
-                rusqlite::params![extended],
+                "CREATE TABLE threads(\
+                    id TEXT PRIMARY KEY,rollout_path TEXT NOT NULL,created_at INTEGER NOT NULL,\
+                    archived INTEGER NOT NULL,archived_at INTEGER);",
             )
             .unwrap();
         connection
             .execute(
-                "INSERT INTO threads(id,rollout_path,archived) VALUES('missing',?1,0)",
-                rusqlite::params![format!(r"\\?\{}", sessions.join("missing.jsonl").display())],
+                "INSERT INTO threads(id,rollout_path,created_at,archived) VALUES(?1,?2,1,0)",
+                rusqlite::params![requested_id, format!(r"\\?\{}", requested.display())],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads(id,rollout_path,created_at,archived) VALUES(?1,?2,3,0)",
+                rusqlite::params![moved_id, moved_source.to_string_lossy()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads(id,rollout_path,created_at,archived) VALUES(?1,?2,2,0)",
+                rusqlite::params![untouched_id, format!(r"\\?\{}", untouched.display())],
             )
             .unwrap();
         drop(connection);
-        let mut cfg = RouterConfig::default();
-        cfg.deploy.codex_home = codex_home.to_string_lossy().to_string();
-        assert_eq!(repair_codex_thread_store_paths(&cfg).unwrap(), 1);
+        let logs = rusqlite::Connection::open(codex_home.join("logs_2.sqlite")).unwrap();
+        logs.execute_batch("CREATE TABLE logs(feedback_log_body TEXT);")
+            .unwrap();
+        logs.execute(
+            "INSERT INTO logs(feedback_log_body) VALUES(?1)",
+            [format!(
+                "app-server request thread/archive clearing thread listener thread_id={requested_id}"
+            )],
+        )
+        .unwrap();
+        logs.execute(
+            "INSERT INTO logs(feedback_log_body) VALUES(?1)",
+            [format!(
+                "app-server request thread/archive thread {moved_id} was active; shutting down"
+            )],
+        )
+        .unwrap();
+        drop(logs);
+
+        let summary = reconcile_codex_archives_at(&codex_home).unwrap();
+        assert_eq!(summary.normalized_paths, 2);
+        assert_eq!(summary.archived_threads, 2);
         let connection = rusqlite::Connection::open(database).unwrap();
-        let repaired: String = connection
-            .query_row("SELECT rollout_path FROM threads WHERE id='repair'", [], |row| row.get(0))
+        let requested_row: (String, i64) = connection
+            .query_row(
+                "SELECT rollout_path,archived FROM threads WHERE id=?1",
+                [requested_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
             .unwrap();
-        let missing: String = connection
-            .query_row("SELECT rollout_path FROM threads WHERE id='missing'", [], |row| row.get(0))
+        let untouched_row: (String, i64) = connection
+            .query_row(
+                "SELECT rollout_path,archived FROM threads WHERE id=?1",
+                [untouched_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
             .unwrap();
-        assert_eq!(repaired, normal);
-        assert!(missing.starts_with(r"\\?\"));
+        assert_eq!(requested_row.1, 1);
+        assert!(requested_row.0.contains("archived_sessions"));
+        assert_eq!(untouched_row, (untouched.to_string_lossy().to_string(), 0));
+        assert!(!requested.exists());
+        assert!(untouched.exists());
+        let moved_archived: i64 = connection
+            .query_row(
+                "SELECT archived FROM threads WHERE id=?1",
+                [moved_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(moved_archived, 1);
         drop(connection);
+        assert!(codex_home.join("backups").is_dir());
         std::fs::remove_dir_all(root).unwrap();
     }
 

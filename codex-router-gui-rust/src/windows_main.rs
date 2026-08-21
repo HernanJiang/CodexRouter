@@ -2789,7 +2789,6 @@ impl CodexRouterApp {
             config.ui_theme = "sky".to_owned();
         }
         logic::normalize_default_model(&mut config);
-        let _ = profiles::repair_codex_thread_store_paths(&config);
         if !configured {
             // Fresh installs always start on 雾蓝 unless the user toggles later.
             config.ui_theme = "sky".to_owned();
@@ -3128,6 +3127,12 @@ impl CodexRouterApp {
             app.runtime_log_stop.clone(),
             app.runtime_log_paused.clone(),
         );
+        if configured {
+            profiles::spawn_codex_archive_reconciler(
+                app.config.clone(),
+                app.runtime_log_stop.clone(),
+            );
+        }
         if configured || legacy_autostart_shortcut_exists() {
             app.reconcile_autostart_registration();
         }
