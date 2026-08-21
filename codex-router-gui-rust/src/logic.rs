@@ -721,6 +721,27 @@ pub fn resolve_default_model(cfg: &RouterConfig) -> Option<String> {
     resolve_default_route(cfg).map(|route| route.public_model_id)
 }
 
+/// Public/catalog model id -> configured output token limit. Fed live to the
+/// Responses gateway so the per-model "max output tokens" setting applies to
+/// every request without restarting the gateway. Models left at 0 are
+/// absent, which preserves the upstream default.
+pub fn max_output_tokens_map(cfg: &RouterConfig) -> std::collections::HashMap<String, i64> {
+    let mut map = std::collections::HashMap::new();
+    for route in catalog::build_route_plan(cfg) {
+        let limit = route.model.max_output_tokens;
+        if limit <= 0 {
+            continue;
+        }
+        map.insert(route.public_model_id.clone(), limit);
+        map.insert(route.public_model_id.to_ascii_lowercase(), limit);
+        if route.model.model != route.public_model_id {
+            map.insert(route.model.model.clone(), limit);
+            map.insert(route.model.model.to_ascii_lowercase(), limit);
+        }
+    }
+    map
+}
+
 pub fn normalize_default_model(cfg: &mut RouterConfig) {
     cfg.default_model = resolve_default_model(cfg).unwrap_or_default();
 }
@@ -4574,6 +4595,35 @@ base_url = "https://api.430123.xyz/v1"
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].index, 0);
         assert_eq!(rows[0].account_count, 3);
+    }
+
+    #[test]
+    fn max_output_tokens_map_indexes_public_and_upstream_ids() {
+        let config = RouterConfig {
+            models: vec![
+                ModelConfig {
+                    model: "gpt-5.6-sol".into(),
+                    max_output_tokens: 8_192,
+                    ..Default::default()
+                },
+                ModelConfig {
+                    model: "deepseek-v4-flash".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let map = max_output_tokens_map(&config);
+        assert_eq!(map.get("gpt-5.6-sol"), Some(&8_192));
+        // Zero means "upstream default" and stays out of the map.
+        assert!(!map.contains_key("deepseek-v4-flash"));
+        let plan = catalog::build_route_plan(&config);
+        let public = plan
+            .iter()
+            .find(|route| route.model.model == "gpt-5.6-sol")
+            .map(|route| route.public_model_id.clone())
+            .expect("route plan should contain the configured model");
+        assert_eq!(map.get(&public), Some(&8_192));
     }
 
     #[test]

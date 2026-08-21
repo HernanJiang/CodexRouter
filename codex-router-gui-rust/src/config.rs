@@ -387,6 +387,11 @@ pub struct ModelConfig {
     /// Zero selects the documented default detected from the model id.
     #[serde(default)]
     pub context_window: i64,
+    /// Zero keeps the upstream/model default output token limit (the field is
+    /// not sent); a positive value is injected into every request for this
+    /// model by the local Responses gateway.
+    #[serde(default)]
+    pub max_output_tokens: i64,
     #[serde(default = "default_auto_compact_percent")]
     pub auto_compact_percent: i32,
     /// Per-model reasoning configuration. `auto` uses the documented preset.
@@ -455,6 +460,7 @@ impl Default for ModelConfig {
             extra: "{}".to_string(),
             multimodal: "auto".to_string(),
             context_window: 0,
+            max_output_tokens: 0,
             auto_compact_percent: default_auto_compact_percent(),
             reasoning_mode: default_auto(),
             reasoning_levels: vec![],

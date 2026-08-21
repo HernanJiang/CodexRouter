@@ -825,7 +825,7 @@ enum AppEvent {
     /// Self-check overwrite detection: `Some(fingerprint)` means Codex's
     /// config.toml was overwritten by an external program and needs a user
     /// decision instead of the old silent auto-repair.
-    CodexBindingProbeFinished(Result<Option<String>, String>),
+    CodexBindingProbeFinished(Result<logic::codex_toml::CodexBindingProbe, String>),
     /// Factory-reset from the overwrite prompt; bool = valid ChatGPT login
     /// still available afterwards.
     CodexFactoryResetFinished(Result<bool, String>),
@@ -1088,6 +1088,8 @@ struct CodexRouterApp {
     configured: bool,
     logo_texture: Option<egui::TextureHandle>,
     fonts_loaded: bool,
+    /// Throttles CJK font reinstall retries after a transient read failure.
+    fonts_retry_after: Option<std::time::Instant>,
     tray_icon: Option<tray_icon::TrayIcon>,
     last_page: Page,
     profiles_return_page: Page,
@@ -1202,6 +1204,9 @@ struct CodexRouterApp {
     /// Run the exact binding check once per manual or scheduled self-check.
     /// The next self-check clears this flag before queueing a new worker.
     codex_binding_check_completed: bool,
+    /// Last user-layer fingerprint for which a "stripped but system-bound"
+    /// log line was emitted, so the three-minute self-check does not spam.
+    codex_binding_safe_strip_logged: Option<String>,
     /// The "Codex config overwritten externally" prompt state.
     codex_overwrite_prompt_open: bool,
     codex_overwrite_pending_fingerprint: String,
@@ -2620,14 +2625,15 @@ fn router_health_failure_recoverable(error: &str) -> bool {
         || normalized.contains("http/1.0 403"))
 }
 
-fn install_app_fonts(ctx: &egui::Context) {
+/// Installs the full font set. Returns false when no CJK font could be read
+/// so callers keep retrying instead of freezing the UI in tofu boxes.
+fn install_app_fonts(ctx: &egui::Context) -> bool {
     let mut fonts = egui::FontDefinitions::default();
     let windows_fonts = std::env::var_os("WINDIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
         .join("Fonts");
     let font_specs = [
-        ("msyh", "msyh.ttc"),
         ("segoe", "segoeui.ttf"),
         ("segoe-symbol", "seguisym.ttf"),
         ("arial-black", "ariblk.ttf"),
@@ -2639,6 +2645,18 @@ fn install_app_fonts(ctx: &egui::Context) {
             fonts
                 .font_data
                 .insert(name.into(), egui::FontData::from_owned(data).into());
+        }
+    }
+    // CJK coverage is what keeps the Chinese UI from turning into tofu. A
+    // transient read failure (file lock, pending Windows update) must not
+    // mark the full font set as installed, so try several CJK candidates and
+    // report whether any of them landed.
+    for file_name in ["msyh.ttc", "msyh.ttf", "msyhbd.ttc", "simsun.ttc", "simhei.ttf", "Deng.ttf"] {
+        if let Ok(data) = std::fs::read(windows_fonts.join(file_name)) {
+            fonts
+                .font_data
+                .insert("msyh".into(), egui::FontData::from_owned(data).into());
+            break;
         }
     }
     if fonts.font_data.contains_key("segoe") {
@@ -2695,7 +2713,9 @@ fn install_app_fonts(ctx: &egui::Context) {
         serif_fonts.push("msyh".into());
     }
     fonts.families.insert(theme::serif_family(), serif_fonts);
+    let cjk_loaded = fonts.font_data.contains_key("msyh");
     ctx.set_fonts(fonts);
+    cjk_loaded
 }
 
 fn install_lightweight_fonts(ctx: &egui::Context) {
@@ -2717,11 +2737,24 @@ fn install_lightweight_fonts(ctx: &egui::Context) {
 /// into tofu boxes (the "zombie" window after a failed full exit).
 pub(crate) fn ensure_full_ui_fonts(app: &mut CodexRouterApp, ctx: &egui::Context) {
     if !app.fonts_loaded {
-        install_app_fonts(ctx);
-        app.fonts_loaded = true;
-        app.installed_theme.clear();
+        if app
+            .fonts_retry_after
+            .is_some_and(|deadline| std::time::Instant::now() < deadline)
+        {
+            return;
+        }
+        if install_app_fonts(ctx) {
+            app.fonts_loaded = true;
+            app.fonts_retry_after = None;
+            app.installed_theme.clear();
+        } else {
+            // No CJK font this time (transient lock or missing fonts);
+            // keep fonts_loaded=false and retry instead of sticking in tofu.
+            app.fonts_retry_after =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+        }
     }
-    if app.tray_lightweight_mode {
+    if app.tray_lightweight_mode && app.fonts_loaded {
         app.tray_lightweight_mode = false;
     }
 }
@@ -2812,11 +2845,12 @@ impl CodexRouterApp {
             .and_then(|storage| storage.get_string("codex-router-ui-language-v1"))
             .filter(|language| matches!(language.as_str(), "zh" | "en"))
             .unwrap_or_else(system_ui_language);
-        if !start_in_background {
-            install_app_fonts(&cc.egui_ctx);
+        let startup_fonts_loaded = if !start_in_background {
+            install_app_fonts(&cc.egui_ctx)
         } else {
             install_lightweight_fonts(&cc.egui_ctx);
-        }
+            false
+        };
         theme::install(&cc.egui_ctx, &theme::palette(&config.ui_theme));
         let installed_theme = config.ui_theme.clone();
         let installed_compact_layout = cc.egui_ctx.content_rect().height() < 700.0;
@@ -2978,7 +3012,8 @@ impl CodexRouterApp {
             apply_settle_until: None,
             configured,
             logo_texture: None,
-            fonts_loaded: !start_in_background,
+            fonts_loaded: startup_fonts_loaded,
+            fonts_retry_after: None,
             tray_icon: tray,
             last_page: page,
             profiles_return_page: Page::Dashboard,
@@ -3099,6 +3134,7 @@ impl CodexRouterApp {
             routing_sync_pending: false,
             codex_binding_repair_running: false,
             codex_binding_check_completed: false,
+            codex_binding_safe_strip_logged: None,
             codex_overwrite_prompt_open: false,
             codex_overwrite_pending_fingerprint: String::new(),
             codex_overwrite_action_running: false,
@@ -3147,6 +3183,9 @@ impl CodexRouterApp {
             let _ = app.persist_ui_preferences();
         }
         if router_mode_enabled {
+            logic::responses_gateway::set_max_output_tokens_map(logic::max_output_tokens_map(
+                &app.config,
+            ));
             let _ = logic::responses_gateway::ensure_responses_gateway(
                 &app.config.deploy.sub2api_host,
                 app.config.rate_limit_max_retries,
@@ -3160,7 +3199,7 @@ impl CodexRouterApp {
         let (runtime_log_tx, runtime_log_rx) = runtime_logs::bounded_channel();
         drop(runtime_log_tx);
 
-        install_app_fonts(&cc.egui_ctx);
+        let _ = install_app_fonts(&cc.egui_ctx);
         let mut config = RouterConfig {
             version: CURRENT_CONFIG_VERSION.to_owned(),
             ui_theme: options.theme.clone(),
@@ -3445,6 +3484,7 @@ impl CodexRouterApp {
             configured: true,
             logo_texture: None,
             fonts_loaded: true,
+            fonts_retry_after: None,
             tray_icon: None,
             last_page: page,
             profiles_return_page: Page::Dashboard,
@@ -3575,6 +3615,7 @@ impl CodexRouterApp {
             routing_sync_pending: false,
             codex_binding_repair_running: false,
             codex_binding_check_completed: false,
+            codex_binding_safe_strip_logged: None,
             codex_overwrite_prompt_open: false,
             codex_overwrite_pending_fingerprint: String::new(),
             codex_overwrite_action_running: false,
@@ -5593,7 +5634,8 @@ impl CodexRouterApp {
                 AppEvent::CodexBindingProbeFinished(result) => {
                     self.codex_binding_repair_running = false;
                     match result {
-                        Ok(Some(fingerprint)) => {
+                        Ok(probe) if !probe.user_layer_bound && !probe.system_layer_bound => {
+                            let fingerprint = probe.fingerprint;
                             let suppressed = !self.codex_overwrite_decision.is_empty()
                                 && self.codex_overwrite_decision_fingerprint == fingerprint;
                             if !suppressed && !self.codex_overwrite_prompt_open {
@@ -5607,10 +5649,37 @@ impl CodexRouterApp {
                                 });
                             }
                         }
-                        Ok(None) => {
-                            // Binding healthy again; close any stale prompt and
-                            // forget any earlier keep/factory decision so a
-                            // fresh overwrite prompts again.
+                        Ok(probe) => {
+                            if let Some((previous, repaired)) = &probe.model_repair {
+                                let previous = previous
+                                    .as_deref()
+                                    .unwrap_or(if zh { "<未设置>" } else { "<unset>" });
+                                self.log(if zh {
+                                    format!(
+                                        "检测到 Codex 用户层 model 被改为无效值（{previous}），已自动修复为默认模型 {repaired}；路由绑定未受影响"
+                                    )
+                                } else {
+                                    format!(
+                                        "Codex's user-layer model was changed to an invalid value ({previous}); repaired to the default model {repaired}. Routing was not affected."
+                                    )
+                                });
+                            }
+                            if !probe.user_layer_bound
+                                && self.codex_binding_safe_strip_logged.as_deref()
+                                    != Some(probe.fingerprint.as_str())
+                            {
+                                self.codex_binding_safe_strip_logged =
+                                    Some(probe.fingerprint.clone());
+                                self.log(if zh {
+                                    "Codex 用户层配置被外部重写；系统层绑定仍在，所有模型仍走本地路由，无需处理".to_owned()
+                                } else {
+                                    "Codex's user-layer config was rewritten externally; the system-layer binding still routes every model locally, no action needed".to_owned()
+                                });
+                            }
+                            // Binding healthy again (user layer or mirrored
+                            // system layer); close any stale prompt and forget
+                            // any earlier keep/factory decision so a fresh
+                            // full overwrite prompts again.
                             self.codex_overwrite_prompt_open = false;
                             if !self.codex_overwrite_decision.is_empty() {
                                 self.codex_overwrite_decision.clear();
@@ -6066,6 +6135,9 @@ impl CodexRouterApp {
             self.health_probe_due = Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
             let host = self.config.deploy.sub2api_host.clone();
             let retries = self.config.rate_limit_max_retries;
+            logic::responses_gateway::set_max_output_tokens_map(logic::max_output_tokens_map(
+                &self.config,
+            ));
             let _ = logic::responses_gateway::ensure_responses_gateway(&host, retries);
         }
         self.refresh_usage_monitor();
@@ -6125,10 +6197,10 @@ impl CodexRouterApp {
         let config = self.config.clone();
         let tx = self.event_tx.clone();
         std::thread::spawn(move || {
-            let result = (|| -> anyhow::Result<Option<String>> {
+            let result = (|| -> anyhow::Result<logic::codex_toml::CodexBindingProbe> {
                 let _config_lock =
                     profiles::acquire_config_apply_lock(&root, std::time::Duration::from_secs(1))?;
-                logic::codex_toml::probe_codex_router_binding_overwrite(&config, &root)
+                logic::codex_toml::probe_codex_binding_state(&config, &root)
             })();
             tx.send(AppEvent::CodexBindingProbeFinished(
                 result.map_err(|error| format!("{error:#}")),
@@ -8491,7 +8563,7 @@ fn run_installer_wizard(archive_path: PathBuf, version: String) -> eframe::Resul
         &title,
         options,
         Box::new(move |cc| {
-            install_app_fonts(&cc.egui_ctx);
+            let _ = install_app_fonts(&cc.egui_ctx);
             Ok(Box::new(InstallerWizardApp::new(archive_path, version)))
         }),
     )

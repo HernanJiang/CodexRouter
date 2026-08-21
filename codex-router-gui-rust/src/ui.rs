@@ -1263,7 +1263,20 @@ impl eframe::App for CodexRouterApp {
             || self.update_dialog_open
             || self.terms_open
             || !self.exit_shutdown_error.is_empty()
-            || (!self.tray_lightweight_mode && ctx.input(|i| i.viewport().minimized != Some(true)));
+            || (!self.tray_lightweight_mode && ctx.input(|i| i.viewport().minimized != Some(true)))
+            // A window the user is actively clicking or typing in is visible
+            // by definition; never leave it on the lightweight font set even
+            // if the viewport minimized flag reports a stale state.
+            || ctx.input(|i| {
+                i.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::PointerButton { .. }
+                            | egui::Event::Key { .. }
+                            | egui::Event::Text(_)
+                    )
+                })
+            });
         if needs_full_fonts && !self.fonts_loaded {
             ensure_full_ui_fonts(self, &ctx);
         }
@@ -3991,6 +4004,59 @@ impl CodexRouterApp {
                                         &this.temp_model
                                     )
                                 ));
+                            });
+                            ui.columns(2, |columns| {
+                                theme::stacked_field_label(
+                                    &mut columns[0],
+                                    t(zh, "最大输出 Token", "MAX OUTPUT TOKENS"),
+                                    t(
+                                        zh,
+                                        "默认不发送该字段，使用模型上游默认值",
+                                        "Unset by default; the upstream model default applies",
+                                    ),
+                                    palette,
+                                );
+                                let mut upstream_default = this.temp_model.max_output_tokens <= 0;
+                                if columns[0]
+                                    .checkbox(
+                                        &mut upstream_default,
+                                        t(zh, "使用模型默认值", "Use model default"),
+                                    )
+                                    .changed()
+                                {
+                                    this.temp_model.max_output_tokens = if upstream_default {
+                                        0
+                                    } else if this.temp_model.max_output_tokens <= 0 {
+                                        8_192
+                                    } else {
+                                        this.temp_model.max_output_tokens
+                                    };
+                                }
+                                if upstream_default {
+                                    columns[0].label(t(
+                                        zh,
+                                        "不限制（由模型决定）",
+                                        "Unlimited (decided by the model)",
+                                    ));
+                                } else {
+                                    if this.temp_model.max_output_tokens <= 0 {
+                                        this.temp_model.max_output_tokens = 8_192;
+                                    }
+                                    let output_response = columns[0].add(
+                                        egui::DragValue::new(
+                                            &mut this.temp_model.max_output_tokens,
+                                        )
+                                        .range(256..=2_000_000)
+                                        .speed(100.0)
+                                        .suffix(" tokens"),
+                                    );
+                                    theme::ascii_response(&mut columns[0], &output_response);
+                                    columns[0].label(t(
+                                        zh,
+                                        "点击数字可直接键盘输入；对每个请求生效",
+                                        "Click the number to type a value; applies to every request",
+                                    ));
+                                }
                             });
                             let vision = super::logic::resolve_multimodal(&this.temp_model);
                             let multimodal_defaults =

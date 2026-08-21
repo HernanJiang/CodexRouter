@@ -73,6 +73,85 @@ fn gateway_slot() -> &'static Mutex<Option<GatewayState>> {
     GATEWAY.get_or_init(|| Mutex::new(None))
 }
 
+/// Optional diagnostics log for the local Codex <-> gateway link. The Codex
+/// side reports "error sending request" without any detail, so every request,
+/// retry, and failure is mirrored here to make the local hop diagnosable.
+static GATEWAY_LOG: OnceLock<std::path::PathBuf> = OnceLock::new();
+const GATEWAY_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Per-model output token limits configured in the Router UI, keyed by the
+/// public model id Codex sends in the request body. Updated live from the
+/// GUI; no gateway restart is needed when the user edits a model.
+static MAX_OUTPUT_TOKENS: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+
+fn max_output_tokens_slot() -> &'static Mutex<HashMap<String, i64>> {
+    MAX_OUTPUT_TOKENS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn set_max_output_tokens_map(map: HashMap<String, i64>) {
+    *max_output_tokens_slot()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = map;
+}
+
+/// Configured output token limit for a request model id, matched
+/// case-insensitively because Codex and the catalog can differ in casing.
+fn max_output_tokens_for(model: &str) -> Option<i64> {
+    let map = max_output_tokens_slot()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    map.get(model)
+        .copied()
+        .or_else(|| map.get(&model.to_ascii_lowercase()).copied())
+        .filter(|limit| *limit > 0)
+}
+
+/// Inject the user-configured output token limit into the request body. The
+/// user setting always wins over whatever the client sent; models left at
+/// the default (0) keep the upstream behaviour of not sending the field.
+fn inject_max_output_tokens(path: &str, body: &mut Value) -> bool {
+    let Some(model) = body.get("model").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(limit) = max_output_tokens_for(model) else {
+        return false;
+    };
+    let field = if is_chat_completions_path(path) {
+        "max_tokens"
+    } else {
+        "max_output_tokens"
+    };
+    body[field] = Value::from(limit);
+    true
+}
+
+pub fn set_gateway_log_path(path: std::path::PathBuf) {
+    let _ = GATEWAY_LOG.set(path);
+}
+
+fn gateway_log(event: &str, detail: &str) {
+    let Some(path) = GATEWAY_LOG.get() else {
+        return;
+    };
+    if cfg!(test) {
+        return;
+    }
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let detail = detail.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', " ");
+    let line = format!("{{\"ts\":\"{timestamp}\",\"event\":\"{event}\",\"detail\":\"{detail}\"}}\n");
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        use std::io::Write as _;
+        let _ = file.write_all(line.as_bytes());
+        if let Ok(meta) = file.metadata() {
+            if meta.len() > GATEWAY_LOG_MAX_BYTES {
+                drop(file);
+                let previous = path.with_extension("previous.jsonl");
+                let _ = std::fs::rename(path, previous);
+            }
+        }
+    }
+}
+
 pub fn responses_gateway_url(sub2api_host: &str) -> anyhow::Result<String> {
     let mut url = Url::parse(sub2api_host.trim()).context("invalid Sub2API host")?;
     let port = url.port_or_known_default().unwrap_or(18080);
@@ -201,7 +280,12 @@ fn run_gateway(
             Ok((stream, _)) => {
                 let upstream = upstream.clone();
                 thread::spawn(move || {
-                    let _ = handle_client(stream, &upstream, rate_limit_max_retries);
+                    let mut client = stream;
+                    if let Err(error) = handle_client(&mut client, &upstream, rate_limit_max_retries)
+                    {
+                        gateway_log("request.error", &format!("{error:#}"));
+                    }
+                    close_client_gracefully(client);
                 });
             }
             Err(error)
@@ -216,7 +300,7 @@ fn run_gateway(
 }
 
 fn handle_client(
-    mut client: TcpStream,
+    client: &mut TcpStream,
     upstream: &str,
     rate_limit_max_retries: u32,
 ) -> anyhow::Result<()> {
@@ -224,7 +308,7 @@ fn handle_client(
         .set_read_timeout(Some(HEADER_TIMEOUT))
         .and_then(|_| client.set_write_timeout(Some(Duration::from_secs(300))))
         .ok();
-    let (header_bytes, leftover) = read_headers(&mut client)?;
+    let (header_bytes, leftover) = read_headers(client)?;
     let header_text = String::from_utf8_lossy(&header_bytes);
     let mut lines = header_text.split("\r\n");
     let request_line = lines.next().unwrap_or_default();
@@ -247,7 +331,7 @@ fn handle_client(
             || path == "/login")
     {
         send_status(
-            &mut client,
+            client,
             200,
             "text/plain; charset=utf-8",
             b"Codex-Router Responses gateway is running. API endpoint: /v1/responses. Admin endpoint: http://127.0.0.1:18080/admin/accounts.",
@@ -260,13 +344,17 @@ fn handle_client(
         .and_then(|value| value.parse::<usize>().ok())
     {
         if length > MAX_BODY_BYTES {
-            send_simple(&mut client, 413, b"request too large")?;
+            send_simple(client, 413, b"request too large")?;
             return Ok(());
         }
-        read_exact_more(&mut client, &mut body, length)?;
+        read_exact_more(client, &mut body, length)?;
         body.truncate(length);
     }
 
+    gateway_log(
+        "request.start",
+        &format!("{method} {path} bytes={}", body.len()),
+    );
     let mut request_body = body;
     let mut openai_family = false;
     if method == "POST" && (is_responses_path(&path) || is_chat_completions_path(&path)) {
@@ -277,6 +365,7 @@ fn handle_client(
                 .is_some_and(is_openai_family_model);
             if !openai_family {
                 let stats = sanitize_responses_request(&path, &mut json_body);
+                inject_max_output_tokens(&path, &mut json_body);
                 if is_compact_path(&path) {
                     let output = json_body
                         .get("input")
@@ -285,9 +374,13 @@ fn handle_client(
                         .unwrap_or_default();
                     let payload =
                         serde_json::to_vec(&synthetic_compact_response(&stats.model, &output))?;
-                    send_status(&mut client, 200, "application/json", &payload)?;
+                    send_status(client, 200, "application/json", &payload)?;
                     return Ok(());
                 }
+                request_body = serde_json::to_vec(&json_body)?;
+            } else if inject_max_output_tokens(&path, &mut json_body) {
+                // OpenAI-family models pass through unsanitized; only
+                // re-serialize when a configured limit was injected.
                 request_body = serde_json::to_vec(&json_body)?;
             }
         }
@@ -302,6 +395,7 @@ fn handle_client(
     let stage_max_retries = rate_limit_max_retries.min(MAX_RATE_LIMIT_RETRIES) as usize;
     let mut stage_attempt = 0_usize;
     let mut sse_prelude_sent = false;
+    let mut stream_resume: Option<StreamResume> = None;
     let (status, response_headers_map, response_body) = loop {
         let response = open_upstream_with_rate_limit_retry(
             upstream,
@@ -318,9 +412,9 @@ fn handle_client(
         let response_headers_map = response.header_map;
         if status < 400 || !is_responses_path(&path) {
             if status < 400 && is_responses_path(&path) && openai_family {
-                client.write_all(&response_headers)?;
+                write_headers_forced_close(client, &response_headers)?;
                 client.write_all(&response_leftover)?;
-                std::io::copy(&mut upstream_stream, &mut client)?;
+                std::io::copy(&mut upstream_stream, client)?;
                 return Ok(());
             }
             if status < 400 && is_responses_path(&path) {
@@ -330,21 +424,51 @@ fn handle_client(
                     || !response_headers_map.contains_key("content-length");
                 if streaming {
                     if !sse_prelude_sent {
-                        write_sse_prelude(&mut client, &response_headers_map)?;
+                        write_sse_prelude(client, &response_headers_map)?;
                         sse_prelude_sent = true;
                     }
                     match forward_agent_sse(
-                        &mut client,
+                        client,
                         &mut upstream_stream,
                         &response_headers_map,
                         response_leftover,
+                        stream_resume.take(),
                     )? {
                         SseForward::Done => return Ok(()),
+                        SseForward::ReconcileFailed => {
+                            // The retry diverged from the delivered text; the
+                            // client still holds a consistent partial answer,
+                            // so close with a clean terminal event.
+                            finish_sse(client, "", false)?;
+                            return Ok(());
+                        }
                         SseForward::RetryableBeforeFirstEvent => {
                             if stage_attempt >= stage_max_retries {
-                                finish_sse(&mut client, "", false)?;
+                                finish_sse(client, "", false)?;
                                 return Ok(());
                             }
+                            gateway_log(
+                                "request.retry",
+                                &format!("{method} {path} pre-content stream retry #{}", stage_attempt + 1),
+                            );
+                            sleep_for_retry(rate_limit_retry_delay(None, stage_attempt));
+                            stage_attempt += 1;
+                            continue;
+                        }
+                        SseForward::RetryableWithPrefix(resume) => {
+                            if stage_attempt >= stage_max_retries {
+                                finish_sse(client, "", false)?;
+                                return Ok(());
+                            }
+                            gateway_log(
+                                "request.retry",
+                                &format!(
+                                    "{method} {path} mid-stream retry #{} delivered_chars={}",
+                                    stage_attempt + 1,
+                                    resume.prefix.len()
+                                ),
+                            );
+                            stream_resume = Some(resume);
                             sleep_for_retry(rate_limit_retry_delay(None, stage_attempt));
                             stage_attempt += 1;
                             continue;
@@ -359,7 +483,7 @@ fn handle_client(
                     ) {
                         Ok(body) => {
                             return forward_rewritten_json_body(
-                                &mut client,
+                                client,
                                 &response_headers_map,
                                 body,
                             );
@@ -368,6 +492,10 @@ fn handle_client(
                             if stage_attempt >= stage_max_retries {
                                 return Err(error);
                             }
+                            gateway_log(
+                                "request.retry",
+                                &format!("{method} {path} body read retry #{}", stage_attempt + 1),
+                            );
                             sleep_for_retry(rate_limit_retry_delay(None, stage_attempt));
                             stage_attempt += 1;
                             continue;
@@ -375,9 +503,9 @@ fn handle_client(
                     }
                 }
             }
-            client.write_all(&response_headers)?;
+            write_headers_forced_close(client, &response_headers)?;
             client.write_all(&response_leftover)?;
-            std::io::copy(&mut upstream_stream, &mut client)?;
+            std::io::copy(&mut upstream_stream, client)?;
             return Ok(());
         }
         // Error statuses are fully buffered before anything reaches the
@@ -388,6 +516,10 @@ fn handle_client(
                 if stage_attempt >= stage_max_retries {
                     return Err(error);
                 }
+                gateway_log(
+                    "request.retry",
+                    &format!("{method} {path} error body read retry #{}", stage_attempt + 1),
+                );
                 sleep_for_retry(rate_limit_retry_delay(None, stage_attempt));
                 stage_attempt += 1;
                 continue;
@@ -419,7 +551,7 @@ fn handle_client(
                     }
                     let retry_text = String::from_utf8_lossy(&retry_body);
                     send_raw(
-                        &mut client,
+                        client,
                         &rebuild_response(
                             rewrite_poisoned_upstream_status(retry_status, &retry_text),
                             &parse_headers(&String::from_utf8_lossy(&retry_headers)),
@@ -432,7 +564,7 @@ fn handle_client(
         }
     }
     send_raw(
-        &mut client,
+        client,
         &rebuild_response(
             rewrite_poisoned_upstream_status(status, &body_text),
             &response_headers_map,
@@ -789,26 +921,404 @@ fn sse_event_is_terminal(event: &str) -> bool {
     })
 }
 
-fn flush_sse_events(
-    client: &mut TcpStream,
-    carry: &mut String,
-    terminal: &mut bool,
-) -> anyhow::Result<usize> {
-    let mut written = 0;
-    while let Some(complete) = take_sse_event(carry) {
-        *terminal |= sse_event_is_terminal(&complete);
-        client.write_all(rewrite_sse_text(&complete).as_bytes())?;
-        written += 1;
-    }
-    Ok(written)
+/// What a mid-stream retry must reproduce before new content may flow to the
+/// client: the exact output text already delivered, plus the stream ids so
+/// post-resume events can be rewritten to match.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct StreamResume {
+    prefix: String,
+    response_id: Option<String>,
+    item_id: Option<String>,
 }
 
 /// Result of forwarding an SSE stream. `RetryableBeforeFirstEvent` means the
 /// upstream died (or exceeded the silence cap) before any real event reached
 /// the client, so the whole request can be transparently retried.
+/// `RetryableWithPrefix` means only plain output text reached the client, so
+/// a retry can resume by suppressing the duplicated prefix. `ReconcileFailed`
+/// means the retry diverged from the delivered text; nothing extra was
+/// forwarded, so the caller can still close with a clean terminal event.
+#[derive(Debug, PartialEq, Eq)]
 enum SseForward {
     Done,
     RetryableBeforeFirstEvent,
+    RetryableWithPrefix(StreamResume),
+    ReconcileFailed,
+}
+
+enum SseFlow {
+    Continue,
+    AbortReconcile,
+}
+
+/// State for a mid-stream retry: the new stream is suppressed until it
+/// regenerates exactly the text the client already received.
+struct ReconcileState {
+    resume: StreamResume,
+    regenerated: String,
+    caught_up: bool,
+    retry_response_id: Option<String>,
+    retry_item_id: Option<String>,
+}
+
+/// Everything tracked while forwarding an SSE stream: whether real events
+/// reached the client, how much output text was delivered, and whether the
+/// stream stayed plain-text (a reconnect replays the answer from scratch, so
+/// only plain-text partial streams can be reconciled by skipping the
+/// duplicated prefix).
+struct SseSink<'a> {
+    client: &'a mut TcpStream,
+    terminal: bool,
+    sent_events: bool,
+    delivered_text: String,
+    text_only: bool,
+    response_id: Option<String>,
+    item_id: Option<String>,
+    reconcile: Option<ReconcileState>,
+}
+
+/// Event types a mid-stream text retry can reproduce or suppress safely.
+/// Anything else (tool calls, reasoning items, unknown events) makes the
+/// partial stream non-retryable.
+const TEXT_RETRY_EVENT_TYPES: [&str; 11] = [
+    "response.created",
+    "response.in_progress",
+    "response.output_item.added",
+    "response.content_part.added",
+    "response.output_text.delta",
+    "response.output_text.done",
+    "response.content_part.done",
+    "response.output_item.done",
+    "response.completed",
+    "response.failed",
+    "response.incomplete",
+];
+
+fn sse_event_data(event: &str) -> Option<Value> {
+    event.lines().find_map(|line| {
+        line.trim_start()
+            .strip_prefix("data:")
+            .map(str::trim)
+            .and_then(|data| serde_json::from_str::<Value>(data).ok())
+    })
+}
+
+fn sse_event_type(event: &str) -> Option<String> {
+    sse_event_data(event)
+        .and_then(|json| json.get("type").and_then(Value::as_str).map(str::to_owned))
+}
+
+fn sse_event_item_type(event: &str) -> Option<String> {
+    sse_event_data(event).and_then(|json| {
+        json.get("item")
+            .and_then(|item| item.get("type"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    })
+}
+
+/// Rewrite an `output_text.delta` event so it carries only the not-yet
+/// delivered suffix, with retry-stream ids replaced by the ids the client
+/// already saw.
+fn rewrite_delta_event(
+    event: &str,
+    new_delta: &str,
+    id_rewrites: &[(String, String)],
+) -> Option<String> {
+    let mut out = String::new();
+    for line in event.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(data) = line.trim_start().strip_prefix("data:") {
+            let mut json = serde_json::from_str::<Value>(data.trim()).ok()?;
+            json["delta"] = Value::String(new_delta.to_owned());
+            let mut data_text = serde_json::to_string(&json).ok()?;
+            for (from, to) in id_rewrites {
+                data_text = data_text.replace(from.as_str(), to.as_str());
+            }
+            out.push_str("data: ");
+            out.push_str(&data_text);
+            out.push('\n');
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out.push('\n');
+    Some(out)
+}
+
+fn forward_event_with_rewrites(
+    client: &mut TcpStream,
+    event: &str,
+    id_rewrites: &[(String, String)],
+) -> anyhow::Result<()> {
+    let mut text = rewrite_sse_text(event);
+    for (from, to) in id_rewrites {
+        text = text.replace(from.as_str(), to.as_str());
+    }
+    client.write_all(text.as_bytes())?;
+    Ok(())
+}
+
+impl<'a> SseSink<'a> {
+    fn new(client: &'a mut TcpStream, resume: Option<StreamResume>) -> SseSink<'a> {
+        let delivered = resume
+            .as_ref()
+            .map(|resume| resume.prefix.clone())
+            .unwrap_or_default();
+        SseSink {
+            client,
+            terminal: false,
+            sent_events: false,
+            delivered_text: delivered,
+            text_only: true,
+            response_id: resume
+                .as_ref()
+                .and_then(|resume| resume.response_id.clone()),
+            item_id: resume.as_ref().and_then(|resume| resume.item_id.clone()),
+            reconcile: resume.map(|resume| ReconcileState {
+                resume,
+                regenerated: String::new(),
+                caught_up: false,
+                retry_response_id: None,
+                retry_item_id: None,
+            }),
+        }
+    }
+
+    fn resume_point(&self) -> StreamResume {
+        StreamResume {
+            prefix: self.delivered_text.clone(),
+            response_id: self.response_id.clone(),
+            item_id: self.item_id.clone(),
+        }
+    }
+
+
+    fn push_event(&mut self, event: &str) -> anyhow::Result<SseFlow> {
+        let kind = sse_event_type(event);
+        let SseSink {
+            client,
+            terminal,
+            sent_events,
+            delivered_text,
+            text_only,
+            response_id,
+            item_id,
+            reconcile,
+        } = self;
+        if let Some(recon) = reconcile {
+            let Some(kind) = kind else {
+                // Keep-alive comments and event-less lines carry no content.
+                return Ok(SseFlow::Continue);
+            };
+            match kind.as_str() {
+                "response.created" => {
+                    recon.retry_response_id = sse_event_data(event)
+                        .and_then(|json| json.get("response").cloned())
+                        .and_then(|response| response.get("id").and_then(Value::as_str).map(str::to_owned));
+                    Ok(SseFlow::Continue)
+                }
+                "response.in_progress" => Ok(SseFlow::Continue),
+                "response.output_item.added" | "response.content_part.added" => {
+                    if kind == "response.output_item.added"
+                        && sse_event_item_type(event).as_deref() != Some("message")
+                    {
+                        // The retry switched to tool calls; cannot reconcile.
+                        return Ok(SseFlow::AbortReconcile);
+                    }
+                    Ok(SseFlow::Continue)
+                }
+                "response.output_text.delta" => {
+                    let json = sse_event_data(event);
+                    let delta = json
+                        .as_ref()
+                        .and_then(|json| json.get("delta"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if recon.retry_item_id.is_none() {
+                        recon.retry_item_id = json
+                            .as_ref()
+                            .and_then(|json| json.get("item_id"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
+                    }
+                    if recon.caught_up {
+                        delivered_text.push_str(delta);
+                        let mut rewrites = Vec::new();
+                        if let (Some(from), Some(to)) = (&recon.retry_response_id, response_id.as_ref()) {
+                            rewrites.push((from.clone(), to.clone()));
+                        }
+                        if let (Some(from), Some(to)) = (&recon.retry_item_id, item_id.as_ref()) {
+                            rewrites.push((from.clone(), to.clone()));
+                        }
+                        forward_event_with_rewrites(client, event, &rewrites)?;
+                        *sent_events = true;
+                        return Ok(SseFlow::Continue);
+                    }
+                    let new_regenerated = format!("{}{delta}", recon.regenerated);
+                    if new_regenerated.len() <= recon.resume.prefix.len() {
+                        if !recon.resume.prefix.starts_with(&new_regenerated) {
+                            return Ok(SseFlow::AbortReconcile);
+                        }
+                        recon.regenerated = new_regenerated;
+                        return Ok(SseFlow::Continue);
+                    }
+                    if !new_regenerated.starts_with(&recon.resume.prefix) {
+                        return Ok(SseFlow::AbortReconcile);
+                    }
+                    let suffix = new_regenerated[recon.resume.prefix.len()..].to_owned();
+                    recon.regenerated = new_regenerated;
+                    recon.caught_up = true;
+                    delivered_text.push_str(&suffix);
+                    let mut rewrites = Vec::new();
+                    if let (Some(from), Some(to)) = (&recon.retry_response_id, response_id.as_ref()) {
+                        rewrites.push((from.clone(), to.clone()));
+                    }
+                    if let (Some(from), Some(to)) = (&recon.retry_item_id, item_id.as_ref()) {
+                        rewrites.push((from.clone(), to.clone()));
+                    }
+                    if let Some(rewritten) = rewrite_delta_event(event, &suffix, &rewrites) {
+                        client.write_all(rewrite_sse_text(&rewritten).as_bytes())?;
+                        *sent_events = true;
+                    }
+                    Ok(SseFlow::Continue)
+                }
+                "response.completed" | "response.failed" | "response.incomplete" => {
+                    if !recon.caught_up
+                        && kind == "response.completed"
+                        && recon.regenerated != recon.resume.prefix
+                    {
+                        // The retry finished with different text; never
+                        // forward a mismatched completion.
+                        return Ok(SseFlow::AbortReconcile);
+                    }
+                    *terminal = true;
+                    let mut rewrites = Vec::new();
+                    if let (Some(from), Some(to)) = (&recon.retry_response_id, response_id.as_ref()) {
+                        rewrites.push((from.clone(), to.clone()));
+                    }
+                    if let (Some(from), Some(to)) = (&recon.retry_item_id, item_id.as_ref()) {
+                        rewrites.push((from.clone(), to.clone()));
+                    }
+                    forward_event_with_rewrites(client, event, &rewrites)?;
+                    *sent_events = true;
+                    Ok(SseFlow::Continue)
+                }
+                "response.output_text.done"
+                | "response.content_part.done"
+                | "response.output_item.done" => {
+                    if recon.caught_up {
+                        let mut rewrites = Vec::new();
+                        if let (Some(from), Some(to)) = (&recon.retry_response_id, response_id.as_ref()) {
+                            rewrites.push((from.clone(), to.clone()));
+                        }
+                        if let (Some(from), Some(to)) = (&recon.retry_item_id, item_id.as_ref()) {
+                            rewrites.push((from.clone(), to.clone()));
+                        }
+                        forward_event_with_rewrites(client, event, &rewrites)?;
+                        *sent_events = true;
+                    }
+                    Ok(SseFlow::Continue)
+                }
+                _ => {
+                    if recon.caught_up {
+                        let mut rewrites = Vec::new();
+                        if let (Some(from), Some(to)) = (&recon.retry_response_id, response_id.as_ref()) {
+                            rewrites.push((from.clone(), to.clone()));
+                        }
+                        if let (Some(from), Some(to)) = (&recon.retry_item_id, item_id.as_ref()) {
+                            rewrites.push((from.clone(), to.clone()));
+                        }
+                        forward_event_with_rewrites(client, event, &rewrites)?;
+                        *sent_events = true;
+                        Ok(SseFlow::Continue)
+                    } else {
+                        Ok(SseFlow::AbortReconcile)
+                    }
+                }
+            }
+        } else {
+            if let Some(kind) = kind.as_deref() {
+                if !TEXT_RETRY_EVENT_TYPES.contains(&kind) {
+                    *text_only = false;
+                }
+                match kind {
+                    "response.created" => {
+                        if response_id.is_none() {
+                            *response_id = sse_event_data(event)
+                                .and_then(|json| json.get("response").cloned())
+                                .and_then(|response| {
+                                    response.get("id").and_then(Value::as_str).map(str::to_owned)
+                                });
+                        }
+                    }
+                    "response.output_item.added" | "response.output_item.done" => {
+                        if sse_event_item_type(event).as_deref() != Some("message") {
+                            *text_only = false;
+                        }
+                    }
+                    "response.output_text.delta" => {
+                        if let Some(json) = sse_event_data(event) {
+                            if let Some(delta) = json.get("delta").and_then(Value::as_str) {
+                                delivered_text.push_str(delta);
+                            }
+                            if item_id.is_none() {
+                                *item_id = json
+                                    .get("item_id")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            *terminal |= sse_event_is_terminal(event);
+            client.write_all(rewrite_sse_text(event).as_bytes())?;
+            *sent_events = true;
+            Ok(SseFlow::Continue)
+        }
+    }
+
+    /// Upstream ended (EOF, read error, silence cap, or corrupt frame).
+    fn eof_outcome(&mut self, carry: &str) -> anyhow::Result<SseForward> {
+        if self.terminal {
+            self.finish(carry)?;
+            return Ok(SseForward::Done);
+        }
+        if self.reconcile.is_some() {
+            // The retry died before completing; keep retrying with whatever
+            // text has been delivered so far.
+            return Ok(SseForward::RetryableWithPrefix(self.resume_point()));
+        }
+        if !self.sent_events {
+            return Ok(SseForward::RetryableBeforeFirstEvent);
+        }
+        if self.text_only {
+            return Ok(SseForward::RetryableWithPrefix(self.resume_point()));
+        }
+        self.finish(carry)?;
+        Ok(SseForward::Done)
+    }
+
+    fn finish(&mut self, carry: &str) -> anyhow::Result<()> {
+        finish_sse(self.client, carry, self.terminal)
+    }
+}
+
+/// Forward every complete SSE event in `carry`; incomplete tails stay
+/// buffered. Returns `AbortReconcile` when a retry stream diverged from the
+/// text the client already received.
+fn push_sse_events(sink: &mut SseSink, carry: &mut String) -> anyhow::Result<SseFlow> {
+    while let Some(complete) = take_sse_event(carry) {
+        if let SseFlow::AbortReconcile = sink.push_event(&complete)? {
+            return Ok(SseFlow::AbortReconcile);
+        }
+    }
+    Ok(SseFlow::Continue)
 }
 
 fn finish_sse(client: &mut TcpStream, carry: &str, terminal: bool) -> anyhow::Result<()> {
@@ -822,14 +1332,12 @@ fn finish_sse(client: &mut TcpStream, carry: &str, terminal: bool) -> anyhow::Re
 }
 
 fn decode_chunked_to_sse(
-    client: &mut TcpStream,
+    sink: &mut SseSink,
     upstream: &mut TcpStream,
     leftover: Vec<u8>,
 ) -> anyhow::Result<SseForward> {
     let mut raw = leftover;
     let mut decoded = String::new();
-    let mut terminal = false;
-    let mut sent_events = false;
     let mut last_activity = Instant::now();
     loop {
         if let Some(line_end) = raw.windows(2).position(|w| w == b"\r\n") {
@@ -837,46 +1345,38 @@ fn decode_chunked_to_sse(
             let size = match parse_chunk_size(&line) {
                 Ok(size) => size,
                 Err(_) => {
-                    // A corrupt chunk frame must not silently drop the session.
-                    // Flush the complete events already decoded and close with
-                    // an explicit terminal event instead of an abrupt EOF.
-                    flush_sse_events(client, &mut decoded, &mut terminal)?;
-                    finish_sse(client, "", terminal)?;
-                    return Ok(SseForward::Done);
+                    // A corrupt chunk frame is treated like an upstream drop:
+                    // pre-content it retries transparently, mid-content a
+                    // plain-text prefix reconciles on the next attempt.
+                    if let SseFlow::AbortReconcile = push_sse_events(sink, &mut decoded)? {
+                        return Ok(SseForward::ReconcileFailed);
+                    }
+                    return sink.eof_outcome("");
                 }
             };
             let after_size = line_end + 2;
             if size == 0 {
-                flush_sse_events(client, &mut decoded, &mut terminal)?;
-                finish_sse(client, &decoded, terminal)?;
-                return Ok(SseForward::Done);
+                if let SseFlow::AbortReconcile = push_sse_events(sink, &mut decoded)? {
+                    return Ok(SseForward::ReconcileFailed);
+                }
+                return sink.eof_outcome(&decoded);
             }
             if raw.len() < after_size + size + 2 {
-                match read_upstream_chunk(upstream, &mut raw, &mut last_activity, client)? {
+                match read_upstream_chunk(upstream, &mut raw, &mut last_activity, sink.client)? {
                     ChunkRead::Received => continue,
-                    ChunkRead::Ended => {
-                        if !terminal && !sent_events {
-                            return Ok(SseForward::RetryableBeforeFirstEvent);
-                        }
-                        finish_sse(client, &decoded, terminal)?;
-                        return Ok(SseForward::Done);
-                    }
+                    ChunkRead::Ended => return sink.eof_outcome(&decoded),
                 }
             }
             decoded.push_str(&String::from_utf8_lossy(&raw[after_size..after_size + size]));
             raw.drain(..after_size + size + 2);
-            sent_events |= flush_sse_events(client, &mut decoded, &mut terminal)? > 0;
+            if let SseFlow::AbortReconcile = push_sse_events(sink, &mut decoded)? {
+                return Ok(SseForward::ReconcileFailed);
+            }
             continue;
         }
-        match read_upstream_chunk(upstream, &mut raw, &mut last_activity, client)? {
+        match read_upstream_chunk(upstream, &mut raw, &mut last_activity, sink.client)? {
             ChunkRead::Received => continue,
-            ChunkRead::Ended => {
-                if !terminal && !sent_events {
-                    return Ok(SseForward::RetryableBeforeFirstEvent);
-                }
-                finish_sse(client, &decoded, terminal)?;
-                return Ok(SseForward::Done);
-            }
+            ChunkRead::Ended => return sink.eof_outcome(&decoded),
         }
     }
 }
@@ -937,16 +1437,16 @@ fn parse_chunk_size(line: &str) -> anyhow::Result<usize> {
 }
 
 fn forward_plain_sse(
-    client: &mut TcpStream,
+    sink: &mut SseSink,
     upstream: &mut TcpStream,
     leftover: Vec<u8>,
 ) -> anyhow::Result<SseForward> {
     let mut carry = String::from_utf8_lossy(&leftover).into_owned();
-    let mut terminal = false;
-    let mut sent_events = false;
     let mut last_activity = Instant::now();
     loop {
-        sent_events |= flush_sse_events(client, &mut carry, &mut terminal)? > 0;
+        if let SseFlow::AbortReconcile = push_sse_events(sink, &mut carry)? {
+            return Ok(SseForward::ReconcileFailed);
+        }
         let mut buffer = [0_u8; 8192];
         let read = match upstream.read(&mut buffer) {
             Ok(0) => break,
@@ -956,34 +1456,22 @@ fn forward_plain_sse(
             }
             Err(error) if stream_read_timed_out(&error) => {
                 if last_activity.elapsed() >= STREAM_MAX_SILENCE {
-                    if !terminal && !sent_events {
-                        return Ok(SseForward::RetryableBeforeFirstEvent);
-                    }
-                    finish_sse(client, &carry, terminal)?;
-                    return Ok(SseForward::Done);
+                    return sink.eof_outcome(&carry);
                 }
-                if send_sse_keepalive(client).is_err() {
+                if send_sse_keepalive(sink.client).is_err() {
                     // The Codex client is gone; stop the worker quietly.
                     return Ok(SseForward::Done);
                 }
                 continue;
             }
-            Err(_) => {
-                if !terminal && !sent_events {
-                    return Ok(SseForward::RetryableBeforeFirstEvent);
-                }
-                finish_sse(client, &carry, terminal)?;
-                return Ok(SseForward::Done);
-            }
+            Err(_) => return sink.eof_outcome(&carry),
         };
         carry.push_str(&String::from_utf8_lossy(&buffer[..read]));
     }
-    sent_events |= flush_sse_events(client, &mut carry, &mut terminal)? > 0;
-    if !terminal && !sent_events {
-        return Ok(SseForward::RetryableBeforeFirstEvent);
+    if let SseFlow::AbortReconcile = push_sse_events(sink, &mut carry)? {
+        return Ok(SseForward::ReconcileFailed);
     }
-    finish_sse(client, &carry, terminal)?;
-    Ok(SseForward::Done)
+    sink.eof_outcome(&carry)
 }
 
 fn forward_agent_sse(
@@ -991,9 +1479,12 @@ fn forward_agent_sse(
     upstream: &mut TcpStream,
     headers: &HashMap<String, String>,
     leftover: Vec<u8>,
+    resume: Option<StreamResume>,
 ) -> anyhow::Result<SseForward> {
     // The SSE prelude is written by the caller, once per client connection,
-    // so a transparent pre-content retry never duplicates response headers.
+    // so a transparent retry never duplicates response headers. A mid-stream
+    // retry carries the delivered text prefix: the new stream is suppressed
+    // until it regenerates that exact prefix, then only the suffix flows.
     // Poll the upstream on a short cadence instead of one long blocking read
     // so keep-alive comments can hold the Codex session open while Grok or
     // Gemini is silent during long reasoning or provider-side failover.
@@ -1003,10 +1494,11 @@ fn forward_agent_sse(
     let chunked = headers
         .get("transfer-encoding")
         .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"));
+    let mut sink = SseSink::new(client, resume);
     if chunked {
-        decode_chunked_to_sse(client, upstream, leftover)
+        decode_chunked_to_sse(&mut sink, upstream, leftover)
     } else {
-        forward_plain_sse(client, upstream, leftover)
+        forward_plain_sse(&mut sink, upstream, leftover)
     }
 }
 
@@ -1081,8 +1573,89 @@ fn send_raw(stream: &mut TcpStream, payload: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Write upstream response headers to the client with `connection: close`
+/// forced. The gateway always closes the client socket after one response;
+/// forwarding an upstream keep-alive header would let the Codex client pool a
+/// connection that is already gone, and the next request on that pooled
+/// connection fails instantly with "error sending request".
+fn write_headers_forced_close(client: &mut TcpStream, raw_headers: &[u8]) -> anyhow::Result<()> {
+    let text = String::from_utf8_lossy(raw_headers);
+    let mut out = String::new();
+    let mut wrote_connection = false;
+    for (index, line) in text.split("
+").enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        if index > 0 && line.to_ascii_lowercase().starts_with("connection:") {
+            wrote_connection = true;
+            out.push_str("connection: close
+");
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !wrote_connection {
+        out.push_str("connection: close
+");
+    }
+    out.push('\n');
+    client.write_all(out.as_bytes())?;
+    Ok(())
+}
+
+/// Close the client socket gracefully: signal EOF for our writes, then drain
+/// whatever the client already pipelined before dropping the socket. Dropping
+/// a socket with unread inbound data makes Windows answer with RST instead of
+/// FIN, and the Codex HTTP client can then lose track of the closed pooled
+/// connection.
+fn close_client_gracefully(mut client: TcpStream) {
+    let _ = client.shutdown(std::net::Shutdown::Write);
+    let _ = client.set_read_timeout(Some(Duration::from_millis(150)));
+    let mut buffer = [0_u8; 8192];
+    let mut drained = 0_usize;
+    loop {
+        match client.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                drained += read;
+                if drained >= 256 * 1024 {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn inject_max_output_tokens_honors_the_configured_model_limit() {
+        // Unique fixture model ids keep this test isolated from the gateway
+        // end-to-end tests that share the process-wide map in parallel.
+        set_max_output_tokens_map(HashMap::from([
+            ("mot-fixture-sol".to_owned(), 8_192),
+            ("mot-fixture-flash".to_owned(), 4_096),
+        ]));
+        // Case-insensitive match against the catalog id.
+        let mut body = serde_json::json!({"model":"MOT-Fixture-Sol","input":[]});
+        assert!(inject_max_output_tokens("/v1/responses", &mut body));
+        assert_eq!(body["max_output_tokens"], serde_json::json!(8_192));
+
+        let mut chat = serde_json::json!({"model":"mot-fixture-flash","messages":[]});
+        assert!(inject_max_output_tokens("/v1/chat/completions", &mut chat));
+        assert_eq!(chat["max_tokens"], serde_json::json!(4_096));
+
+        // Unmapped models keep the upstream default: nothing is injected.
+        let mut unmapped = serde_json::json!({"model":"mot-fixture-unmapped"});
+        assert!(!inject_max_output_tokens("/v1/responses", &mut unmapped));
+        assert!(unmapped.get("max_output_tokens").is_none());
+
+        set_max_output_tokens_map(HashMap::new());
+        assert!(!inject_max_output_tokens("/v1/responses", &mut body));
+    }
     use super::*;
     use std::net::Ipv4Addr;
 
@@ -1120,8 +1693,8 @@ mod tests {
         let gateway_addr = gateway.local_addr().unwrap();
         let upstream_url = format!("http://127.0.0.1:{}", upstream_addr.port());
         thread::spawn(move || {
-            let (stream, _) = gateway.accept().unwrap();
-            handle_client(stream, &upstream_url, DEFAULT_RATE_LIMIT_RETRIES).unwrap();
+            let (mut stream, _) = gateway.accept().unwrap();
+            handle_client(&mut stream, &upstream_url, DEFAULT_RATE_LIMIT_RETRIES).unwrap();
         });
 
         let mut client = TcpStream::connect(gateway_addr).unwrap();
@@ -1163,8 +1736,8 @@ mod tests {
         let gateway_addr = gateway.local_addr().unwrap();
         let upstream_url = format!("http://127.0.0.1:{}", upstream_addr.port());
         thread::spawn(move || {
-            let (stream, _) = gateway.accept().unwrap();
-            handle_client(stream, &upstream_url, DEFAULT_RATE_LIMIT_RETRIES).unwrap();
+            let (mut stream, _) = gateway.accept().unwrap();
+            handle_client(&mut stream, &upstream_url, DEFAULT_RATE_LIMIT_RETRIES).unwrap();
         });
 
         let mut client = TcpStream::connect(gateway_addr).unwrap();
@@ -1217,8 +1790,8 @@ mod tests {
         let gateway_addr = gateway.local_addr().unwrap();
         let upstream_url = format!("http://127.0.0.1:{}", upstream_addr.port());
         thread::spawn(move || {
-            let (stream, _) = gateway.accept().unwrap();
-            handle_client(stream, &upstream_url, DEFAULT_RATE_LIMIT_RETRIES).unwrap();
+            let (mut stream, _) = gateway.accept().unwrap();
+            handle_client(&mut stream, &upstream_url, DEFAULT_RATE_LIMIT_RETRIES).unwrap();
         });
 
         let mut client = TcpStream::connect(gateway_addr).unwrap();
@@ -1266,7 +1839,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_plain_sse_emits_a_failed_terminal_event() {
+    fn interrupted_text_stream_reports_retryable_with_the_delivered_prefix() {
         let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
         let upstream_addr = upstream.local_addr().unwrap();
         thread::spawn(move || {
@@ -1280,15 +1853,25 @@ mod tests {
         let mut upstream_stream = TcpStream::connect(upstream_addr).unwrap();
         let worker = thread::spawn(move || {
             let (mut client, _) = client_listener.accept().unwrap();
-            forward_plain_sse(&mut client, &mut upstream_stream, Vec::new()).unwrap();
+            let mut sink = SseSink::new(&mut client, None);
+            let outcome = forward_plain_sse(&mut sink, &mut upstream_stream, Vec::new()).unwrap();
+            // Plain-text partial output is retryable: the caller reopens the
+            // upstream instead of ending the session.
+            assert_eq!(
+                outcome,
+                SseForward::RetryableWithPrefix(StreamResume {
+                    prefix: "half".to_owned(),
+                    response_id: None,
+                    item_id: None,
+                })
+            );
         });
         let mut client = TcpStream::connect(client_addr).unwrap();
         let mut output = String::new();
         client.read_to_string(&mut output).unwrap();
         worker.join().unwrap();
         assert!(output.contains("response.output_text.delta"));
-        assert!(output.contains("response.failed"));
-        assert!(output.contains("upstream_stream_interrupted"));
+        assert!(!output.contains("response.failed"));
     }
 
     #[test]
@@ -1315,7 +1898,8 @@ mod tests {
             .unwrap();
         let worker = thread::spawn(move || {
             let (mut client, _) = client_listener.accept().unwrap();
-            forward_plain_sse(&mut client, &mut upstream_stream, Vec::new()).unwrap();
+            let mut sink = SseSink::new(&mut client, None);
+            forward_plain_sse(&mut sink, &mut upstream_stream, Vec::new()).unwrap();
         });
         let mut client = TcpStream::connect(client_addr).unwrap();
         let mut output = String::new();
@@ -1330,7 +1914,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_chunk_frame_closes_with_a_terminal_event_instead_of_silence() {
+    fn corrupt_chunk_frame_reports_retryable_instead_of_silence() {
         let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
         let upstream_addr = upstream.local_addr().unwrap();
         thread::spawn(move || {
@@ -1347,15 +1931,18 @@ mod tests {
             .unwrap();
         let worker = thread::spawn(move || {
             let (mut client, _) = client_listener.accept().unwrap();
-            decode_chunked_to_sse(&mut client, &mut upstream_stream, Vec::new()).unwrap();
+            let mut sink = SseSink::new(&mut client, None);
+            let outcome = decode_chunked_to_sse(&mut sink, &mut upstream_stream, Vec::new()).unwrap();
+            // A corrupt frame is handled like an upstream drop: the delivered
+            // plain-text prefix can be reconciled on a retry.
+            assert!(matches!(outcome, SseForward::RetryableWithPrefix(_)));
         });
         let mut client = TcpStream::connect(client_addr).unwrap();
         let mut output = String::new();
         client.read_to_string(&mut output).unwrap();
         worker.join().unwrap();
         assert!(output.contains("response.output_text.delta"));
-        assert!(output.contains("response.failed"));
-        assert!(output.contains("upstream_stream_interrupted"));
+        assert!(!output.contains("response.failed"));
     }
 
     #[test]
@@ -1548,8 +2135,8 @@ mod tests {
         let client_addr = client_listener.local_addr().unwrap();
         let upstream_url = format!("http://127.0.0.1:{}", upstream_addr.port());
         let worker = thread::spawn(move || {
-            let (stream, _) = client_listener.accept().unwrap();
-            handle_client(stream, &upstream_url, max_retries).unwrap();
+            let (mut stream, _) = client_listener.accept().unwrap();
+            handle_client(&mut stream, &upstream_url, max_retries).unwrap();
         });
         let mut client = TcpStream::connect(client_addr).unwrap();
         client
@@ -1666,11 +2253,138 @@ mod tests {
         let mut upstream_stream = TcpStream::connect(upstream_addr).unwrap();
         let worker = thread::spawn(move || {
             let (mut client, _) = client_listener.accept().unwrap();
-            let outcome = forward_plain_sse(&mut client, &mut upstream_stream, Vec::new()).unwrap();
+            let mut sink = SseSink::new(&mut client, None);
+            let outcome = forward_plain_sse(&mut sink, &mut upstream_stream, Vec::new()).unwrap();
             assert!(matches!(outcome, SseForward::RetryableBeforeFirstEvent));
         });
         let client = TcpStream::connect(client_addr).unwrap();
         worker.join().unwrap();
         drop(client);
+    }
+
+    #[test]
+    fn mid_stream_text_retry_reconciles_and_completes() {
+        // Attempt 1 dies after delivering "hello "; attempt 2 regenerates the
+        // same text and continues. The client must see the answer exactly
+        // once, with the original stream ids, and no failure event.
+        let (output, attempts) = run_client_against_mock(
+            |attempt, socket| {
+                if attempt == 0 {
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\n\ndata: {\"type\":\"response.in_progress\"}\n\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"i1\",\"type\":\"message\"}}\n\ndata: {\"type\":\"response.content_part.added\",\"item_id\":\"i1\"}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello \",\"item_id\":\"i1\"}\n\n")
+                        .unwrap();
+                    return;
+                }
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r2\"}}\n\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"i2\",\"type\":\"message\"}}\n\ndata: {\"type\":\"response.content_part.added\",\"item_id\":\"i2\"}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello \",\"item_id\":\"i2\"}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"world\",\"item_id\":\"i2\"}\n\ndata: {\"type\":\"response.output_text.done\",\"text\":\"hello world\",\"item_id\":\"i2\"}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"i2\",\"type\":\"message\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r2\"}}\n\n")
+                    .unwrap();
+            },
+            3,
+        );
+        assert_eq!(attempts, 2);
+        // "hello " was delivered before the drop; the retry delivered only the
+        // "world" suffix, so the assembled answer appears exactly once.
+        assert_eq!(output.matches("\"delta\":\"hello ").count(), 1);
+        assert_eq!(output.matches("\"delta\":\"world").count(), 1);
+        assert_eq!(output.matches("response.completed").count(), 1);
+        assert!(!output.contains("response.failed"));
+        assert!(!output.contains("upstream_stream_interrupted"));
+        // Retry-stream ids are rewritten to the ids the client already saw.
+        assert!(!output.contains("r2"));
+        assert!(!output.contains("i2"));
+        assert_eq!(output.matches("HTTP/1.1 200").count(), 1);
+    }
+
+    #[test]
+    fn mid_stream_retry_aborts_cleanly_when_the_text_diverges() {
+        // Attempt 2 regenerates different text; nothing extra is forwarded and
+        // the session closes with a clean failure event.
+        let (output, attempts) = run_client_against_mock(
+            |attempt, socket| {
+                if attempt == 0 {
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\n\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"i1\",\"type\":\"message\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello \",\"item_id\":\"i1\"}\n\n")
+                        .unwrap();
+                    return;
+                }
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r3\"}}\n\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"i3\",\"type\":\"message\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"goodbye\",\"item_id\":\"i3\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r3\"}}\n\n")
+                    .unwrap();
+            },
+            3,
+        );
+        assert_eq!(attempts, 2);
+        assert_eq!(output.matches("hello ").count(), 1);
+        // The divergent retry is fully suppressed; no duplicated or garbled
+        // content ever reaches the client.
+        assert!(!output.contains("goodbye"));
+        assert!(output.contains("response.failed"));
+        assert!(output.contains("upstream_stream_interrupted"));
+    }
+
+    #[test]
+    fn structural_only_eof_retries_with_an_empty_prefix() {
+        // Only response.created/in_progress reached the client before the
+        // drop; a retry can resume with an empty text prefix.
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            socket
+                .write_all(b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"r9\"}}\n\ndata: {\"type\":\"response.in_progress\"}\n\n")
+                .unwrap();
+        });
+        let client_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client_addr = client_listener.local_addr().unwrap();
+        let mut upstream_stream = TcpStream::connect(upstream_addr).unwrap();
+        let worker = thread::spawn(move || {
+            let (mut client, _) = client_listener.accept().unwrap();
+            let mut sink = SseSink::new(&mut client, None);
+            let outcome = forward_plain_sse(&mut sink, &mut upstream_stream, Vec::new()).unwrap();
+            assert_eq!(
+                outcome,
+                SseForward::RetryableWithPrefix(StreamResume {
+                    prefix: String::new(),
+                    response_id: Some("r9".to_owned()),
+                    item_id: None,
+                })
+            );
+        });
+        let mut client = TcpStream::connect(client_addr).unwrap();
+        let mut output = String::new();
+        client.read_to_string(&mut output).unwrap();
+        worker.join().unwrap();
+        assert!(output.contains("response.created"));
+        assert!(!output.contains("response.failed"));
+    }
+
+    #[test]
+    fn tool_call_partial_stream_is_not_retryable_and_fails_cleanly() {
+        // A partial stream containing tool-call items cannot be reconciled by
+        // text prefix, so it keeps the clean terminal-event behavior.
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            socket
+                .write_all(b"data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"f1\",\"type\":\"function_call\"}}\n\ndata: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{}\",\"item_id\":\"f1\"}\n\n")
+                .unwrap();
+        });
+        let client_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client_addr = client_listener.local_addr().unwrap();
+        let mut upstream_stream = TcpStream::connect(upstream_addr).unwrap();
+        let worker = thread::spawn(move || {
+            let (mut client, _) = client_listener.accept().unwrap();
+            let mut sink = SseSink::new(&mut client, None);
+            let outcome = forward_plain_sse(&mut sink, &mut upstream_stream, Vec::new()).unwrap();
+            assert_eq!(outcome, SseForward::Done);
+        });
+        let mut client = TcpStream::connect(client_addr).unwrap();
+        let mut output = String::new();
+        client.read_to_string(&mut output).unwrap();
+        worker.join().unwrap();
+        assert!(output.contains("function_call"));
+        assert!(output.contains("response.failed"));
+        assert!(output.contains("upstream_stream_interrupted"));
     }
 }

@@ -869,6 +869,129 @@ pub fn probe_codex_router_binding_overwrite(
     probe_codex_router_binding_overwrite_with_key(cfg, router_root, &local_api_key)
 }
 
+/// Full binding health across the user layer and the mirrored system layer.
+/// Codex Desktop periodically strips the user file; as long as the system
+/// layer still carries the Router binding, routing keeps working and the app
+/// must not nag the user with the overwrite prompt.
+#[derive(Clone, Debug)]
+pub struct CodexBindingProbe {
+    /// Fingerprint of the user-layer content, used for keep-decision
+    /// suppression when the binding is truly lost.
+    pub fingerprint: String,
+    /// The user `config.toml` still points at the Router by itself.
+    pub user_layer_bound: bool,
+    /// The `%ProgramData%` system layer still carries a valid Router binding.
+    pub system_layer_bound: bool,
+    /// The user-layer `model` value before any repair, when present.
+    pub user_model: Option<String>,
+    /// `Some((previous, repaired))` when an invalid/missing user-layer `model`
+    /// key (for example `model = "first"` after a ChatGPT update) was silently
+    /// rewritten to the Router default model. Repairing only runs while at
+    /// least one layer still routes through the local gateway.
+    pub model_repair: Option<(Option<String>, String)>,
+}
+
+pub fn probe_codex_binding_state(
+    cfg: &RouterConfig,
+    router_root: &Path,
+) -> anyhow::Result<CodexBindingProbe> {
+    let local_api_key = super::ensure_local_api_key()?;
+    probe_codex_binding_state_with_key(
+        cfg,
+        router_root,
+        &local_api_key,
+        &codex_system_config_path(),
+    )
+}
+
+pub(crate) fn probe_codex_binding_state_with_key(
+    cfg: &RouterConfig,
+    _router_root: &Path,
+    _local_api_key: &str,
+    system_config_path: &Path,
+) -> anyhow::Result<CodexBindingProbe> {
+    let codex_home = resolve_codex_home(cfg);
+    let config_path = codex_home.join("config.toml");
+    let existing = match std::fs::read_to_string(&config_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error).context("failed to read Codex config for overwrite detection")
+        }
+    };
+    let base_url = codex_public_base_url(cfg);
+    let user_layer_bound =
+        !existing.trim().is_empty() && super::codex_config_uses_router(&existing, &base_url);
+    let system_content = std::fs::read_to_string(system_config_path).unwrap_or_default();
+    let system_layer_bound = system_content
+        .lines()
+        .any(|line| line.trim() == SYSTEM_BINDING_MARKER)
+        && super::codex_config_uses_router(&system_content, &base_url);
+    let user_model = existing
+        .parse::<DocumentMut>()
+        .ok()
+        .and_then(|document| {
+            document
+                .get("model")
+                .and_then(Item::as_str)
+                .map(str::to_owned)
+        });
+    let mut model_repair = None;
+    if (user_layer_bound || system_layer_bound) && !existing.trim().is_empty() {
+        model_repair = repair_codex_user_model_key(cfg, &existing, &config_path)?;
+    }
+    Ok(CodexBindingProbe {
+        fingerprint: codex_config_fingerprint(&existing),
+        user_layer_bound,
+        system_layer_bound,
+        user_model,
+        model_repair,
+    })
+}
+
+/// Silently rewrite the user-layer `model` key when Codex Desktop replaced it
+/// with a value outside the Router catalog. The Desktop model picker falls
+/// back to "Custom" for unknown ids, which hides the configured default
+/// model even though routing itself still works. Only the single key is
+/// touched so Desktop-owned content (desktop section, plugins, projects)
+/// survives the repair byte-for-byte. Returns `Some((old, new))` on rewrite.
+fn repair_codex_user_model_key(
+    cfg: &RouterConfig,
+    existing: &str,
+    config_path: &Path,
+) -> anyhow::Result<Option<(Option<String>, String)>> {
+    let Ok(mut document) = existing.parse::<DocumentMut>() else {
+        return Ok(None);
+    };
+    let valid: Vec<String> = super::catalog::build_route_plan(cfg)
+        .iter()
+        .filter(|route| route.include_in_catalog)
+        .map(|route| route.public_model_id.clone())
+        .collect();
+    if valid.is_empty() {
+        return Ok(None);
+    }
+    let current = document
+        .get("model")
+        .and_then(Item::as_str)
+        .map(str::to_owned);
+    if current
+        .as_deref()
+        .is_some_and(|model| valid.iter().any(|candidate| candidate == model))
+    {
+        return Ok(None);
+    }
+    let target = if valid.iter().any(|candidate| candidate == &cfg.default_model) {
+        cfg.default_model.clone()
+    } else {
+        valid[0].clone()
+    };
+    document["model"] = toml_edit::value(target.as_str());
+    std::fs::write(config_path, document.to_string())
+        .context("failed to repair the Codex user-layer model key")?;
+    Ok(Some((current, target)))
+}
+
 pub(crate) fn probe_codex_router_binding_overwrite_with_key(
     cfg: &RouterConfig,
     _router_root: &Path,
@@ -1798,6 +1921,161 @@ sandbox = "unelevated"
                 .unwrap()
                 .is_none(),
             "Desktop writing forced_login_method back is not an external overwrite"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn probe_fixture(tmp: &Path) -> (PathBuf, PathBuf, RouterConfig) {
+        let router_root = tmp.join("router-root");
+        let codex_home = tmp.join("codex-home");
+        std::fs::create_dir_all(&router_root).unwrap();
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let cfg = RouterConfig {
+            default_model: "gpt-5.6-sol".to_owned(),
+            models: vec![
+                ModelConfig {
+                    source: "apikey".to_owned(),
+                    model: "gpt-5.6-sol".to_owned(),
+                    ..Default::default()
+                },
+                ModelConfig {
+                    source: "apikey".to_owned(),
+                    model: "deepseek-v4-flash".to_owned(),
+                    ..Default::default()
+                },
+            ],
+            deploy: crate::config::DeployConfig {
+                codex_home: codex_home.to_string_lossy().into_owned(),
+                sub2api_host: "http://127.0.0.1:18082".to_owned(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        (router_root, codex_home, cfg)
+    }
+
+    #[test]
+    fn binding_probe_repairs_invalid_user_model_when_system_layer_still_routes() {
+        let tmp = std::env::temp_dir().join(format!(
+            "codex-router-probe-repair-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (_root, codex_home, cfg) = probe_fixture(&tmp);
+        let system_config = tmp.join("system").join("config.toml");
+        let catalog = tmp.join("model-catalog.json");
+        std::fs::write(&catalog, "{}").unwrap();
+        // The public gateway base URL is the Sub2API port + 2 (18084 here).
+        write_codex_system_binding_to(
+            &system_config,
+            &catalog,
+            "fixture-local-router-key",
+            "http://127.0.0.1:18084",
+            true,
+            false,
+        )
+        .unwrap();
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "model = \"first\"\nsandbox_mode = \"danger-full-access\"\n\n[desktop]\nsansFontSize = 17\n",
+        )
+        .unwrap();
+
+        let probe = probe_codex_binding_state_with_key(
+            &cfg,
+            &tmp,
+            "fixture-local-router-key",
+            &system_config,
+        )
+        .unwrap();
+        assert!(!probe.user_layer_bound);
+        assert!(probe.system_layer_bound);
+        assert_eq!(probe.user_model.as_deref(), Some("first"));
+        assert_eq!(
+            probe.model_repair,
+            Some((Some("first".to_owned()), "gpt-5.6-sol".to_owned()))
+        );
+        let repaired = std::fs::read_to_string(codex_home.join("config.toml")).unwrap();
+        assert!(repaired.contains("model = \"gpt-5.6-sol\""));
+        assert!(repaired.contains("sansFontSize = 17"));
+
+        // A second pass sees a valid model and leaves the file untouched.
+        let again = probe_codex_binding_state_with_key(
+            &cfg,
+            &tmp,
+            "fixture-local-router-key",
+            &system_config,
+        )
+        .unwrap();
+        assert_eq!(again.model_repair, None);
+        assert_eq!(again.user_model.as_deref(), Some("gpt-5.6-sol"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn binding_probe_reports_full_loss_only_when_both_layers_unbound() {
+        let tmp = std::env::temp_dir().join(format!(
+            "codex-router-probe-loss-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (_root, codex_home, cfg) = probe_fixture(&tmp);
+        let overwritten = "model_provider = \"micu\"\nmodel = \"deepseek-v4-flash\"\n";
+        std::fs::write(codex_home.join("config.toml"), overwritten).unwrap();
+        let missing_system = tmp.join("missing-system").join("config.toml");
+        let probe = probe_codex_binding_state_with_key(
+            &cfg,
+            &tmp,
+            "fixture-local-router-key",
+            &missing_system,
+        )
+        .unwrap();
+        assert!(!probe.user_layer_bound);
+        assert!(!probe.system_layer_bound);
+        assert_eq!(probe.fingerprint, codex_config_fingerprint(overwritten));
+        assert_eq!(probe.model_repair, None);
+        // No silent edit happens while routing is genuinely broken.
+        assert_eq!(
+            std::fs::read_to_string(codex_home.join("config.toml")).unwrap(),
+            overwritten
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn binding_probe_keeps_a_valid_nondefault_user_model() {
+        let tmp = std::env::temp_dir().join(format!(
+            "codex-router-probe-valid-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (_root, codex_home, cfg) = probe_fixture(&tmp);
+        let system_config = tmp.join("system").join("config.toml");
+        assert!(
+            repair_codex_router_binding_impl(&cfg, &tmp, "fixture-local-router-key", &system_config)
+                .unwrap()
+        );
+        // The user picked a different catalog model in Codex; that choice is
+        // valid and must survive the probe untouched.
+        let chosen = std::fs::read_to_string(codex_home.join("config.toml"))
+            .unwrap()
+            .replace("model = \"gpt-5.6-sol\"", "model = \"deepseek-v4-flash\"");
+        std::fs::write(codex_home.join("config.toml"), &chosen).unwrap();
+        let probe = probe_codex_binding_state_with_key(
+            &cfg,
+            &tmp,
+            "fixture-local-router-key",
+            &system_config,
+        )
+        .unwrap();
+        assert!(probe.user_layer_bound);
+        assert_eq!(probe.model_repair, None);
+        assert_eq!(
+            std::fs::read_to_string(codex_home.join("config.toml")).unwrap(),
+            chosen
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
