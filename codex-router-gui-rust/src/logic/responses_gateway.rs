@@ -293,64 +293,107 @@ fn handle_client(
         }
     }
 
-    let response = open_upstream_with_rate_limit_retry(
-        upstream,
-        &method,
-        &path,
-        &headers,
-        &request_body,
-        rate_limit_max_retries,
-    )?;
-    let mut upstream_stream = response.stream;
-    let response_headers = response.headers;
-    let response_leftover = response.leftover;
-    let status = response.status;
-    let response_headers_map = response.header_map;
-    if status < 400 || !is_responses_path(&path) {
-        if status < 400 && is_responses_path(&path) && openai_family {
+    // One retry budget shared by every pre-content stage: opening the
+    // upstream, outwaiting a silent pre-stream stall, and buffering a
+    // complete body. Until real SSE events (or a buffered body) reach the
+    // Codex client a transparent upstream retry is seamless; afterwards a
+    // reconnect would replay the answer from scratch, so late failures
+    // surface a clean `response.failed` instead of a retry.
+    let stage_max_retries = rate_limit_max_retries.min(MAX_RATE_LIMIT_RETRIES) as usize;
+    let mut stage_attempt = 0_usize;
+    let mut sse_prelude_sent = false;
+    let (status, response_headers_map, response_body) = loop {
+        let response = open_upstream_with_rate_limit_retry(
+            upstream,
+            &method,
+            &path,
+            &headers,
+            &request_body,
+            rate_limit_max_retries,
+        )?;
+        let mut upstream_stream = response.stream;
+        let response_headers = response.headers;
+        let response_leftover = response.leftover;
+        let status = response.status;
+        let response_headers_map = response.header_map;
+        if status < 400 || !is_responses_path(&path) {
+            if status < 400 && is_responses_path(&path) && openai_family {
+                client.write_all(&response_headers)?;
+                client.write_all(&response_leftover)?;
+                std::io::copy(&mut upstream_stream, &mut client)?;
+                return Ok(());
+            }
+            if status < 400 && is_responses_path(&path) {
+                let content_type = content_type_of(&response_headers_map);
+                let streaming = content_type.contains("text/event-stream")
+                    || response_headers_map.contains_key("transfer-encoding")
+                    || !response_headers_map.contains_key("content-length");
+                if streaming {
+                    if !sse_prelude_sent {
+                        write_sse_prelude(&mut client, &response_headers_map)?;
+                        sse_prelude_sent = true;
+                    }
+                    match forward_agent_sse(
+                        &mut client,
+                        &mut upstream_stream,
+                        &response_headers_map,
+                        response_leftover,
+                    )? {
+                        SseForward::Done => return Ok(()),
+                        SseForward::RetryableBeforeFirstEvent => {
+                            if stage_attempt >= stage_max_retries {
+                                finish_sse(&mut client, "", false)?;
+                                return Ok(());
+                            }
+                            sleep_for_retry(rate_limit_retry_delay(None, stage_attempt));
+                            stage_attempt += 1;
+                            continue;
+                        }
+                    }
+                }
+                if content_type.contains("json") {
+                    match read_full_body(
+                        &mut upstream_stream,
+                        &response_headers_map,
+                        response_leftover,
+                    ) {
+                        Ok(body) => {
+                            return forward_rewritten_json_body(
+                                &mut client,
+                                &response_headers_map,
+                                body,
+                            );
+                        }
+                        Err(error) => {
+                            if stage_attempt >= stage_max_retries {
+                                return Err(error);
+                            }
+                            sleep_for_retry(rate_limit_retry_delay(None, stage_attempt));
+                            stage_attempt += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
             client.write_all(&response_headers)?;
             client.write_all(&response_leftover)?;
             std::io::copy(&mut upstream_stream, &mut client)?;
             return Ok(());
         }
-        if status < 400 && is_responses_path(&path) {
-            let content_type = content_type_of(&response_headers_map);
-            let streaming = content_type.contains("text/event-stream")
-                || response_headers_map.contains_key("transfer-encoding")
-                || !response_headers_map.contains_key("content-length");
-            if streaming {
-                return forward_agent_sse(
-                    &mut client,
-                    &mut upstream_stream,
-                    &response_headers_map,
-                    response_leftover,
-                );
-            }
-            if content_type.contains("json") {
-                return forward_rewritten_json(
-                    &mut client,
-                    &mut upstream_stream,
-                    &response_headers_map,
-                    response_leftover,
-                );
+        // Error statuses are fully buffered before anything reaches the
+        // client, so an upstream drop mid-body retries the whole request.
+        match read_full_body(&mut upstream_stream, &response_headers_map, response_leftover) {
+            Ok(body) => break (status, response_headers_map, body),
+            Err(error) => {
+                if stage_attempt >= stage_max_retries {
+                    return Err(error);
+                }
+                sleep_for_retry(rate_limit_retry_delay(None, stage_attempt));
+                stage_attempt += 1;
+                continue;
             }
         }
-        client.write_all(&response_headers)?;
-        client.write_all(&response_leftover)?;
-        std::io::copy(&mut upstream_stream, &mut client)?;
-        return Ok(());
-    }
-
-    let mut response_body = response_leftover;
-    if let Some(length) = response_headers_map
-        .get("content-length")
-        .and_then(|value| value.parse::<usize>().ok())
-    {
-        read_exact_more(&mut upstream_stream, &mut response_body, length)?;
-        response_body.truncate(length);
-    } else {
-        upstream_stream.read_to_end(&mut response_body).ok();
-    }
+    };
     let body_text = String::from_utf8_lossy(&response_body);
     if should_retry_after_upstream_error(status, &body_text) {
         if let Ok(mut json_body) = serde_json::from_slice::<Value>(&request_body) {
@@ -750,12 +793,22 @@ fn flush_sse_events(
     client: &mut TcpStream,
     carry: &mut String,
     terminal: &mut bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<usize> {
+    let mut written = 0;
     while let Some(complete) = take_sse_event(carry) {
         *terminal |= sse_event_is_terminal(&complete);
         client.write_all(rewrite_sse_text(&complete).as_bytes())?;
+        written += 1;
     }
-    Ok(())
+    Ok(written)
+}
+
+/// Result of forwarding an SSE stream. `RetryableBeforeFirstEvent` means the
+/// upstream died (or exceeded the silence cap) before any real event reached
+/// the client, so the whole request can be transparently retried.
+enum SseForward {
+    Done,
+    RetryableBeforeFirstEvent,
 }
 
 fn finish_sse(client: &mut TcpStream, carry: &str, terminal: bool) -> anyhow::Result<()> {
@@ -772,10 +825,11 @@ fn decode_chunked_to_sse(
     client: &mut TcpStream,
     upstream: &mut TcpStream,
     leftover: Vec<u8>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<SseForward> {
     let mut raw = leftover;
     let mut decoded = String::new();
     let mut terminal = false;
+    let mut sent_events = false;
     let mut last_activity = Instant::now();
     loop {
         if let Some(line_end) = raw.windows(2).position(|w| w == b"\r\n") {
@@ -787,28 +841,42 @@ fn decode_chunked_to_sse(
                     // Flush the complete events already decoded and close with
                     // an explicit terminal event instead of an abrupt EOF.
                     flush_sse_events(client, &mut decoded, &mut terminal)?;
-                    return finish_sse(client, "", terminal);
+                    finish_sse(client, "", terminal)?;
+                    return Ok(SseForward::Done);
                 }
             };
             let after_size = line_end + 2;
             if size == 0 {
                 flush_sse_events(client, &mut decoded, &mut terminal)?;
-                return finish_sse(client, &decoded, terminal);
+                finish_sse(client, &decoded, terminal)?;
+                return Ok(SseForward::Done);
             }
             if raw.len() < after_size + size + 2 {
                 match read_upstream_chunk(upstream, &mut raw, &mut last_activity, client)? {
                     ChunkRead::Received => continue,
-                    ChunkRead::Ended => return finish_sse(client, &decoded, terminal),
+                    ChunkRead::Ended => {
+                        if !terminal && !sent_events {
+                            return Ok(SseForward::RetryableBeforeFirstEvent);
+                        }
+                        finish_sse(client, &decoded, terminal)?;
+                        return Ok(SseForward::Done);
+                    }
                 }
             }
             decoded.push_str(&String::from_utf8_lossy(&raw[after_size..after_size + size]));
             raw.drain(..after_size + size + 2);
-            flush_sse_events(client, &mut decoded, &mut terminal)?;
+            sent_events |= flush_sse_events(client, &mut decoded, &mut terminal)? > 0;
             continue;
         }
         match read_upstream_chunk(upstream, &mut raw, &mut last_activity, client)? {
             ChunkRead::Received => continue,
-            ChunkRead::Ended => return finish_sse(client, &decoded, terminal),
+            ChunkRead::Ended => {
+                if !terminal && !sent_events {
+                    return Ok(SseForward::RetryableBeforeFirstEvent);
+                }
+                finish_sse(client, &decoded, terminal)?;
+                return Ok(SseForward::Done);
+            }
         }
     }
 }
@@ -872,12 +940,13 @@ fn forward_plain_sse(
     client: &mut TcpStream,
     upstream: &mut TcpStream,
     leftover: Vec<u8>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<SseForward> {
     let mut carry = String::from_utf8_lossy(&leftover).into_owned();
     let mut terminal = false;
+    let mut sent_events = false;
     let mut last_activity = Instant::now();
     loop {
-        flush_sse_events(client, &mut carry, &mut terminal)?;
+        sent_events |= flush_sse_events(client, &mut carry, &mut terminal)? > 0;
         let mut buffer = [0_u8; 8192];
         let read = match upstream.read(&mut buffer) {
             Ok(0) => break,
@@ -887,20 +956,34 @@ fn forward_plain_sse(
             }
             Err(error) if stream_read_timed_out(&error) => {
                 if last_activity.elapsed() >= STREAM_MAX_SILENCE {
-                    return finish_sse(client, &carry, terminal);
+                    if !terminal && !sent_events {
+                        return Ok(SseForward::RetryableBeforeFirstEvent);
+                    }
+                    finish_sse(client, &carry, terminal)?;
+                    return Ok(SseForward::Done);
                 }
                 if send_sse_keepalive(client).is_err() {
                     // The Codex client is gone; stop the worker quietly.
-                    return Ok(());
+                    return Ok(SseForward::Done);
                 }
                 continue;
             }
-            Err(_) => return finish_sse(client, &carry, terminal),
+            Err(_) => {
+                if !terminal && !sent_events {
+                    return Ok(SseForward::RetryableBeforeFirstEvent);
+                }
+                finish_sse(client, &carry, terminal)?;
+                return Ok(SseForward::Done);
+            }
         };
         carry.push_str(&String::from_utf8_lossy(&buffer[..read]));
     }
-    flush_sse_events(client, &mut carry, &mut terminal)?;
-    finish_sse(client, &carry, terminal)
+    sent_events |= flush_sse_events(client, &mut carry, &mut terminal)? > 0;
+    if !terminal && !sent_events {
+        return Ok(SseForward::RetryableBeforeFirstEvent);
+    }
+    finish_sse(client, &carry, terminal)?;
+    Ok(SseForward::Done)
 }
 
 fn forward_agent_sse(
@@ -908,8 +991,9 @@ fn forward_agent_sse(
     upstream: &mut TcpStream,
     headers: &HashMap<String, String>,
     leftover: Vec<u8>,
-) -> anyhow::Result<()> {
-    write_sse_prelude(client, headers)?;
+) -> anyhow::Result<SseForward> {
+    // The SSE prelude is written by the caller, once per client connection,
+    // so a transparent pre-content retry never duplicates response headers.
     // Poll the upstream on a short cadence instead of one long blocking read
     // so keep-alive comments can hold the Codex session open while Grok or
     // Gemini is silent during long reasoning or provider-side failover.
@@ -926,22 +1010,38 @@ fn forward_agent_sse(
     }
 }
 
-fn forward_rewritten_json(
-    client: &mut TcpStream,
-    upstream: &mut TcpStream,
+/// Buffer the rest of an upstream response body. Read errors propagate so
+/// the caller can retry the whole request while nothing has reached the
+/// client yet.
+fn read_full_body(
+    stream: &mut TcpStream,
     headers: &HashMap<String, String>,
-    leftover: Vec<u8>,
-) -> anyhow::Result<()> {
-    let mut body = leftover;
+    mut body: Vec<u8>,
+) -> anyhow::Result<Vec<u8>> {
     if let Some(length) = headers
         .get("content-length")
         .and_then(|value| value.parse::<usize>().ok())
     {
-        read_exact_more(upstream, &mut body, length)?;
+        read_exact_more(stream, &mut body, length)?;
+        if body.len() < length {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "upstream closed the connection mid-body",
+            )
+            .into());
+        }
         body.truncate(length);
     } else {
-        upstream.read_to_end(&mut body).ok();
+        stream.read_to_end(&mut body)?;
     }
+    Ok(body)
+}
+
+fn forward_rewritten_json_body(
+    client: &mut TcpStream,
+    headers: &HashMap<String, String>,
+    mut body: Vec<u8>,
+) -> anyhow::Result<()> {
     if let Ok(mut json) = serde_json::from_slice::<Value>(&body) {
         rewrite_provider_json(&mut json);
         crate::logic::responses_compat::strip_think_tags_from_value(&mut json);
@@ -1414,5 +1514,163 @@ mod tests {
         // Later steps saturate and clamp at the per-step ceiling.
         assert_eq!(rate_limit_retry_delay(None, 5), MAX_RATE_LIMIT_DELAY);
         assert_eq!(rate_limit_retry_delay(None, 32), MAX_RATE_LIMIT_DELAY);
+    }
+
+    /// Spin a mock Sub2API that answers per attempt, then run one client
+    /// request through `handle_client` and return what the client received.
+    fn run_client_against_mock<F>(answer: F, max_retries: u32) -> (String, usize)
+    where
+        F: Fn(usize, &mut TcpStream) + Send + 'static,
+    {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+        thread::spawn(move || {
+            while let Ok((mut socket, _)) = upstream.accept() {
+                let (headers, leftover) = match read_headers(&mut socket) {
+                    Ok(parts) => parts,
+                    Err(_) => continue,
+                };
+                let length = parse_headers(&String::from_utf8_lossy(&headers))
+                    .get("content-length")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let mut body = leftover;
+                if read_exact_more(&mut socket, &mut body, length).is_err() {
+                    continue;
+                }
+                let attempt = attempts_clone.fetch_add(1, Ordering::Relaxed);
+                answer(attempt, &mut socket);
+            }
+        });
+        let client_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client_addr = client_listener.local_addr().unwrap();
+        let upstream_url = format!("http://127.0.0.1:{}", upstream_addr.port());
+        let worker = thread::spawn(move || {
+            let (stream, _) = client_listener.accept().unwrap();
+            handle_client(stream, &upstream_url, max_retries).unwrap();
+        });
+        let mut client = TcpStream::connect(client_addr).unwrap();
+        client
+            .write_all(b"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 18\r\nConnection: close\r\n\r\n{\"model\":\"grok-t\"}")
+            .unwrap();
+        let mut output = String::new();
+        client.read_to_string(&mut output).unwrap();
+        worker.join().unwrap();
+        (output, attempts.load(Ordering::Relaxed))
+    }
+
+    #[test]
+    fn pre_content_sse_disconnect_retries_transparently() {
+        // First attempt sends SSE headers then dies without a single event;
+        // the client has only seen the prelude, so a retry is seamless.
+        let (output, attempts) = run_client_against_mock(
+            |attempt, socket| {
+                if attempt == 0 {
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                        .unwrap();
+                    return;
+                }
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\ndata: {\"type\":\"response.completed\"}\n\n")
+                    .unwrap();
+            },
+            3,
+        );
+        assert_eq!(attempts, 2);
+        assert!(output.contains("response.output_text.delta"));
+        assert!(output.contains("response.completed"));
+        // The answer is delivered exactly once: no duplicated prefix, no
+        // failure event, and the HTTP prelude is written only once.
+        assert_eq!(output.matches("response.output_text.delta").count(), 1);
+        assert_eq!(output.matches("HTTP/1.1 200").count(), 1);
+        assert!(!output.contains("upstream_stream_interrupted"));
+    }
+
+    #[test]
+    fn pre_content_sse_disconnect_emits_failed_event_after_budget_exhaustion() {
+        // Every attempt dies before the first event; after the retry budget
+        // the client still gets a clean terminal event instead of an EOF.
+        let (output, attempts) = run_client_against_mock(
+            |_attempt, socket| {
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+            },
+            2,
+        );
+        assert_eq!(attempts, 3);
+        assert!(output.contains("response.failed"));
+        assert!(output.contains("upstream_stream_interrupted"));
+    }
+
+    #[test]
+    fn truncated_json_body_retries_the_whole_request() {
+        // First attempt promises 100 bytes but dies mid-body; nothing reached
+        // the client, so the gateway retries and serves the full JSON.
+        let (output, attempts) = run_client_against_mock(
+            |attempt, socket| {
+                if attempt == 0 {
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{\"partial\":true,")
+                        .unwrap();
+                    return;
+                }
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}")
+                    .unwrap();
+            },
+            3,
+        );
+        assert_eq!(attempts, 2);
+        assert!(output.contains("HTTP/1.1 200"));
+        assert!(output.contains("\"ok\":true"));
+        assert!(!output.contains("partial"));
+    }
+
+    #[test]
+    fn truncated_error_body_retries_the_whole_request() {
+        // Error responses are buffered before forwarding; a mid-body drop
+        // retries instead of hanging up on the Codex client.
+        let (output, attempts) = run_client_against_mock(
+            |attempt, socket| {
+                if attempt == 0 {
+                    socket
+                        .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{\"err")
+                        .unwrap();
+                    return;
+                }
+                socket
+                    .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nConnection: close\r\n\r\nupstream exploded")
+                    .unwrap();
+            },
+            3,
+        );
+        assert_eq!(attempts, 2);
+        assert!(output.contains("upstream exploded"));
+        assert!(!output.contains("{\"err"));
+    }
+
+    #[test]
+    fn empty_sse_eof_reports_retryable_before_any_event() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        thread::spawn(move || {
+            let (_socket, _) = upstream.accept().unwrap();
+            // Immediate EOF without a single byte.
+        });
+        let client_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client_addr = client_listener.local_addr().unwrap();
+        let mut upstream_stream = TcpStream::connect(upstream_addr).unwrap();
+        let worker = thread::spawn(move || {
+            let (mut client, _) = client_listener.accept().unwrap();
+            let outcome = forward_plain_sse(&mut client, &mut upstream_stream, Vec::new()).unwrap();
+            assert!(matches!(outcome, SseForward::RetryableBeforeFirstEvent));
+        });
+        let client = TcpStream::connect(client_addr).unwrap();
+        worker.join().unwrap();
+        drop(client);
     }
 }
