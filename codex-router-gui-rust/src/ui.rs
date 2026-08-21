@@ -7578,8 +7578,8 @@ impl CodexRouterApp {
                     egui::Label::new(
                         egui::RichText::new(t(
                             zh,
-                            "上游 429 / 断网自动重试次数（2s / 10s / 30s / 1min / 3min / 5min）",
-                            "Automatic retries on 429 or network errors (2s / 10s / 30s / 1min / 3min / 5min)",
+                            "上游 429 / 断网自动重试次数（首次 5s，之后每次 ×5：25s / 125s / 625s …，单次封顶 1h）",
+                            "Automatic retries on 429 or network errors (first retry 5s, then x5 each time: 25s / 125s / 625s ..., capped at 1h per step)",
                         ))
                         .small()
                         .color(palette.ink_soft),
@@ -7589,8 +7589,8 @@ impl CodexRouterApp {
                 if retries_response.changed() {
                     self.status_text = t(
                         zh,
-                        "429 限流重试次数已修改；保存并应用后生效",
-                        "The 429 retry count changed. Save & apply to activate it.",
+                        "断网/429 重试次数已修改；保存并应用后生效",
+                        "The retry count changed. Save & apply to activate it.",
                     )
                     .into();
                 }

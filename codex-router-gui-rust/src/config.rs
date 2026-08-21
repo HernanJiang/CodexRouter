@@ -512,8 +512,8 @@ pub struct RouterConfig {
     pub reasoning: ReasoningConfig,
     /// Maximum automatic retries when an upstream answers 429, a transient
     /// network error, or Sub2API reports the account pool drained as 503.
-    /// Each retry waits on a staged backoff (2s, 10s, 30s, 1min, 3min, 5min)
-    /// so a burst-limited conversation keeps waiting instead of ending.
+    /// The first retry waits 5s and every further retry multiplies the wait
+    /// by five (5s, 25s, 125s, 625s, ...), capped at one hour per step.
     #[serde(default = "default_rate_limit_max_retries")]
     pub rate_limit_max_retries: u32,
     #[serde(default)]

@@ -30,16 +30,18 @@ const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default number of automatic retries when an upstream answers 429, a
 /// transient network error, or the Sub2API exhausted-account 503.
-/// Overridable through the Router config. Six retries use the staged
-/// 2s / 10s / 30s / 1min / 3min / 5min waits.
-pub const DEFAULT_RATE_LIMIT_RETRIES: u32 = 6;
+/// Overridable through the Router config. The first retry waits 5s and
+/// every further retry multiplies the wait by five (5s / 25s / 125s / ...).
+pub const DEFAULT_RATE_LIMIT_RETRIES: u32 = 3;
 /// Hard ceiling for a configured retry count so a typo cannot pin a worker
 /// thread on a sleeping retry loop forever.
 const MAX_RATE_LIMIT_RETRIES: u32 = 32;
 /// Ceiling for one backoff step. A `Retry-After` hint above this is clamped
 /// instead of skipping the retry, so the conversation keeps waiting.
-const MAX_RATE_LIMIT_DELAY: Duration = Duration::from_secs(300);
-const RATE_LIMIT_RETRY_DELAYS_SECS: [u64; 6] = [2, 10, 30, 60, 180, 300];
+const MAX_RATE_LIMIT_DELAY: Duration = Duration::from_secs(3600);
+/// First retry wait in seconds. Every further retry multiplies the wait by
+/// five: 5s, 25s, 125s, 625s, ... (each step clamped at the ceiling above).
+const RATE_LIMIT_RETRY_BASE_DELAY_SECS: u64 = 5;
 /// While streaming an agent (non-OpenAI-family) response, the upstream socket
 /// is polled on this cadence so the gateway can keep the Codex session alive
 /// through long provider-side reasoning pauses.
@@ -515,14 +517,15 @@ fn buffer_error_body(
     }
 }
 
-/// Staged backoff: 2s, 10s, 30s, 1min, 3min, 5min.
+/// Stepped backoff: 5s for the first retry, then x5 per extra retry
+/// (5s, 25s, 125s, 625s, ...), saturating and clamped per step.
 /// A `Retry-After` hint can only lengthen a step, never shorten it, so a
 /// 1-second burst hint cannot burn the retry budget.
 fn rate_limit_retry_delay(
     headers: Option<&HashMap<String, String>>,
     attempt: usize,
 ) -> Duration {
-    let staged = RATE_LIMIT_RETRY_DELAYS_SECS[attempt.min(RATE_LIMIT_RETRY_DELAYS_SECS.len() - 1)];
+    let staged = RATE_LIMIT_RETRY_BASE_DELAY_SECS.saturating_pow(attempt as u32 + 1);
     let hinted = headers
         .and_then(|headers| headers.get("retry-after"))
         .and_then(|value| value.trim().parse::<u64>().ok())
@@ -1381,48 +1384,35 @@ mod tests {
         // retry, so the conversation keeps waiting rather than ending.
         assert_eq!(
             rate_limit_retry_delay(
-                Some(&HashMap::from([("retry-after".to_owned(), "600".to_owned())])),
+                Some(&HashMap::from([("retry-after".to_owned(), "8000".to_owned())])),
                 0,
             ),
             MAX_RATE_LIMIT_DELAY
         );
+        // A hint shorter than the current step never shortens the wait.
         assert_eq!(
             rate_limit_retry_delay(
                 Some(&HashMap::from([("retry-after".to_owned(), "3".to_owned())])),
                 0,
             ),
-            Duration::from_secs(3)
+            Duration::from_secs(5)
         );
+        // A hint longer than the current step lengthens the wait.
         assert_eq!(
             rate_limit_retry_delay(
-                Some(&HashMap::from([("retry-after".to_owned(), "1".to_owned())])),
+                Some(&HashMap::from([("retry-after".to_owned(), "30".to_owned())])),
                 0,
             ),
-            Duration::from_secs(2)
-        );
-        assert_eq!(
-            rate_limit_retry_delay(None, 0),
-            Duration::from_secs(2)
-        );
-        assert_eq!(
-            rate_limit_retry_delay(None, 1),
-            Duration::from_secs(10)
-        );
-        assert_eq!(
-            rate_limit_retry_delay(None, 2),
             Duration::from_secs(30)
         );
-        assert_eq!(
-            rate_limit_retry_delay(None, 3),
-            Duration::from_secs(60)
-        );
-        assert_eq!(
-            rate_limit_retry_delay(None, 4),
-            Duration::from_secs(180)
-        );
-        assert_eq!(
-            rate_limit_retry_delay(None, 5),
-            Duration::from_secs(300)
-        );
+        // Stepped ladder: 5s for the first retry, then x5 per extra retry.
+        assert_eq!(rate_limit_retry_delay(None, 0), Duration::from_secs(5));
+        assert_eq!(rate_limit_retry_delay(None, 1), Duration::from_secs(25));
+        assert_eq!(rate_limit_retry_delay(None, 2), Duration::from_secs(125));
+        assert_eq!(rate_limit_retry_delay(None, 3), Duration::from_secs(625));
+        assert_eq!(rate_limit_retry_delay(None, 4), Duration::from_secs(3125));
+        // Later steps saturate and clamp at the per-step ceiling.
+        assert_eq!(rate_limit_retry_delay(None, 5), MAX_RATE_LIMIT_DELAY);
+        assert_eq!(rate_limit_retry_delay(None, 32), MAX_RATE_LIMIT_DELAY);
     }
 }
