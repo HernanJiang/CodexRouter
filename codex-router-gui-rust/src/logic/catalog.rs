@@ -471,20 +471,17 @@ pub fn build_model_catalog_with_root(cfg: &RouterConfig, router_root: &Path) -> 
             entry["supports_search_tool"] = Value::Bool(false);
             entry["web_search_tool_type"] = Value::Null;
         } else {
+            // Official ChatGPT OAuth still gets web search.
+            // Do not copy `code_mode_only` / `use_responses_lite` / v2
+            // collaboration from the official catalog template. Through
+            // Router/CLIProxy those make Desktop expose `collaboration.spawn_agent`
+            // while the model emits empty JSON `{}`, which Desktop rejects as
+            // missing field `message`. Keep JSON `exec_command` and v1 agents.
             entry["supports_search_tool"] = Value::Bool(true);
             entry["web_search_tool_type"] = Value::String("text_and_image".to_owned());
-            entry["use_responses_lite"] = entry
-                .get("use_responses_lite")
-                .cloned()
-                .unwrap_or(Value::Bool(true));
-            entry["multi_agent_version"] = entry
-                .get("multi_agent_version")
-                .cloned()
-                .unwrap_or(Value::String("v2".to_owned()));
-            entry["tool_mode"] = entry
-                .get("tool_mode")
-                .cloned()
-                .unwrap_or(Value::String("code_mode_only".to_owned()));
+            entry["use_responses_lite"] = Value::Bool(false);
+            entry["multi_agent_version"] = Value::String("v1".to_owned());
+            entry["tool_mode"] = Value::String("default".to_owned());
         }
 
         // Remove the optional web_search_tool_type field when it is explicitly
@@ -707,8 +704,9 @@ mod tests {
             .iter()
             .find(|entry| entry["slug"] == "gpt-5.6-sol")
             .unwrap();
-        assert_eq!(chatgpt["multi_agent_version"], "v2");
-        assert_eq!(chatgpt["tool_mode"], "code_mode_only");
+        assert_eq!(chatgpt["multi_agent_version"], "v1");
+        assert_eq!(chatgpt["tool_mode"], "default");
+        assert_eq!(chatgpt["use_responses_lite"], false);
         assert_eq!(chatgpt["shell_type"], "shell_command");
         assert_eq!(chatgpt["apply_patch_tool_type"], "freeform");
     }
@@ -828,7 +826,7 @@ mod tests {
     }
 
     #[test]
-    fn official_search_and_v2_stay_on_chatgpt_oauth_only() {
+    fn official_search_stays_on_chatgpt_oauth_only() {
         let oauth_cfg = crate::config::RouterConfig {
             models: vec![ModelConfig {
                 model: "gpt-5.6-sol".to_owned(),
@@ -859,7 +857,9 @@ mod tests {
         let oauth = &build_model_catalog(&oauth_cfg)[0];
         let relay = &build_model_catalog(&relay_cfg)[0];
         assert_eq!(oauth["supports_search_tool"], true);
-        assert_eq!(oauth["multi_agent_version"], "v2");
+        assert_eq!(oauth["multi_agent_version"], "v1");
+        assert_eq!(oauth["tool_mode"], "default");
+        assert_eq!(oauth["use_responses_lite"], false);
         assert_eq!(relay["supports_search_tool"], false);
         assert_eq!(relay["multi_agent_version"], "v1");
         assert_eq!(oauth_platform_for_catalog(&gemini), "gemini");

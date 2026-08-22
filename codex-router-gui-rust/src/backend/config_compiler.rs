@@ -585,6 +585,38 @@ mod tests {
     }
 
     #[test]
+    fn legacy_openai_compatibility_without_capabilities_still_loads() {
+        let yaml = r#"
+host: 127.0.0.1
+port: 18081
+remote-management: {}
+auth-dir: ./auth
+openai-compatibility:
+  - name: legacy
+    prefix: legacy
+    base-url: https://example.com/v1
+    api-key-entries:
+      - api-key: placeholder
+    models:
+      - name: upstream
+        alias: public
+        force-mapping: true
+plugins:
+  enabled: true
+  dir: ./plugins
+  configs:
+    gemini-cli:
+      enabled: true
+"#;
+
+        let config = from_yaml(yaml).unwrap();
+        assert!(config.openai_compatibility[0]
+            .openai_capabilities
+            .is_empty());
+        assert!(to_yaml(&config).unwrap().contains("openai-compatibility:"));
+    }
+
+    #[test]
     fn compiler_rejects_empty_routes_and_loopback_violations() {
         assert!(compile(&[], "k", "s", "./auth").is_err());
         let config = CliProxyConfig {

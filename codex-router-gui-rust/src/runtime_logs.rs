@@ -18,6 +18,11 @@ const MAX_BATCH_BYTES: usize = 32 * 1024;
 const MAX_BATCH_RECORDS: usize = 64;
 const DROPPED_SUMMARY_RESERVE_BYTES: usize = 256;
 const RUNTIME_LOG_CHANNEL_CAPACITY: usize = 8;
+/// The startup tail replay exists to explain the current run. Structured
+/// Router events older than this window around the GUI start belong to a
+/// previous run (for example a failed upstream session from hours ago) and
+/// would otherwise flood the activity log with stale `request_failure` rows.
+const ROUTER_EVENTS_HISTORY_GRACE: Duration = Duration::from_secs(120);
 
 #[derive(Debug)]
 pub(crate) struct RuntimeLogBatch {
@@ -260,6 +265,7 @@ pub(crate) fn spawn(
     paused: Arc<AtomicBool>,
 ) {
     std::thread::spawn(move || {
+        let started_at = chrono::Utc::now();
         let mut sources = vec![
             LogSource::new(
                 &router_root,
@@ -337,6 +343,10 @@ pub(crate) fn spawn(
                         if initial_read {
                             let mut recent = VecDeque::with_capacity(INITIAL_LINES_PER_SOURCE);
                             for line in lines {
+                                if !initial_history_line_is_current(source.kind, &line, started_at)
+                                {
+                                    continue;
+                                }
                                 if let Some(record) =
                                     format_diagnostic_line(source.label, source.kind, &line)
                                 {
@@ -445,18 +455,80 @@ fn format_diagnostic_line(label: &str, kind: LogKind, line: &str) -> Option<Stri
     }
 }
 
+/// Extract the structured `"timestamp"` field of a Router event JSONL record.
+fn router_event_timestamp(line: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    static EVENT_TIMESTAMP: OnceLock<Regex> = OnceLock::new();
+    let regex = EVENT_TIMESTAMP.get_or_init(|| {
+        Regex::new(r#""timestamp"\s*:\s*"([^"]+)""#).expect("event timestamp regex is valid")
+    });
+    let value = regex.captures(line)?.get(1)?.as_str();
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+        .ok()
+}
+
+/// Whether a line from the initial tail replay is still relevant. Stale
+/// structured Router events are dropped from the replay (they reappear live
+/// only if they happen again); lines without a parsable timestamp stay
+/// visible so a malformed feed never hides a real problem, and the other log
+/// sources keep their existing behavior.
+fn initial_history_line_is_current(
+    kind: LogKind,
+    line: &str,
+    started_at: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if !matches!(kind, LogKind::RouterEvents) {
+        return true;
+    }
+    let Some(timestamp) = router_event_timestamp(line) else {
+        return true;
+    };
+    let grace = chrono::Duration::from_std(ROUTER_EVENTS_HISTORY_GRACE)
+        .expect("history grace fits into a chrono duration");
+    // Future timestamps (clock skew) count as current.
+    started_at.signed_duration_since(timestamp) <= grace
+}
+
 /// The structured JSONL event stream is the mandated diagnostic feed; only
 /// WARN and above reaches the UI so per-request INFO traffic stays on disk.
 fn is_router_events_diagnostic(line: &str) -> bool {
     let upper = line.to_ascii_uppercase();
-    [
+    let level_ok = [
         r#""LEVEL":"WARN""#,
         r#""LEVEL":"ERROR""#,
         r#""LEVEL":"FATAL""#,
         r#""LEVEL":"PANIC""#,
     ]
     .iter()
-    .any(|needle| upper.contains(needle))
+    .any(|needle| upper.contains(*needle));
+    if !level_ok {
+        return false;
+    }
+    // Configuration sync emits WARN-level `configuration` rows on every Apply.
+    // They are not user-actionable and flood the activity log.
+    if router_event_name(line).eq_ignore_ascii_case("configuration")
+        || upper.contains(r#""EVENT":"CONFIGURATION""#)
+        || router_event_name(line).eq_ignore_ascii_case("ledger.record_failed")
+        || upper.contains(r#""EVENT":"LEDGER.RECORD_FAILED""#)
+    {
+        return false;
+    }
+    true
+}
+
+fn router_event_json_field(line: &str, field: &str) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_str(line).ok()?;
+    json.get(field)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn router_event_name(line: &str) -> String {
+    router_event_json_field(line, "event")
+        .or_else(|| router_event_json_field(line, "class"))
+        .unwrap_or_default()
 }
 
 /// CLIProxyAPI writes Go-slog style console lines; forward only lines that
@@ -537,7 +609,22 @@ pub(crate) fn summarize_error_for_display(text: &str) -> String {
     for code in error_code_markers(text) {
         append_field(&mut output, "code", &code);
     }
+    if let Some(event) = router_event_name_from_text(text) {
+        if !output.contains("event=") {
+            append_field(&mut output, "event", &event);
+        }
+    }
     output
+}
+
+fn router_event_name_from_text(text: &str) -> Option<String> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    let event = router_event_name(&text[start..=end]);
+    (!event.is_empty()).then_some(event)
 }
 
 /// Router error codes (`CR-XXX-NNNN`) are fixed, secret-free identifiers
@@ -977,7 +1064,20 @@ mod tests {
             .expect("warn event is diagnostic");
         assert!(safe.contains("[Router events]"));
         assert!(safe.contains("CR-CFG-0005"));
+        assert!(safe.contains("event=backend.config_push_failed"), "{safe}");
         assert!(!safe.contains("secret-key"), "payload leaked: {safe}");
+        let configuration = concat!(
+            r#"{"error_code":"CR-CFG-0005","event":"configuration","#,
+            r#""level":"WARN"}"#
+        );
+        assert!(format_diagnostic_line(
+            "Router events",
+            LogKind::RouterEvents,
+            configuration
+        )
+        .is_none());
+        let ledger = r#"{"error_description":"request ledger entry already exists","event":"ledger.record_failed","level":"WARN"}"#;
+        assert!(format_diagnostic_line("Router events", LogKind::RouterEvents, ledger).is_none());
     }
 
     #[test]
@@ -1102,6 +1202,61 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert!(records[0].contains("dropped_records=1"));
         assert!(!records[0].contains("private-secret"));
+    }
+
+    #[test]
+    fn stale_router_event_history_is_not_replayed_on_startup() {
+        let started_at = chrono::Utc::now();
+        let event_at = |timestamp: chrono::DateTime<chrono::Utc>| {
+            format!(
+                r#"{{"level":"ERROR","error_code":"CR-SYS-0001","timestamp":"{}"}}"#,
+                timestamp.to_rfc3339()
+            )
+        };
+        let stale = event_at(started_at - chrono::Duration::hours(2));
+        let just_before = event_at(started_at - ROUTER_EVENTS_HISTORY_GRACE);
+        let live = event_at(started_at);
+
+        assert!(!initial_history_line_is_current(
+            LogKind::RouterEvents,
+            &stale,
+            started_at
+        ));
+        // Events right at the grace boundary still explain the current run.
+        assert!(initial_history_line_is_current(
+            LogKind::RouterEvents,
+            &just_before,
+            started_at
+        ));
+        assert!(initial_history_line_is_current(
+            LogKind::RouterEvents,
+            &live,
+            started_at
+        ));
+        // Clock skew into the future is treated as current.
+        let future = event_at(started_at + chrono::Duration::minutes(5));
+        assert!(initial_history_line_is_current(
+            LogKind::RouterEvents,
+            &future,
+            started_at
+        ));
+        // A line without a parsable timestamp never gets hidden.
+        assert!(initial_history_line_is_current(
+            LogKind::RouterEvents,
+            r#"{"level":"ERROR","error_code":"CR-SYS-0001"}"#,
+            started_at
+        ));
+        // Other log sources keep their existing replay behavior.
+        assert!(initial_history_line_is_current(
+            LogKind::Stderr,
+            &stale,
+            started_at
+        ));
+        assert!(initial_history_line_is_current(
+            LogKind::CliProxyApi,
+            &stale,
+            started_at
+        ));
     }
 
     #[test]

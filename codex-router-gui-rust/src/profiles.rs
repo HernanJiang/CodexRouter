@@ -567,6 +567,7 @@ fn capture_current_state(
 
 fn restore_full_state(
     source: &Path,
+    router_root: &Path,
     cfg: &RouterConfig,
     manifest: &StateManifest,
 ) -> anyhow::Result<()> {
@@ -591,6 +592,13 @@ fn restore_full_state(
     } else {
         logic::normalize_windows_sandbox_config(&snapshot_config)
     };
+    // Keep a dormant codex_router provider (and the catalog copy) so threads
+    // created under Router routing still open after the binding is removed.
+    let merged_config = logic::codex_toml::preserve_router_provider_for_history(
+        cfg,
+        router_root,
+        &merged_config,
+    );
     let config_content = (!merged_config.trim().is_empty()).then(|| merged_config.into_bytes());
     let auth_content = if manifest.auth_present {
         let auth_temp = codex_home.join(format!("{}.json.tmp", timestamp_id("auth-restore")));
@@ -1215,6 +1223,7 @@ pub(crate) fn merge_codex_route_config(current: &str, target: &str) -> anyhow::R
 
 fn restore_shared_config(
     source: &Path,
+    router_root: &Path,
     cfg: &RouterConfig,
     manifest: &StateManifest,
 ) -> anyhow::Result<()> {
@@ -1237,6 +1246,10 @@ fn restore_shared_config(
         logic::normalize_windows_sandbox_config(&snapshot)
     };
     let merged = logic::preserve_windows_sandbox_config(&current, &merged);
+    // Keep a dormant codex_router provider (and the catalog copy) so threads
+    // created under Router routing still open after the binding is removed.
+    let merged =
+        logic::codex_toml::preserve_router_provider_for_history(cfg, router_root, &merged);
     if merged.trim().is_empty() {
         clear_optional_file(&target_path)?;
     } else {
@@ -1319,6 +1332,7 @@ pub fn recover_missing_chatgpt_auth(
 
 fn restore_state(
     source: &Path,
+    router_root: &Path,
     cfg: &RouterConfig,
     share_codex_state: bool,
     recover_missing_shared_auth: bool,
@@ -1341,12 +1355,12 @@ fn restore_state(
     let preserve_shared_state = share_codex_state;
 
     if preserve_shared_state {
-        restore_shared_config(source, cfg, &manifest)?;
+        restore_shared_config(source, router_root, cfg, &manifest)?;
         if recover_missing_shared_auth && !auth_target.is_file() && snapshot_auth.valid_chatgpt {
             restore_snapshot_auth(source, cfg)?;
         }
     } else {
-        restore_full_state(source, cfg, &manifest)?;
+        restore_full_state(source, router_root, cfg, &manifest)?;
     }
 
     let final_auth = read_auth_info(&auth_target);
@@ -1361,7 +1375,7 @@ fn sanitize_router_config(text: &str) -> String {
     let Ok(mut document) = text.parse::<DocumentMut>() else {
         return text.to_owned();
     };
-    let router_provider = document
+    let active_router_provider = document
         .get("model_provider")
         .and_then(Item::as_str)
         .filter(|provider_id| matches!(*provider_id, "codex_router" | "custom" | "sub2api"))
@@ -1377,9 +1391,17 @@ fn sanitize_router_config(text: &str) -> String {
                     == Some("Codex-Router")
         })
         .map(str::to_owned);
-    let Some(provider_id) = router_provider else {
+    let dormant_router_provider = document
+        .get("model_providers")
+        .and_then(Item::as_table_like)
+        .and_then(|providers| providers.get("codex_router"))
+        .and_then(Item::as_table_like)
+        .and_then(|provider| provider.get("name"))
+        .and_then(Item::as_str)
+        == Some("Codex-Router");
+    if active_router_provider.is_none() && !dormant_router_provider {
         return text.to_owned();
-    };
+    }
 
     for key in [
         "model_provider",
@@ -1402,7 +1424,9 @@ fn sanitize_router_config(text: &str) -> String {
         .get_mut("model_providers")
         .and_then(Item::as_table_like_mut)
     {
-        providers.remove(&provider_id);
+        if let Some(provider_id) = active_router_provider.as_deref() {
+            providers.remove(provider_id);
+        }
         providers.remove("codex_router");
         providers.remove("sub2api");
         let remove_legacy_custom = providers
@@ -1497,7 +1521,13 @@ pub fn restore_original_codex(
     share_codex_state: bool,
 ) -> anyhow::Result<RestoreOutcome> {
     ensure_original_codex_snapshot(router_root, cfg)?;
-    restore_state(&original_root(router_root), cfg, share_codex_state, true)
+    restore_state(
+        &original_root(router_root),
+        router_root,
+        cfg,
+        share_codex_state,
+        true,
+    )
 }
 
 /// Reset Codex to its own factory defaults instead of replaying a Router
@@ -1519,10 +1549,24 @@ pub fn initialize_codex_defaults(
     if config_path.is_file() {
         let current = std::fs::read_to_string(&config_path)?;
         let cleaned = sanitize_router_config(&current);
+        // Keep a dormant codex_router provider (and the catalog copy) so
+        // conversations created under Router routing stay openable even after
+        // the default route returns to Codex official.
+        let cleaned =
+            logic::codex_toml::preserve_router_provider_for_history(cfg, router_root, &cleaned);
         if cleaned.trim().is_empty() {
             clear_optional_file(&config_path)?;
         } else {
             atomic_write(&config_path, cleaned.as_bytes())?;
+        }
+    } else {
+        // No config file at all: still leave the dormant provider behind when
+        // this machine previously served Router models, so historical
+        // conversations keep their provider definition.
+        let overlaid =
+            logic::codex_toml::preserve_router_provider_for_history(cfg, router_root, "");
+        if !overlaid.trim().is_empty() {
+            atomic_write(&config_path, overlaid.as_bytes())?;
         }
     }
 
@@ -1631,7 +1675,7 @@ pub fn restore_point_config(
     share_codex_state: bool,
 ) -> anyhow::Result<(RouterConfig, RestoreOutcome)> {
     let source = history_root(router_root).join(&point.id);
-    let outcome = restore_state(&source, fallback, share_codex_state, false)?;
+    let outcome = restore_state(&source, router_root, fallback, share_codex_state, false)?;
     let saved_router = source.join("router-config.json");
     let config = if saved_router.is_file() {
         RouterConfig::load(&saved_router)
@@ -1791,6 +1835,7 @@ pub fn restore_profile_codex_state(
 ) -> anyhow::Result<RestoreOutcome> {
     restore_state(
         &profile_root(router_root).join(&profile.id),
+        router_root,
         cfg,
         share_codex_state,
         false,
@@ -2304,6 +2349,25 @@ experimental_bearer_token = "sk-local-test"
             "chat"
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sanitizer_removes_a_dormant_router_catalog_overlay() {
+        let input = r#"model_catalog_json = "C:/Users/Test/.codex/model-catalog.codex-router.json"
+model = "deepseek-v4-flash"
+approval_policy = "never"
+
+[model_providers.codex_router]
+name = "Codex-Router"
+base_url = "http://127.0.0.1:28082/v1"
+experimental_bearer_token = "fixture-secret"
+"#;
+        let output = sanitize_router_config(input);
+        assert!(output.contains("approval_policy = \"never\""));
+        assert!(!output.contains("model_catalog_json"));
+        assert!(!output.contains("deepseek-v4-flash"));
+        assert!(!output.contains("codex_router"));
+        assert!(!output.contains("fixture-secret"));
     }
 
     #[test]

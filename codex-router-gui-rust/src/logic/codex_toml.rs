@@ -896,12 +896,28 @@ pub fn probe_codex_binding_state(
     router_root: &Path,
 ) -> anyhow::Result<CodexBindingProbe> {
     let local_api_key = super::ensure_local_api_key()?;
-    probe_codex_binding_state_with_key(
+    let probe = probe_codex_binding_state_with_key(
         cfg,
         router_root,
         &local_api_key,
         &codex_system_config_path(),
-    )
+    )?;
+    if !probe.user_layer_bound
+        && !probe.system_layer_bound
+        && probe
+            .user_model
+            .as_deref()
+            .is_some_and(|model| model.eq_ignore_ascii_case("first"))
+    {
+        repair_codex_router_binding_with_key(cfg, router_root, &local_api_key)?;
+        return probe_codex_binding_state_with_key(
+            cfg,
+            router_root,
+            &local_api_key,
+            &codex_system_config_path(),
+        );
+    }
+    Ok(probe)
 }
 
 pub(crate) fn probe_codex_binding_state_with_key(
@@ -1252,6 +1268,92 @@ pub(crate) fn remove_codex_system_binding_from(path: &Path) -> anyhow::Result<bo
 
 pub fn remove_codex_system_binding() -> anyhow::Result<bool> {
     remove_codex_system_binding_from(&codex_system_config_path())
+}
+
+/// Keep historical Codex conversations loadable after the Router binding is
+/// removed (factory reset, official-route switch, full exit). Threads created
+/// under Router routing store `model_provider = "codex_router"`; without a
+/// matching provider block Codex refuses to open them ("Model provider
+/// codex_router not found"). This adds a *dormant* `codex_router` provider
+/// block, but never sets the `model_provider` default or the global catalog
+/// pointer. New threads and the model picker therefore stay official while old
+/// threads can still resolve their stored provider id.
+///
+/// Best-effort: any failure returns the input unchanged so a restore never
+/// fails because of this compatibility overlay.
+pub fn preserve_router_provider_for_history(
+    cfg: &RouterConfig,
+    router_root: &Path,
+    text: &str,
+) -> String {
+    // Cheap gates first: a missing catalog means this machine never served
+    // Router models, and an existing block means the work is already done.
+    // Only then is the local credential worth reading.
+    let catalog_source = crate::user_data::state_root(router_root).join("model-catalog.json");
+    if !catalog_source.is_file() || history_overlay_present(text) {
+        return text.to_owned();
+    }
+    let result = super::ensure_local_api_key().and_then(|key| {
+        preserve_router_provider_for_history_with_key(cfg, router_root, text, &key)
+    });
+    result.unwrap_or_else(|_| text.to_owned())
+}
+
+fn history_overlay_present(text: &str) -> bool {
+    let Ok(doc) = text.parse::<DocumentMut>() else {
+        return false;
+    };
+    if text.trim().is_empty() {
+        return false;
+    }
+    doc.get("model_provider").and_then(Item::as_str) == Some("codex_router")
+        || doc
+            .get("model_providers")
+            .and_then(Item::as_table_like)
+            .and_then(|providers| providers.get("codex_router"))
+            .is_some()
+}
+
+fn preserve_router_provider_for_history_with_key(
+    cfg: &RouterConfig,
+    router_root: &Path,
+    text: &str,
+    local_api_key: &str,
+) -> anyhow::Result<String> {
+    if local_api_key.is_empty() {
+        return Ok(text.to_owned());
+    }
+    let mut doc: DocumentMut = if text.trim().is_empty() {
+        DocumentMut::new()
+    } else {
+        text.parse().context("config.toml is not valid TOML")?
+    };
+    // Still router-bound, or the dormant block already exists: nothing to add.
+    if history_overlay_present(text) {
+        return Ok(text.to_owned());
+    }
+    // Without a deployed catalog the Router never served this machine, so no
+    // historical thread can reference the provider either.
+    let catalog_source = crate::user_data::state_root(router_root).join("model-catalog.json");
+    if !catalog_source.is_file() {
+        return Ok(text.to_owned());
+    }
+    let codex_home = resolve_codex_home(cfg);
+    std::fs::create_dir_all(&codex_home)?;
+    let provider = build_codex_router_provider(
+        &codex_public_base_url(cfg),
+        local_api_key,
+        login_requires_openai_auth(&codex_home, cfg, text),
+        false,
+    );
+    let model_providers =
+        doc["model_providers"].or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+    model_providers["codex_router"] = toml_edit::Item::Table(provider);
+    let mut out = doc.to_string();
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -2294,6 +2396,154 @@ sandbox = "unelevated"
         assert!(path.exists());
         assert!(remove_codex_system_binding_from(&path).unwrap());
         assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn history_overlay_fixture(name: &str) -> (PathBuf, PathBuf, PathBuf, RouterConfig) {
+        let tmp = std::env::temp_dir().join(format!(
+            "codex-router-history-overlay-{name}-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let router_root = tmp.join("router");
+        let codex_home = tmp.join("codex-home");
+        std::fs::create_dir_all(&router_root).unwrap();
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let mut cfg = RouterConfig::default();
+        cfg.deploy.codex_home = codex_home.to_string_lossy().into_owned();
+        cfg.deploy.sub2api_host = "http://127.0.0.1:28080".to_owned();
+        (tmp, router_root, codex_home, cfg)
+    }
+
+    #[test]
+    fn history_overlay_adds_a_dormant_provider_without_changing_the_model_menu() {
+        let (tmp, router_root, codex_home, cfg) = history_overlay_fixture("adds");
+        std::fs::write(router_root.join("model-catalog.json"), "{\"models\":[]}").unwrap();
+        let input = "model = \"gpt-5.6-sol\"\napproval_policy = \"never\"\n";
+
+        let out = preserve_router_provider_for_history_with_key(
+            &cfg,
+            &router_root,
+            input,
+            "fixture-history-key",
+        )
+        .unwrap();
+
+        // The dormant provider lets historical threads keep loading...
+        assert!(out.contains("[model_providers.codex_router]"));
+        assert!(out.contains("name = \"Codex-Router\""));
+        assert!(out.contains("experimental_bearer_token = \"fixture-history-key\""));
+        assert!(out.contains("base_url = \"http://127.0.0.1:28082/v1\""));
+        assert!(!out.contains("model_catalog_json"));
+        assert!(!out.contains("model-catalog.codex-router.json"));
+        // ...but the default route and model menu stay official.
+        assert!(!out.contains("model_provider ="));
+        // The user's own settings survive without registering a custom model
+        // catalog in the desktop picker.
+        assert!(out.contains("approval_policy = \"never\""));
+        assert!(out.contains("model = \"gpt-5.6-sol\""));
+        assert!(!codex_home.join("model-catalog.codex-router.json").exists());
+        assert!(out.ends_with('\n'));
+        // Re-running the overlay is a no-op.
+        let again = preserve_router_provider_for_history_with_key(
+            &cfg,
+            &router_root,
+            &out,
+            "fixture-history-key",
+        )
+        .unwrap();
+        assert_eq!(again, out);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn history_overlay_is_a_no_op_when_the_router_is_still_bound() {
+        let (tmp, router_root, _codex_home, cfg) = history_overlay_fixture("bound");
+        std::fs::write(router_root.join("model-catalog.json"), "{}").unwrap();
+        let input = "model_provider = \"codex_router\"\nmodel = \"gpt-5.6-sol\"\n";
+
+        let out = preserve_router_provider_for_history_with_key(
+            &cfg,
+            &router_root,
+            input,
+            "fixture-history-key",
+        )
+        .unwrap();
+
+        assert_eq!(out, input);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn history_overlay_is_a_no_op_without_a_deployed_catalog() {
+        let (tmp, router_root, codex_home, cfg) = history_overlay_fixture("no-catalog");
+        let input = "model = \"gpt-5.6-sol\"\n";
+
+        let out = preserve_router_provider_for_history_with_key(
+            &cfg,
+            &router_root,
+            input,
+            "fixture-history-key",
+        )
+        .unwrap();
+
+        assert_eq!(out, input);
+        assert!(!codex_home.join("model-catalog.codex-router.json").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn history_overlay_keeps_an_existing_catalog_pointer() {
+        let (tmp, router_root, _codex_home, cfg) = history_overlay_fixture("keeps-pointer");
+        std::fs::write(router_root.join("model-catalog.json"), "{}").unwrap();
+        let input = "model = \"gpt-5.6-sol\"\nmodel_catalog_json = \"D:/elsewhere/catalog.json\"\n";
+
+        let out = preserve_router_provider_for_history_with_key(
+            &cfg,
+            &router_root,
+            input,
+            "fixture-history-key",
+        )
+        .unwrap();
+
+        assert!(out.contains("model_catalog_json = \"D:/elsewhere/catalog.json\""));
+        assert!(!out.contains("model-catalog.codex-router.json\""));
+        assert!(out.contains("[model_providers.codex_router]"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn history_overlay_builds_a_minimal_config_from_nothing() {
+        let (tmp, router_root, _codex_home, cfg) = history_overlay_fixture("from-empty");
+        std::fs::write(router_root.join("model-catalog.json"), "{}").unwrap();
+
+        let out =
+            preserve_router_provider_for_history_with_key(&cfg, &router_root, "", "fixture-history-key")
+                .unwrap();
+
+        assert!(out.contains("[model_providers.codex_router]"));
+        assert!(!out.contains("model_catalog_json"));
+        assert!(!out.contains("model_provider ="));
+        // The result parses as valid TOML again.
+        out.parse::<DocumentMut>().unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn history_overlay_never_fails_on_invalid_input_or_missing_key() {
+        let (tmp, router_root, _codex_home, cfg) = history_overlay_fixture("best-effort");
+        std::fs::write(router_root.join("model-catalog.json"), "{}").unwrap();
+        let invalid = "not [valid";
+        assert_eq!(
+            preserve_router_provider_for_history(&cfg, &router_root, invalid),
+            invalid
+        );
+        let input = "model = \"gpt-5.6-sol\"\n";
+        assert_eq!(
+            preserve_router_provider_for_history_with_key(&cfg, &router_root, input, "").unwrap(),
+            input
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

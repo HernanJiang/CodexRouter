@@ -64,7 +64,7 @@ const OAUTH_RECOVERY_MAX_INTERVAL: std::time::Duration =
 const DEFAULT_ROUTER_REQUIRES_OPENAI_AUTH: bool = true;
 const HEALTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 const API_MODEL_VALIDATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
-const EXIT_CONFIG_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const EXIT_CONFIG_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const EXIT_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 #[cfg(test)]
 const EXIT_PROCESS_KILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -252,6 +252,43 @@ fn initial_page_for_config(config: Option<&RouterConfig>) -> (Page, bool) {
     (page, configured)
 }
 
+fn codex_user_model_is_invalid_first(config: &RouterConfig) -> bool {
+    let path = logic::resolve_codex_home(config).join("config.toml");
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| text.parse::<toml_edit::DocumentMut>().ok())
+        .and_then(|document| {
+            document
+                .get("model")
+                .and_then(toml_edit::Item::as_str)
+                .map(str::to_owned)
+        })
+        .is_some_and(|model| model.eq_ignore_ascii_case("first"))
+}
+
+fn router_mode_enabled_on_startup(
+    prefer_router_mode: bool,
+    official_mode_selected: bool,
+    configured_router_mode: bool,
+    configured: bool,
+    has_models: bool,
+    invalid_first_model: bool,
+) -> bool {
+    !official_mode_selected
+        && (prefer_router_mode
+            || configured_router_mode
+            || configured && has_models && invalid_first_model)
+}
+
+fn recover_single_profile_binding(
+    generate_isolation: bool,
+    active_profile_id: &str,
+    profiles: &[IsolationProfile],
+) -> Option<String> {
+    (generate_isolation && active_profile_id.trim().is_empty() && profiles.len() == 1)
+        .then(|| profiles[0].id.clone())
+}
+
 #[derive(Clone, Debug)]
 struct UiAuditOptions {
     scenario: String,
@@ -396,6 +433,190 @@ fn auto_enable_first_oauth_model(
     }
     logic::normalize_default_model(config);
     Some(display_name)
+}
+
+fn fallback_oauth_model_id(platform: &str) -> &'static str {
+    match platform.trim().to_ascii_lowercase().as_str() {
+        "openai" | "chatgpt" => "gpt-5.6-sol",
+        "anthropic" | "claude" => "claude-sonnet-4-5",
+        "gemini" => "gemini-3.1-pro",
+        "antigravity" => "gemini-3.1-pro",
+        "grok" | "xai" | "x-ai" => "grok-4.5",
+        _ => "grok-4.5",
+    }
+}
+
+fn oauth_catalog_model_id(platform: &str, model_id: &str) -> String {
+    if platform.eq_ignore_ascii_case("openai") && model_id.eq_ignore_ascii_case("gpt-5.6") {
+        "gpt-5.6-sol".to_owned()
+    } else {
+        model_id.to_owned()
+    }
+}
+
+fn existing_oauth_pool_models<'a>(
+    config: &'a RouterConfig,
+    account: &OAuthAccountSummary,
+) -> Vec<&'a ModelConfig> {
+    config
+        .models
+        .iter()
+        .filter(|existing| {
+            existing.source == "oauth"
+                && oauth_platform_matches(&existing.oauth_platform, &account.platform)
+        })
+        .collect()
+}
+
+fn push_oauth_model_channel(
+    config: &mut RouterConfig,
+    account: &OAuthAccountSummary,
+    model_id: String,
+    display_name: String,
+    template: Option<&ModelConfig>,
+) -> bool {
+    if config.models.iter().any(|existing| {
+        existing.source == "oauth"
+            && existing.oauth_account_id == account.id
+            && logic::canonical_route_model_id(&existing.model)
+                == logic::canonical_route_model_id(&model_id)
+    }) {
+        return false;
+    }
+    let mut channel = template.cloned().unwrap_or_else(|| ModelConfig {
+        alias_customized: Some(false),
+        base_url: format!("Router OAuth / {}", account.platform),
+        priority: config.oauth_fallback.official_priority,
+        source: "oauth".to_owned(),
+        user_selected: true,
+        multimodal: "auto".to_owned(),
+        ..Default::default()
+    });
+    channel.model = model_id;
+    if template.is_none() || template.is_some_and(|item| item.alias_customized != Some(true)) {
+        channel.alias = display_name;
+        channel.alias_customized = Some(false);
+    }
+    channel.source = "oauth".to_owned();
+    channel.oauth_account_id = account.id;
+    channel.oauth_platform = account.platform.clone();
+    channel.user_selected = true;
+    if channel.base_url.trim().is_empty() {
+        channel.base_url = format!("Router OAuth / {}", account.platform);
+    }
+    config.models.push(channel);
+    true
+}
+
+fn import_oauth_account_default_model(
+    config: &mut RouterConfig,
+    account: &OAuthAccountSummary,
+) -> Option<String> {
+    if !account.bound_to_router {
+        return None;
+    }
+    let selected = config.oauth_account_ids.get_or_insert_with(Vec::new);
+    if !selected.contains(&account.id) {
+        selected.push(account.id);
+    }
+
+    let pool_models = existing_oauth_pool_models(config, account)
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut imported = Vec::new();
+
+    if !pool_models.is_empty() {
+        // Same provider pool: attach this account to every existing route card
+        // (Grok 4.5 + Grok 4.6 share the three-account pool).
+        for template in &pool_models {
+            if push_oauth_model_channel(
+                config,
+                account,
+                template.model.clone(),
+                template.alias.clone(),
+                Some(template),
+            ) {
+                imported.push(template.alias.clone());
+            }
+        }
+    }
+
+    let catalog: Vec<(String, String)> = if account.models.is_empty() {
+        if pool_models.is_empty() {
+            let model_id = fallback_oauth_model_id(&account.platform).to_owned();
+            vec![(model_id.clone(), model_id)]
+        } else {
+            Vec::new()
+        }
+    } else {
+        account
+            .models
+            .iter()
+            .map(|model| {
+                let model_id = oauth_catalog_model_id(&account.platform, &model.id);
+                let display_name = if model.display_name.trim().is_empty() {
+                    model_id.clone()
+                } else {
+                    model.display_name.clone()
+                };
+                (model_id, display_name)
+            })
+            .collect()
+    };
+
+    for (model_id, display_name) in catalog {
+        let template = pool_models
+            .iter()
+            .find(|existing| {
+                logic::canonical_route_model_id(&existing.model)
+                    == logic::canonical_route_model_id(&model_id)
+            })
+            .cloned();
+        if push_oauth_model_channel(
+            config,
+            account,
+            model_id,
+            display_name.clone(),
+            template.as_ref(),
+        ) {
+            imported.push(display_name);
+        }
+    }
+
+    if imported.is_empty() {
+        return None;
+    }
+    logic::normalize_default_model(config);
+    imported.sort();
+    imported.dedup();
+    Some(imported.join("、"))
+}
+
+fn auto_import_new_oauth_models(
+    config: &mut RouterConfig,
+    accounts: &[OAuthAccountSummary],
+    provider: Option<&str>,
+    previous_ids: &[i64],
+) -> Vec<String> {
+    let mut imported = Vec::new();
+    for account in accounts {
+        if !account.bound_to_router {
+            continue;
+        }
+        if previous_ids.contains(&account.id) {
+            continue;
+        }
+        if let Some(requested) = provider {
+            if !oauth_platform_matches(&account.platform, requested) {
+                continue;
+            }
+        }
+        if let Some(name) = import_oauth_account_default_model(config, account) {
+            imported.push(name);
+        }
+    }
+    imported
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -837,6 +1058,12 @@ struct ProviderOAuthPromptState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResultDialogKind {
+    Success,
+    Failure,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TrayAction {
     RestoreWindow,
     HideWindow,
@@ -1113,6 +1340,10 @@ struct CodexRouterApp {
     close_prompt_open: bool,
     apply_success_dialog_open: bool,
     apply_success_is_subscription: bool,
+    result_dialog_open: bool,
+    result_dialog_kind: ResultDialogKind,
+    result_dialog_title: String,
+    result_dialog_body: String,
     remember_close_choice: bool,
     exit_after_prompt: bool,
     exit_shutdown_in_progress: bool,
@@ -1137,6 +1368,9 @@ struct CodexRouterApp {
     oauth_model_hint_seen: bool,
     pending_oauth_provider: Option<String>,
     oauth_auto_enable_provider: Option<String>,
+    oauth_in_flight_provider: Option<String>,
+    oauth_known_account_ids: Vec<i64>,
+    oauth_success_pending: bool,
     provider_oauth_preparing: bool,
     provider_oauth_preparing_provider: Option<String>,
     provider_oauth_prepare_generation: u64,
@@ -1149,6 +1383,7 @@ struct CodexRouterApp {
     provider_oauth_gemini_code_assist: bool,
     provider_oauth_project_draft: String,
     oauth_revoke_target: Option<OAuthAccountSummary>,
+    oauth_revoke_candidates: Vec<OAuthAccountSummary>,
     oauth_revoking: bool,
     oauth_priority_target: Option<OAuthAccountSummary>,
     oauth_priority_draft: i32,
@@ -1171,6 +1406,7 @@ struct CodexRouterApp {
     monitor_api_order: Vec<i64>,
     share_codex_state: bool,
     router_mode_enabled: bool,
+    official_mode_selected: bool,
     router_mode_switching: bool,
     codex_account_mode_status: profiles::CodexAccountModeStatus,
     codex_account_mode_switching: bool,
@@ -1315,6 +1551,7 @@ fn restore_codex_and_stop_router_for_exit(
         router_root,
         config,
         share_codex_state,
+        &logic::codex_toml::codex_system_config_path(),
         stop_router_for_exit,
     )
 }
@@ -1323,44 +1560,55 @@ fn restore_codex_and_stop_router_for_exit_with<F>(
     router_root: &Path,
     fallback_config: &RouterConfig,
     share_codex_state: bool,
+    system_config_path: &Path,
     stop_router: F,
 ) -> anyhow::Result<()>
 where
     F: FnOnce(&Path, &RouterConfig) -> anyhow::Result<()>,
 {
-    let mut stop_config = fallback_config.clone();
-    let restore_result = (|| -> anyhow::Result<()> {
-        let _config_lock =
-            profiles::acquire_config_apply_lock(router_root, EXIT_CONFIG_LOCK_TIMEOUT)
-                .context("could not acquire the Router configuration lock during exit")?;
-        let config_path = user_data::config_path(router_root);
-        if config_path.is_file() {
-            let applied_config = RouterConfig::load(&config_path)
-                .context("could not load the last applied Router configuration during exit")?;
-            stop_config = applied_config.clone();
-            let router_mode_configured = logic::codex_router_mode_configured(&applied_config);
-            restore_codex_for_exit(
-                router_root,
-                &applied_config,
-                share_codex_state,
-                router_mode_configured,
-            )?;
-        }
-        Ok(())
-    })();
-
-    // A broken/stale Codex snapshot must not leave the forwarding stack alive
-    // after the user explicitly selected Exit. Always attempt both halves and
-    // retain both errors when cleanup also fails.
-    let stop_result = stop_router(router_root, &stop_config);
-    match (restore_result, stop_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(restore_error), Ok(())) => Err(restore_error),
-        (Ok(()), Err(stop_error)) => Err(stop_error),
-        (Err(restore_error), Err(stop_error)) => Err(anyhow::anyhow!(
-            "Codex restore failed: {restore_error}; Router shutdown also failed: {stop_error}"
-        )),
+    // Wait for any in-flight Apply to finish first (exit already signalled its
+    // cancel flag). Only then do we own both the config file and the services.
+    let _config_lock = profiles::acquire_config_apply_lock(router_root, EXIT_CONFIG_LOCK_TIMEOUT)
+        .context("could not acquire the Router configuration lock during exit")?;
+    let config_path = user_data::config_path(router_root);
+    if !config_path.is_file() {
+        // Router was never applied from this data root: nothing to restore,
+        // only local services (if any) need to stop.
+        return stop_router(router_root, fallback_config);
     }
+    let stop_config = match RouterConfig::load(&config_path) {
+        Ok(applied_config) => applied_config,
+        Err(error) => {
+            // A broken saved Router config must not block the service
+            // shutdown; report it after stopping instead of skipping it.
+            let stop_result = stop_router(router_root, fallback_config);
+            let load_error = error
+                .context("could not load the last applied Router configuration during exit");
+            return match stop_result {
+                Ok(()) => Err(load_error),
+                Err(stop_error) => Err(anyhow::anyhow!(
+                    "Router shutdown failed: {stop_error}; saved Router config was also unreadable: {load_error}"
+                )),
+            };
+        }
+    };
+
+    // Stop first: while any managed service is still running, the Codex binding
+    // must stay in place so the desktop client keeps working. A failed stop
+    // therefore returns early with the Codex configuration untouched. Only a
+    // fully stopped stack is followed by the config restore, so Codex never
+    // ends up pointing at a dead local gateway.
+    stop_router(router_root, &stop_config)?;
+    let router_mode_configured = logic::codex_router_mode_configured(&stop_config);
+    restore_codex_for_exit(
+        router_root,
+        &stop_config,
+        share_codex_state,
+        router_mode_configured,
+    )?;
+    logic::codex_toml::remove_codex_system_binding_from(system_config_path)
+        .map(|_| ())
+        .context("could not remove the system-layer Router binding during exit")
 }
 
 fn restore_codex_for_exit(
@@ -2309,12 +2557,15 @@ where
             "ROUTER_DEPLOY_NO_MODELS: the configuration has no model channel, so nothing can be deployed"
         );
     }
+    let previous_host = cfg.deploy.sub2api_host.clone();
     if let Some(host) = lifecycle::adopt_isolated_host_if_foreign(router_root, cfg) {
         on_log(
             if zh {
-                format!("检测到 18080 已被另一份 Router 占用，本次改用 {host}")
+                format!("检测到 {previous_host} 已被另一份 Router 或程序占用，本次改用 {host}")
             } else {
-                format!("Port 18080 belongs to another Router; this apply uses {host}")
+                format!(
+                    "Port(s) for {previous_host} belong to another Router or program; this apply uses {host}"
+                )
             },
         );
     }
@@ -2784,9 +3035,9 @@ impl CodexRouterApp {
         // explicit and portable across subsequent versions.
         let _ = ui_preferences.save(&ui_preferences_path);
         let close_behavior = ui_preferences.close_behavior;
-        let active_profile_id = ui_preferences.active_profile_id;
-        let monitor_subscription_order = ui_preferences.monitor_subscription_order;
-        let monitor_api_order = ui_preferences.monitor_api_order;
+        let mut active_profile_id = ui_preferences.active_profile_id.clone();
+        let monitor_subscription_order = ui_preferences.monitor_subscription_order.clone();
+        let monitor_api_order = ui_preferences.monitor_api_order.clone();
         let share_codex_state = ui_preferences.share_codex_state;
         let oauth_model_hint_seen = ui_preferences.oauth_model_hint_seen;
         let isolation_profiles = profiles::list_profiles(&router_root).unwrap_or_default();
@@ -2810,6 +3061,15 @@ impl CodexRouterApp {
                 (RouterConfig::default(), page, configured)
             }
         };
+        if let Some(recovered) = recover_single_profile_binding(
+            config.deploy.generate_isolation,
+            &active_profile_id,
+            &isolation_profiles,
+        ) {
+            active_profile_id = recovered;
+            ui_preferences.active_profile_id.clone_from(&active_profile_id);
+            let _ = ui_preferences.save(&ui_preferences_path);
+        }
         if std::env::var_os("CODEX_ROUTER_FORCE_WELCOME").is_some_and(|value| value == "1")
             || !user_data::config_looks_configured(&config)
         {
@@ -2977,7 +3237,14 @@ impl CodexRouterApp {
         let configured_router_mode = logic::codex_router_mode_configured(&config);
         // Prefer the explicit dashboard switch intent. Third-party tools that
         // rewrite model_providers.custom must not silently disable Router mode.
-        let router_mode_enabled = ui_preferences.prefer_router_mode || configured_router_mode;
+        let router_mode_enabled = router_mode_enabled_on_startup(
+            ui_preferences.prefer_router_mode,
+            ui_preferences.official_mode_selected,
+            configured_router_mode,
+            configured,
+            !config.models.is_empty(),
+            codex_user_model_is_invalid_first(&config),
+        );
         let codex_account_mode_status = profiles::codex_account_mode_status(&router_root, &config);
         let has_selected_oauth = config
             .oauth_account_ids
@@ -2986,6 +3253,7 @@ impl CodexRouterApp {
             || config.models.iter().any(|model| model.source == "oauth");
         let oauth_recovery_due = (configured && router_mode_enabled && has_selected_oauth)
             .then(|| std::time::Instant::now() + std::time::Duration::from_secs(300));
+        let startup_router_recovery = configured && router_mode_enabled;
         let runtime_log_paused = Arc::new(AtomicBool::new(start_in_background));
         let mut app = Self {
             ui_audit_mode: false,
@@ -3037,6 +3305,10 @@ impl CodexRouterApp {
             close_prompt_open: false,
             apply_success_dialog_open: false,
             apply_success_is_subscription: false,
+            result_dialog_open: false,
+            result_dialog_kind: ResultDialogKind::Success,
+            result_dialog_title: String::new(),
+            result_dialog_body: String::new(),
             remember_close_choice: false,
             exit_after_prompt: false,
             exit_shutdown_in_progress: false,
@@ -3061,6 +3333,9 @@ impl CodexRouterApp {
             oauth_model_hint_seen,
             pending_oauth_provider: None,
             oauth_auto_enable_provider: None,
+            oauth_in_flight_provider: None,
+            oauth_known_account_ids: Vec::new(),
+            oauth_success_pending: false,
             provider_oauth_preparing: false,
             provider_oauth_preparing_provider: None,
             provider_oauth_prepare_generation: 0,
@@ -3073,6 +3348,7 @@ impl CodexRouterApp {
             provider_oauth_gemini_code_assist: false,
             provider_oauth_project_draft: String::new(),
             oauth_revoke_target: None,
+            oauth_revoke_candidates: Vec::new(),
             oauth_revoking: false,
             oauth_priority_target: None,
             oauth_priority_draft: 1,
@@ -3097,6 +3373,7 @@ impl CodexRouterApp {
             monitor_api_order,
             share_codex_state,
             router_mode_enabled,
+            official_mode_selected: ui_preferences.official_mode_selected,
             router_mode_switching: false,
             codex_account_mode_status,
             codex_account_mode_switching: false,
@@ -3128,7 +3405,7 @@ impl CodexRouterApp {
                 .then(|| std::time::Instant::now() + HEALTHY_PROBE_INTERVAL),
             health_probe_running: false,
             health_probe_failures: 0,
-            health_recovery_running: false,
+            health_recovery_running: startup_router_recovery,
             health_recovery_cancel: Arc::new(AtomicBool::new(false)),
             routing_sync_running: false,
             routing_sync_pending: false,
@@ -3150,6 +3427,17 @@ impl CodexRouterApp {
             update_dialog_open: false,
             update_info: None,
         };
+        if startup_router_recovery {
+            let root = app.router_root.clone();
+            let tx = app.event_tx.clone();
+            let cancel = app.health_recovery_cancel.clone();
+            std::thread::spawn(move || {
+                let result = lifecycle::ensure_services(&root, true, &cancel, false)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string());
+                tx.send(AppEvent::RouterHealthRecoveryFinished(result)).ok();
+            });
+        }
         if !start_in_background {
             app.load_usage_monitor_cache();
             if configured {
@@ -3181,15 +3469,6 @@ impl CodexRouterApp {
         if router_mode_enabled && !ui_preferences.prefer_router_mode {
             // Migrate older installs that already bind Codex to Router.
             let _ = app.persist_ui_preferences();
-        }
-        if router_mode_enabled {
-            logic::responses_gateway::set_max_output_tokens_map(logic::max_output_tokens_map(
-                &app.config,
-            ));
-            let _ = logic::responses_gateway::ensure_responses_gateway(
-                &app.config.deploy.sub2api_host,
-                app.config.rate_limit_max_retries,
-            );
         }
         app
     }
@@ -3508,6 +3787,10 @@ impl CodexRouterApp {
             close_prompt_open: false,
             apply_success_dialog_open: false,
             apply_success_is_subscription: false,
+            result_dialog_open: false,
+            result_dialog_kind: ResultDialogKind::Success,
+            result_dialog_title: String::new(),
+            result_dialog_body: String::new(),
             remember_close_choice: false,
             exit_after_prompt: false,
             exit_shutdown_in_progress: false,
@@ -3547,6 +3830,9 @@ impl CodexRouterApp {
             oauth_model_hint_seen: false,
             pending_oauth_provider: None,
             oauth_auto_enable_provider: None,
+            oauth_in_flight_provider: None,
+            oauth_known_account_ids: Vec::new(),
+            oauth_success_pending: false,
             provider_oauth_preparing: false,
             provider_oauth_preparing_provider: None,
             provider_oauth_prepare_generation: 0,
@@ -3559,6 +3845,7 @@ impl CodexRouterApp {
             provider_oauth_gemini_code_assist: false,
             provider_oauth_project_draft: String::new(),
             oauth_revoke_target: None,
+            oauth_revoke_candidates: Vec::new(),
             oauth_revoking: false,
             oauth_priority_target: None,
             oauth_priority_draft: 1,
@@ -3581,6 +3868,7 @@ impl CodexRouterApp {
             monitor_api_order: vec![303],
             share_codex_state: true,
             router_mode_enabled: true,
+            official_mode_selected: false,
             router_mode_switching: false,
             codex_account_mode_status: profiles::CodexAccountModeStatus {
                 mode: profiles::CodexAccountMode::Official,
@@ -3809,6 +4097,7 @@ impl CodexRouterApp {
             monitor_api_order: self.monitor_api_order.clone(),
             share_codex_state: self.share_codex_state,
             prefer_router_mode: self.router_mode_enabled,
+            official_mode_selected: self.official_mode_selected,
             oauth_model_hint_seen: self.oauth_model_hint_seen,
             codex_overwrite_decision: self.codex_overwrite_decision.clone(),
             codex_overwrite_fingerprint: self.codex_overwrite_decision_fingerprint.clone(),
@@ -4125,6 +4414,7 @@ impl CodexRouterApp {
                 self.active_profile_id.clear();
                 self.pending_profile_activation = None;
                 self.router_mode_enabled = false;
+                self.official_mode_selected = true;
                 self.oauth_recovery_due = None;
                 self.persist_ui_preferences();
                 self.status_text = if outcome.auth_available {
@@ -4614,9 +4904,21 @@ impl CodexRouterApp {
                     if self.exit_shutdown_in_progress {
                         continue;
                     }
+                    // The apply may have adopted a different local port group
+                    // when the configured one was owned by another Router copy.
+                    // Pull the committed value back so health probes, the
+                    // gateway ensure, and future applies use the live port.
+                    if let Ok(applied) =
+                        RouterConfig::load(&user_data::config_path(&self.router_root))
+                    {
+                        if self.config.deploy.sub2api_host != applied.deploy.sub2api_host {
+                            self.config.deploy.sub2api_host = applied.deploy.sub2api_host;
+                        }
+                    }
                     self.apply_success_dialog_open = true;
                     self.configured = true;
                     self.router_mode_enabled = true;
+                    self.official_mode_selected = false;
                     self.persist_ui_preferences();
                     self.codex_account_mode_status =
                         profiles::codex_account_mode_status(&self.router_root, &self.config);
@@ -4800,6 +5102,16 @@ impl CodexRouterApp {
                             .then(left.platform.cmp(&right.platform))
                             .then(left.id.cmp(&right.id))
                     });
+                    let previous_ids = if self.oauth_known_account_ids.is_empty() {
+                        self.oauth_accounts
+                            .iter()
+                            .filter(|account| account.bound_to_router)
+                            .map(|account| account.id)
+                            .collect::<Vec<_>>()
+                    } else {
+                        self.oauth_known_account_ids.clone()
+                    };
+                    let in_flight = self.oauth_in_flight_provider.clone();
                     let auto_enabled_model = self
                         .oauth_auto_enable_provider
                         .clone()
@@ -4814,6 +5126,27 @@ impl CodexRouterApp {
                         self.oauth_auto_enable_provider = None;
                         self.apply_success_is_subscription = true;
                     }
+                    let imported = if in_flight.is_some()
+                        || self.oauth_success_pending
+                        || self.provider_oauth_running
+                    {
+                        auto_import_new_oauth_models(
+                            &mut self.config,
+                            &accounts,
+                            in_flight.as_deref(),
+                            &previous_ids,
+                        )
+                    } else {
+                        Vec::new()
+                    };
+                    let discovered_in_flight = in_flight.is_some()
+                        && accounts.iter().any(|account| {
+                            account.bound_to_router
+                                && !previous_ids.contains(&account.id)
+                                && in_flight.as_deref().is_none_or(|provider| {
+                                    oauth_platform_matches(&account.platform, provider)
+                                })
+                        });
                     let mut selected = self.config.oauth_account_ids.clone().unwrap_or_default();
                     let mut seen = self.config.oauth_seen_account_ids.clone();
                     let bound_account_ids = accounts
@@ -4832,10 +5165,29 @@ impl CodexRouterApp {
                         self.grok_sso_auto_select_pending = false;
                     }
                     self.oauth_accounts = accounts;
-                    if auto_added > 0 {
+                    let should_announce = !imported.is_empty()
+                        || discovered_in_flight
+                        || (self.oauth_success_pending && !self.result_dialog_open);
+                    if should_announce {
+                        let provider = in_flight.clone().unwrap_or_default();
+                        self.show_oauth_authorized_dialog(&provider, &imported);
+                    }
+                    if self.oauth_success_pending
+                        || !imported.is_empty()
+                        || discovered_in_flight
+                    {
+                        self.oauth_success_pending = false;
+                        self.oauth_in_flight_provider = None;
+                        self.oauth_known_account_ids.clear();
+                        self.provider_oauth_running = false;
+                    }
+                    if auto_added > 0 || !imported.is_empty() {
                         let selected = self.config.oauth_account_ids.clone();
                         let seen = self.config.oauth_seen_account_ids.clone();
+                        let models = self.config.models.clone();
+                        let default_model = self.config.default_model.clone();
                         let config_path = user_data::config_path(&self.router_root);
+                        let persist_models = !imported.is_empty();
                         let persisted = (|| -> anyhow::Result<()> {
                             let mut saved = if config_path.is_file() {
                                 RouterConfig::load(&config_path)?
@@ -4844,6 +5196,10 @@ impl CodexRouterApp {
                             };
                             saved.oauth_account_ids = selected.clone();
                             saved.oauth_seen_account_ids = seen.clone();
+                            if persist_models {
+                                saved.models = models;
+                                saved.default_model = default_model;
+                            }
                             saved.save(&config_path)?;
                             if !self.active_profile_id.trim().is_empty() {
                                 profiles::update_profile_oauth_selection(
@@ -4864,15 +5220,17 @@ impl CodexRouterApp {
                         if self.page != Page::OAuth {
                             self.schedule_usage_refresh();
                         }
-                        self.status_text = if zh {
-                            format!(
-                                "已自动把 {auto_added} 个新 OAuth 账号加入当前配置，并刷新用量统计"
-                            )
-                        } else {
-                            format!(
-                                "Added {auto_added} new OAuth account(s) to this profile and refreshed usage statistics"
-                            )
-                        };
+                        if !self.result_dialog_open {
+                            self.status_text = if zh {
+                                format!(
+                                    "已自动将 {auto_added} 个新 OAuth 账号加入当前配置，并刷新用量统计"
+                                )
+                            } else {
+                                format!(
+                                    "Added {auto_added} new OAuth account(s) to this profile and refreshed usage statistics"
+                                )
+                            };
+                        }
                         // Discovering a new OAuth account is a background
                         // observation. Never invoke the full Apply path here:
                         // Apply rewrites Codex config/catalog and restarts the
@@ -4893,11 +5251,13 @@ impl CodexRouterApp {
                         self.refresh_usage_monitor();
                     }
                     if let Some(model) = auto_enabled_model {
-                        self.status_text = if zh {
-                            format!("订阅认证成功，已默认启用第一个可用模型：{model}")
-                        } else {
-                            format!("Subscription authorized. Enabled the first available model: {model}")
-                        };
+                        if !self.result_dialog_open {
+                            self.status_text = if zh {
+                                format!("订阅授权成功，已默认启用第一个可用模型：{model}")
+                            } else {
+                                format!("Subscription authorized. Enabled the first available model: {model}")
+                            };
+                        }
                     }
                 }
                 AppEvent::OAuthAccountsError(error) => {
@@ -5016,55 +5376,44 @@ impl CodexRouterApp {
                     self.provider_oauth_prompt = None;
                     self.provider_oauth_code_draft.clear();
                     self.provider_oauth_project_draft.clear();
-                    // Wizard / first-run access never shows the tip. After the
-                    // product is configured, the first successful OAuth add
-                    // from a post-setup surface shows it once.
-                    let wizard_surface = matches!(
-                        self.page,
-                        Page::Welcome
-                            | Page::Project
-                            | Page::Auth
-                            | Page::Model
-                            | Page::Proxy
-                            | Page::Finish
-                    ) || matches!(
-                        self.oauth_return_page,
-                        Page::Welcome
-                            | Page::Project
-                            | Page::Auth
-                            | Page::Model
-                            | Page::Proxy
-                            | Page::Finish
-                    );
-                    if self.configured
-                        && !wizard_surface
-                        && !self.oauth_model_hint_seen
-                        && !self.ui_audit_mode
-                    {
-                        self.oauth_post_login_prompt_open = true;
-                    }
+                    self.oauth_success_pending = true;
                     self.status_text = if zh {
-                        "OAuth 登录成功，正在自动同步到当前配置与用量统计…"
+                        "授权已成功，正在同步账号和模型…".to_owned()
                     } else {
-                        "OAuth login succeeded. Syncing it to this profile and usage statistics…"
-                    }
-                    .to_owned();
+                        "Authorization succeeded. Syncing the account and models…".to_owned()
+                    };
                     self.refresh_oauth_accounts();
                 }
                 AppEvent::ProviderOAuthError(error) => {
+                    let detail = runtime_logs::summarize_error_for_display(&error);
+                    let cancelled = detail.to_ascii_lowercase().contains("cancelled")
+                        || detail.to_ascii_lowercase().contains("class=cancelled");
+                    if self.oauth_success_pending
+                        || cancelled && self.oauth_in_flight_provider.is_none()
+                    {
+                        self.provider_oauth_running = false;
+                        continue;
+                    }
                     self.provider_oauth_running = false;
                     self.oauth_auto_enable_provider = None;
+                    self.oauth_in_flight_provider = None;
+                    self.oauth_success_pending = false;
                     self.provider_oauth_prompt = None;
                     self.provider_oauth_code_draft.clear();
                     self.provider_oauth_project_draft.clear();
-                    let detail = runtime_logs::summarize_error_for_display(&error);
-                    self.status_text = if zh {
-                        format!("OAuth 登录未完成：{detail}")
-                    } else {
-                        format!("OAuth login did not complete: {detail}")
-                    }
-                    .to_owned();
-                    self.log(self.status_text.clone());
+                    self.show_result_dialog(
+                        ResultDialogKind::Failure,
+                        if zh {
+                            "授权未完成"
+                        } else {
+                            "Authorization did not finish"
+                        },
+                        if zh {
+                            format!("授权未完成，请检查配置后重试。{detail}")
+                        } else {
+                            format!("Authorization did not finish. Check the configuration and retry. {detail}")
+                        },
+                    );
                 }
                 AppEvent::UsageLoaded {
                     profile_key,
@@ -5183,6 +5532,7 @@ impl CodexRouterApp {
                 AppEvent::RouterModeDisabled(outcome) => {
                     self.router_mode_switching = false;
                     self.router_mode_enabled = false;
+                    self.official_mode_selected = true;
                     let _ = self.persist_ui_preferences();
                     self.codex_account_mode_status =
                         profiles::codex_account_mode_status(&self.router_root, &self.config);
@@ -5268,6 +5618,14 @@ impl CodexRouterApp {
                     self.grok_sso_draft.clear();
                     self.grok_sso_error.clear();
                     self.grok_sso_auto_select_pending = true;
+                    self.oauth_in_flight_provider = Some("grok".to_owned());
+                    self.oauth_success_pending = true;
+                    self.oauth_known_account_ids = self
+                        .oauth_accounts
+                        .iter()
+                        .filter(|account| account.bound_to_router)
+                        .map(|account| account.id)
+                        .collect();
                     self.status_text = if zh {
                         "Grok 授权码已导入；账号已加入当前路由配置".to_owned()
                     } else {
@@ -5295,6 +5653,7 @@ impl CodexRouterApp {
                 } => {
                     self.oauth_revoking = false;
                     self.oauth_revoke_target = None;
+                    self.oauth_revoke_candidates.clear();
                     logic::remove_oauth_account_references(&mut self.config, account_id);
                     self.schedule_usage_refresh();
                     let mut cleanup_errors = Vec::new();
@@ -5340,6 +5699,7 @@ impl CodexRouterApp {
                 AppEvent::OAuthAccountRevokeError(error) => {
                     self.oauth_revoking = false;
                     self.oauth_revoke_target = None;
+                    self.oauth_revoke_candidates.clear();
                     let detail = runtime_logs::summarize_error_for_display(&error);
                     self.oauth_error.clone_from(&detail);
                     self.status_text = if zh {
@@ -5410,23 +5770,42 @@ impl CodexRouterApp {
                         Ok(()) => {
                             self.temp_model = (*model).clone();
                             self.commit_model_draft(*model, editing_model, model_from_wizard);
+                            if !model_from_wizard {
+                                self.show_result_dialog(
+                                    ResultDialogKind::Success,
+                                    if zh {
+                                        "添加成功"
+                                    } else {
+                                        "Added successfully"
+                                    },
+                                    if zh {
+                                        "本配置有效，模型已添加。保存并应用后即可在 Codex 使用。"
+                                    } else {
+                                        "This configuration is valid and the model was added. Save & apply to use it in Codex."
+                                    },
+                                );
+                            }
                         }
                         Err(code) => {
                             self.temp_model = *model;
-                            self.status_text = format!(
-                                "{}：{}",
+                            let detail = api_model_validation_message(&code, zh);
+                            self.show_result_dialog(
+                                ResultDialogKind::Failure,
                                 if zh {
-                                    "API 渠道不可用，未添加"
+                                    "本配置无效"
                                 } else {
-                                    "API channel unavailable; not added"
+                                    "Configuration is invalid"
                                 },
-                                api_model_validation_message(&code, zh)
+                                if zh {
+                                    format!("本配置无效，请检查配置。{detail}")
+                                } else {
+                                    format!("This configuration is invalid. Please check the settings. {detail}")
+                                },
                             );
-                            self.status_expires_at = None;
-                            self.log(self.status_text.clone());
                         }
                     }
                 }
+
                 AppEvent::UpdateProgress(progress) => {
                     self.update_downloaded_bytes = progress.downloaded_bytes;
                     self.update_total_bytes = progress.total_bytes;
@@ -5577,6 +5956,10 @@ impl CodexRouterApp {
                                 8,
                             );
                             self.log(self.status_text.clone());
+                            self.oauth_retry_due = Some(std::time::Instant::now());
+                            self.schedule_usage_refresh();
+                            self.codex_binding_check_completed = false;
+                            self.observe_codex_binding_state();
                         }
                         Err(error) => {
                             let detail = runtime_logs::summarize_error_for_display(&error);
@@ -7012,6 +7395,69 @@ impl CodexRouterApp {
     }
 
 
+    fn show_result_dialog(
+        &mut self,
+        kind: ResultDialogKind,
+        title: impl Into<String>,
+        body: impl Into<String>,
+    ) {
+        self.result_dialog_kind = kind;
+        self.result_dialog_title = title.into();
+        self.result_dialog_body = body.into();
+        self.result_dialog_open = true;
+        self.status_text = self.result_dialog_body.clone();
+        if kind == ResultDialogKind::Failure {
+            self.status_expires_at = None;
+        }
+        self.log(self.result_dialog_body.clone());
+    }
+
+    fn show_oauth_authorized_dialog(&mut self, provider: &str, imported: &[String]) {
+        let zh = self.ui_language == "zh";
+        let provider_key = provider.trim().to_ascii_lowercase();
+        let provider_label = match provider_key.as_str() {
+            "openai" | "chatgpt" => "ChatGPT",
+            "anthropic" | "claude" => "Claude",
+            "gemini" => "Gemini",
+            "antigravity" => "Antigravity",
+            "grok" | "xai" | "x-ai" => "Grok",
+            other if !other.is_empty() => other,
+            _ => {
+                if zh {
+                    "订阅"
+                } else {
+                    "subscription"
+                }
+            }
+        };
+        let body = if zh {
+            if imported.is_empty() {
+                format!("{provider_label} 授权已成功。账号已加入当前配置；请在 OAuth 页选择要使用的模型后保存并应用。")
+            } else {
+                format!(
+                    "{provider_label} 授权已成功，已将 {} 加入当前模型列表。保存并应用后即可在 Codex 使用。",
+                    imported.join("、")
+                )
+            }
+        } else if imported.is_empty() {
+            format!("{provider_label} authorization succeeded. The account was added to this profile; choose models on the OAuth page, then Save & apply.")
+        } else {
+            format!(
+                "{provider_label} authorization succeeded and added {} to this profile. Save & apply to use it in Codex.",
+                imported.join(", ")
+            )
+        };
+        self.show_result_dialog(
+            ResultDialogKind::Success,
+            if zh {
+                "授权已成功"
+            } else {
+                "Authorization succeeded"
+            },
+            body,
+        );
+    }
+
     fn local_sub2api_base_url(&self) -> String {
         let fallback = crate::config::default_router_host();
         let candidate = self.config.deploy.sub2api_host.trim().trim_end_matches('/');
@@ -7051,6 +7497,8 @@ impl CodexRouterApp {
         self.provider_oauth_preparing_provider = None;
         self.pending_oauth_provider = None;
         self.oauth_auto_enable_provider = None;
+        self.oauth_in_flight_provider = None;
+        self.oauth_success_pending = false;
         self.status_text = if self.ui_language == "zh" {
             "已取消 OAuth 登录。关闭浏览器标签后可重新点击登录。".to_owned()
         } else {
@@ -7210,6 +7658,14 @@ impl CodexRouterApp {
         let cancel = self.provider_oauth_cancel.clone();
         cancel.store(false, Ordering::Relaxed);
         self.provider_oauth_running = true;
+        self.oauth_in_flight_provider = Some(provider.clone());
+        self.oauth_success_pending = false;
+        self.oauth_known_account_ids = self
+            .oauth_accounts
+            .iter()
+            .filter(|account| account.bound_to_router)
+            .map(|account| account.id)
+            .collect();
         self.status_text = if self.ui_language == "zh" {
             format!("正在打开 {provider} 官方授权页；请按新窗口提示完成登录")
         } else {
@@ -8637,7 +9093,7 @@ mod main_tests {
     use std::io::{Read, Write};
 
     use super::{
-        append_bounded_log, auto_enable_first_oauth_model, classify_router_health_error,
+        append_bounded_log, auto_enable_first_oauth_model, auto_import_new_oauth_models, classify_router_health_error,
         clear_stale_oauth_account_errors, decode_icon,
         default_oauth_recovery_seconds, deploy_router_config, failover_account_id,
         fallback_transition_notification, fit_window_to_monitor, fit_window_to_work_area,
@@ -8649,7 +9105,7 @@ mod main_tests {
         oauth_recovery_schedule_delay, profile_binding_ready, request_result_disposition,
         restore_apply_ui_fields,         restore_codex_and_stop_router_for_exit_with,
         restore_codex_for_exit, restored_window_size, retain_last_good_oauth_models,
-        runtime_probes_allowed,
+        recover_single_profile_binding, router_mode_enabled_on_startup, runtime_probes_allowed,
         run_hidden_powershell_output, should_leave_tray_lightweight, stored_window_size,
         scheduled_oauth_recovery_can_start, scheduled_usage_refresh_is_due,
         window_size_is_usable,
@@ -8800,6 +9256,235 @@ mod main_tests {
             None
         );
         assert_eq!(config.models.len(), 1);
+    }
+
+    #[test]
+    fn later_oauth_account_imports_its_default_model() {
+        let first = OAuthAccountSummary {
+            id: 11,
+            name: "Grok one".to_owned(),
+            platform: "grok".to_owned(),
+            status: "active".to_owned(),
+            email: String::new(),
+            plan: String::new(),
+            priority: 1,
+            bound_to_router: true,
+            error: String::new(),
+            expires_at: String::new(),
+            models: vec![OAuthModelSummary {
+                id: "grok-4.5".to_owned(),
+                display_name: "Grok 4.5".to_owned(),
+            }],
+            models_error: String::new(),
+        };
+        let third = OAuthAccountSummary {
+            id: 24,
+            name: "Grok three".to_owned(),
+            platform: "xai".to_owned(),
+            status: "active".to_owned(),
+            email: String::new(),
+            plan: String::new(),
+            priority: 3,
+            bound_to_router: true,
+            error: String::new(),
+            expires_at: String::new(),
+            models: vec![OAuthModelSummary {
+                id: "grok-4.5".to_owned(),
+                display_name: "Grok 4.5 Team".to_owned(),
+            }],
+            models_error: String::new(),
+        };
+        let mut config = RouterConfig::default();
+        assert_eq!(
+            auto_enable_first_oauth_model(&mut config, std::slice::from_ref(&first), "grok"),
+            Some("Grok 4.5".to_owned())
+        );
+        config.models.push(ModelConfig {
+            model: "grok-4.6".to_owned(),
+            alias: "Grok 4.6".to_owned(),
+            source: "oauth".to_owned(),
+            oauth_account_id: 11,
+            oauth_platform: "grok".to_owned(),
+            ..Default::default()
+        });
+        let imported = auto_import_new_oauth_models(
+            &mut config,
+            &[first.clone(), third.clone()],
+            Some("grok"),
+            &[11],
+        );
+        assert!(imported.iter().any(|name| name.contains("Grok 4.5 Team") || name.contains("Grok 4.6")), "{imported:?}");
+        assert_eq!(
+            config
+                .models
+                .iter()
+                .filter(|model| model.oauth_account_id == 24)
+                .count(),
+            2
+        );
+        assert!(config.models.iter().any(|model| {
+            model.oauth_account_id == 24 && model.model == "grok-4.6"
+        }));
+        assert!(config.models.iter().any(|model| {
+            model.oauth_account_id == 24 && model.model == "grok-4.5"
+        }));
+        assert_eq!(
+            auto_import_new_oauth_models(&mut config, &[first, third], Some("grok"), &[11, 24]),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn later_oauth_account_without_catalog_still_imports_a_route_slot() {
+        let first = OAuthAccountSummary {
+            id: 11,
+            name: "Grok one".to_owned(),
+            platform: "grok".to_owned(),
+            status: "active".to_owned(),
+            email: String::new(),
+            plan: String::new(),
+            priority: 1,
+            bound_to_router: true,
+            error: String::new(),
+            expires_at: String::new(),
+            models: vec![OAuthModelSummary {
+                id: "grok-4.5".to_owned(),
+                display_name: "Grok 4.5".to_owned(),
+            }],
+            models_error: String::new(),
+        };
+        let third = OAuthAccountSummary {
+            id: 36,
+            name: "Grok OAuth (oauth.user@example.com)".to_owned(),
+            platform: "x-ai".to_owned(),
+            status: "active".to_owned(),
+            email: "oauth.user@example.com".to_owned(),
+            plan: String::new(),
+            priority: 1,
+            bound_to_router: true,
+            error: String::new(),
+            expires_at: String::new(),
+            models: Vec::new(),
+            models_error: String::new(),
+        };
+        let mut config = RouterConfig::default();
+        assert_eq!(
+            auto_enable_first_oauth_model(&mut config, std::slice::from_ref(&first), "grok"),
+            Some("Grok 4.5".to_owned())
+        );
+        config.models.push(ModelConfig {
+            model: "grok-4.6".to_owned(),
+            alias: "Grok 4.6".to_owned(),
+            source: "oauth".to_owned(),
+            oauth_account_id: 11,
+            oauth_platform: "grok".to_owned(),
+            ..Default::default()
+        });
+        let imported = auto_import_new_oauth_models(
+            &mut config,
+            &[first, third],
+            Some("grok"),
+            &[11],
+        );
+        assert!(!imported.is_empty());
+        assert_eq!(
+            config
+                .models
+                .iter()
+                .filter(|model| model.oauth_account_id == 36)
+                .count(),
+            2
+        );
+        assert!(config.models.iter().any(|model| {
+            model.oauth_account_id == 36 && model.model == "grok-4.6"
+        }));
+        assert!(config.models.iter().any(|model| {
+            model.oauth_account_id == 36 && model.model == "grok-4.5"
+        }));
+    }
+
+    #[test]
+    fn grok_pool_accounts_attach_to_every_existing_route_card() {
+        let first = OAuthAccountSummary {
+            id: 42,
+            name: "Grok one".to_owned(),
+            platform: "grok".to_owned(),
+            status: "active".to_owned(),
+            email: "one@example.com".to_owned(),
+            plan: String::new(),
+            priority: 1,
+            bound_to_router: true,
+            error: String::new(),
+            expires_at: String::new(),
+            models: vec![
+                OAuthModelSummary {
+                    id: "grok-4.5".to_owned(),
+                    display_name: "Grok 4.5".to_owned(),
+                },
+                OAuthModelSummary {
+                    id: "grok-4.6".to_owned(),
+                    display_name: "Grok 4.6".to_owned(),
+                },
+            ],
+            models_error: String::new(),
+        };
+        let second = OAuthAccountSummary {
+            id: 43,
+            name: "Grok two".to_owned(),
+            platform: "x-ai".to_owned(),
+            status: "active".to_owned(),
+            email: "two@example.com".to_owned(),
+            plan: String::new(),
+            priority: 1,
+            bound_to_router: true,
+            error: String::new(),
+            expires_at: String::new(),
+            models: Vec::new(),
+            models_error: String::new(),
+        };
+        let mut config = RouterConfig {
+            models: vec![
+                ModelConfig {
+                    model: "grok-4.6".to_owned(),
+                    alias: "Grok 4.6".to_owned(),
+                    source: "oauth".to_owned(),
+                    oauth_account_id: 42,
+                    oauth_platform: "grok".to_owned(),
+                    ..Default::default()
+                },
+                ModelConfig {
+                    model: "grok-4.5".to_owned(),
+                    alias: "Grok 4.5".to_owned(),
+                    source: "oauth".to_owned(),
+                    oauth_account_id: 42,
+                    oauth_platform: "grok".to_owned(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let imported = auto_import_new_oauth_models(
+            &mut config,
+            &[first, second],
+            Some("grok"),
+            &[42],
+        );
+        assert!(!imported.is_empty());
+        let grok46 = config
+            .models
+            .iter()
+            .filter(|model| model.model == "grok-4.6")
+            .map(|model| model.oauth_account_id)
+            .collect::<Vec<_>>();
+        let grok45 = config
+            .models
+            .iter()
+            .filter(|model| model.model == "grok-4.5")
+            .map(|model| model.oauth_account_id)
+            .collect::<Vec<_>>();
+        assert_eq!(grok46, vec![42, 43]);
+        assert_eq!(grok45, vec![42, 43]);
+        assert_eq!(crate::logic::dashboard_model_rows(&config.models)[0].account_count, 2);
     }
 
     #[test]
@@ -9329,13 +10014,16 @@ mod main_tests {
         let apply_lock =
             super::profiles::acquire_config_apply_lock(&root, std::time::Duration::from_secs(1))
                 .unwrap();
+        let system_binding = root.join("system-config.toml");
         let worker_root = root.clone();
         let worker_config = config.clone();
+        let worker_system_binding = system_binding.clone();
         let exit = std::thread::spawn(move || {
             restore_codex_and_stop_router_for_exit_with(
                 &worker_root,
                 &worker_config,
                 true,
+                &worker_system_binding,
                 |_, _| Ok(()),
             )
         });
@@ -9372,12 +10060,14 @@ mod main_tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("codex-router-config.json"), b"{invalid-json").unwrap();
+        let system_binding = root.join("system-config.toml");
 
         let mut stopped = false;
         let result = restore_codex_and_stop_router_for_exit_with(
             &root,
             &RouterConfig::default(),
             true,
+            &system_binding,
             |_, _| {
             stopped = true;
             Ok(())
@@ -9390,6 +10080,50 @@ mod main_tests {
         assert!(
             stopped,
             "a restore failure skipped the mandatory Router shutdown"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_exit_shutdown_leaves_codex_config_and_system_binding_untouched() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-router-exit-stop-failure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let codex_home = root.join("codex-home");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let mut config = RouterConfig::default();
+        config.deploy.codex_home = codex_home.to_string_lossy().into_owned();
+        config.save(&root.join("codex-router-config.json")).unwrap();
+        let codex_config = "model_provider = \"codex_router\"\nmodel = \"router-model\"\n\
+             [model_providers.codex_router]\nname = \"Codex-Router\"\n\
+             base_url = \"http://127.0.0.1:18082/v1\"\n";
+        std::fs::write(codex_home.join("config.toml"), codex_config).unwrap();
+        let system_binding = root.join("system-config.toml");
+        std::fs::write(&system_binding, "model_provider = \"codex_router\"\n").unwrap();
+
+        let result = restore_codex_and_stop_router_for_exit_with(
+            &root,
+            &RouterConfig::default(),
+            true,
+            &system_binding,
+            |_, _| Err(anyhow::anyhow!("simulated foreign-port conflict")),
+        );
+
+        assert!(result.is_err(), "the shutdown failure must be reported");
+        // While any managed service is still up, Codex must keep pointing at
+        // it: neither the user config nor the system binding may be touched.
+        assert_eq!(
+            std::fs::read_to_string(codex_home.join("config.toml")).unwrap(),
+            codex_config
+        );
+        assert_eq!(
+            std::fs::read_to_string(&system_binding).unwrap(),
+            "model_provider = \"codex_router\"\n"
         );
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -9731,6 +10465,40 @@ mod main_tests {
         assert!(!runtime_probes_allowed(true, false, Page::Dashboard, false));
         assert!(runtime_probes_allowed(true, false, Page::Dashboard, true));
         assert!(runtime_probes_allowed(true, false, Page::Monitor, true));
+    }
+
+    #[test]
+    fn invalid_first_model_recovers_router_mode_unless_official_mode_was_explicit() {
+        assert!(router_mode_enabled_on_startup(
+            false, false, false, true, true, true
+        ));
+        assert!(!router_mode_enabled_on_startup(
+            false, true, false, true, true, true
+        ));
+        assert!(!router_mode_enabled_on_startup(
+            false, false, false, true, true, false
+        ));
+        assert!(router_mode_enabled_on_startup(
+            true, false, false, true, true, false
+        ));
+    }
+
+    #[test]
+    fn one_isolated_profile_recovers_a_missing_shared_binding() {
+        let profiles = vec![IsolationProfile {
+            id: "profile-only".to_owned(),
+            name: "Only profile".to_owned(),
+            kind: IsolationKind::Local,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }];
+        assert_eq!(
+            recover_single_profile_binding(true, "", &profiles).as_deref(),
+            Some("profile-only")
+        );
+        assert!(recover_single_profile_binding(false, "", &profiles).is_none());
+        assert!(recover_single_profile_binding(true, "already", &profiles).is_none());
+        assert!(recover_single_profile_binding(true, "", &[]).is_none());
     }
 
     #[test]

@@ -140,13 +140,21 @@ impl CallbackListeners {
         Ok(Self { listeners })
     }
 
-    fn receive(
+    fn wait<F>(
         &self,
         expected_state: &str,
         timeout: Duration,
         cancel: &AtomicBool,
-    ) -> anyhow::Result<(Zeroizing<String>, String)> {
+        poll_every: Duration,
+        mut on_poll: F,
+    ) -> anyhow::Result<CallbackWait>
+    where
+        F: FnMut() -> anyhow::Result<Option<OAuthResult>>,
+    {
         let deadline = Instant::now() + timeout;
+        let mut last_poll = Instant::now()
+            .checked_sub(poll_every)
+            .unwrap_or_else(Instant::now);
         while Instant::now() < deadline {
             if cancel.load(Ordering::Acquire) {
                 bail!("ROUTER_OAUTH_CANCELLED: class=cancelled")
@@ -156,7 +164,7 @@ impl CallbackListeners {
                     Ok((mut stream, _)) => {
                         if let Ok(callback) = read_callback(&mut stream, expected_state) {
                             let _ = send_callback_page(&mut stream, true);
-                            return Ok(callback);
+                            return Ok(CallbackWait::Code(callback.0, callback.1));
                         }
                         let _ = send_callback_page(&mut stream, false);
                     }
@@ -164,10 +172,23 @@ impl CallbackListeners {
                     Err(error) => return Err(error).context("class=request_failure"),
                 }
             }
+            if last_poll.elapsed() >= poll_every {
+                last_poll = Instant::now();
+                // Polling the account list is best-effort. A transient admin
+                // read must not abort an otherwise successful device login.
+                if let Ok(Some(account)) = on_poll() {
+                    return Ok(CallbackWait::Account(account));
+                }
+            }
             std::thread::sleep(Duration::from_millis(100));
         }
         bail!("ROUTER_OAUTH_CALLBACK_TIMEOUT: class=timeout")
     }
+}
+
+enum CallbackWait {
+    Code(Zeroizing<String>, String),
+    Account(OAuthResult),
 }
 
 pub fn prepare(
@@ -275,51 +296,100 @@ where
     } else {
         None
     };
-    let (code, state) = if let Some(listener) = automatic_listener {
-        listener.receive(
+    let (code, state, finished_account) = if let Some(listener) = automatic_listener {
+        match listener.wait(
             &expected_state,
             Duration::from_secs(300),
             cancel,
-        )?
+            Duration::from_secs(1),
+            || {
+                match load_existing_accounts(&admin, provider) {
+                    Ok(current) => Ok(first_new_account(&existing, current)),
+                    Err(_) => Ok(None),
+                }
+            },
+        )? {
+            CallbackWait::Code(code, state) => (code, state, None),
+            CallbackWait::Account(account) => {
+                (Zeroizing::new(String::new()), String::new(), Some(account))
+            }
+        }
     } else if provider.automatic_callback()
         && !provider.router_owns_callback()
         && !cli_callback_unavailable
     {
-        (Zeroizing::new(String::new()), expected_state.clone())
+        (Zeroizing::new(String::new()), expected_state.clone(), None)
     } else {
         let manual = provider.automatic_callback()
             && (listeners.is_none() || cli_callback_unavailable);
-        match prompt(Prompt::AuthorizationCode { provider, manual })? {
+        let (code, state) = match prompt(Prompt::AuthorizationCode { provider, manual })? {
             PromptResponse::AuthorizationCode(code) if !code.trim().is_empty() => {
                 parse_manual_authorization(code.trim(), &expected_state)?
             }
             PromptResponse::Cancelled => bail!("ROUTER_OAUTH_CANCELLED: class=cancelled"),
             PromptResponse::AuthorizationCode(_) => bail!("class=configuration"),
             PromptResponse::GeminiConfiguration { .. } => bail!("class=configuration"),
-        }
+        };
+        (code, state, None)
     };
     if cancel.load(Ordering::Acquire) {
         bail!("ROUTER_OAUTH_CANCELLED: class=cancelled")
     }
 
-    let created = create_account(
-        &admin,
-        provider,
-        &session_id,
-        &code,
-        &state,
-        group_id,
-        priority,
-        &existing,
-        &gemini,
-    )?;
+    let created = if let Some(account) = finished_account {
+        return finalize_oauth_account(&admin, provider, account);
+    } else {
+        create_account(
+            &admin,
+            provider,
+            &session_id,
+            &code,
+            &state,
+            group_id,
+            priority,
+            &existing,
+            &gemini,
+        )?
+    };
     let result = reconcile_new_account(&admin, provider, created, &existing, group_id)?;
-    let models = super::load_live_oauth_models(&admin, result.account_id, provider.as_str())
-        .context("ROUTER_OAUTH_MODEL_REGISTRY_NOT_READY")?;
-    if models.is_empty() {
-        bail!("ROUTER_OAUTH_MODEL_REGISTRY_EMPTY: class=invalid_response")
-    }
-    let _ = ensure_scheduled_recovery(&admin, result.account_id, provider.recovery_model());
+    finalize_oauth_account(&admin, provider, result)
+}
+
+
+
+fn platform_matches(provider: Provider, platform: &str) -> bool {
+    let normalize = |value: &str| match value.trim().to_ascii_lowercase().as_str() {
+        "chatgpt" => "openai".to_owned(),
+        "claude" => "anthropic".to_owned(),
+        "xai" | "x-ai" => "grok".to_owned(),
+        value => value.to_owned(),
+    };
+    normalize(provider.as_str()) == normalize(platform)
+}
+
+fn first_new_account(
+    known: &[ExistingAccount],
+    current: Vec<ExistingAccount>,
+) -> Option<OAuthResult> {
+    current.into_iter().find(|account| {
+        known.iter().all(|existing| existing.id != account.id)
+    }).map(|account| OAuthResult {
+        account_id: account.id,
+        account_name: account.name,
+        reused_existing: false,
+    })
+}
+
+fn finalize_oauth_account(
+    admin: &usage::AdminClient,
+    provider: Provider,
+    result: OAuthResult,
+) -> anyhow::Result<OAuthResult> {
+    // The account row is the source of truth. Model catalog sync can lag a
+    // few seconds after Grok device authorization; do not keep the UI waiting
+    // or fail the login just because the first catalog read is empty.
+    let _ = super::load_live_oauth_models(admin, result.account_id, provider.as_str());
+    let _ = ensure_scheduled_recovery(admin, result.account_id, provider.recovery_model());
     Ok(result)
 }
 
@@ -485,7 +555,7 @@ fn load_existing_accounts(
     let mut existing = Vec::new();
     for summary in usage::array(items) {
         if usage::string(summary, "type") != "oauth"
-            || !usage::string(summary, "platform").eq_ignore_ascii_case(provider.as_str())
+            || !platform_matches(provider, &usage::string(summary, "platform"))
         {
             continue;
         }
@@ -1200,4 +1270,49 @@ mod tests {
         assert!(usage::get(&credentials, "unrelated").is_none());
         assert_eq!(usage::string(&extra, "subscription_tier"), "premium");
     }
+    #[test]
+    fn first_new_account_returns_the_unseen_id() {
+        let known = vec![ExistingAccount {
+            id: 11,
+            name: "Grok one".to_owned(),
+            priority: 1,
+            identity: Some("grok|subject|a".to_owned()),
+        }];
+        let current = vec![
+            ExistingAccount {
+                id: 11,
+                name: "Grok one".to_owned(),
+                priority: 1,
+                identity: Some("grok|subject|a".to_owned()),
+            },
+            ExistingAccount {
+                id: 24,
+                name: "Grok three".to_owned(),
+                priority: 3,
+                identity: Some("grok|subject|c".to_owned()),
+            },
+        ];
+        let found = first_new_account(&known, current).expect("new account");
+        assert_eq!(found.account_id, 24);
+        assert_eq!(found.account_name, "Grok three");
+        assert!(!found.reused_existing);
+    }
+
+    #[test]
+    fn first_new_account_ignores_already_known_ids() {
+        let known = vec![ExistingAccount {
+            id: 11,
+            name: "Grok one".to_owned(),
+            priority: 1,
+            identity: Some("grok|subject|a".to_owned()),
+        }];
+        let current = vec![ExistingAccount {
+            id: 11,
+            name: "Grok one".to_owned(),
+            priority: 1,
+            identity: Some("grok|subject|a".to_owned()),
+        }];
+        assert!(first_new_account(&known, current).is_none());
+    }
+
 }

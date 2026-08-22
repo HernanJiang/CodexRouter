@@ -1,6 +1,6 @@
 [package]
 name = "codex-router"
-version = "2.0.11"
+version = "2.0.17"
 edition = "2021"
 
 [target.'cfg(windows)'.dependencies]

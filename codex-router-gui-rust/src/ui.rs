@@ -1241,6 +1241,13 @@ impl eframe::App for CodexRouterApp {
                 self.health_probe_failures = 0;
             }
             self.process_scheduled_oauth_account_refresh(ctx);
+            if self.provider_oauth_running
+                && !self.oauth_loading
+                && self.oauth_retry_due.is_none()
+            {
+                self.oauth_retry_due =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+            }
         }
         self.handle_close_request(ctx);
         self.handle_native_minimize(ctx);
@@ -1252,6 +1259,7 @@ impl eframe::App for CodexRouterApp {
         // restore CJK fonts first. Otherwise the UI becomes tofu boxes.
         let needs_full_fonts = self.close_prompt_open
             || self.apply_success_dialog_open
+            || self.result_dialog_open
             || self.codex_overwrite_prompt_open
             || self.oauth_post_login_prompt_open
             || self.profile_delete_target.is_some()
@@ -1401,6 +1409,9 @@ impl eframe::App for CodexRouterApp {
         }
         if self.apply_success_dialog_open {
             self.show_apply_success_dialog(&ctx, &palette);
+        }
+        if self.result_dialog_open {
+            self.show_result_notice_dialog(&ctx, &palette);
         }
         if self.oauth_post_login_prompt_open {
             self.show_oauth_post_login_prompt(&ctx, &palette);
@@ -1941,6 +1952,79 @@ impl CodexRouterApp {
         if acknowledged {
             self.apply_success_dialog_open = false;
             self.apply_success_is_subscription = false;
+        }
+    }
+
+    fn show_result_notice_dialog(&mut self, ctx: &egui::Context, palette: &theme::Palette) {
+        let zh = self.ui_language == "zh";
+        let mut acknowledged = false;
+        let success = self.result_dialog_kind == super::ResultDialogKind::Success;
+        let dialog_size = fit_dialog_size(
+            ctx.content_rect().size(),
+            egui::vec2(520.0, 280.0),
+            egui::vec2(400.0, 220.0),
+        );
+        egui::Window::new("")
+            .id(egui::Id::new("result-notice-dialog"))
+            .title_bar(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .frame(theme::dialog_window_frame())
+            .default_size(dialog_size)
+            .min_size(dialog_size)
+            .max_size(dialog_size)
+            .show(ctx, |ui| {
+                ui.set_width(dialog_size.x);
+                theme::dialog_shell(
+                    ui,
+                    palette,
+                    |ui| {
+                        theme::dialog_title(
+                            ui,
+                            if self.result_dialog_title.is_empty() {
+                                if success {
+                                    t(zh, "操作成功", "Succeeded")
+                                } else {
+                                    t(zh, "操作未完成", "Did not finish")
+                                }
+                            } else {
+                                self.result_dialog_title.as_str()
+                            },
+                        );
+                    },
+                    |ui| {
+                        ui.label(
+                            egui::RichText::new(&self.result_dialog_body)
+                                .size(15.5)
+                                .color(palette.ink),
+                        );
+                        ui.add_space(18.0);
+                        ui.vertical_centered(|ui| {
+                            if ui
+                                .add_sized(
+                                    [160.0, 46.0],
+                                    egui::Button::new(
+                                        egui::RichText::new(t(zh, "知道了", "Got it"))
+                                            .strong()
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .fill(if success { palette.action } else { palette.danger })
+                                    .stroke(egui::Stroke::NONE)
+                                    .corner_radius(egui::CornerRadius::same(7)),
+                                )
+                                .clicked()
+                            {
+                                acknowledged = true;
+                            }
+                        });
+                    },
+                );
+            });
+        if acknowledged {
+            self.result_dialog_open = false;
+            self.result_dialog_title.clear();
+            self.result_dialog_body.clear();
         }
     }
 
@@ -6229,9 +6313,13 @@ impl CodexRouterApp {
         let Some(account) = self.oauth_revoke_target.clone() else {
             return;
         };
+        if self.oauth_revoke_candidates.is_empty() {
+            self.oauth_revoke_candidates = vec![account.clone()];
+        }
         let mut open = true;
         let mut confirm = false;
         let mut cancel = false;
+        let mut selected = account.clone();
         let dialog_size = fit_dialog_size(
             ctx.content_rect().size(),
             egui::vec2(560.0, 360.0),
@@ -6306,23 +6394,31 @@ impl CodexRouterApp {
                             .inner_margin(egui::Margin::same(16))
                             .show(ui, |ui| {
                                 ui.label(
-                                    egui::RichText::new(if account.email.is_empty() {
-                                        account.name.clone()
-                                    } else {
-                                        format!("{} · {}", account.name, account.email)
-                                    })
-                                    .size(20.0)
+                                    egui::RichText::new(t(
+                                        zh,
+                                        "选择要撤销的订阅账号",
+                                        "Choose the subscription account to revoke",
+                                    ))
+                                    .size(16.0)
                                     .strong()
                                     .color(palette.ink),
                                 );
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{} · ID {}",
-                                        account.platform, account.id
-                                    ))
-                                    .small()
-                                    .color(palette.muted),
-                                );
+                                ui.add_space(8.0);
+                                for candidate in self.oauth_revoke_candidates.clone() {
+                                    let label = if candidate.email.is_empty() {
+                                        format!("{} · ID {}", candidate.name, candidate.id)
+                                    } else {
+                                        format!(
+                                            "{} · {} · ID {}",
+                                            candidate.name, candidate.email, candidate.id
+                                        )
+                                    };
+                                    let checked = selected.id == candidate.id;
+                                    if ui.selectable_label(checked, label).clicked() {
+                                        selected = candidate.clone();
+                                        self.oauth_revoke_target = Some(candidate.clone());
+                                    }
+                                }
                                 ui.add_space(12.0);
                                 ui.label(
                                     egui::RichText::new(t(
@@ -6374,9 +6470,11 @@ impl CodexRouterApp {
             });
         if confirm {
             self.oauth_revoke_target = None;
-            self.revoke_oauth_account(account);
+            self.oauth_revoke_candidates.clear();
+            self.revoke_oauth_account(selected);
         } else if cancel || !open {
             self.oauth_revoke_target = None;
+            self.oauth_revoke_candidates.clear();
         }
     }
 
@@ -7230,20 +7328,14 @@ impl CodexRouterApp {
                                     .stroke(egui::Stroke::new(1.0, palette.danger))
                                     .corner_radius(egui::CornerRadius::same(6)),
                             )
-                            .on_hover_text(if accounts.len() == 1 {
-                                t(
-                                    zh,
-                                    "删除本机保存的订阅令牌、账号和所有配置引用",
-                                    "Delete the local subscription token, account, and profile references",
-                                )
-                                .to_owned()
-                            } else if zh {
-                                format!("先撤销账号 {}；其余账号仍保留", subscription_account_identifier(representative))
-                            } else {
-                                format!("Revoke {} first; other accounts remain", subscription_account_identifier(representative))
-                            });
+                            .on_hover_text(t(
+                                zh,
+                                "打开账号列表，选择要撤销的订阅",
+                                "Open the account list and choose which subscription to revoke",
+                            ));
                         if revoke.clicked() {
                             *revoke_account = Some(representative.clone());
+                            self.oauth_revoke_candidates = accounts.to_vec();
                         }
                     });
                 });
@@ -7851,12 +7943,20 @@ impl CodexRouterApp {
             }
             super::logic::normalize_default_model(&mut self.config);
             self.schedule_usage_refresh();
-            self.status_text = t(
-                zh,
-                "订阅模型已加入当前配置；点击“保存并应用”后可在 Codex 中使用",
-                "The subscription model was added to this profile. Save & apply to use it in Codex.",
-            )
-            .into();
+            self.show_result_dialog(
+                super::ResultDialogKind::Success,
+                if zh {
+                    "添加成功"
+                } else {
+                    "Added successfully"
+                },
+                t(
+                    zh,
+                    "订阅模型已加入当前配置。保存并应用后即可在 Codex 使用。",
+                    "The subscription model was added to this profile. Save & apply to use it in Codex.",
+                ),
+            );
+
         }
     }
 

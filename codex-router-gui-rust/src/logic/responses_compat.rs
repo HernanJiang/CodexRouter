@@ -1407,8 +1407,10 @@ pub fn continue_after_local_compact_instructions() -> &'static str {
 }
 
 pub fn strip_think_tags(text: &str) -> String {
-    // Remove <think>...</think> and <thinking>...</thinking> blocks case-insensitively.
-    // If opening tag has no closing tag, strip to end (truncated stream).
+    // Remove provider reasoning blocks case-insensitively.
+    // Unclosed tags at the end of a truncated provider stream still drop
+    // the remainder. Tags wrapped in Markdown inline/fenced code are left
+    // intact so a documentation example cannot swallow a completed answer.
     let lower = text.to_ascii_lowercase();
     let mut out = String::with_capacity(text.len());
     let mut pos = 0;
@@ -1432,8 +1434,13 @@ pub fn strip_think_tags(text: &str) -> String {
             }
         };
         let abs_start = pos + rel;
-        out.push_str(&text[pos..abs_start]);
         let after_open = abs_start + open_len;
+        if think_tag_is_literal(text, abs_start, open_len) {
+            out.push_str(&text[pos..after_open.min(text.len())]);
+            pos = after_open.min(text.len());
+            continue;
+        }
+        out.push_str(&text[pos..abs_start]);
         if after_open > text.len() {
             break;
         }
@@ -1441,11 +1448,33 @@ pub fn strip_think_tags(text: &str) -> String {
         if let Some(end_rel) = after_lower.find(close_tag) {
             pos = after_open + end_rel + close_tag.len();
         } else {
-            // No closing tag — truncated stream, drop remainder.
+            // No closing tag: truncated provider stream, drop remainder.
             break;
         }
     }
     out
+}
+
+fn think_tag_is_literal(text: &str, tag_start: usize, open_len: usize) -> bool {
+    let bytes = text.as_bytes();
+    if tag_start > 0 && bytes[tag_start - 1] == b'`' {
+        return true;
+    }
+    let after = tag_start + open_len;
+    if after < bytes.len() && bytes[after] == b'`' {
+        return true;
+    }
+    inside_fenced_code_block(text, tag_start)
+}
+
+fn inside_fenced_code_block(text: &str, index: usize) -> bool {
+    let mut in_fence = false;
+    for line in text[..index].split('\n') {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+        }
+    }
+    in_fence
 }
 
 pub fn strip_think_tags_from_value(value: &mut Value) -> bool {
@@ -2004,6 +2033,18 @@ mod tests {
         let mut v = json!({"delta": "<think>secret</think> hello"});
         assert!(strip_think_tags_from_value(&mut v));
         assert_eq!(v["delta"], " hello");
+        let inline = format!(
+            "SSE rewrite only on leaked tool or `{tag}` then more",
+            tag = "<think>"
+        );
+        assert_eq!(strip_think_tags(&inline), inline);
+        let fenced = format!("before\n```\n{tag} raw\n```\nafter", tag = "<think>");
+        assert_eq!(strip_think_tags(&fenced), fenced);
+        let table = format!(
+            "| Router empty delta | no. `{tag}` then more |",
+            tag = "<think>"
+        );
+        assert_eq!(strip_think_tags(&table), table);
     }
 
     #[test]

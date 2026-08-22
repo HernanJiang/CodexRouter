@@ -2,6 +2,54 @@
 
 本文件记录面向用户的重要变化。完整技术细节以对应版本的源码和 GitHub Release 为准。
 
+## 2.0.17 - 2026-08-22
+
+### 修复
+
+- 修复 OAuth ChatGPT 在 2.0.16 换入后仍发送空 `spawn_agent {}`，Desktop 报 missing field message / 「后台分工接口当前拒绝了有效任务参数」。实测命令已走 `exec_command`，但 catalog 仍开着 v2 collaboration。现改为 v1 子 Agent，保留 web search 与 JSON `exec_command`。
+
+## 2.0.16 - 2026-08-22
+
+### 修复
+
+- 修复 Grok 解释推理标签时答案被切在行内代码反引号处：`strip_think_tags` 把 Markdown 行内/围栏代码中的开标签当字面量，不再把后文整段丢掉；真推理块和未闭合的真实截断流仍剥离。
+- 修复 OAuth ChatGPT 经 Router 后把 `spawn_agent {}` / 无参 `exec` 发给 Desktop，界面提示“后台分工接口当前拒绝了有效任务参数”。官方 catalog 的 `code_mode_only` + `use_responses_lite` 不再抄到 Router 转发路径；OAuth ChatGPT 保留 web search 与 v2 子 Agent，工具改为 JSON `exec_command`（`tool_mode=default`，完整 Responses）。
+
+## 2.0.15 - 2026-08-22
+
+### 修复
+
+- 同一服务商号池共享到该平台已有模型卡片：新授权的 Grok 账号会同时出现在 Grok 4.5 / 4.6 等现有渠道上，卡片显示“3 · 独立订阅”，不再只给默认模型加一条。
+- “撤销此订阅”改为先弹出该服务商全部已有账号，再选择要撤销哪一条。
+- 过滤活动日志里的 `ledger.record_failed`（request ledger entry already exists）刷屏；Host 对同一 request_id 的重复记账不再记 WARN。
+- 保留并收紧上游半截断流重试：Host 合成的 `Upstream stream ended before completion` / `before a terminal event` 仍由网关重试并对账，不把合成 failed 直接交给 Codex。
+
+## 2.0.14 - 2026-08-22
+
+### 修复
+
+- 修复 Grok 等 OAuth：网页已显示“设备已授权”、号池也出现新账号后，界面仍转圈“正在等待当前订阅授权完成”，超时后弹出“授权未完成”。账号进入 Router 即结束等待并弹出“授权已成功”；等待期间轮询失败不再把整次登录打成失败。
+- 第三个及后续 OAuth 账号即使模型目录暂时为空，也会立即写入当前路由配置卡片（Grok 默认 grok-4.5），优先级弹窗不再只显示旧的两个号。
+- 活动日志不再把 Router 事件压成空的 `class=request_failure` / `class=configuration` 刷屏；配置同步事件不再进活动日志，其余 WARN/ERROR 会带上 `event=` 与错误码。
+
+## 2.0.13 - 2026-08-22
+
+### 修复
+
+- 修复旧 CLI YAML 中 `openai-compatibility` 条目缺少 `openai-capabilities` 时 Router Host 启动即退出，进而导致 `[2/7]`、`class=configuration`、OAuth 账号为 0 和管理会话/用量查询连锁失败。
+- 端口隔离改为整体检查 Router Host、派生 CLIProxyAPI 与 Responses Gateway，只有派生端口冲突时也会自动换到完整空闲端口组。
+- 完整继承 2.0.12 的历史线程休眠 provider、退出保护和 Router events 启动回放时间过滤修复，并重新构建完整发布包。
+
+## 2.0.12 - 2026-08-22
+
+### 修复
+
+- 新增 API 渠道测试连接失败时弹出“本配置无效，请检查配置”，成功添加时弹出“添加成功”。
+- 各平台 OAuth 授权成功后弹出“授权已成功”，不再只写状态栏后继续转圈等待。
+- Grok 等网页显示设备已授权、但本机仍显示“正在等待当前订阅授权完成”时，改为同时轮询新账号；账号已进入 Router 即结束等待并同步模型。
+- 已有模型列表时，新授权的第三个及后续 OAuth 账号会自动加入当前配置的默认模型，不再只出现在 OAuth 页。
+- 修复 Codex 对话框 `stream disconnected before completion: upstream stream ended before a terminal event`。Host 在 CLIProxyAPI SSE 提前结束时会合成 `response.failed`/`CR-UP-0014`；网关把它当成可重试断流，不再转发给 Codex。无内容静默重试，纯文本流对账后只补后缀，tool/reasoning 仍干净收尾。额度等真实业务失败继续转发。
+
 ## 2.0.11 - 2026-08-22
 
 ### 修复

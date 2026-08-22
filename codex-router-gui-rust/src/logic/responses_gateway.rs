@@ -1017,6 +1017,45 @@ fn sse_event_item_type(event: &str) -> Option<String> {
     })
 }
 
+fn sse_error_code_and_message(event: &str) -> (String, String) {
+    let Some(json) = sse_event_data(event) else {
+        return (String::new(), String::new());
+    };
+    let error = json
+        .get("response")
+        .and_then(|response| response.get("error"))
+        .or_else(|| json.get("error"));
+    let code = error
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let message = error
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    (code, message)
+}
+
+/// Host synthesizes `response.failed` with CR-UP-0014 when CLIProxyAPI
+/// closes the SSE body before a terminal event. That is a dropped stream,
+/// not a model/business failure, so the gateway must retry instead of
+/// showing Codex "upstream stream ended before a terminal event".
+fn sse_event_is_retryable_interrupt(event: &str) -> bool {
+    if sse_event_type(event).as_deref() != Some("response.failed") {
+        return false;
+    }
+    let (code, message) = sse_error_code_and_message(event);
+    let message = message.to_ascii_lowercase();
+    // Host also stamps CR-UP-0014 onto genuine failed events that had no
+    // code. Only treat it as a dropped stream when the message says so.
+    code.eq_ignore_ascii_case("upstream_stream_interrupted")
+        || message.contains("before a terminal event")
+        || message.contains("ended before completion")
+        || message.contains("stream interrupted")
+}
+
 /// Rewrite an `output_text.delta` event so it carries only the not-yet
 /// delivered suffix, with retry-stream ids replaced by the ids the client
 /// already saw.
@@ -1099,6 +1138,12 @@ impl<'a> SseSink<'a> {
 
     fn push_event(&mut self, event: &str) -> anyhow::Result<SseFlow> {
         let kind = sse_event_type(event);
+        if sse_event_is_retryable_interrupt(event) {
+            // Do not forward Host's synthetic failed event and do not mark
+            // the stream terminal. The caller then hits EOF and the existing
+            // retry/reconcile path can recover.
+            return Ok(SseFlow::Continue);
+        }
         let SseSink {
             client,
             terminal,
@@ -1985,6 +2030,18 @@ mod tests {
         ));
         assert_eq!(parse_chunk_size("1a;foo=bar").unwrap(), 26);
         assert!(parse_chunk_size("not-hex").is_err());
+        assert!(sse_event_is_retryable_interrupt(
+            "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"CR-UP-0014\",\"message\":\"upstream stream ended before a terminal event\"}}}\n\n"
+        ));
+        assert!(sse_event_is_retryable_interrupt(
+            "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"upstream_stream_interrupted\",\"message\":\"Upstream stream ended before completion.\"}}}\n\n"
+        ));
+        assert!(!sse_event_is_retryable_interrupt(
+            "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"insufficient_quota\",\"message\":\"quota\"}}}\n\n"
+        ));
+        assert!(!sse_event_is_retryable_interrupt(
+            "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"CR-UP-0014\",\"message\":\"upstream failed\"}}}\n\n"
+        ));
     }
 
     #[test]
@@ -2702,5 +2759,126 @@ mod tests {
         assert!(output.contains("function_call"));
         assert!(output.contains("response.failed"));
         assert!(output.contains("upstream_stream_interrupted"));
+    }
+
+    #[test]
+    fn host_synthetic_failed_after_text_is_retryable() {
+        // Host wraps CLIProxyAPI EOF as response.failed / CR-UP-0014. That
+        // must look like a dropped stream so mid-stream text can resume.
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            socket
+                .write_all(b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello \",\"item_id\":\"i1\"}\n\nevent: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"CR-UP-0014\",\"message\":\"upstream stream ended before a terminal event\"}},\"request_id\":\"req-1\"}\n\n")
+                .unwrap();
+        });
+        let client_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client_addr = client_listener.local_addr().unwrap();
+        let mut upstream_stream = TcpStream::connect(upstream_addr).unwrap();
+        let worker = thread::spawn(move || {
+            let (mut client, _) = client_listener.accept().unwrap();
+            let mut sink = SseSink::new(&mut client, None);
+            let outcome = forward_plain_sse(&mut sink, &mut upstream_stream, Vec::new()).unwrap();
+            assert_eq!(
+                outcome,
+                SseForward::RetryableWithPrefix(StreamResume {
+                    prefix: "hello ".to_owned(),
+                    response_id: Some("r1".to_owned()),
+                    item_id: Some("i1".to_owned()),
+                })
+            );
+        });
+        let mut client = TcpStream::connect(client_addr).unwrap();
+        let mut output = String::new();
+        client.read_to_string(&mut output).unwrap();
+        worker.join().unwrap();
+        assert!(output.contains("hello "));
+        assert!(!output.contains("response.failed"));
+        assert!(!output.contains("CR-UP-0014"));
+        assert!(!output.contains("before a terminal event"));
+    }
+
+    #[test]
+    fn host_synthetic_failed_before_content_is_retryable() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            socket
+                .write_all(b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"CR-UP-0014\",\"message\":\"upstream stream failed before a terminal event\"}}}\n\n")
+                .unwrap();
+        });
+        let client_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client_addr = client_listener.local_addr().unwrap();
+        let mut upstream_stream = TcpStream::connect(upstream_addr).unwrap();
+        let worker = thread::spawn(move || {
+            let (mut client, _) = client_listener.accept().unwrap();
+            let mut sink = SseSink::new(&mut client, None);
+            let outcome = forward_plain_sse(&mut sink, &mut upstream_stream, Vec::new()).unwrap();
+            assert!(matches!(outcome, SseForward::RetryableBeforeFirstEvent));
+        });
+        let mut client = TcpStream::connect(client_addr).unwrap();
+        let mut output = String::new();
+        client.read_to_string(&mut output).unwrap();
+        worker.join().unwrap();
+        assert!(!output.contains("response.failed"));
+        assert!(!output.contains("CR-UP-0014"));
+    }
+
+    #[test]
+    fn genuine_upstream_failed_is_still_forwarded() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            socket
+                .write_all(b"data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"insufficient_quota\",\"message\":\"quota exceeded\"}}}\n\n")
+                .unwrap();
+        });
+        let client_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client_addr = client_listener.local_addr().unwrap();
+        let mut upstream_stream = TcpStream::connect(upstream_addr).unwrap();
+        let worker = thread::spawn(move || {
+            let (mut client, _) = client_listener.accept().unwrap();
+            let mut sink = SseSink::new(&mut client, None);
+            let outcome = forward_plain_sse(&mut sink, &mut upstream_stream, Vec::new()).unwrap();
+            assert_eq!(outcome, SseForward::Done);
+        });
+        let mut client = TcpStream::connect(client_addr).unwrap();
+        let mut output = String::new();
+        client.read_to_string(&mut output).unwrap();
+        worker.join().unwrap();
+        assert!(output.contains("response.failed"));
+        assert!(output.contains("insufficient_quota"));
+        assert!(output.contains("quota exceeded"));
+    }
+
+    #[test]
+    fn host_synthetic_failed_mid_stream_retries_and_reconciles() {
+        let (output, attempts) = run_client_against_mock(
+            |attempt, socket| {
+                if attempt == 0 {
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\n\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"i1\",\"type\":\"message\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello \",\"item_id\":\"i1\"}\n\nevent: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"CR-UP-0014\",\"message\":\"upstream stream ended before a terminal event\"}}}\n\n")
+                        .unwrap();
+                    return;
+                }
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r2\"}}\n\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"i2\",\"type\":\"message\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello \",\"item_id\":\"i2\"}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"world\",\"item_id\":\"i2\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r2\"}}\n\n")
+                    .unwrap();
+            },
+            3,
+        );
+        assert_eq!(attempts, 2);
+        assert_eq!(output.matches("\"delta\":\"hello ").count(), 1);
+        assert_eq!(output.matches("\"delta\":\"world").count(), 1);
+        assert_eq!(output.matches("response.completed").count(), 1);
+        assert!(!output.contains("response.failed"));
+        assert!(!output.contains("CR-UP-0014"));
+        assert!(!output.contains("before a terminal event"));
+        assert!(!output.contains("r2"));
+        assert!(!output.contains("i2"));
+        assert_eq!(output.matches("HTTP/1.1 200").count(), 1);
     }
 }

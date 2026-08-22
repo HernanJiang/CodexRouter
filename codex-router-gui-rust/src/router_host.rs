@@ -729,11 +729,17 @@ fn attribute_account(state: &HostState, headers: &reqwest::header::HeaderMap) ->
 fn record_ledger(state: &HostState, input: &usage_ledger::LedgerInput<'_>) {
     let entry = usage_ledger::ledger_entry(input);
     if let Err(error) = usage_ledger::record_terminal(&state.control.store, &entry) {
+        let description = error.to_string();
+        // A second terminal write for the same request_id is expected after
+        // retries / synthetic failed events. Do not spam the activity log.
+        if description.contains("already exists") {
+            return;
+        }
         let _ = state.control.logger.write(serde_json::json!({
             "level": "WARN",
             "event": "ledger.record_failed",
             "request_id": input.request_id,
-            "error_description": error.to_string(),
+            "error_description": description,
         }));
     }
 }

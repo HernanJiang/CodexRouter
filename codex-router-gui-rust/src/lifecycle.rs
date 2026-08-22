@@ -41,26 +41,99 @@ pub struct LifecyclePorts {
     pub cli: u16,
 }
 
+/// Alternate host-port candidates tried when the configured port is owned by
+/// another Router installation or program. Candidates step by 3 so each pick
+/// also reserves the derived CLIProxyAPI port (host+1) and the in-process
+/// responses gateway port (host+2) without overlapping the next candidate.
+const ADOPT_HOST_PORT_CANDIDATES: &[u16] = &[
+    28_080, 28_083, 28_086, 28_089, 28_092, 28_095, 28_098, 28_101,
+];
+
 pub fn adopt_isolated_host_if_foreign(
     router_root: &Path,
     config: &mut RouterConfig,
 ) -> Option<String> {
+    adopt_isolated_host_if_foreign_with_candidates(
+        router_root,
+        config,
+        ADOPT_HOST_PORT_CANDIDATES,
+    )
+}
+
+fn adopt_isolated_host_if_foreign_with_candidates(
+    router_root: &Path,
+    config: &mut RouterConfig,
+    candidates: &[u16],
+) -> Option<String> {
     let Ok(ports) = LifecyclePorts::from_config(config) else {
         return None;
     };
-    let expected = host_executable(router_root);
-    match listener_process_id(ports.host, &expected, ServiceKind::RouterHost) {
-        Err(error) => {
-            let text = error.to_string();
-            if text.contains("ROUTER_INSTALL_ROOT_CONFLICT") || text.contains("ROUTER_PORT_CONFLICT")
-            {
-                config.deploy.sub2api_host = "http://127.0.0.1:28080".to_owned();
-                Some(config.deploy.sub2api_host.clone())
-            } else {
-                None
-            }
+    let expected_host = host_executable(router_root);
+    let expected_cli = cli_executable(router_root);
+    let configured_group_conflicts =
+        listener_process_id(ports.host, &expected_host, ServiceKind::RouterHost)
+            .is_err_and(|error| is_port_conflict_error(&error))
+            || listener_process_id(ports.cli, &expected_cli, ServiceKind::CliProxyApi)
+                .is_err_and(|error| is_port_conflict_error(&error))
+            || !gateway_port_usable(ports.host.saturating_add(2));
+    if !configured_group_conflicts {
+        return None;
+    }
+    for candidate in candidates {
+        let candidate = *candidate;
+        if candidate == ports.host || candidate < 1024 {
+            continue;
         }
-        Ok(_) => None,
+        // The host port itself is usable when it is free or already owned by
+        // this installation's host (for example after a config rewrite).
+        let host_usable =
+            listener_process_id(candidate, &expected_host, ServiceKind::RouterHost).is_ok();
+        // The derived CLIProxyAPI port must not belong to another install.
+        let cli_usable = listener_process_id(
+            candidate.saturating_add(1),
+            &expected_cli,
+            ServiceKind::CliProxyApi,
+        )
+        .is_ok();
+        // The responses gateway is served by this GUI process; the port is
+        // usable when nothing listens or only this process does.
+        let gateway_usable = gateway_port_usable(candidate.saturating_add(2));
+        if host_usable && cli_usable && gateway_usable {
+            config.deploy.sub2api_host = format!("http://127.0.0.1:{candidate}");
+            return Some(config.deploy.sub2api_host.clone());
+        }
+    }
+    None
+}
+
+fn is_port_conflict_error(error: &anyhow::Error) -> bool {
+    let text = error.to_string();
+    text.contains("ROUTER_INSTALL_ROOT_CONFLICT") || text.contains("ROUTER_PORT_CONFLICT")
+}
+
+fn gateway_port_usable(port: u16) -> bool {
+    let Ok(rows) = tcp_rows() else {
+        return false;
+    };
+    let current = std::process::id();
+    rows.into_iter()
+        .filter(|row| row.dwState == MIB_TCP_STATE_LISTEN as u32 && row_port(row) == port)
+        .all(|row| row.dwOwningPid == current)
+}
+
+/// Listener owned by *this* installation. A foreign Router copy or an
+/// unrelated program holding the port is reported as `None` (nothing of ours
+/// to stop or show) instead of an error, so Stop/Status/exit never fail just
+/// because another installation is running.
+fn owned_listener_or_none(
+    port: u16,
+    expected_path: &Path,
+    kind: ServiceKind,
+) -> anyhow::Result<Option<u32>> {
+    match listener_process_id(port, expected_path, kind) {
+        Ok(process_id) => Ok(process_id),
+        Err(error) if is_port_conflict_error(&error) => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -69,10 +142,23 @@ impl LifecyclePorts {
         let configured = loopback_base_uri(&config.deploy.sub2api_host)?
             .port_or_known_default()
             .context("ROUTER_CONFIG_INVALID_BASE_URI: Router Host port is missing")?;
+        let host = environment_port("CODEX_ROUTER_HOST_PORT", configured)?;
         Ok(Self {
-            host: environment_port("CODEX_ROUTER_HOST_PORT", configured)?,
-            cli: environment_port("CODEX_ROUTER_CLI_PORT", DEFAULT_CLI_PORT)?,
+            host,
+            cli: environment_port("CODEX_ROUTER_CLI_PORT", default_cli_port(host))?,
         })
+    }
+}
+
+/// The CLIProxyAPI port sits next to the Router Host port. The default pair is
+/// 18080/18081; when this installation adopts an alternate host port because
+/// 18080 is owned by another Router copy or program, the CLI moves along to
+/// host+1 so two installations never fight over 18081.
+fn default_cli_port(host: u16) -> u16 {
+    if host == 18_080 {
+        DEFAULT_CLI_PORT
+    } else {
+        host.saturating_add(1)
     }
 }
 
@@ -642,7 +728,15 @@ pub fn ensure_services(
     cancel: &AtomicBool,
     lock_inherited: bool,
 ) -> anyhow::Result<LifecycleStatus> {
-    let config = load_config(router_root)?;
+    let mut config = load_config(router_root)?;
+    // Self-heal the persisted ports before touching any process: when another
+    // Router copy owns the configured port, move to a free port group and save
+    // it so Status/Stop and the next launch agree with this start.
+    if adopt_isolated_host_if_foreign(router_root, &mut config).is_some() {
+        config
+            .save(&user_data::config_path(router_root))
+            .context("could not persist the adopted Router Host port")?;
+    }
     ensure_services_with_config(router_root, &config, repair, cancel, lock_inherited)
 }
 
@@ -744,7 +838,9 @@ pub fn stop_services_with_config(
         process_path(*process_id)
             .is_ok_and(|path| paths_equal(&path, &host_path))
     });
-    let listening_host = listener_process_id(ports.host, &host_path, ServiceKind::RouterHost)?;
+    // A listener owned by another Router installation or program is not ours
+    // to stop; treat the port as foreign-owned and leave it running.
+    let listening_host = owned_listener_or_none(ports.host, &host_path, ServiceKind::RouterHost)?;
     if saved_host.is_some()
         && listening_host.is_some()
         && saved_host != listening_host
@@ -752,7 +848,7 @@ pub fn stop_services_with_config(
         bail!("Router Host PID file and listener refer to different processes");
     }
     let cli_path = cli_executable(router_root);
-    let listening_cli = listener_process_id(ports.cli, &cli_path, ServiceKind::CliProxyApi)?;
+    let listening_cli = owned_listener_or_none(ports.cli, &cli_path, ServiceKind::CliProxyApi)?;
     if let Some(process_id) = saved_host.or(listening_host) {
         if !force {
             assert_interruption_allowed(process_id, ports.host, "Stop Router")?;
@@ -763,7 +859,7 @@ pub fn stop_services_with_config(
     // normally dies with it; sweep the private port anyway in case the job
     // assignment failed or an older build left an orphan behind.
     if let Some(captured_process_id) = listening_cli {
-        match listener_process_id(ports.cli, &cli_path, ServiceKind::CliProxyApi)? {
+        match owned_listener_or_none(ports.cli, &cli_path, ServiceKind::CliProxyApi)? {
             Some(current_process_id) if current_process_id == captured_process_id => {
                 terminate_verified_process(current_process_id, &cli_path)?;
             }
@@ -801,12 +897,14 @@ fn status_services_with_config(
 ) -> anyhow::Result<LifecycleStatus> {
     let ports = LifecyclePorts::from_config(config)?;
     let base_uri = loopback_base_uri(&config.deploy.sub2api_host)?;
-    let host = listener_process_id(
+    // Status answers "are *this* installation's services up". A port owned by
+    // another Router copy or program therefore reads as not running here.
+    let host = owned_listener_or_none(
         ports.host,
         &host_executable(router_root),
         ServiceKind::RouterHost,
     )?;
-    let cli = listener_process_id(
+    let cli = owned_listener_or_none(
         ports.cli,
         &cli_executable(router_root),
         ServiceKind::CliProxyApi,
@@ -834,6 +932,12 @@ fn status_services_with_config(
 mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
+    use std::sync::{Mutex, OnceLock};
+
+    fn port_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     fn temporary_root(name: &str) -> PathBuf {
         let nonce = std::time::SystemTime::now()
@@ -892,9 +996,99 @@ mod tests {
         let ports = LifecyclePorts::from_config(&config).unwrap();
         assert_eq!(ports.host, 19_090);
         if std::env::var_os("CODEX_ROUTER_CLI_PORT").is_none() {
-            assert_eq!(ports.cli, DEFAULT_CLI_PORT);
+            // An adopted host port drags the private CLI port along so two
+            // installations never share 18081.
+            assert_eq!(ports.cli, 19_091);
         }
         config.deploy.sub2api_host = "http://0.0.0.0:8080".to_owned();
         assert!(LifecyclePorts::from_config(&config).is_err());
+    }
+
+    fn find_free_port_triple() -> u16 {
+        for _ in 0..64 {
+            let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let port = probe.local_addr().unwrap().port();
+            drop(probe);
+            if !(1024..=65_532).contains(&port) {
+                continue;
+            }
+            let next_free = TcpListener::bind((Ipv4Addr::LOCALHOST, port + 1)).is_ok();
+            let gateway_free = TcpListener::bind((Ipv4Addr::LOCALHOST, port + 2)).is_ok();
+            if next_free && gateway_free {
+                return port;
+            }
+        }
+        panic!("could not find three consecutive free loopback ports");
+    }
+
+    #[test]
+    fn adopt_leaves_a_free_configured_port_alone() {
+        let _guard = port_test_lock();
+        let root = temporary_root("adopt-free");
+        let port = find_free_port_triple();
+        let mut config = RouterConfig::default();
+        config.deploy.sub2api_host = format!("http://127.0.0.1:{port}");
+        assert!(adopt_isolated_host_if_foreign(&root, &mut config).is_none());
+        assert_eq!(
+            config.deploy.sub2api_host,
+            format!("http://127.0.0.1:{port}")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn adopt_scans_past_ports_owned_by_other_processes() {
+        let _guard = port_test_lock();
+        let root = temporary_root("adopt-scan");
+        // The configured port and the first candidate are both owned by this
+        // test process, which is foreign to the expected Router Host binary.
+        let configured = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let configured_port = configured.local_addr().unwrap().port();
+        let busy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let busy_port = busy.local_addr().unwrap().port();
+        let free_triple = find_free_port_triple();
+        let mut config = RouterConfig::default();
+        config.deploy.sub2api_host = format!("http://127.0.0.1:{configured_port}");
+
+        let adopted = adopt_isolated_host_if_foreign_with_candidates(
+            &root,
+            &mut config,
+            &[busy_port, free_triple],
+        );
+        assert_eq!(
+            adopted,
+            Some(format!("http://127.0.0.1:{free_triple}")),
+            "adoption must skip the busy candidate and keep a fully free port group"
+        );
+        assert_eq!(
+            config.deploy.sub2api_host,
+            format!("http://127.0.0.1:{free_triple}")
+        );
+        drop(configured);
+        drop(busy);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn adopt_moves_when_only_the_derived_cli_port_is_foreign() {
+        let _guard = port_test_lock();
+        let root = temporary_root("adopt-cli-conflict");
+        let configured = find_free_port_triple();
+        let cli = TcpListener::bind((Ipv4Addr::LOCALHOST, configured + 1)).unwrap();
+        let replacement = find_free_port_triple();
+        let mut config = RouterConfig::default();
+        config.deploy.sub2api_host = format!("http://127.0.0.1:{configured}");
+
+        let adopted = adopt_isolated_host_if_foreign_with_candidates(
+            &root,
+            &mut config,
+            &[replacement],
+        );
+        assert_eq!(
+            adopted,
+            Some(format!("http://127.0.0.1:{replacement}"))
+        );
+        drop(cli);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

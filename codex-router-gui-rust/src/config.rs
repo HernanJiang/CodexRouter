@@ -142,6 +142,10 @@ pub struct UiPreferences {
     /// model_providers.custom cannot silently flip the switch off.
     #[serde(default)]
     pub prefer_router_mode: bool,
+    /// Set only when the user explicitly switches back to the official Codex
+    /// route. An externally rewritten config.toml must not look like intent.
+    #[serde(default)]
+    pub official_mode_selected: bool,
     /// After first successful post-setup OAuth login, the "add models" tip is
     /// shown once and then suppressed.
     #[serde(default)]
@@ -171,6 +175,7 @@ impl Default for UiPreferences {
             monitor_api_order: Vec::new(),
             share_codex_state: true,
             prefer_router_mode: false,
+            official_mode_selected: false,
             oauth_model_hint_seen: false,
             codex_overwrite_decision: String::new(),
             codex_overwrite_fingerprint: String::new(),
@@ -946,6 +951,7 @@ mod tests {
             monitor_api_order: vec![4, 1],
             share_codex_state: false,
             prefer_router_mode: true,
+            official_mode_selected: false,
             oauth_model_hint_seen: true,
             codex_overwrite_decision: "keep".into(),
             codex_overwrite_fingerprint: "abc123".into(),
@@ -962,6 +968,7 @@ mod tests {
         assert_eq!(restored.monitor_api_order, vec![4, 1]);
         assert!(!restored.share_codex_state);
         assert!(restored.prefer_router_mode);
+        assert!(!restored.official_mode_selected);
         assert_eq!(restored.codex_overwrite_decision, "keep");
         assert_eq!(restored.codex_overwrite_fingerprint, "abc123");
         assert_eq!(restored.window_width, 1064.0);
@@ -969,6 +976,7 @@ mod tests {
         let legacy_no_prefer: UiPreferences =
             serde_json::from_str(r#"{"shareCodexState":true}"#).unwrap();
         assert!(!legacy_no_prefer.prefer_router_mode);
+        assert!(!legacy_no_prefer.official_mode_selected);
         assert!(legacy_no_prefer.codex_overwrite_decision.is_empty());
         assert!(legacy_no_prefer.codex_overwrite_fingerprint.is_empty());
     }
