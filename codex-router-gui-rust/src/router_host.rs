@@ -1545,7 +1545,32 @@ async fn data_plane(State(state): State<HostState>, request: Request) -> Respons
             .body(Body::from_stream(stream))
             .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
     } else {
-        let body_bytes = upstream.bytes().await.unwrap_or_default();
+        let body_bytes = match read_complete_response_body(upstream).await {
+            Ok(body) => body,
+            Err(_) => {
+                record_ledger(
+                    &state,
+                    &usage_ledger::LedgerInput {
+                        request_id: &request_id,
+                        model: &plan.public_model,
+                        pool_id: &plan.pool_id,
+                        account_id: ledger_account,
+                        protocol,
+                        status: "failed",
+                        elapsed_ms: elapsed,
+                        error_code: Some("CR-UP-0014"),
+                        ..Default::default()
+                    },
+                );
+                let _ = terminal.complete("upstream_error", Some(502), Some("CR-UP-0014"), 1);
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "CR-UP-0014",
+                    "upstream response body was interrupted",
+                    &request_id,
+                );
+            }
+        };
         let mut parsed: Option<Value> = serde_json::from_slice(&body_bytes).ok();
         if let Some(body) = parsed.as_mut() {
             if !plan.public_model.is_empty() {
@@ -1613,6 +1638,12 @@ async fn data_plane(State(state): State<HostState>, request: Request) -> Respons
             .body(Body::from(output))
             .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
     }
+}
+
+async fn read_complete_response_body(
+    response: reqwest::Response,
+) -> std::result::Result<axum::body::Bytes, reqwest::Error> {
+    response.bytes().await
 }
 
 struct SseContext {
@@ -3230,6 +3261,7 @@ mod tests {
     use codex_router_lib::state::StateStore as TestStateStore;
     use futures_util::TryStreamExt;
     use std::collections::HashMap as StdHashMap;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tower::ServiceExt;
 
     #[test]
@@ -3241,6 +3273,37 @@ mod tests {
         assert_eq!(sanitize_zip_entry_name("  "), "item");
         assert_eq!(sanitize_zip_entry_name("..."), "item");
         assert_eq!(sanitize_zip_entry_name("a b:c"), "a_b_c");
+    }
+
+    async fn mock_response_with_length(body: &'static [u8], declared_length: usize) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {declared_length}\r\nConnection: close\r\n\r\n"
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            socket.write_all(body).await.unwrap();
+        });
+        format!("http://{address}/v1/responses")
+    }
+
+    #[tokio::test]
+    async fn interrupted_json_response_body_is_never_returned_as_success() {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let complete = mock_response_with_length(br#"{"ok":true}"#, 11).await;
+        let response = client.get(complete).send().await.unwrap();
+        assert_eq!(
+            read_complete_response_body(response).await.unwrap(),
+            &b"{\"ok\":true}"[..]
+        );
+
+        let truncated = mock_response_with_length(br#"{"partial":true,"#, 100).await;
+        let response = client.get(truncated).send().await.unwrap();
+        assert!(read_complete_response_body(response).await.is_err());
     }
 
     fn test_host_state() -> HostState {

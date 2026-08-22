@@ -17,7 +17,7 @@ use anyhow::{bail, Context};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -50,6 +50,11 @@ const STREAM_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Grok/Gemini deep-reasoning pauses legitimately exceed the old fixed 300s
 /// socket timeout; 30 minutes of complete silence is a genuine hang.
 const STREAM_MAX_SILENCE: Duration = Duration::from_secs(1800);
+/// Codex client write/read timeout after the request headers have been read.
+const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(300);
+/// Drain window used while half-closing the Codex socket so reqwest sees a
+/// FIN instead of a Windows RST ("error decoding response body").
+const CLIENT_CLOSE_DRAIN: Duration = Duration::from_millis(50);
 
 struct GatewayState {
     stop: std::sync::Arc<AtomicBool>,
@@ -281,11 +286,13 @@ fn run_gateway(
                 let upstream = upstream.clone();
                 thread::spawn(move || {
                     let mut client = stream;
-                    if let Err(error) = handle_client(&mut client, &upstream, rate_limit_max_retries)
-                    {
-                        gateway_log("request.error", &format!("{error:#}"));
+                    let result = handle_client(&mut client, &upstream, rate_limit_max_retries);
+                    close_client_gracefully(&mut client);
+                    if let Err(error) = result {
+                        if !client_connection_ended(&error) {
+                            gateway_log("request.error", &format!("{error:#}"));
+                        }
                     }
-                    close_client_gracefully(client);
                 });
             }
             Err(error)
@@ -304,10 +311,7 @@ fn handle_client(
     upstream: &str,
     rate_limit_max_retries: u32,
 ) -> anyhow::Result<()> {
-    client
-        .set_read_timeout(Some(HEADER_TIMEOUT))
-        .and_then(|_| client.set_write_timeout(Some(Duration::from_secs(300))))
-        .ok();
+    prepare_client_socket(client)?;
     let (header_bytes, leftover) = read_headers(client)?;
     let header_text = String::from_utf8_lossy(&header_bytes);
     let mut lines = header_text.split("\r\n");
@@ -355,11 +359,14 @@ fn handle_client(
         "request.start",
         &format!("{method} {path} bytes={}", body.len()),
     );
+    // The request is fully buffered; stretch the socket timeout so a long
+    // Kimi/ChatGPT stream is not cut by the 30s header deadline.
+    client.set_read_timeout(Some(CLIENT_IO_TIMEOUT)).ok();
+    client.set_write_timeout(Some(CLIENT_IO_TIMEOUT)).ok();
     let mut request_body = body;
-    let mut openai_family = false;
     if method == "POST" && (is_responses_path(&path) || is_chat_completions_path(&path)) {
         if let Ok(mut json_body) = serde_json::from_slice::<Value>(&request_body) {
-            openai_family = json_body
+            let openai_family = json_body
                 .get("model")
                 .and_then(Value::as_str)
                 .is_some_and(is_openai_family_model);
@@ -411,17 +418,9 @@ fn handle_client(
         let status = response.status;
         let response_headers_map = response.header_map;
         if status < 400 || !is_responses_path(&path) {
-            if status < 400 && is_responses_path(&path) && openai_family {
-                write_headers_forced_close(client, &response_headers)?;
-                client.write_all(&response_leftover)?;
-                std::io::copy(&mut upstream_stream, client)?;
-                return Ok(());
-            }
             if status < 400 && is_responses_path(&path) {
                 let content_type = content_type_of(&response_headers_map);
-                let streaming = content_type.contains("text/event-stream")
-                    || response_headers_map.contains_key("transfer-encoding")
-                    || !response_headers_map.contains_key("content-length");
+                let streaming = content_type.contains("text/event-stream");
                 if streaming {
                     if !sse_prelude_sent {
                         write_sse_prelude(client, &response_headers_map)?;
@@ -504,8 +503,8 @@ fn handle_client(
                 }
             }
             write_headers_forced_close(client, &response_headers)?;
-            client.write_all(&response_leftover)?;
-            std::io::copy(&mut upstream_stream, client)?;
+            write_all_socket(client, &response_leftover)?;
+            copy_socket(&mut upstream_stream, client)?;
             return Ok(());
         }
         // Error statuses are fully buffered before anything reaches the
@@ -545,8 +544,8 @@ fn handle_client(
                     forward_error_exchange(upstream, &path, &headers, &retry_body)
                 {
                     if retry_status < 400 {
-                        client.write_all(&retry_headers)?;
-                        client.write_all(&retry_body)?;
+                        write_all_socket(client, &retry_headers)?;
+                        write_all_socket(client, &retry_body)?;
                         return Ok(());
                     }
                     let retry_text = String::from_utf8_lossy(&retry_body);
@@ -578,8 +577,7 @@ fn connect_upstream(upstream: &str) -> anyhow::Result<TcpStream> {
     let address = socket_addr(upstream)?;
     let stream = TcpStream::connect_timeout(&address, UPSTREAM_CONNECT_TIMEOUT)
         .context("could not connect to Sub2API")?;
-    stream.set_read_timeout(Some(Duration::from_secs(300))).ok();
-    stream.set_write_timeout(Some(Duration::from_secs(300))).ok();
+    prepare_upstream_socket(&stream);
     Ok(stream)
 }
 
@@ -676,7 +674,7 @@ fn buffer_error_body(
         let target = length.min(MAX_ERROR_BODY_BYTES);
         while leftover.len() < target {
             let mut buffer = [0_u8; 8192];
-            match stream.read(&mut buffer) {
+            match read_socket(stream, &mut buffer) {
                 Ok(0) | Err(_) => break,
                 Ok(read) => leftover.extend_from_slice(&buffer[..read]),
             }
@@ -685,7 +683,7 @@ fn buffer_error_body(
     }
     let mut buffer = [0_u8; 8192];
     while leftover.len() < MAX_ERROR_BODY_BYTES {
-        match stream.read(&mut buffer) {
+        match read_socket(stream, &mut buffer) {
             Ok(0) | Err(_) => break,
             Ok(read) => leftover.extend_from_slice(&buffer[..read]),
         }
@@ -739,9 +737,8 @@ fn write_upstream_request(
         outgoing.push_str("\r\n");
     }
     outgoing.push_str("\r\n");
-    stream.write_all(outgoing.as_bytes())?;
-    stream.write_all(body)?;
-    stream.flush()?;
+    write_all_socket(stream, outgoing.as_bytes())?;
+    write_all_socket(stream, body)?;
     Ok(())
 }
 
@@ -766,7 +763,7 @@ fn forward_error_exchange(
         read_exact_more(&mut stream, &mut response_body, length)?;
         response_body.truncate(length);
     } else {
-        stream.read_to_end(&mut response_body).ok();
+        let _ = read_to_end_socket(&mut stream, &mut response_body);
     }
     Ok((status, response_headers, response_body))
 }
@@ -774,7 +771,7 @@ fn forward_error_exchange(
 fn read_exact_more(stream: &mut TcpStream, body: &mut Vec<u8>, length: usize) -> anyhow::Result<()> {
     while body.len() < length {
         let mut buffer = [0_u8; 8192];
-        let read = stream.read(&mut buffer)?;
+        let read = read_socket(stream, &mut buffer)?;
         if read == 0 {
             break;
         }
@@ -782,6 +779,9 @@ fn read_exact_more(stream: &mut TcpStream, body: &mut Vec<u8>, length: usize) ->
         if body.len() > MAX_BODY_BYTES {
             bail!("HTTP body is too large");
         }
+    }
+    if body.len() < length {
+        bail!("incomplete HTTP body: expected {length} bytes, received {}", body.len());
     }
     Ok(())
 }
@@ -844,7 +844,7 @@ fn read_headers(stream: &mut TcpStream) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     let mut data = Vec::new();
     let mut buffer = [0_u8; 2048];
     loop {
-        let read = stream.read(&mut buffer)?;
+        let read = read_socket(stream, &mut buffer)?;
         if read == 0 {
             bail!("incomplete HTTP headers");
         }
@@ -886,7 +886,7 @@ fn write_sse_prelude(
         prelude.push_str("\r\n");
     }
     prelude.push_str("connection: close\r\n\r\n");
-    client.write_all(prelude.as_bytes())?;
+    write_all_socket(client, prelude.as_bytes())?;
     Ok(())
 }
 
@@ -1058,7 +1058,7 @@ fn forward_event_with_rewrites(
     for (from, to) in id_rewrites {
         text = text.replace(from.as_str(), to.as_str());
     }
-    client.write_all(text.as_bytes())?;
+    write_all_socket(client, text.as_bytes())?;
     Ok(())
 }
 
@@ -1181,7 +1181,7 @@ impl<'a> SseSink<'a> {
                         rewrites.push((from.clone(), to.clone()));
                     }
                     if let Some(rewritten) = rewrite_delta_event(event, &suffix, &rewrites) {
-                        client.write_all(rewrite_sse_text(&rewritten).as_bytes())?;
+                        write_all_socket(client, rewrite_sse_text(&rewritten).as_bytes())?;
                         *sent_events = true;
                     }
                     Ok(SseFlow::Continue)
@@ -1277,7 +1277,7 @@ impl<'a> SseSink<'a> {
                 }
             }
             *terminal |= sse_event_is_terminal(event);
-            client.write_all(rewrite_sse_text(event).as_bytes())?;
+            write_all_socket(client, rewrite_sse_text(event).as_bytes())?;
             *sent_events = true;
             Ok(SseFlow::Continue)
         }
@@ -1323,10 +1323,10 @@ fn push_sse_events(sink: &mut SseSink, carry: &mut String) -> anyhow::Result<Sse
 
 fn finish_sse(client: &mut TcpStream, carry: &str, terminal: bool) -> anyhow::Result<()> {
     if !carry.is_empty() {
-        client.write_all(rewrite_sse_text(carry).as_bytes())?;
+        write_all_socket(client, rewrite_sse_text(carry).as_bytes())?;
     }
     if !terminal {
-        client.write_all(b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"upstream_stream_interrupted\",\"message\":\"Upstream stream ended before completion.\"}}}\n\n")?;
+        write_all_socket(client, b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"upstream_stream_interrupted\",\"message\":\"Upstream stream ended before completion.\"}}}\n\n")?;
     }
     Ok(())
 }
@@ -1396,7 +1396,7 @@ fn read_upstream_chunk(
     client: &mut TcpStream,
 ) -> anyhow::Result<ChunkRead> {
     let mut buffer = [0_u8; 8192];
-    match upstream.read(&mut buffer) {
+    match read_socket(upstream, &mut buffer) {
         Ok(0) => Ok(ChunkRead::Ended),
         Ok(read) => {
             *last_activity = Instant::now();
@@ -1421,13 +1421,13 @@ fn stream_read_timed_out(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-    )
+    ) || matches!(error.raw_os_error(), Some(10035 | 10060 | 11 | 35))
 }
 
 /// An SSE comment line is ignored by event parsers but resets Codex's stream
 /// idle timer, so long Grok/Gemini reasoning pauses no longer abort the task.
 fn send_sse_keepalive(client: &mut TcpStream) -> anyhow::Result<()> {
-    client.write_all(b": codex-router keep-alive\n\n")?;
+    write_all_socket(client, b": codex-router keep-alive\n\n")?;
     Ok(())
 }
 
@@ -1448,7 +1448,7 @@ fn forward_plain_sse(
             return Ok(SseForward::ReconcileFailed);
         }
         let mut buffer = [0_u8; 8192];
-        let read = match upstream.read(&mut buffer) {
+        let read = match read_socket(upstream, &mut buffer) {
             Ok(0) => break,
             Ok(read) => {
                 last_activity = Instant::now();
@@ -1488,6 +1488,7 @@ fn forward_agent_sse(
     // Poll the upstream on a short cadence instead of one long blocking read
     // so keep-alive comments can hold the Codex session open while Grok or
     // Gemini is silent during long reasoning or provider-side failover.
+    upstream.set_nonblocking(false).ok();
     upstream
         .set_read_timeout(Some(STREAM_POLL_TIMEOUT))
         .ok();
@@ -1510,6 +1511,12 @@ fn read_full_body(
     headers: &HashMap<String, String>,
     mut body: Vec<u8>,
 ) -> anyhow::Result<Vec<u8>> {
+    if headers
+        .get("transfer-encoding")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
+    {
+        return read_chunked_body(stream, body);
+    }
     if let Some(length) = headers
         .get("content-length")
         .and_then(|value| value.parse::<usize>().ok())
@@ -1524,9 +1531,52 @@ fn read_full_body(
         }
         body.truncate(length);
     } else {
-        stream.read_to_end(&mut body)?;
+        read_to_end_socket(stream, &mut body)?;
     }
     Ok(body)
+}
+
+fn read_chunked_body(stream: &mut TcpStream, mut raw: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+    let mut decoded = Vec::new();
+    loop {
+        let line_end = loop {
+            if let Some(position) = raw.windows(2).position(|window| window == b"\r\n") {
+                break position;
+            }
+            let mut buffer = [0_u8; 8192];
+            let read = read_socket(stream, &mut buffer)?;
+            if read == 0 {
+                bail!("upstream closed during chunk header");
+            }
+            raw.extend_from_slice(&buffer[..read]);
+        };
+        let line = String::from_utf8_lossy(&raw[..line_end]);
+        let size = parse_chunk_size(&line)?;
+        let data_start = line_end + 2;
+        let required = data_start + size + 2;
+        while raw.len() < required {
+            let mut buffer = [0_u8; 8192];
+            let read = read_socket(stream, &mut buffer)?;
+            if read == 0 {
+                bail!("upstream closed during chunk body");
+            }
+            raw.extend_from_slice(&buffer[..read]);
+            if decoded.len() + raw.len() > MAX_BODY_BYTES {
+                bail!("HTTP body is too large");
+            }
+        }
+        if raw.get(data_start + size..required) != Some(b"\r\n") {
+            bail!("invalid upstream chunk terminator");
+        }
+        if size == 0 {
+            return Ok(decoded);
+        }
+        decoded.extend_from_slice(&raw[data_start..data_start + size]);
+        if decoded.len() > MAX_BODY_BYTES {
+            bail!("HTTP body is too large");
+        }
+        raw.drain(..required);
+    }
 }
 
 fn forward_rewritten_json_body(
@@ -1563,13 +1613,13 @@ fn send_status(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    stream.write_all(header.as_bytes())?;
-    stream.write_all(body)?;
+    write_all_socket(stream, header.as_bytes())?;
+    write_all_socket(stream, body)?;
     Ok(())
 }
 
 fn send_raw(stream: &mut TcpStream, payload: &[u8]) -> anyhow::Result<()> {
-    stream.write_all(payload)?;
+    write_all_socket(stream, payload)?;
     Ok(())
 }
 
@@ -1579,53 +1629,150 @@ fn send_raw(stream: &mut TcpStream, payload: &[u8]) -> anyhow::Result<()> {
 /// connection that is already gone, and the next request on that pooled
 /// connection fails instantly with "error sending request".
 fn write_headers_forced_close(client: &mut TcpStream, raw_headers: &[u8]) -> anyhow::Result<()> {
-    let text = String::from_utf8_lossy(raw_headers);
-    let mut out = String::new();
-    let mut wrote_connection = false;
-    for (index, line) in text.split("
-").enumerate() {
-        if line.is_empty() {
-            continue;
-        }
-        if index > 0 && line.to_ascii_lowercase().starts_with("connection:") {
-            wrote_connection = true;
-            out.push_str("connection: close
-");
-            continue;
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    if !wrote_connection {
-        out.push_str("connection: close
-");
-    }
-    out.push('\n');
-    client.write_all(out.as_bytes())?;
+    write_all_socket(client, &force_connection_close_headers(raw_headers))?;
     Ok(())
 }
 
-/// Close the client socket gracefully: signal EOF for our writes, then drain
-/// whatever the client already pipelined before dropping the socket. Dropping
-/// a socket with unread inbound data makes Windows answer with RST instead of
-/// FIN, and the Codex HTTP client can then lose track of the closed pooled
-/// connection.
-fn close_client_gracefully(mut client: TcpStream) {
-    let _ = client.shutdown(std::net::Shutdown::Write);
-    let _ = client.set_read_timeout(Some(Duration::from_millis(150)));
-    let mut buffer = [0_u8; 8192];
-    let mut drained = 0_usize;
+fn client_connection_ended(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::UnexpectedEof
+            ) || matches!(io.raw_os_error(), Some(10053 | 10054 | 32 | 104))
+        })
+    })
+}
+
+fn io_interrupted(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::Interrupted || matches!(error.raw_os_error(), Some(4))
+}
+
+fn io_would_block(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || matches!(error.raw_os_error(), Some(10035 | 11 | 35))
+}
+
+fn prepare_client_socket(stream: &TcpStream) -> anyhow::Result<()> {
+    // Windows inherits non-blocking from the listener. Leaving the accepted
+    // socket non-blocking turns a full send buffer into WSAEWOULDBLOCK
+    // (os error 10035), which Codex surfaces as "error sending request".
+    stream
+        .set_nonblocking(false)
+        .context("could not switch the Codex socket to blocking I/O")?;
+    stream.set_nodelay(true).ok();
+    stream
+        .set_read_timeout(Some(HEADER_TIMEOUT))
+        .and_then(|_| stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT)))
+        .context("could not set Codex socket timeouts")?;
+    Ok(())
+}
+
+fn prepare_upstream_socket(stream: &TcpStream) {
+    stream.set_nonblocking(false).ok();
+    stream.set_nodelay(true).ok();
+    stream.set_read_timeout(Some(CLIENT_IO_TIMEOUT)).ok();
+    stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT)).ok();
+}
+
+fn read_socket(stream: &mut TcpStream, buf: &mut [u8]) -> std::io::Result<usize> {
     loop {
-        match client.read(&mut buffer) {
-            Ok(0) | Err(_) => break,
-            Ok(read) => {
-                drained += read;
-                if drained >= 256 * 1024 {
-                    break;
+        match stream.read(buf) {
+            Err(error) if io_interrupted(&error) => continue,
+            other => return other,
+        }
+    }
+}
+
+fn write_all_socket(stream: &mut TcpStream, mut buf: &[u8]) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        match stream.write(buf) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "socket write returned zero bytes",
+                ));
+            }
+            Ok(wrote) => buf = &buf[wrote..],
+            Err(error) if io_interrupted(&error) || io_would_block(&error) => {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    stream.flush()
+}
+
+fn copy_socket(src: &mut TcpStream, dst: &mut TcpStream) -> std::io::Result<u64> {
+    let mut buffer = [0_u8; 8192];
+    let mut total = 0_u64;
+    loop {
+        match read_socket(src, &mut buffer)? {
+            0 => return Ok(total),
+            n => {
+                write_all_socket(dst, &buffer[..n])?;
+                total += n as u64;
+            }
+        }
+    }
+}
+
+fn read_to_end_socket(stream: &mut TcpStream, body: &mut Vec<u8>) -> std::io::Result<usize> {
+    let mut buffer = [0_u8; 8192];
+    let mut total = 0;
+    loop {
+        match read_socket(stream, &mut buffer)? {
+            0 => return Ok(total),
+            n => {
+                body.extend_from_slice(&buffer[..n]);
+                total += n;
+                if body.len() > MAX_BODY_BYTES {
+                    return Err(std::io::Error::other("HTTP body is too large"));
                 }
             }
         }
     }
+}
+
+fn close_client_gracefully(stream: &mut TcpStream) {
+    let _ = stream.flush();
+    let _ = stream.shutdown(Shutdown::Write);
+    stream.set_read_timeout(Some(CLIENT_CLOSE_DRAIN)).ok();
+    let mut buf = [0_u8; 512];
+    for _ in 0..8 {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+fn force_connection_close_headers(raw_headers: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(raw_headers);
+    let mut out = String::new();
+    let mut wrote_connection = false;
+    for line in text.split('\n') {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        if line.to_ascii_lowercase().starts_with("connection:") {
+            wrote_connection = true;
+            out.push_str("connection: close\r\n");
+            continue;
+        }
+        out.push_str(line);
+        out.push_str("\r\n");
+    }
+    if !wrote_connection {
+        out.push_str("connection: close\r\n");
+    }
+    out.push_str("\r\n");
+    out.into_bytes()
 }
 
 #[cfg(test)]
@@ -1782,7 +1929,7 @@ mod tests {
             body.truncate(length);
             *received_clone.lock().unwrap() = Some(body);
             socket
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n11\r\ndata: {\"ok\":1}\r\n\r\n\r\n0\r\n\r\n")
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\ndata: {\"type\":\"response.completed\"}\n\n")
                 .unwrap();
         });
 
@@ -1812,8 +1959,10 @@ mod tests {
         };
         assert_eq!(forwarded, body);
         let text = String::from_utf8_lossy(&response);
-        assert!(text.contains("Transfer-Encoding: chunked") || text.contains("transfer-encoding: chunked"));
-        assert!(text.contains("data: {\"ok\":1}"));
+        assert!(text.to_ascii_lowercase().contains("connection: close"));
+        assert!(text.contains("response.output_text.delta"));
+        assert!(text.contains("response.completed"));
+        assert!(!text.contains("response.failed"));
     }
 
     #[test]
@@ -2109,6 +2258,17 @@ mod tests {
     where
         F: Fn(usize, &mut TcpStream) + Send + 'static,
     {
+        run_model_client_against_mock("grok-t", answer, max_retries)
+    }
+
+    fn run_model_client_against_mock<F>(
+        model: &str,
+        answer: F,
+        max_retries: u32,
+    ) -> (String, usize)
+    where
+        F: Fn(usize, &mut TcpStream) + Send + 'static,
+    {
         let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
         let upstream_addr = upstream.local_addr().unwrap();
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2139,13 +2299,146 @@ mod tests {
             handle_client(&mut stream, &upstream_url, max_retries).unwrap();
         });
         let mut client = TcpStream::connect(client_addr).unwrap();
+        let body = format!(r#"{{"model":"{model}"}}"#);
+        let request = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
         client
-            .write_all(b"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 18\r\nConnection: close\r\n\r\n{\"model\":\"grok-t\"}")
+            .write_all(request.as_bytes())
             .unwrap();
         let mut output = String::new();
         client.read_to_string(&mut output).unwrap();
         worker.join().unwrap();
         (output, attempts.load(Ordering::Relaxed))
+    }
+
+    #[test]
+    fn chatgpt_sse_disconnect_uses_valid_terminal_semantics() {
+        let (output, attempts) = run_model_client_against_mock(
+            "gpt-5.6-sol",
+            |attempt, socket| {
+                if attempt == 0 {
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                        .unwrap();
+                    return;
+                }
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: {\"type\":\"response.completed\"}\n\n")
+                    .unwrap();
+            },
+            1,
+        );
+        assert_eq!(attempts, 2);
+        assert_eq!(output.matches("HTTP/1.1 200").count(), 1);
+        assert!(output.contains("response.completed"));
+        assert!(!output.contains("upstream_stream_interrupted"));
+
+        let (failed, attempts) = run_model_client_against_mock(
+            "gpt-5.6-sol",
+            |_attempt, socket| {
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+            },
+            0,
+        );
+        assert_eq!(attempts, 1);
+        assert!(failed.contains("response.failed"));
+        assert!(failed.contains("upstream_stream_interrupted"));
+    }
+
+    #[test]
+    fn client_cancellation_errors_are_not_gateway_failures() {
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::UnexpectedEof,
+        ] {
+            let error = anyhow::Error::new(std::io::Error::new(kind, "fixture"));
+            assert!(client_connection_ended(&error));
+        }
+        let aborted = std::io::Error::from_raw_os_error(10053);
+        assert!(client_connection_ended(&anyhow::Error::new(aborted)));
+    }
+
+    #[test]
+    fn would_block_is_retried_instead_of_treated_as_client_cancel() {
+        for kind in [std::io::ErrorKind::WouldBlock, std::io::ErrorKind::TimedOut] {
+            let error = anyhow::Error::new(std::io::Error::new(kind, "fixture"));
+            assert!(!client_connection_ended(&error));
+        }
+        let would_block = std::io::Error::from_raw_os_error(10035);
+        assert!(io_would_block(&would_block));
+        assert!(!client_connection_ended(&anyhow::Error::new(would_block)));
+    }
+
+    #[test]
+    fn force_connection_close_headers_uses_crlf_and_replaces_keep_alive() {
+        let rewritten = force_connection_close_headers(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n",
+        );
+        let text = String::from_utf8(rewritten).unwrap();
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(text.contains("connection: close\r\n"));
+        assert!(!text.to_ascii_lowercase().contains("keep-alive"));
+        assert!(text.ends_with("\r\n\r\n"));
+        assert!(!text.contains("connection: close\nconnection"));
+    }
+
+    #[test]
+    fn handle_client_survives_nonblocking_listener_accept() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            let (headers, leftover) = read_headers(&mut socket).unwrap();
+            let length = parse_headers(&String::from_utf8_lossy(&headers))
+                .get("content-length")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            let mut body = leftover;
+            read_exact_more(&mut socket, &mut body, length).unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\ndata: {\"type\":\"response.completed\"}\n\n")
+                .unwrap();
+        });
+
+        let gateway = TcpListener::bind("127.0.0.1:0").unwrap();
+        gateway.set_nonblocking(true).unwrap();
+        let gateway_addr = gateway.local_addr().unwrap();
+        let upstream_url = format!("http://127.0.0.1:{}", upstream_addr.port());
+        let worker = thread::spawn(move || {
+            let mut stream = loop {
+                match gateway.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            };
+            handle_client(&mut stream, &upstream_url, DEFAULT_RATE_LIMIT_RETRIES).unwrap();
+            close_client_gracefully(&mut stream);
+        });
+
+        let mut client = TcpStream::connect(gateway_addr).unwrap();
+        let body = br#"{"model":"gpt-5.6-sol","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}"#;
+        let request = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        client.write_all(request.as_bytes()).unwrap();
+        client.write_all(body).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        worker.join().unwrap();
+        assert!(response.to_ascii_lowercase().contains("connection: close"));
+        assert!(response.contains("response.output_text.delta"));
+        assert!(response.contains("response.completed"));
+        assert!(!response.contains("response.failed"));
     }
 
     #[test]
@@ -2215,6 +2508,29 @@ mod tests {
         assert!(output.contains("HTTP/1.1 200"));
         assert!(output.contains("\"ok\":true"));
         assert!(!output.contains("partial"));
+    }
+
+    #[test]
+    fn truncated_chunked_json_retries_and_decodes_before_forwarding() {
+        let (output, attempts) = run_client_against_mock(
+            |attempt, socket| {
+                if attempt == 0 {
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nb\r\n{\"partial")
+                        .unwrap();
+                    return;
+                }
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nb\r\n{\"ok\":true}\r\n0\r\n\r\n")
+                    .unwrap();
+            },
+            1,
+        );
+        assert_eq!(attempts, 2);
+        assert!(output.contains("{\"ok\":true}"));
+        assert!(!output.contains("partial"));
+        assert!(!output.to_ascii_lowercase().contains("transfer-encoding"));
+        assert!(output.to_ascii_lowercase().contains("content-length: 11"));
     }
 
     #[test]

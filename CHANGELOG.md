@@ -2,6 +2,41 @@
 
 本文件记录面向用户的重要变化。完整技术细节以对应版本的源码和 GitHub Release 为准。
 
+## 2.0.11 - 2026-08-22
+
+### 修复
+
+- 修复 Codex 对话框 `stream disconnected before completion: error sending request for url (http://127.0.0.1:28082/v1/responses)` 与 `error decoding response body`。
+- 根因是本机 Responses 网关 listener 非阻塞，Windows 上 accepted 套接字继承非阻塞；大请求写回 SSE 时触发 WSAEWOULDBLOCK (10035)，旧逻辑当成客户端取消并 RST，Codex 解码失败。Kimi 与 ChatGPT 都走同一条 28082 本地链路。
+- 网关 accept 后强制阻塞套接字和 TCP_NODELAY；读写遇到 10035/WouldBlock 短睡重试；请求读完后超时从 30s 提到 300s；响应结束 half-close(FIN) 并排空，避免 RST。
+- `connection: close` 响应头改为标准 CRLF。
+- Router Host 对截断的上游 JSON 响应体返回 502，不再把半截 body 当成成功。
+
+### 说明
+
+- 上游仍是 CLIProxyAPI 7.2.135 + Router Host；`28082` 是 Codex-Router.exe 内嵌网关。
+- 升级后请完全重启 CodexRouter，并用新线程验证；旧失败对话框不会自动消失。
+
+## 2.0.10 - 2026-08-22
+
+### 功能
+
+- 模型编辑面板新增最大输出 Token（默认 0 = 不发送，使用上游默认）；网关按请求 model 注入 `max_output_tokens` / `max_tokens`，映射可热更新。
+
+### 修复
+
+- 网关对 OpenAI 家族透传强制 `connection: close`，并增加 `gateway-requests.jsonl` 诊断。
+- 纯文本 SSE 中段断流自动重试并对账去重：只补后缀，分叉则干净 `response.failed`。
+- 绑定探测同时检查用户层与系统层；系统层在位不再弹“路由绑定已变化”，用户层无效 model（如 `first`）静默修复为默认模型。
+- 托盘恢复后中文方框：字体安装失败不再误置成功，2s 节流重试，CJK 候选扩充，交互时强制恢复全量字体。
+
+## 2.0.9 - 2026-08-22
+
+### 修复
+
+- 断网 / 请求错误 / 429 自动重试改为首次 5s、之后每次 ×5（5s / 25s / 125s / …，单步封顶 1h）；默认重试次数 6 → 3，UI 可自定义 0–32。
+- 重试覆盖产内容前所有阶段：SSE 首事件前断线静默重试，JSON/错误响应体中途断线整请求重试；已输出内容后断流保持干净 `response.failed`。
+
 ## 2.0.8 - 2026-08-21
 
 ### 修复
