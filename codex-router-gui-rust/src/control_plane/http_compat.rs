@@ -4025,7 +4025,10 @@ mod tests {
         let requests = requests.lock().unwrap_or_else(|error| error.into_inner());
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0]["auth_index"], "authoritative-probe-index");
-        assert_eq!(requests[0]["url"], "https://api.openai.com/v1/models");
+        assert_eq!(
+            requests[0]["url"],
+            "https://chatgpt.com/backend-api/codex/models?client_version=0.144.1"
+        );
 
         server.abort();
         let _ = std::fs::remove_dir_all(root);

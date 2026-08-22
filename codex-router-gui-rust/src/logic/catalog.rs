@@ -401,8 +401,12 @@ pub fn build_model_catalog_with_root(cfg: &RouterConfig, router_root: &Path) -> 
             .collect();
         let supports_images = resolve_multimodal(model);
         let context_window = resolve_context_window(model);
-        let compact_percent = model.auto_compact_percent.clamp(60, 90);
-        let auto_compact_token_limit = context_window * compact_percent as i64 / 100;
+        let compact_percent = super::clamp_auto_compact_percent(model.auto_compact_percent);
+        // Codex uses auto_compact_token_limit as the effective window shown to
+        // the user and as the compact trigger. Keep it equal to the physical
+        // window so Grok/ChatGPT see the full documented size; the percent is
+        // only a user-tunable compact trigger relative to that full window.
+        let auto_compact_token_limit = context_window;
         let display_name = route_display_name(route);
 
         let mut entry = template.clone();

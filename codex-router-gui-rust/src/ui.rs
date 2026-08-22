@@ -397,11 +397,11 @@ mod ordering_tests {
 
         assert!(apply_model_priority_order(&mut config, "grok-4.5", &[2, 0]));
         assert_eq!(config.models[0].base_url, "https://api.example.com/v1");
-        assert_eq!(config.models[0].priority, 10);
+        assert_eq!(config.models[0].priority, 1);
         assert_eq!(config.models[1].model, "other-model");
         assert_eq!(config.models[1].priority, 70);
         assert_eq!(config.models[2].source, "oauth");
-        assert_eq!(config.models[2].priority, 20);
+        assert_eq!(config.models[2].priority, 2);
         assert_eq!(
             crate::logic::model_route_policy(&config, "grok-4.5"),
             crate::logic::ModelRoutePolicy::ApiFirst
@@ -975,7 +975,7 @@ fn apply_model_priority_order(
     let old_models = config.models.clone();
     for (position, (slot, source)) in slots.iter().zip(order.iter()).enumerate() {
         let mut model = old_models[*source].clone();
-        model.priority = (position as i32 + 1) * 10;
+        model.priority = position as i32 + 1;
         config.models[*slot] = model;
     }
     let policy = if config.models[slots[0]].source == "oauth" {
@@ -1412,6 +1412,9 @@ impl eframe::App for CodexRouterApp {
         }
         if self.result_dialog_open {
             self.show_result_notice_dialog(&ctx, &palette);
+        }
+        if self.api_model_choice_open {
+            self.show_api_model_choice_dialog(&ctx, &palette);
         }
         if self.oauth_post_login_prompt_open {
             self.show_oauth_post_login_prompt(&ctx, &palette);
@@ -1952,6 +1955,107 @@ impl CodexRouterApp {
         if acknowledged {
             self.apply_success_dialog_open = false;
             self.apply_success_is_subscription = false;
+        }
+    }
+
+    fn show_api_model_choice_dialog(&mut self, ctx: &egui::Context, palette: &theme::Palette) {
+        let zh = self.ui_language == "zh";
+        let mut open = true;
+        let mut selected = None;
+        let mut cancel = false;
+        let ids = self.api_model_choice_ids.clone();
+        let dialog_size = fit_dialog_size(
+            ctx.content_rect().size(),
+            egui::vec2(560.0, 460.0),
+            egui::vec2(420.0, 320.0),
+        );
+        egui::Window::new("")
+            .id(egui::Id::new("api-model-choice-dialog"))
+            .title_bar(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .frame(theme::dialog_window_frame())
+            .default_size(dialog_size)
+            .min_size(dialog_size)
+            .max_size(dialog_size)
+            .show(ctx, |ui| {
+                ui.set_width(dialog_size.x);
+                theme::dialog_shell(
+                    ui,
+                    palette,
+                    |ui| {
+                        theme::dialog_title(
+                            ui,
+                            t(zh, "选择上游返回的模型", "Choose a listed model"),
+                        );
+                    },
+                    |ui| {
+                        ui.label(
+                            egui::RichText::new(t(
+                                zh,
+                                "Key 有效，但填写的模型 ID 不在 /models 列表中。下面是这次返回的全部可用模型，点选一项即可添加。",
+                                "The key is valid, but the typed model ID was not listed. Choose one of the models returned by /models.",
+                            ))
+                            .color(palette.ink),
+                        );
+                        ui.add_space(10.0);
+                        egui::ScrollArea::vertical()
+                            .id_salt("api-model-choice-list")
+                            .max_height((dialog_size.y - 170.0).max(160.0))
+                            .show(ui, |ui| {
+                                for id in &ids {
+                                    if ui
+                                        .add_sized(
+                                            [ui.available_width(), 32.0],
+                                            egui::Button::new(
+                                                egui::RichText::new(id).color(palette.ink),
+                                            )
+                                            .fill(palette.paper_alt),
+                                        )
+                                        .clicked()
+                                    {
+                                        selected = Some(id.clone());
+                                    }
+                                }
+                            });
+                        ui.add_space(12.0);
+                        if theme::secondary_button(ui, t(zh, "取消", "Cancel"), palette).clicked() {
+                            cancel = true;
+                        }
+                    },
+                );
+            });
+        if let Some(model_id) = selected {
+            if let Some(mut model) = self.api_model_choice_model.take() {
+                model.model = model_id;
+                if model.alias_customized != Some(true) {
+                    model.alias = super::logic::recommended_model_display_name(&model.model);
+                    model.alias_customized = Some(false);
+                }
+                let editing = self.api_model_choice_editing;
+                let from_wizard = self.api_model_choice_from_wizard;
+                self.temp_model = (*model).clone();
+                self.commit_model_draft(*model, editing, from_wizard);
+                if !from_wizard {
+                    self.show_result_dialog(
+                        super::ResultDialogKind::Success,
+                        if zh { "添加成功" } else { "Added successfully" },
+                        if zh {
+                            "已改用上游返回的模型并添加。保存并应用后即可在 Codex 使用。"
+                        } else {
+                            "The listed model was selected and added. Save & apply to use it in Codex."
+                        },
+                    );
+                }
+            }
+            self.api_model_choice_open = false;
+            self.api_model_choice_ids.clear();
+        } else if cancel || !open {
+            self.api_model_choice_open = false;
+            self.api_model_choice_ids.clear();
+            self.api_model_choice_model = None;
         }
     }
 
@@ -4070,15 +4174,15 @@ impl CodexRouterApp {
                                     t(zh, "自动压缩", "AUTO COMPACTION"),
                                     t(
                                         zh,
-                                        "默认 80%，提前保留输出余量",
-                                        "80% default leaves conservative output headroom",
+                                        "默认 95%，与官方有效窗口一致；仍可手动下调",
+                                        "95% default matches the official effective window; still adjustable",
                                     ),
                                     palette,
                                 );
                                 columns[1].add(
                                     egui::Slider::new(
                                         &mut this.temp_model.auto_compact_percent,
-                                        60..=90,
+                                        60..=95,
                                     )
                                     .suffix("%"),
                                 );
@@ -4301,6 +4405,7 @@ impl CodexRouterApp {
                                             editing_model: None,
                                             model_from_wizard,
                                             result,
+                                            available_models: Vec::new(),
                                         })
                                         .ok();
                                     });
@@ -8225,8 +8330,8 @@ impl CodexRouterApp {
                         ui.label(
                             egui::RichText::new(t(
                                 zh,
-                                "拖动左侧手柄调整同名模型的调用顺序，订阅默认靠前",
-                                "Drag the left handle to reorder same-name models; subscription first by default",
+                                "拖动左侧手柄调整同名模型的账号优先级，越靠前越先调度；保存后与订阅页是同一套 P 值",
+                                "Drag to set account priority for this model; earlier rows run first. This is the same P value as the subscription page.",
                             ))
                             .color(egui::Color32::from_white_alpha(215))
                             .small(),
@@ -10789,7 +10894,7 @@ impl CodexRouterApp {
                                             &format!(
                                                 "{}K / {}%",
                                                 super::logic::resolve_context_window(model) / 1000,
-                                                model.auto_compact_percent.clamp(60, 90)
+                                                super::logic::clamp_auto_compact_percent(model.auto_compact_percent)
                                             ),
                                             palette.paper_alt,
                                             palette.ink_soft,

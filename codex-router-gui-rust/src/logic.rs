@@ -337,7 +337,7 @@ pub fn apply_channel_preset(model: &mut ModelConfig, preset_id: &str) -> bool {
     model.extra = "{}".to_owned();
     model.multimodal = "auto".to_owned();
     model.context_window = 0;
-    model.auto_compact_percent = 80;
+    model.auto_compact_percent = 95;
     model.reasoning_mode = "auto".to_owned();
     model.reasoning_levels.clear();
     model.default_reasoning_level.clear();
@@ -1583,8 +1583,12 @@ pub fn resolve_context_window(model: &ModelConfig) -> i64 {
     }
 }
 
+pub fn clamp_auto_compact_percent(percent: i32) -> i32 {
+    percent.clamp(60, 95)
+}
+
 pub fn resolve_auto_compact_token_limit(model: &ModelConfig) -> i64 {
-    let percent = model.auto_compact_percent.clamp(60, 90) as i64;
+    let percent = clamp_auto_compact_percent(model.auto_compact_percent) as i64;
     resolve_context_window(model) * percent / 100
 }
 
@@ -1698,7 +1702,32 @@ pub fn stamp_channel_route_metadata(model: &mut ModelConfig) {
     model.extra = serde_json::to_string(&Value::Object(extra)).unwrap_or_else(|_| "{}".to_owned());
 }
 
+pub fn sync_account_priorities_from_model_slots(cfg: &mut RouterConfig) {
+    let mut account_priority: std::collections::BTreeMap<i64, i32> = std::collections::BTreeMap::new();
+    for model in &cfg.models {
+        if model.source != "oauth" || model.oauth_account_id <= 0 {
+            continue;
+        }
+        if !(1..=999).contains(&model.priority) {
+            continue;
+        }
+        account_priority
+            .entry(model.oauth_account_id)
+            .and_modify(|current| *current = (*current).min(model.priority))
+            .or_insert(model.priority);
+    }
+    for model in &mut cfg.models {
+        if model.source != "oauth" {
+            continue;
+        }
+        if let Some(priority) = account_priority.get(&model.oauth_account_id) {
+            model.priority = *priority;
+        }
+    }
+}
+
 pub fn write_all_files(cfg: &mut RouterConfig, router_root: &Path) -> anyhow::Result<()> {
+    sync_account_priorities_from_model_slots(cfg);
     for model in &mut cfg.models {
         stamp_channel_route_metadata(model);
     }
@@ -3793,7 +3822,7 @@ base_url = "https://api.430123.xyz/v1"
         assert_eq!(model.credential_name, "SavedCredential");
         assert_eq!(model.priority, 40);
         assert_eq!(model.context_window, 0);
-        assert_eq!(model.auto_compact_percent, 80);
+        assert_eq!(model.auto_compact_percent, 95);
         assert_eq!(model.reasoning_mode, "auto");
         assert_eq!(model.extra, "{}");
         assert!(!apply_channel_preset(&mut model, "unknown"));
@@ -4542,6 +4571,40 @@ base_url = "https://api.430123.xyz/v1"
     }
 
     #[test]
+    fn account_priority_is_shared_across_every_slot_for_the_same_oauth_account() {
+        let mut config = RouterConfig {
+            models: vec![
+                ModelConfig {
+                    model: "grok-4.6".into(),
+                    source: "oauth".into(),
+                    oauth_account_id: 42,
+                    priority: 1,
+                    ..Default::default()
+                },
+                ModelConfig {
+                    model: "grok-4.5".into(),
+                    source: "oauth".into(),
+                    oauth_account_id: 42,
+                    priority: 20,
+                    ..Default::default()
+                },
+                ModelConfig {
+                    model: "grok-4.6".into(),
+                    source: "oauth".into(),
+                    oauth_account_id: 43,
+                    priority: 2,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        sync_account_priorities_from_model_slots(&mut config);
+        assert_eq!(config.models[0].priority, 1);
+        assert_eq!(config.models[1].priority, 1);
+        assert_eq!(config.models[2].priority, 2);
+    }
+
+    #[test]
     fn dashboard_merges_duplicate_oauth_models_and_keeps_distinct_api_rows() {
         let models = vec![
             ModelConfig {
@@ -4941,29 +5004,29 @@ base_url = "https://api.430123.xyz/v1"
             ..Default::default()
         };
         assert_eq!(resolve_context_window(&kimi), 262_144);
-        assert_eq!(resolve_auto_compact_token_limit(&kimi), 209_715);
+        assert_eq!(resolve_auto_compact_token_limit(&kimi), 249_036);
 
         kimi.model = "gpt-5.6-sol".into();
         assert_eq!(resolve_context_window(&kimi), 272_000);
-        assert_eq!(resolve_auto_compact_token_limit(&kimi), 217_600);
+        assert_eq!(resolve_auto_compact_token_limit(&kimi), 258_400);
 
         kimi.model = "grok-4.6".into();
         assert_eq!(resolve_context_window(&kimi), 500_000);
-        assert_eq!(resolve_auto_compact_token_limit(&kimi), 400_000);
+        assert_eq!(resolve_auto_compact_token_limit(&kimi), 475_000);
 
         for model in ["gemini-3.6-flash", "mimo-v2.5-pro", "deepseek-v4-pro"] {
             kimi.model = model.into();
             assert_eq!(resolve_context_window(&kimi), 1_048_576, "{model}");
-            assert_eq!(resolve_auto_compact_token_limit(&kimi), 838_860, "{model}");
+            assert_eq!(resolve_auto_compact_token_limit(&kimi), 996_147, "{model}");
         }
 
         kimi.model = "k3-256k".into();
         assert_eq!(resolve_context_window(&kimi), 262_144);
-        assert_eq!(resolve_auto_compact_token_limit(&kimi), 209_715);
+        assert_eq!(resolve_auto_compact_token_limit(&kimi), 249_036);
 
         kimi.model = "claude-opus-5".into();
         assert_eq!(resolve_context_window(&kimi), 1_000_000);
-        assert_eq!(resolve_auto_compact_token_limit(&kimi), 800_000);
+        assert_eq!(resolve_auto_compact_token_limit(&kimi), 950_000);
 
         kimi.context_window = 200_000;
         kimi.auto_compact_percent = 75;
@@ -4990,7 +5053,8 @@ base_url = "https://api.430123.xyz/v1"
         assert!(catalog["models"][0]["additional_speed_tiers"].is_array());
         assert_eq!(catalog["models"][0]["slug"], "portable-test-model");
         assert_eq!(catalog["models"][0]["context_window"], 128_000);
-        assert_eq!(catalog["models"][0]["auto_compact_token_limit"], 102_400);
+        assert_eq!(catalog["models"][0]["auto_compact_token_limit"], 128_000);
+        assert_eq!(catalog["models"][0]["effective_context_window_percent"], 95);
         assert_eq!(catalog["models"][0]["input_modalities"], json!(["text"]));
         assert!(!raw.contains("must-not-be-written"));
         // The deployment scripts read the Router config through

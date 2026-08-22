@@ -378,6 +378,33 @@ struct OAuthAccountSummary {
     models_error: String,
 }
 
+fn listed_api_model_ids(payload: &serde_json::Value) -> Vec<String> {
+    let entries = payload
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| payload.get("models").and_then(serde_json::Value::as_array))
+        .or_else(|| payload.as_array());
+    let Some(entries) = entries else {
+        return Vec::new();
+    };
+    let mut ids = Vec::new();
+    for entry in entries {
+        let raw = entry
+            .get("id")
+            .or_else(|| entry.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if raw.is_empty() {
+            continue;
+        }
+        if !ids.iter().any(|seen: &String| seen.eq_ignore_ascii_case(raw)) {
+            ids.push(raw.to_owned());
+        }
+    }
+    ids
+}
+
 fn oauth_platform_matches(account_platform: &str, requested_provider: &str) -> bool {
     let normalize = |value: &str| match value.trim().to_ascii_lowercase().as_str() {
         "chatgpt" => "openai".to_owned(),
@@ -1036,6 +1063,7 @@ enum AppEvent {
         editing_model: Option<usize>,
         model_from_wizard: bool,
         result: Result<(), String>,
+        available_models: Vec<String>,
     },
     UpdateProgress(updater::DownloadProgress),
     UpdateResult(Box<GitHubUpdateInfo>),
@@ -1154,21 +1182,27 @@ fn validate_api_model_connection(
     let payload = response
         .json::<serde_json::Value>()
         .map_err(|_| "invalid_response".to_owned())?;
-    let ids = payload
-        .get("data")
-        .and_then(serde_json::Value::as_array)
-        .or_else(|| payload.get("models").and_then(serde_json::Value::as_array))
-        .or_else(|| payload.as_array())
-        .ok_or_else(|| "invalid_response".to_owned())?;
+    let ids = listed_api_model_ids(&payload);
+    if ids.is_empty()
+        && payload
+            .get("data")
+            .and_then(serde_json::Value::as_array)
+            .or_else(|| payload.get("models").and_then(serde_json::Value::as_array))
+            .or_else(|| payload.as_array())
+            .is_none()
+    {
+        return Err("invalid_response".to_owned());
+    }
     let expected = logic::canonical_route_model_id(&model.model);
-    if !ids.iter().any(|entry| {
-        entry
-            .get("id")
-            .or_else(|| entry.get("name"))
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|id| logic::canonical_route_model_id(id) == expected)
-    }) {
-        return Err("model_missing".to_owned());
+    if !ids
+        .iter()
+        .any(|id| logic::canonical_route_model_id(id) == expected)
+    {
+        return Err(if ids.is_empty() {
+            "model_missing".to_owned()
+        } else {
+            format!("model_missing:{}", ids.join("\n"))
+        });
     }
 
     let probe = |protocol: logic::UpstreamProtocol| -> Result<(), String> {
@@ -1246,6 +1280,21 @@ fn validate_api_model_connection(
     }
 }
 
+fn split_model_missing_code(code: &str) -> (&str, Vec<String>) {
+    if let Some(rest) = code.strip_prefix("model_missing:") {
+        (
+            "model_missing",
+            rest.split('\n')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(ToOwned::to_owned)
+                .collect(),
+        )
+    } else {
+        (code, Vec::new())
+    }
+}
+
 fn api_model_validation_message(code: &str, zh: bool) -> &'static str {
     match (code, zh) {
         ("invalid_url", true) => "Base URL 无效，请填写完整的 http/https 地址",
@@ -1302,6 +1351,11 @@ struct CodexRouterApp {
     editing_model: Option<usize>,
     model_from_wizard: bool,
     api_model_validation_running: bool,
+    api_model_choice_open: bool,
+    api_model_choice_ids: Vec<String>,
+    api_model_choice_model: Option<Box<ModelConfig>>,
+    api_model_choice_editing: Option<usize>,
+    api_model_choice_from_wizard: bool,
     proxy_from_wizard: bool,
     status_text: String,
     status_expires_at: Option<std::time::Instant>,
@@ -3268,6 +3322,11 @@ impl CodexRouterApp {
             editing_model: None,
             model_from_wizard: true,
             api_model_validation_running: false,
+            api_model_choice_open: false,
+            api_model_choice_ids: Vec::new(),
+            api_model_choice_model: None,
+            api_model_choice_editing: None,
+            api_model_choice_from_wizard: false,
             proxy_from_wizard: true,
             status_text: String::new(),
             status_expires_at: None,
@@ -3750,6 +3809,11 @@ impl CodexRouterApp {
             editing_model: None,
             model_from_wizard: true,
             api_model_validation_running: false,
+            api_model_choice_open: false,
+            api_model_choice_ids: Vec::new(),
+            api_model_choice_model: None,
+            api_model_choice_editing: None,
+            api_model_choice_from_wizard: false,
             proxy_from_wizard: true,
             status_text: "UI audit mode: no system configuration will be changed.".to_owned(),
             status_expires_at: None,
@@ -5722,6 +5786,14 @@ impl CodexRouterApp {
                     {
                         account.priority = priority;
                     }
+                    for model in &mut self.config.models {
+                        if model.source == "oauth" && model.oauth_account_id == account_id {
+                            model.priority = priority;
+                        }
+                    }
+                    let _ = self
+                        .config
+                        .save(&crate::user_data::config_path(&self.router_root));
                     self.oauth_accounts.sort_by(|left, right| {
                         left.priority
                             .cmp(&right.priority)
@@ -5750,6 +5822,7 @@ impl CodexRouterApp {
                     editing_model,
                     model_from_wizard,
                     result,
+                    available_models,
                 } => {
                     self.api_model_validation_running = false;
                     let draft_unchanged = self.page == Page::Model
@@ -5787,21 +5860,40 @@ impl CodexRouterApp {
                             }
                         }
                         Err(code) => {
-                            self.temp_model = *model;
-                            let detail = api_model_validation_message(&code, zh);
-                            self.show_result_dialog(
-                                ResultDialogKind::Failure,
-                                if zh {
-                                    "本配置无效"
+                            self.temp_model = (*model).clone();
+                            let (code, listed) = split_model_missing_code(&code);
+                            let available = if listed.is_empty() {
+                                available_models
+                            } else {
+                                listed
+                            };
+                            if code == "model_missing" && !available.is_empty() {
+                                self.api_model_choice_open = true;
+                                self.api_model_choice_ids = available;
+                                self.api_model_choice_model = Some(model);
+                                self.api_model_choice_editing = editing_model;
+                                self.api_model_choice_from_wizard = model_from_wizard;
+                                self.status_text = if zh {
+                                    "连接成功，但填写的模型 ID 不在上游列表中。请从返回的可用模型里选择一项。".to_owned()
                                 } else {
-                                    "Configuration is invalid"
-                                },
-                                if zh {
-                                    format!("本配置无效，请检查配置。{detail}")
-                                } else {
-                                    format!("This configuration is invalid. Please check the settings. {detail}")
-                                },
-                            );
+                                    "Connected, but the typed model ID was not listed. Choose one of the models returned by the API.".to_owned()
+                                };
+                            } else {
+                                let detail = api_model_validation_message(code, zh);
+                                self.show_result_dialog(
+                                    ResultDialogKind::Failure,
+                                    if zh {
+                                        "本配置无效"
+                                    } else {
+                                        "Configuration is invalid"
+                                    },
+                                    if zh {
+                                        format!("本配置无效，请检查配置。{detail}")
+                                    } else {
+                                        format!("This configuration is invalid. Please check the settings. {detail}")
+                                    },
+                                );
+                            }
                         }
                     }
                 }
@@ -9199,7 +9291,7 @@ mod main_tests {
             api_validation_fixture("200 OK", r#"{"data":[{"id":"another-model"}]}"#, &[]);
         assert_eq!(
             super::validate_api_model_connection(&cfg, &mut model),
-            Err("model_missing".to_owned())
+            Err("model_missing:another-model".to_owned())
         );
         assert!(!super::api_model_validation_message("unauthorized", true).contains("secret"));
 
@@ -9214,6 +9306,41 @@ mod main_tests {
         );
         let extra: serde_json::Value = serde_json::from_str(&model.extra).unwrap();
         assert_eq!(extra["openai_responses_mode"], "force_chat_completions");
+    }
+
+    #[test]
+    fn api_model_validation_lists_all_ids_when_expected_model_is_missing() {
+        assert_eq!(
+            super::listed_api_model_ids(&serde_json::json!({
+                "data": [
+                    {"id": "gpt-5.6"},
+                    {"id": "gpt-5.4"},
+                    {"name": "deepseek-v4-pro"}
+                ]
+            })),
+            vec![
+                "gpt-5.6".to_owned(),
+                "gpt-5.4".to_owned(),
+                "deepseek-v4-pro".to_owned()
+            ]
+        );
+        assert_eq!(
+            crate::logic::canonical_route_model_id("gpt-5.6"),
+            crate::logic::canonical_route_model_id("gpt-5.6-sol")
+        );
+
+        let (cfg, mut model) = api_validation_fixture(
+            "200 OK",
+            r#"{"data":[{"id":"gpt-4.1"},{"id":"gpt-5.4"}]}"#,
+            &[],
+        );
+        model.model = "gpt-5.6-sol".to_owned();
+        let error = super::validate_api_model_connection(&cfg, &mut model).unwrap_err();
+        assert!(error.starts_with("model_missing:"), "{error}");
+        assert!(error.contains("gpt-4.1"));
+        assert!(error.contains("gpt-5.4"));
+        let (_code, listed) = super::split_model_missing_code(&error);
+        assert_eq!(listed, vec!["gpt-4.1".to_owned(), "gpt-5.4".to_owned()]);
     }
 
     #[test]

@@ -179,17 +179,13 @@ fn maybe_recover_misdisabled_account(
         return false;
     }
     let recover_path = format!("/api/v1/admin/accounts/{id}/recover-state");
-    if retry_account_read(|| {
+    let _ = retry_account_read(|| {
         admin.post(
             &recover_path,
             None,
             remaining(deadline, Duration::from_secs(10))?,
         )
-    })
-    .is_err()
-    {
-        return false;
-    }
+    });
     let schedulable_path = format!("/api/v1/admin/accounts/{id}/schedulable");
     retry_account_read(|| {
         admin.post(
@@ -2104,7 +2100,9 @@ fn resolve_state(
     fresh: bool,
 ) -> (String, String) {
     let mut detail = detail.to_owned();
-    if fresh || (status == "active" && schedulable != Some(false)) {
+    if schedulable != Some(false)
+        && (fresh || (status == "active" && schedulable != Some(false)))
+    {
         detail.clear();
     }
     let exhausted = windows
@@ -2565,13 +2563,13 @@ fn recover_oauth_account(
     router_group_id: i64,
     deadline: Instant,
 ) -> anyhow::Result<()> {
-    retry_account_read(|| {
+    let _ = retry_account_read(|| {
         admin.post(
             &format!("/api/v1/admin/accounts/{account_id}/recover-state"),
             None,
             remaining(deadline, Duration::from_secs(10))?,
         )
-    })?;
+    });
     retry_account_read(|| {
         admin.post(
             &format!("/api/v1/admin/accounts/{account_id}/schedulable"),
@@ -2657,6 +2655,8 @@ fn reconcile_oauth_recovery_observations(
             .map(|entry| entry.observed_at.as_str())
             .unwrap_or("");
         let currently_isolated = record.account.status == "error"
+            || record.account.health == "quotaExhausted"
+            || record.account.health == "cooldown"
             || record.account.status_detail.contains("fallback")
             || (record.quota_evidence == OAuthQuotaEvidence::Unknown
                 && observation_index.is_some());
@@ -3677,6 +3677,90 @@ mod tests {
             true,
         );
         assert_eq!(state, ("healthy".to_owned(), String::new()));
+    }
+
+    #[test]
+    fn parked_oauth_keeps_fallback_detail_until_it_is_rescheduled() {
+        let windows = vec![coding_window("weekly", 88.0, None, "")];
+        let state = resolve_state(
+            "active",
+            Some(false),
+            "OAuth quota exhausted; matching API fallback is active.",
+            &windows,
+            true,
+        );
+        assert_eq!(state.0, "quotaExhausted");
+        assert!(state.1.contains("fallback"));
+    }
+
+    #[test]
+    fn usable_quota_reenables_account_even_when_recovery_probe_fails() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(750);
+            let mut paths = Vec::new();
+            while Instant::now() < deadline && paths.len() < 2 {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("mock server accept failed: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                let mut request = [0_u8; 4096];
+                let read = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                let path = request.lines().next().unwrap_or_default().to_owned();
+                let body = if path.contains("recover-state") {
+                    r#"{"success":false,"error_code":"CR-UP-0003","message":"probe failed"}"#
+                } else {
+                    r#"{"data":{"schedulable":true}}"#
+                };
+                let status = "HTTP/1.1 200 OK";
+                write!(
+                    stream,
+                    "{status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                paths.push(path);
+            }
+            paths
+        });
+        let admin = AdminClient {
+            client: Client::builder().no_proxy().build().unwrap(),
+            base_url: format!("http://{address}"),
+            bearer: Arc::new(Zeroizing::new("test-token".to_owned())),
+        };
+        let task = AccountTask {
+            account: json!({
+                "id": 1,
+                "type": "oauth",
+                "platform": "openai",
+                "status": "active",
+                "schedulable": false,
+                "error_message": "OAuth quota exhausted; matching API fallback is active."
+            }),
+            channel: None,
+            query_provider_usage: false,
+            auto_isolate_on_exhaustion: true,
+        };
+        let windows = vec![coding_window("weekly", 88.0, None, "")];
+        assert!(maybe_recover_misdisabled_account(
+            &admin,
+            &task,
+            &windows,
+            true,
+            "",
+            Instant::now() + Duration::from_secs(2),
+        ));
+        let paths = server.join().unwrap();
+        assert!(paths.iter().any(|path| path.contains("recover-state")));
+        assert!(paths.iter().any(|path| path.contains("/schedulable")));
     }
 
     #[test]

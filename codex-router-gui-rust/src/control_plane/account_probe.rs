@@ -50,6 +50,7 @@ struct ProbeMaterial {
     proxy_url: Option<String>,
     base_url: Option<String>,
     project_id: Option<String>,
+    chatgpt_account_id: Option<String>,
 }
 
 fn account_material(store: &StateStore, account_id: i64) -> Result<Option<ProbeMaterial>> {
@@ -59,7 +60,8 @@ fn account_material(store: &StateStore, account_id: i64) -> Result<Option<ProbeM
                 "SELECT a.platform,a.account_type,a.auth_index,a.auth_file,
                         COALESCE(p.normalized_url,json_extract(a.payload,'$.proxy_url')),
                         json_extract(a.payload,'$.credentials.base_url'),
-                        json_extract(a.payload,'$.credentials.project_id')
+                        json_extract(a.payload,'$.credentials.project_id'),
+                        json_extract(a.payload,'$.credentials.chatgpt_account_id')
                  FROM accounts a
                  LEFT JOIN proxies p ON p.id=COALESCE(
                     a.proxy_id,
@@ -76,6 +78,7 @@ fn account_material(store: &StateStore, account_id: i64) -> Result<Option<ProbeM
                         proxy_url: row.get(4)?,
                         base_url: row.get(5)?,
                         project_id: row.get(6)?,
+                        chatgpt_account_id: row.get(7)?,
                     })
                 },
             )
@@ -162,15 +165,38 @@ fn build_probe_request(material: &ProbeMaterial, auth_index: &str) -> Result<Val
     let oauth = material.account_type.eq_ignore_ascii_case("oauth");
     let (method, url, headers, data) = if oauth {
         match platform.as_str() {
-            "openai" => (
-                "GET",
-                "https://api.openai.com/v1/models".to_owned(),
-                json!({
-                    "Authorization":"Bearer $TOKEN$",
-                    "Accept":"application/json"
-                }),
-                None,
-            ),
+            "openai" => {
+                let mut headers = serde_json::Map::new();
+                headers.insert(
+                    "Authorization".to_owned(),
+                    Value::String("Bearer $TOKEN$".to_owned()),
+                );
+                headers.insert(
+                    "Accept".to_owned(),
+                    Value::String("application/json".to_owned()),
+                );
+                headers.insert(
+                    "Originator".to_owned(),
+                    Value::String("Codex-Router".to_owned()),
+                );
+                headers.insert(
+                    "User-Agent".to_owned(),
+                    Value::String("Codex-Router".to_owned()),
+                );
+                if let Some(account_id) = clean_optional(&material.chatgpt_account_id) {
+                    headers.insert(
+                        "Chatgpt-Account-Id".to_owned(),
+                        Value::String(account_id.to_owned()),
+                    );
+                }
+                (
+                    "GET",
+                    "https://chatgpt.com/backend-api/codex/models?client_version=0.144.1"
+                        .to_owned(),
+                    Value::Object(headers),
+                    None,
+                )
+            }
             "anthropic" => (
                 "GET",
                 "https://api.anthropic.com/api/oauth/profile".to_owned(),
@@ -433,5 +459,29 @@ mod tests {
         assert_eq!(upstream_failure(401, 1).error_code, "CR-UP-0002");
         assert_eq!(upstream_failure(429, 1).error_code, "CR-UP-0008");
         assert_eq!(upstream_failure(503, 1).error_code, "CR-UP-0011");
+    }
+
+    #[test]
+    fn openai_oauth_probe_uses_chatgpt_codex_models() {
+        let request = build_probe_request(
+            &ProbeMaterial {
+                platform: "openai".into(),
+                account_type: "oauth".into(),
+                auth_index: "idx".into(),
+                auth_file: "legacy-openai-1.json".into(),
+                proxy_url: None,
+                base_url: None,
+                project_id: None,
+                chatgpt_account_id: Some("acc-1".into()),
+            },
+            "idx",
+        )
+        .unwrap();
+        assert_eq!(
+            request["url"],
+            "https://chatgpt.com/backend-api/codex/models?client_version=0.144.1"
+        );
+        assert_eq!(request["header"]["Chatgpt-Account-Id"], "acc-1");
+        assert_eq!(request["header"]["Authorization"], "Bearer $TOKEN$");
     }
 }

@@ -219,7 +219,7 @@ impl Default for CliProxyConfig {
             max_retry_credentials: 4,
             routing: RoutingConfig {
                 strategy: "weighted-round-robin".to_owned(),
-                session_affinity: true,
+                session_affinity: false,
             },
             gemini_api_key: Vec::new(),
             claude_api_key: Vec::new(),
@@ -534,6 +534,8 @@ mod tests {
         assert!(yaml.contains("gemini-cli"));
         let parsed = from_yaml(&yaml).unwrap();
         assert_eq!(parsed, config);
+        assert!(!config.routing.session_affinity);
+        assert!(!yaml.contains("session-affinity: true"));
     }
     #[test]
     fn multiple_public_models_compile_side_by_side() {

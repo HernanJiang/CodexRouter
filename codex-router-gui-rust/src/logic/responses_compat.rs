@@ -709,7 +709,7 @@ fn summarize_dropped_items(items: &[Value]) -> String {
         }
     }
     let mut lines = vec![format!(
-        "【本地压缩摘要】已折叠 {} 条较早记录。这不是任务结束，请立即继续完成压缩前未完成的用户任务。",
+        "【本地压缩摘要】已折叠 {} 条较早记录。这不是新任务，也不是任务结束；用户没有要求停止。不要写交接、不要空回复收工，立即从压缩前未完成的那一步继续。",
         items.len()
     )];
     if !user_goals.is_empty() {
@@ -767,7 +767,55 @@ fn input_looks_like_post_compact_replay(items: &[Value]) -> bool {
             || text.contains(
                 "Another language model started to solve this problem and produced a summary",
             )
+            || text.contains("Here is the summary produced by the other language model")
     })
+}
+
+fn rewrite_codex_compact_handoff_text(text: &str) -> Option<String> {
+    let marker = "Another language model started to solve this problem and produced a summary";
+    if !text.contains(marker)
+        && !text.contains("Here is the summary produced by the other language model")
+    {
+        return None;
+    }
+    let summary = text
+        .split("use the information in this summary to assist with your own analysis:")
+        .nth(1)
+        .or_else(|| {
+            text.split("Here is the summary produced by the other language model")
+                .nth(1)
+        })
+        .unwrap_or(text)
+        .trim();
+    Some(format!(
+        "【自动压缩后续跑】用户没有停止，也没有换任务。下面只是压缩后的工作摘要，不是交接、不是收工指令。不要输出空回复，不要写 handoff，不要等待新指令。立刻从摘要里未完成的那一步继续执行，直到原任务完成。\n\n{}",
+        summary
+    ))
+}
+
+fn rewrite_codex_compact_handoff(map: &mut Map<String, Value>) -> bool {
+    let mut changed = false;
+    if let Some(parts) = map.get_mut("content").and_then(Value::as_array_mut) {
+        for part in parts {
+            let Some(part_map) = part.as_object_mut() else {
+                continue;
+            };
+            let Some(text) = part_map.get("text").and_then(Value::as_str) else {
+                continue;
+            };
+            if let Some(rewritten) = rewrite_codex_compact_handoff_text(text) {
+                part_map.insert("text".to_owned(), Value::String(rewritten));
+                changed = true;
+            }
+        }
+    }
+    if let Some(text) = map.get("text").and_then(Value::as_str) {
+        if let Some(rewritten) = rewrite_codex_compact_handoff_text(text) {
+            map.insert("text".to_owned(), Value::String(rewritten));
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn strip_unusable_third_party_continuation(object: &mut Map<String, Value>) -> bool {
@@ -842,10 +890,16 @@ pub fn sanitize_responses_request(path: &str, body: &mut Value) -> SanitizeStats
                     stats.converted_items += 1;
                 }
                 if grok {
+                    if rewrite_codex_compact_handoff(&mut map) {
+                        stats.converted_items += 1;
+                    }
                     let (item, converted) = sanitize_grok_item(map);
                     stats.converted_items += converted;
                     replacement.push(item);
                     continue;
+                }
+                if rewrite_codex_compact_handoff(&mut map) {
+                    stats.converted_items += 1;
                 }
                 stats.converted_items += sanitize_content_parts(&mut map);
                 let kind = item_type(&Value::Object(map.clone()));
@@ -1403,7 +1457,7 @@ fn rewrite_sse_event(event: &str) -> String {
 }
 
 pub fn continue_after_local_compact_instructions() -> &'static str {
-    "压缩已完成。请立即继续执行压缩前未完成的用户任务，不要停止。默认使用简体中文。只使用当前对话工作目录，不要读取 CodexRouter 源码目录，除非它就是当前 cwd。"
+    "这不是新任务，也不是任务结束。上下文压缩只是把较早记录折成摘要，用户没有要求停止。不要输出交接文档、不要总结后收工、不要等待新指令。立即从压缩前未完成的那一步继续执行，直到用户原任务真正完成。默认使用简体中文。只使用当前对话工作目录，不要读取 CodexRouter 源码目录，除非它就是当前 cwd。"
 }
 
 pub fn strip_think_tags(text: &str) -> String {
@@ -1759,7 +1813,7 @@ mod tests {
         assert!(items.len() <= LOCAL_COMPACT_KEEP_LAST + 1);
         let notice = items[0]["content"][0]["text"].as_str().unwrap();
         assert!(notice.contains("本地压缩摘要"));
-        assert!(notice.contains("这不是任务结束"));
+        assert!(notice.contains("这不是新任务"));
         assert!(notice.contains("未完成任务"));
     }
 
@@ -1798,6 +1852,27 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("本地压缩摘要"));
+    }
+
+    #[test]
+    fn grok_codex_compact_handoff_is_rewritten_into_continuation() {
+        let mut body = json!({
+            "model": "grok-4.6",
+            "input": [
+                {
+                    "type":"message",
+                    "role":"user",
+                    "content":[{"type":"input_text","text":"Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:\n# Handoff\n还差把优先级统一成账号 priority。"}]
+                }
+            ]
+        });
+        let stats = sanitize_responses_request("/v1/responses", &mut body);
+        assert!(stats.converted_items >= 1);
+        let text = body["input"][0]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("自动压缩后续跑"));
+        assert!(text.contains("不要输出空回复"));
+        assert!(text.contains("优先级统一成账号 priority"));
+        assert!(!text.contains("Another language model started"));
     }
 
     #[test]

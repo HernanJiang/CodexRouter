@@ -446,7 +446,7 @@ fn is_false(value: &bool) -> bool {
 }
 
 fn default_auto_compact_percent() -> i32 {
-    80
+    95
 }
 
 impl Default for ModelConfig {
@@ -830,7 +830,7 @@ mod tests {
     fn legacy_model_gets_conservative_compaction_defaults() {
         let model: ModelConfig = serde_json::from_str(r#"{"model":"legacy"}"#).unwrap();
         assert_eq!(model.context_window, 0);
-        assert_eq!(model.auto_compact_percent, 80);
+        assert_eq!(model.auto_compact_percent, 95);
         assert_eq!(model.reasoning_mode, "auto");
         assert!(model.reasoning_levels.is_empty());
         assert!(!model.fast_mode);

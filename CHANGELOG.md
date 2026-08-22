@@ -2,6 +2,33 @@
 
 本文件记录面向用户的重要变化。完整技术细节以对应版本的源码和 GitHub Release 为准。
 
+## 2.0.19 - 2026-08-22
+
+### 功能
+
+- 自动压缩默认改为官方 95%，滑条 60–95 仍可调。catalog 把 `auto_compact_token_limit` 写成完整 `context_window`，Codex 看到完整窗口（Grok 500k），不再用 80% 当有效窗。
+- API Key 有效但填写的模型 ID 不在上游 `/models` 时，弹出可滚动可用列表，点选即添加。`gpt-5.6` 仍 canonical 到 `gpt-5.6-sol`。
+- 调度源统一为账号 priority：模型卡片拖拽顺序即账号 P 值（01→P1，02→P2）；Apply 把同一 OAuth 账号全部槽位写成同一个 P；订阅页改 P 也会写回槽位。
+- 本版本只提供便携包，不再提供 installer。
+
+### 修复
+
+- Codex 对 Grok 的 compact handoff（“Another language model started…”）改写成续跑指令，避免把摘要当交接收工导致空回复结束。
+- 保留自动补槽位：新 Grok 号挂到现有 4.5/4.6 卡片；catalog 为空也补。
+
+### 说明
+
+- 旧配置里已经写成 80% 的模型卡片不会自动改到 95%。
+- 未打开 Grok 官方 `/responses/compact`。
+
+## 2.0.18 - 2026-08-22
+
+### 修复
+
+- 修复 ChatGPT Plus 额度恢复后仍走第三方 API：恢复探测不再打 `api.openai.com/v1/models`（OAuth token 会 403），改为 Codex `chatgpt.com/backend-api/codex/models`。live quota 可用时即使探测失败也会重新 `schedulable=1`，订阅优先重新生效。
+- 关闭 CLI `session-affinity`。额度恢复后旧线程不再粘在回退 API 上，按当前优先级重新选号。
+- 停用的 OAuth 账号在额度未满时不再被 UI/恢复逻辑当成健康号；隔离判定包含 `quotaExhausted` / `cooldown`。
+
 ## 2.0.17 - 2026-08-22
 
 ### 修复
