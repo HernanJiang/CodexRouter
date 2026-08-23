@@ -160,7 +160,7 @@ fn endpoint(base_url: &str, suffix: &str) -> Result<String> {
     Ok(value)
 }
 
-fn build_probe_request(material: &ProbeMaterial, auth_index: &str) -> Result<Value> {
+fn build_probe_request(material: &ProbeMaterial, auth_index: &str, model: &str) -> Result<Value> {
     let platform = config_compiler::normalize_platform(&material.platform);
     let oauth = material.account_type.eq_ignore_ascii_case("oauth");
     let (method, url, headers, data) = if oauth {
@@ -230,12 +230,31 @@ fn build_probe_request(material: &ProbeMaterial, auth_index: &str) -> Result<Val
                     Some(data),
                 )
             }
-            "xai" => (
-                "GET",
-                "https://api.x.ai/v1/models".to_owned(),
-                json!({"Authorization":"Bearer $TOKEN$","Accept":"application/json"}),
-                None,
-            ),
+            "xai" => {
+                let base = clean_optional(&material.base_url)
+                    .unwrap_or("https://cli-chat-proxy.grok.com/v1");
+                (
+                    "POST",
+                    endpoint(base, "/v1/responses")?,
+                    json!({
+                        "Authorization":"Bearer $TOKEN$",
+                        "Accept":"application/json",
+                        "Content-Type":"application/json",
+                        "User-Agent":"grok-pager/0.2.93 grok-shell/0.2.93 (windows; x86_64)",
+                        "x-xai-token-auth":"xai-grok-cli",
+                        "x-grok-client-version":"0.2.93"
+                    }),
+                    Some(
+                        json!({
+                            "model":model,
+                            "input":"Reply with OK.",
+                            "stream":false,
+                            "max_output_tokens":16
+                        })
+                        .to_string(),
+                    ),
+                )
+            }
             _ => bail!("unsupported OAuth probe provider"),
         }
     } else {
@@ -381,7 +400,7 @@ pub async fn probe_account(
             502,
         ));
     }
-    let request = build_probe_request(&material, &auth_index)
+    let request = build_probe_request(&material, &auth_index, model)
         .map_err(|_| ProbeFailure::new("CR-VAL-0003", "account provider cannot be probed", 400))?;
     let started = Instant::now();
     let (management_status, response) = cli
@@ -475,6 +494,7 @@ mod tests {
                 chatgpt_account_id: Some("acc-1".into()),
             },
             "idx",
+            "gpt-test",
         )
         .unwrap();
         assert_eq!(
@@ -483,5 +503,35 @@ mod tests {
         );
         assert_eq!(request["header"]["Chatgpt-Account-Id"], "acc-1");
         assert_eq!(request["header"]["Authorization"], "Bearer $TOKEN$");
+    }
+
+    #[test]
+    fn grok_oauth_probe_uses_the_selected_model_for_a_minimal_generation() {
+        let request = build_probe_request(
+            &ProbeMaterial {
+                platform: "grok".into(),
+                account_type: "oauth".into(),
+                auth_index: "idx".into(),
+                auth_file: "legacy-xai-1.json".into(),
+                proxy_url: None,
+                base_url: Some("https://cli-chat-proxy.grok.com/v1".into()),
+                project_id: None,
+                chatgpt_account_id: None,
+            },
+            "idx",
+            "grok-4.6",
+        )
+        .unwrap();
+        assert_eq!(request["method"], "POST");
+        assert_eq!(
+            request["url"],
+            "https://cli-chat-proxy.grok.com/v1/responses"
+        );
+        assert_eq!(request["header"]["Authorization"], "Bearer $TOKEN$");
+        assert_eq!(request["header"]["x-xai-token-auth"], "xai-grok-cli");
+        let data: Value = serde_json::from_str(request["data"].as_str().unwrap()).unwrap();
+        assert_eq!(data["model"], "grok-4.6");
+        assert_eq!(data["input"], "Reply with OK.");
+        assert_eq!(data["stream"], false);
     }
 }

@@ -19,68 +19,32 @@ $repositoryUrl = 'https://github.com/HernanJiang/CodexRouter'
 $releaseApiUrl = 'https://api.github.com/repos/HernanJiang/CodexRouter/releases/latest'
 $repositoryName = 'HernanJiang/CodexRouter'
 
-function Get-GitHubCliPath {
-    $command = Get-Command gh -ErrorAction SilentlyContinue
-    if ($null -eq $command -or [string]::IsNullOrWhiteSpace([string]$command.Source)) {
-        throw 'PRIVATE_GITHUB_AUTH_REQUIRED'
-    }
-    return [string]$command.Source
-}
-
 function Get-LatestGitHubRelease {
-    try {
-        return Invoke-RestMethod -Headers @{
-            'User-Agent' = 'CodexRouter-Updater'
-            'Accept' = 'application/vnd.github+json'
-            'X-GitHub-Api-Version' = '2022-11-28'
-        } -Uri $releaseApiUrl -TimeoutSec 30
-    } catch {
-        $statusCode = 0
-        if ($null -ne $_.Exception.Response -and $null -ne $_.Exception.Response.StatusCode) {
-            $statusCode = [int]$_.Exception.Response.StatusCode
-        }
-        if ($statusCode -notin @(403, 404)) { throw }
-    }
-
-    $gh = Get-GitHubCliPath
-    $json = & $gh api "repos/$repositoryName/releases/latest" 2>$null
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace(($json -join "`n"))) {
-        throw 'PRIVATE_GITHUB_AUTH_REQUIRED'
-    }
-    return ($json -join "`n") | ConvertFrom-Json
-}
-
-function Receive-PrivateReleaseAsset {
-    param(
-        [Parameter(Mandatory)][Uri]$Uri,
-        [Parameter(Mandatory)][string]$AssetName,
-        [Parameter(Mandatory)][string]$Destination,
-        [Parameter(Mandatory)][string]$UpdatesDirectory
+    $urls = @(
+        $releaseApiUrl
+        'https://ghfast.top/https://api.github.com/repos/HernanJiang/CodexRouter/releases/latest'
+        'https://ghproxy.net/https://api.github.com/repos/HernanJiang/CodexRouter/releases/latest'
+        'https://mirror.ghproxy.com/https://api.github.com/repos/HernanJiang/CodexRouter/releases/latest'
     )
-    $match = [regex]::Match(
-        $Uri.AbsolutePath,
-        '^/HernanJiang/Codex(?:-)?Router/releases/download/([^/]+)/([^/]+)$',
-        [Text.RegularExpressions.RegexOptions]::IgnoreCase)
-    if (-not $match.Success -or
-        [Uri]::UnescapeDataString($match.Groups[2].Value) -ne $AssetName) {
-        throw 'The private release asset URL is not recognized.'
-    }
-    $tag = [Uri]::UnescapeDataString($match.Groups[1].Value)
-    $gh = Get-GitHubCliPath
-    $staging = Join-Path $UpdatesDirectory ('.gh-release-' + [Guid]::NewGuid().ToString('N'))
-    [IO.Directory]::CreateDirectory($staging) | Out-Null
-    try {
-        & $gh release download $tag --repo $repositoryName --pattern $AssetName --dir $staging --clobber 2>$null
-        $downloaded = Join-Path $staging $AssetName
-        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $downloaded -PathType Leaf)) {
-            throw 'PRIVATE_GITHUB_AUTH_REQUIRED'
-        }
-        Move-Item -LiteralPath $downloaded -Destination $Destination -Force
-    } finally {
-        if (Test-Path -LiteralPath $staging) {
-            Remove-Item -LiteralPath $staging -Recurse -Force
+    $lastError = $null
+    foreach ($url in $urls) {
+        try {
+            return Invoke-RestMethod -Headers @{
+                'User-Agent' = 'CodexRouter-Updater'
+                'Accept' = 'application/vnd.github+json'
+                'X-GitHub-Api-Version' = '2022-11-28'
+            } -Uri $url -TimeoutSec 30
+        } catch {
+            $statusCode = 0
+            if ($null -ne $_.Exception.Response -and $null -ne $_.Exception.Response.StatusCode) {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+            }
+            if ($statusCode -eq 404) { throw }
+            $lastError = $_
         }
     }
+    if ($null -ne $lastError) { throw $lastError }
+    throw 'GitHub and public mirrors could not return the latest release'
 }
 
 function Write-UpdateResult {
@@ -137,18 +101,31 @@ if ($Action -eq 'Download') {
         New-Item -ItemType Directory -Path $updatesDirectory -Force | Out-Null
         $destination = Join-Path $updatesDirectory $safeName
         $temporary = "$destination.download"
-        try {
-            Invoke-WebRequest -UseBasicParsing -Headers @{
-                'User-Agent' = 'CodexRouter-Updater'
-                'Accept' = 'application/octet-stream'
-            } -Uri $uri.AbsoluteUri -OutFile $temporary -TimeoutSec 600
-        } catch {
-            Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
-            Receive-PrivateReleaseAsset `
-                -Uri $uri `
-                -AssetName $safeName `
-                -Destination $temporary `
-                -UpdatesDirectory $updatesDirectory
+        $downloadUrls = @(
+            $uri.AbsoluteUri
+            ('https://ghfast.top/' + $uri.AbsoluteUri)
+            ('https://ghproxy.net/' + $uri.AbsoluteUri)
+            ('https://mirror.ghproxy.com/' + $uri.AbsoluteUri)
+            ($uri.AbsoluteUri -replace 'https://github.com/', 'https://kkgithub.com/')
+        )
+        $downloaded = $false
+        $lastError = $null
+        foreach ($candidate in $downloadUrls) {
+            try {
+                Invoke-WebRequest -UseBasicParsing -Headers @{
+                    'User-Agent' = 'CodexRouter-Updater'
+                    'Accept' = 'application/octet-stream'
+                } -Uri $candidate -OutFile $temporary -TimeoutSec 600
+                $downloaded = $true
+                break
+            } catch {
+                $lastError = $_
+                Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+            }
+        }
+        if (-not $downloaded) {
+            if ($null -ne $lastError) { throw $lastError }
+            throw 'GitHub and public mirrors could not download the update package.'
         }
         $actualSize = (Get-Item -LiteralPath $temporary).Length
         if ($ExpectedSize -gt 0 -and $actualSize -ne $ExpectedSize) {
@@ -204,10 +181,6 @@ try {
         -AssetSize $(if ($selectedAsset) { $selectedAsset.Size } else { 0 }) `
         -Message $(if ($hasUpdate -and -not $selectedAsset) { 'A new release exists, but it has no supported Windows package.' } else { '' })
 } catch {
-    if ($_.Exception.Message -eq 'PRIVATE_GITHUB_AUTH_REQUIRED') {
-        Write-UpdateResult -Status 'private_auth_required' -Message 'This repository is private. Install GitHub CLI and sign in to receive private releases; public releases update without GitHub CLI.'
-        exit 0
-    }
     $statusCode = 0
     if ($null -ne $_.Exception.Response -and $null -ne $_.Exception.Response.StatusCode) {
         $statusCode = [int]$_.Exception.Response.StatusCode

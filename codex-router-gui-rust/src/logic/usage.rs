@@ -101,6 +101,18 @@ fn live_quota_is_exhausted(windows: &[UsageWindow]) -> bool {
             .any(|window| window.used_percent.is_some_and(|value| value >= 99.999))
 }
 
+fn live_usage_payload_is_fresh(value: &Value) -> bool {
+    !value.is_null()
+        && get(value, "stale").and_then(Value::as_bool) != Some(true)
+        && !string(value, "source").eq_ignore_ascii_case("cache")
+}
+
+fn admin_action_succeeded(value: &Value) -> bool {
+    get(value, "success").and_then(Value::as_bool) != Some(false)
+        && string(value, "error_code").is_empty()
+        && string(value, "errorCode").is_empty()
+}
+
 fn maybe_isolate_exhausted_oauth_account(
     admin: &AdminClient,
     task: &AccountTask,
@@ -166,9 +178,12 @@ fn maybe_recover_misdisabled_account(
 ) -> bool {
     let status = string(&task.account, "status");
     let schedulable = get(&task.account, "schedulable").and_then(Value::as_bool);
-    if (status != "error" && schedulable != Some(false))
-        || !fresh
-        || !live_quota_is_usable(windows)
+    let currently_disabled = status == "error" || schedulable == Some(false);
+    let live_quota_usable = fresh && live_quota_is_usable(windows);
+    let may_probe_without_live_quota =
+        string(&task.account, "type") == "oauth" && !fresh;
+    if !currently_disabled
+        || (!live_quota_usable && !may_probe_without_live_quota)
         || credential_rejected(query_note)
     {
         return false;
@@ -179,13 +194,20 @@ fn maybe_recover_misdisabled_account(
         return false;
     }
     let recover_path = format!("/api/v1/admin/accounts/{id}/recover-state");
-    let _ = retry_account_read(|| {
+    if retry_account_read(|| {
         admin.post(
             &recover_path,
             None,
             remaining(deadline, Duration::from_secs(10))?,
         )
-    });
+    })
+    .is_ok_and(|response| admin_action_succeeded(&response))
+    {
+        return true;
+    }
+    if !live_quota_usable {
+        return false;
+    }
     let schedulable_path = format!("/api/v1/admin/accounts/{id}/schedulable");
     retry_account_read(|| {
         admin.post(
@@ -674,7 +696,8 @@ fn query_account(
     add_standard_window(&mut windows, "fiveHour", get(&usage, "five_hour"), "");
     add_standard_window(&mut windows, "weekly", get(&usage, "seven_day"), "");
     add_standard_window(&mut windows, "monthly", get(&usage, "monthly"), "");
-    let mut fresh = kind == "oauth" && !usage.is_null() && !windows.is_empty();
+    let mut fresh =
+        kind == "oauth" && live_usage_payload_is_fresh(&usage) && !windows.is_empty();
     if kind == "oauth" && matches!(platform.as_str(), "openai" | "chatgpt") {
         if let Ok(quota) = retry_account_read(|| {
             admin.get(
@@ -683,6 +706,7 @@ fn query_account(
             )
         }) {
             let quota = data(quota);
+            let quota_is_fresh = live_usage_payload_is_fresh(&quota);
             if let Some(rate_limit) = get(&quota, "rate_limit") {
                 for name in ["primary_window", "secondary_window"] {
                     if let Some(window) = get(rate_limit, name) {
@@ -691,7 +715,7 @@ fn query_account(
                         if let Some(candidate) = standard_window(&kind, window, "") {
                             windows.retain(|item| item.kind != kind);
                             windows.push(candidate);
-                            fresh = true;
+                            fresh |= quota_is_fresh;
                         }
                     }
                 }
@@ -706,12 +730,12 @@ fn query_account(
         } else {
             &grok_quota
         });
-        fresh |= !grok_quota.is_null() && !parsed.is_empty();
+        fresh |= live_usage_payload_is_fresh(&grok_quota) && !parsed.is_empty();
         windows.extend(parsed);
     }
     if kind == "oauth" && platform == "antigravity" {
         let parsed = normalize_antigravity(&usage);
-        fresh |= !parsed.is_empty();
+        fresh |= live_usage_payload_is_fresh(&usage) && !parsed.is_empty();
         windows.extend(parsed);
         if windows.is_empty() {
             let error_code = string(&usage, "error_code");
@@ -779,10 +803,27 @@ fn query_account(
         windows.extend(provider.windows);
         append_note(&mut query_note, &provider.note);
     }
+    if kind == "oauth" && !usage.is_null() && !live_usage_payload_is_fresh(&usage) {
+        let error_code = string(&usage, "error_code");
+        let note = match error_code.as_str() {
+            "unauthenticated" => "class=authentication",
+            "forbidden" => "class=permission",
+            "rate_limited" => "class=rate_limit",
+            "network_error" => "class=network",
+            _ if platform == "grok" => {
+                "Grok billing quota is unavailable; showing cached quota."
+            }
+            _ if platform == "openai" => {
+                "OpenAI quota refresh unavailable; showing cached usage."
+            }
+            _ => "OAuth quota refresh unavailable; showing cached usage.",
+        };
+        append_note(&mut query_note, note);
+    }
 
     if kind == "oauth" {
         let key = cache_key(&format!("oauth-{platform}"), &format!("account:{id}"), "");
-        if !windows.is_empty() {
+        if fresh && !windows.is_empty() {
             save_cache(cache, &key, &mut windows, !query_note.is_empty(), "");
         } else if let Some(fallback) = cached_usage(
             cache,
@@ -822,7 +863,12 @@ fn query_account(
     }
     let (health, status_detail) = resolve_state(&status, schedulable, &detail, &windows, fresh);
     let channel = task.channel.as_ref();
-    let quota_evidence = if kind == "oauth" && fresh && !credential_rejected(&query_note) {
+    let quota_evidence = if kind == "oauth" && recovered {
+        // recover-state only succeeds after a credential-scoped upstream probe.
+        // Treat that as current usable evidence even when the provider's
+        // dedicated billing endpoint only returned a stale cache snapshot.
+        OAuthQuotaEvidence::Usable
+    } else if kind == "oauth" && fresh && !credential_rejected(&query_note) {
         if live_quota_is_exhausted(&windows) {
             OAuthQuotaEvidence::Exhausted
         } else if live_quota_is_usable(&windows) {
@@ -3897,9 +3943,8 @@ mod tests {
             Instant::now() + Duration::from_secs(2),
         ));
         let paths = server.join().unwrap();
-        assert_eq!(paths.len(), 2);
+        assert_eq!(paths.len(), 1);
         assert!(paths[0].contains("/api/v1/admin/accounts/42/recover-state"));
-        assert!(paths[1].contains("/api/v1/admin/accounts/42/schedulable"));
     }
 
     #[test]
@@ -4016,9 +4061,8 @@ mod tests {
             Instant::now() + Duration::from_secs(2),
         ));
         let paths = server.join().unwrap();
-        assert_eq!(paths.len(), 2);
+        assert_eq!(paths.len(), 1);
         assert!(paths[0].contains("/api/v1/admin/accounts/44/recover-state"));
-        assert!(paths[1].contains("/api/v1/admin/accounts/44/schedulable"));
     }
 
     #[test]
@@ -4305,6 +4349,176 @@ mod tests {
         let paths = server.join().unwrap();
 
         assert!(paths.iter().all(|path| !path.ends_with("/models")));
+    }
+
+    #[test]
+    fn stale_grok_quota_cache_cannot_reenable_without_a_successful_probe() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(900);
+            let mut paths = Vec::new();
+            while Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("mock server accept failed: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                let mut request = [0_u8; 4096];
+                let read = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or_default()
+                    .to_owned();
+                let (status, body) = if path.ends_with("/stats") {
+                    ("200 OK", r#"{"data":{"total_tokens":1}}"#)
+                } else if path.ends_with("/quota") {
+                    (
+                        "200 OK",
+                        r#"{"data":{"billing":{"usage_percent":25,"period_type":"monthly"},"source":"cache","stale":true}}"#,
+                    )
+                } else if path.ends_with("/recover-state") {
+                    (
+                        "503 Service Unavailable",
+                        r#"{"error_code":"CR-UP-0011","message":"probe unavailable"}"#,
+                    )
+                } else if path.ends_with("/schedulable") {
+                    ("200 OK", r#"{"data":{"schedulable":true}}"#)
+                } else {
+                    ("404 Not Found", r#"{"error":"unexpected path"}"#)
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                paths.push(path);
+            }
+            paths
+        });
+        let admin = AdminClient {
+            client: Client::builder().no_proxy().build().unwrap(),
+            base_url: format!("http://{address}"),
+            bearer: Arc::new(Zeroizing::new("test-token".to_owned())),
+        };
+        let task = AccountTask {
+            account: json!({
+                "id": 42,
+                "type": "oauth",
+                "platform": "grok",
+                "status": "error",
+                "schedulable": false,
+                "error_message": "quota exhausted"
+            }),
+            channel: None,
+            query_provider_usage: false,
+            auto_isolate_on_exhaustion: true,
+        };
+
+        let record = query_account(
+            &admin,
+            task,
+            &Arc::new(Mutex::new(UsageCache::new())),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+        let paths = server.join().unwrap();
+
+        assert_eq!(record.account.status, "error");
+        assert!(!record.routing_changed);
+        assert!(paths.iter().any(|path| path.ends_with("/recover-state")));
+        assert!(paths.iter().all(|path| !path.ends_with("/schedulable")));
+    }
+
+    #[test]
+    fn stale_grok_quota_uses_a_successful_account_probe_to_restore_the_pool() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(900);
+            let mut paths = Vec::new();
+            while Instant::now() < deadline && paths.len() < 3 {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("mock server accept failed: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                let mut request = [0_u8; 4096];
+                let read = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or_default()
+                    .to_owned();
+                let body = if path.ends_with("/stats") {
+                    r#"{"data":{"total_tokens":1}}"#
+                } else if path.ends_with("/quota") {
+                    r#"{"data":{"billing":{"usage_percent":25,"period_type":"monthly"},"source":"cache","stale":true}}"#
+                } else if path.ends_with("/recover-state") {
+                    r#"{"data":{"status":"active","schedulable":true}}"#
+                } else {
+                    r#"{"error":"unexpected path"}"#
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                paths.push(path);
+            }
+            paths
+        });
+        let admin = AdminClient {
+            client: Client::builder().no_proxy().build().unwrap(),
+            base_url: format!("http://{address}"),
+            bearer: Arc::new(Zeroizing::new("test-token".to_owned())),
+        };
+        let task = AccountTask {
+            account: json!({
+                "id": 42,
+                "type": "oauth",
+                "platform": "grok",
+                "status": "error",
+                "schedulable": false,
+                "error_message": "quota exhausted"
+            }),
+            channel: None,
+            query_provider_usage: false,
+            auto_isolate_on_exhaustion: true,
+        };
+
+        let record = query_account(
+            &admin,
+            task,
+            &Arc::new(Mutex::new(UsageCache::new())),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+        let paths = server.join().unwrap();
+
+        assert_eq!(record.account.status, "active");
+        assert_eq!(record.account.health, "healthy");
+        assert_eq!(record.quota_evidence, OAuthQuotaEvidence::Usable);
+        assert!(record.routing_changed);
+        assert!(paths.iter().any(|path| path.ends_with("/recover-state")));
+        assert!(paths.iter().all(|path| !path.ends_with("/schedulable")));
     }
 
     #[test]

@@ -16,6 +16,17 @@ use std::os::windows::process::CommandExt;
 const RELEASE_API_URL: &str =
     "https://api.github.com/repos/HernanJiang/CodexRouter/releases/latest";
 const REPOSITORY_URL: &str = "https://github.com/HernanJiang/CodexRouter";
+const RELEASE_API_MIRRORS: &[&str] = &[
+    "https://ghfast.top/https://api.github.com/repos/HernanJiang/CodexRouter/releases/latest",
+    "https://ghproxy.net/https://api.github.com/repos/HernanJiang/CodexRouter/releases/latest",
+    "https://mirror.ghproxy.com/https://api.github.com/repos/HernanJiang/CodexRouter/releases/latest",
+];
+const DOWNLOAD_MIRROR_PREFIXES: &[&str] = &[
+    "https://ghfast.top/",
+    "https://ghproxy.net/",
+    "https://mirror.ghproxy.com/",
+];
+const HOST_REWRITE_MIRRORS: &[&str] = &["kkgithub.com"];
 const RELEASE_DOWNLOAD_PREFIXES: &[&str] = &[
     "/HernanJiang/CodexRouter/releases/download/",
     "/HernanJiang/Codex-Router/releases/download/",
@@ -127,38 +138,78 @@ struct AppliedUpdate {
 
 pub(crate) fn check_for_updates(current_version: &str) -> anyhow::Result<UpdateInfo> {
     let client = update_http_client()?;
+    let mut last_error: Option<anyhow::Error> = None;
+    for (index, url) in release_query_urls().into_iter().enumerate() {
+        match fetch_latest_release(&client, &url) {
+            Ok(release) => {
+                let mut info = update_info_from_release(current_version, release)?;
+                if index > 0 && info.message.is_empty() {
+                    info.message = "GitHub official API was unavailable; fetched through a public mirror.".to_owned();
+                }
+                return Ok(info);
+            }
+            Err(error) if error.not_found => {
+                return Ok(UpdateInfo {
+                    status: "no_release".to_owned(),
+                    current_version: current_version.to_owned(),
+                    release_url: REPOSITORY_URL.to_owned(),
+                    message: "The official GitHub repository has not published a Release yet."
+                        .to_owned(),
+                    ..Default::default()
+                });
+            }
+            Err(error) => {
+                last_error = Some(error.source);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("GitHub Release query failed"))).context(
+        "class=update_request_failure | GitHub and public mirrors could not return the latest release",
+    )
+}
+
+struct ReleaseFetchError {
+    not_found: bool,
+    source: anyhow::Error,
+}
+
+fn release_query_urls() -> Vec<String> {
+    let mut urls = vec![RELEASE_API_URL.to_owned()];
+    urls.extend(RELEASE_API_MIRRORS.iter().map(|url| (*url).to_owned()));
+    urls
+}
+
+fn fetch_latest_release(client: &Client, url: &str) -> Result<GitHubRelease, ReleaseFetchError> {
     let response = client
-        .get(RELEASE_API_URL)
+        .get(url)
         .header(USER_AGENT, USER_AGENT_VALUE)
         .header(ACCEPT, "application/vnd.github+json")
         .send()
-        .context("class=update_request_failure | GitHub Release query failed")?;
-    let status = response.status();
-    if status.as_u16() == 404 {
-        return Ok(UpdateInfo {
-            status: "no_release".to_owned(),
-            current_version: current_version.to_owned(),
-            release_url: REPOSITORY_URL.to_owned(),
-            message: "The official GitHub repository has not published a Release yet.".to_owned(),
-            ..Default::default()
+        .map_err(|error| ReleaseFetchError {
+            not_found: false,
+            source: anyhow::Error::new(error)
+                .context("class=update_request_failure | GitHub Release query failed"),
+        })?;
+    let status = response.status().as_u16();
+    if status == 404 {
+        return Err(ReleaseFetchError {
+            not_found: true,
+            source: anyhow::anyhow!("GitHub Release was not found"),
         });
     }
-    if status.as_u16() == 403 {
-        return Ok(UpdateInfo {
-            status: "private_auth_required".to_owned(),
-            current_version: current_version.to_owned(),
-            release_url: REPOSITORY_URL.to_owned(),
-            message: "This release is not available through the public GitHub API.".to_owned(),
-            ..Default::default()
+    if !response.status().is_success() {
+        return Err(ReleaseFetchError {
+            not_found: false,
+            source: anyhow::anyhow!(
+                "class=update_request_failure | GitHub Release query was rejected with status {status}"
+            ),
         });
     }
-    let response = response
-        .error_for_status()
-        .context("class=update_request_failure | GitHub Release query was rejected")?;
-    let release: GitHubRelease = response
-        .json()
-        .context("class=update_response_invalid | GitHub returned invalid Release metadata")?;
-    update_info_from_release(current_version, release)
+    response.json().map_err(|error| ReleaseFetchError {
+        not_found: false,
+        source: anyhow::Error::new(error)
+            .context("class=update_response_invalid | GitHub returned invalid Release metadata"),
+    })
 }
 
 pub(crate) fn download_and_stage_update<F>(
@@ -175,22 +226,51 @@ where
     cleanup_incomplete_downloads(&cache_root);
 
     let client = update_http_client()?;
-    let response = client
-        .get(&info.download_url)
-        .header(USER_AGENT, USER_AGENT_VALUE)
-        .header(ACCEPT, "application/octet-stream")
-        .send()
-        .context("class=update_download_failure | update download failed")?
-        .error_for_status()
-        .context("class=update_download_failure | update asset request was rejected")?;
     let destination = cache_root.join(&info.asset_name);
-    let archive = receive_verified_payload(
-        response,
-        &destination,
-        info.asset_size,
-        &info.asset_sha256,
-        &mut on_progress,
-    )?;
+    let mut last_error: Option<anyhow::Error> = None;
+    let mut archive = None;
+    for url in download_candidate_urls(&info.download_url) {
+        match client
+            .get(&url)
+            .header(USER_AGENT, USER_AGENT_VALUE)
+            .header(ACCEPT, "application/octet-stream")
+            .send()
+        {
+            Ok(response) if response.status().is_success() => {
+                match receive_verified_payload(
+                    response,
+                    &destination,
+                    info.asset_size,
+                    &info.asset_sha256,
+                    &mut on_progress,
+                ) {
+                    Ok(path) => {
+                        archive = Some(path);
+                        break;
+                    }
+                    Err(error) => {
+                        last_error = Some(error);
+                        let _ = fs::remove_file(&destination);
+                    }
+                }
+            }
+            Ok(response) => {
+                last_error = Some(anyhow::anyhow!(
+                    "class=update_download_failure | update asset request was rejected with status {}",
+                    response.status().as_u16()
+                ));
+            }
+            Err(error) => {
+                last_error = Some(
+                    anyhow::Error::new(error)
+                        .context("class=update_download_failure | update download failed"),
+                );
+            }
+        }
+    }
+    let archive = archive.ok_or_else(|| {
+        last_error.unwrap_or_else(|| anyhow::anyhow!("update download failed"))
+    })?;
     let staged_root = extract_and_verify_archive(router_root, &archive, &info.latest_version)?;
 
     let mut prepared = info.clone();
@@ -585,18 +665,63 @@ fn validate_download_metadata(info: &UpdateInfo) -> anyhow::Result<()> {
     validate_official_download_url(&info.download_url, &info.asset_name)
 }
 
-fn validate_official_download_url(value: &str, expected_name: &str) -> anyhow::Result<()> {
-    let url = url::Url::parse(value).context("the update download URL is invalid")?;
-    if url.scheme() != "https"
-        || !url
+fn official_github_download_url(url: &url::Url) -> bool {
+    url.scheme() == "https"
+        && url
             .host_str()
             .is_some_and(|host| host.eq_ignore_ascii_case("github.com"))
-        || !RELEASE_DOWNLOAD_PREFIXES
+        && RELEASE_DOWNLOAD_PREFIXES
+            .iter()
+            .any(|prefix| url.path().starts_with(prefix))
+}
+
+fn canonical_github_download_url(value: &str) -> anyhow::Result<url::Url> {
+    let url = url::Url::parse(value).context("the update download URL is invalid")?;
+    if official_github_download_url(&url) {
+        return Ok(url);
+    }
+    if url.scheme() != "https" {
+        bail!("the update download URL is not HTTPS");
+    }
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    if HOST_REWRITE_MIRRORS
+        .iter()
+        .any(|candidate| host.eq_ignore_ascii_case(candidate))
+        && RELEASE_DOWNLOAD_PREFIXES
             .iter()
             .any(|prefix| url.path().starts_with(prefix))
     {
-        bail!("the update download URL is not an official CodexRouter GitHub release URL");
+        let mut rewritten = url.clone();
+        rewritten
+            .set_host(Some("github.com"))
+            .context("could not rewrite the mirrored GitHub download host")?;
+        return Ok(rewritten);
     }
+    let nested = url
+        .as_str()
+        .split_once("/https://")
+        .map(|(_, rest)| format!("https://{rest}"))
+        .or_else(|| {
+            url.query_pairs().find_map(|(key, value)| {
+                if key == "url" || key == "q" {
+                    Some(value.into_owned())
+                } else {
+                    None
+                }
+            })
+        });
+    if let Some(nested) = nested {
+        let nested = url::Url::parse(&nested)
+            .context("the mirrored update download URL is invalid")?;
+        if official_github_download_url(&nested) {
+            return Ok(nested);
+        }
+    }
+    bail!("the update download URL is not an official CodexRouter GitHub release URL")
+}
+
+fn validate_official_download_url(value: &str, expected_name: &str) -> anyhow::Result<()> {
+    let url = canonical_github_download_url(value)?;
     let safe_name = Path::new(expected_name)
         .file_name()
         .and_then(|name| name.to_str())
@@ -612,6 +737,22 @@ fn validate_official_download_url(value: &str, expected_name: &str) -> anyhow::R
         bail!("the update asset name does not match its official URL");
     }
     Ok(())
+}
+
+fn download_candidate_urls(official: &str) -> Vec<String> {
+    let Ok(canonical) = canonical_github_download_url(official) else {
+        return vec![official.to_owned()];
+    };
+    let official = canonical.as_str().to_owned();
+    let mut urls = vec![official.clone()];
+    for prefix in DOWNLOAD_MIRROR_PREFIXES {
+        urls.push(format!("{prefix}{official}"));
+    }
+    let mut kkgithub = canonical.clone();
+    if kkgithub.set_host(Some("kkgithub.com")).is_ok() {
+        urls.push(kkgithub.as_str().to_owned());
+    }
+    urls
 }
 
 fn percent_decode(value: &str) -> anyhow::Result<String> {
@@ -1305,6 +1446,30 @@ mod tests {
                 .unwrap();
         }
         writer.finish().unwrap();
+    }
+
+    #[test]
+    fn official_github_rate_limit_is_not_private_auth() {
+        let official = "https://github.com/HernanJiang/CodexRouter/releases/download/v2.1.3/Codex-Router-Portable-2.1.3-windows-x64.zip";
+        validate_official_download_url(
+            official,
+            "Codex-Router-Portable-2.1.3-windows-x64.zip",
+        )
+        .unwrap();
+        validate_official_download_url(
+            &format!("https://ghfast.top/{official}"),
+            "Codex-Router-Portable-2.1.3-windows-x64.zip",
+        )
+        .unwrap();
+        validate_official_download_url(
+            "https://kkgithub.com/HernanJiang/CodexRouter/releases/download/v2.1.3/Codex-Router-Portable-2.1.3-windows-x64.zip",
+            "Codex-Router-Portable-2.1.3-windows-x64.zip",
+        )
+        .unwrap();
+        let urls = download_candidate_urls(official);
+        assert_eq!(urls[0], official);
+        assert!(urls.iter().any(|url| url.starts_with("https://ghfast.top/")));
+        assert!(urls.iter().any(|url| url.contains("kkgithub.com")));
     }
 
     #[test]

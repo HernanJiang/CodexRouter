@@ -792,6 +792,7 @@ pub fn ensure_services_with_config(
         user_data::logs_root(router_root).join("gateway-requests.jsonl"),
     );
     logic::responses_gateway::set_max_output_tokens_map(logic::max_output_tokens_map(config));
+    logic::responses_gateway::set_context_budget_map(logic::context_budget_map(config));
     logic::responses_gateway::ensure_responses_gateway(
         base_uri.as_str(),
         config.rate_limit_max_retries,

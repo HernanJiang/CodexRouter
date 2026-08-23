@@ -1033,7 +1033,28 @@ fn remaining_quota_percent(used_percent: Option<f32>) -> Option<f32> {
 
 fn friendly_error(raw: &str, zh: bool) -> String {
     let normalized = raw.to_ascii_lowercase();
-    if normalized.contains("router_oauth_accounts_unavailable")
+    if normalized.contains("oauth token is missing")
+        || normalized.contains("private_github_auth_required")
+        || normalized.contains("private_auth_required")
+        || normalized.contains("github_cli")
+    {
+        t(
+            zh,
+            "官方 GitHub 暂时不可用（常见于国内网络或限流）。请再点一次「检查更新」，软件会自动改走国内镜像下载并覆盖安装，无需登录 GitHub。",
+            "The official GitHub endpoint is temporarily unavailable (often a regional network or rate-limit issue). Click Check Update again; the app will retry through a public mirror and install automatically. You do not need to sign in to GitHub.",
+        )
+        .to_owned()
+    } else if normalized.contains("class=update_request_failure")
+        || normalized.contains("class=update_download_failure")
+        || normalized.contains("github and public mirrors")
+    {
+        t(
+            zh,
+            "暂时无法下载更新。请检查网络后再次点击「检查更新」；成功后会自动覆盖程序目录并重启，模型和 Key 不会丢失。",
+            "The update could not be downloaded. Check the network and click Check Update again. A successful update replaces program files and restarts; models and keys are kept.",
+        )
+        .to_owned()
+    } else if normalized.contains("router_oauth_accounts_unavailable")
         || normalized.contains("connection_refused")
         || normalized.contains("connection_closed")
         || normalized.contains("lifecycle_busy")
@@ -1231,6 +1252,7 @@ impl eframe::App for CodexRouterApp {
         }
         self.enforce_background_start_hidden(ctx);
         self.process_app_events(ctx);
+        self.process_codex_overwrite_countdown(ctx);
         if !self.exit_shutdown_in_progress {
             if self.runtime_probes_allowed() {
                 self.process_router_health_protection(ctx);
@@ -1779,6 +1801,26 @@ impl CodexRouterApp {
                         ))
                         .color(palette.ink_soft),
                     );
+                    if !running {
+                        if let Some(deadline) = self.codex_overwrite_auto_apply_at {
+                            let seconds = deadline
+                                .saturating_duration_since(std::time::Instant::now())
+                                .as_secs_f32()
+                                .ceil()
+                                .max(1.0) as u64;
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new(if zh {
+                                    format!("窗口保持前台时，将在 {seconds} 秒后自动写回并重启 Codex")
+                                } else {
+                                    format!(
+                                        "While this window stays in the foreground, Router settings will be restored and Codex restarted in {seconds}s"
+                                    )
+                                })
+                                .color(palette.accent),
+                            );
+                        }
+                    }
                     if running {
                         ui.add_space(8.0);
                         ui.label(
@@ -2517,8 +2559,8 @@ impl CodexRouterApp {
                 if Self::topbar_button(ui, label, !self.update_checking, palette)
                     .on_hover_text(t(
                         zh,
-                        "从官方 GitHub Releases 检查新版本",
-                        "Check official GitHub Releases for a new version",
+                        "检查新版本：优先官方 GitHub，失败则走国内镜像。下载校验后会自动覆盖程序目录并重启，模型和 Key 保留。",
+                        "Check for a new version. GitHub is tried first, then a public mirror. After download and verification the app replaces its program files and restarts; models and keys are kept.",
                     ))
                     .clicked()
                 {
@@ -2694,8 +2736,8 @@ impl CodexRouterApp {
                         ),
                         t(
                             zh,
-                            "从官方 GitHub Release 下载并校验后，程序会安全退出、自动覆盖当前版本并重新启动。",
-                            "After the official GitHub Release is downloaded and verified, the app will exit safely, replace the current version, and restart automatically.",
+                            "正在下载并校验更新包。完成后会自动覆盖当前程序目录并重启，无需手动解压。已配置的模型、Key 和 UserData 不会被覆盖。",
+                            "Downloading and verifying the update. When it finishes, the app will replace the program directory and restart. You do not need to unzip anything. Configured models, keys, and UserData stay in place.",
                         )
                         .to_owned(),
                     ),
@@ -2718,12 +2760,12 @@ impl CodexRouterApp {
                         .to_owned(),
                     ),
                     "private_auth_required" => (
-                        t(zh, "需要 GitHub 私有仓库授权", "Private GitHub access required")
+                        t(zh, "官方 GitHub 暂时不可用", "Official GitHub is temporarily unavailable")
                             .to_owned(),
                         t(
                             zh,
-                            "当前仓库处于私有发布阶段。请安装 GitHub CLI 并登录后重试；仓库公开后普通用户无需 GitHub CLI。",
-                            "This repository is currently private. Install GitHub CLI and sign in, then retry. Public releases do not require GitHub CLI.",
+                            "这通常是国内网络或 GitHub 限流，不是需要登录。请再点「检查更新」，软件会改走国内镜像并自动覆盖安装。",
+                            "This is usually a regional network or GitHub rate-limit issue, not a sign-in requirement. Click Check Update again; the app will retry through a public mirror and install automatically.",
                         )
                         .to_owned(),
                     ),
@@ -2731,8 +2773,8 @@ impl CodexRouterApp {
                         t(zh, "更新包已下载", "Update downloaded").to_owned(),
                         t(
                             zh,
-                            "请关闭 Codex-Router 后解压或运行更新包。现有配置和数据不会被自动删除。",
-                            "Close Codex-Router before extracting or running the package. Existing configuration and data are not deleted automatically.",
+                            "更新包已就绪。关闭后会自动覆盖程序目录并启动新版本，无需手动解压。模型和 Key 会保留。",
+                            "The package is ready. After exit, the app will replace the program directory and start the new version. You do not need to unzip it. Models and keys are kept.",
                         )
                         .to_owned(),
                     ),
@@ -2750,8 +2792,8 @@ impl CodexRouterApp {
                         if info.message.is_empty() {
                             t(
                                 zh,
-                                "无法连接官方 GitHub。",
-                                "Could not reach the official GitHub repository.",
+                                "暂时无法检查更新。请检查网络后重试；成功后会自动覆盖安装，无需去 GitHub 找包。",
+                                "Could not check for updates. Check the network and try again. A successful update installs automatically; you do not need to find a GitHub package.",
                             )
                             .to_owned()
                         } else {
@@ -2837,7 +2879,7 @@ impl CodexRouterApp {
                         let label = if self.update_downloading {
                             t(zh, "正在下载…", "Downloading…")
                         } else {
-                            t(zh, "下载更新", "Download update")
+                            t(zh, "重新下载", "Download again")
                         };
                         if ui
                             .add_enabled(

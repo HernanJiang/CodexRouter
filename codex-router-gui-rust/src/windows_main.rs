@@ -114,6 +114,30 @@ fn should_leave_tray_lightweight(
     maximized || !minimized || size.is_some_and(|size| !window_size_is_usable(size))
 }
 
+fn advance_overwrite_countdown(
+    deadline: &mut Option<std::time::Instant>,
+    paused_at: &mut Option<std::time::Instant>,
+    now: std::time::Instant,
+    foreground_focused: bool,
+) -> bool {
+    let Some(current_deadline) = *deadline else {
+        *paused_at = None;
+        return false;
+    };
+    if !foreground_focused {
+        paused_at.get_or_insert(now);
+        return false;
+    }
+    if let Some(paused) = paused_at.take() {
+        *deadline = Some(current_deadline + now.saturating_duration_since(paused));
+    }
+    if deadline.is_some_and(|deadline| now >= deadline) {
+        *deadline = None;
+        return true;
+    }
+    false
+}
+
 fn fit_window_to_monitor(current: [f32; 2], monitor: [f32; 2]) -> [f32; 2] {
     let maximum = [
         (monitor[0] - WINDOWS_RUNTIME_MONITOR_ALLOWANCE[0]).max(1.0),
@@ -953,6 +977,14 @@ fn queue_oauth_catalog_refresh(pending: &mut bool) {
     *pending = true;
 }
 
+fn queue_self_check_account_maintenance(
+    oauth_catalog_refresh_pending: &mut bool,
+    quota_refresh_pending: &mut bool,
+) {
+    queue_oauth_catalog_refresh(oauth_catalog_refresh_pending);
+    *quota_refresh_pending = true;
+}
+
 fn scheduled_usage_refresh_is_due(
     _tray_lightweight_mode: bool,
     due: Option<std::time::Instant>,
@@ -1455,6 +1487,7 @@ struct CodexRouterApp {
     usage_error: String,
     usage_return_page: Page,
     usage_refresh_due: Option<std::time::Instant>,
+    self_check_quota_refresh_pending: bool,
     notified_quota_accounts: BTreeSet<i64>,
     monitor_subscription_order: Vec<i64>,
     monitor_api_order: Vec<i64>,
@@ -1499,6 +1532,11 @@ struct CodexRouterApp {
     codex_binding_safe_strip_logged: Option<String>,
     /// The "Codex config overwritten externally" prompt state.
     codex_overwrite_prompt_open: bool,
+    /// Foreground countdown; writing Router config fires when this elapses.
+    codex_overwrite_auto_apply_at: Option<std::time::Instant>,
+    /// Start of the current unfocused/minimized/tray pause. The deadline is
+    /// shifted by this duration when the window returns to the foreground.
+    codex_overwrite_countdown_paused_at: Option<std::time::Instant>,
     codex_overwrite_pending_fingerprint: String,
     codex_overwrite_action_running: bool,
     /// Persisted user decision ("", "keep", "factory") plus the fingerprint it
@@ -3433,6 +3471,7 @@ impl CodexRouterApp {
             // Repair an externally overwritten Codex binding immediately on
             // startup; subsequent checks retain the three-minute cadence.
             usage_refresh_due: (configured && router_mode_enabled).then(std::time::Instant::now),
+            self_check_quota_refresh_pending: false,
             notified_quota_accounts: BTreeSet::new(),
             monitor_subscription_order,
             monitor_api_order,
@@ -3478,6 +3517,8 @@ impl CodexRouterApp {
             codex_binding_check_completed: false,
             codex_binding_safe_strip_logged: None,
             codex_overwrite_prompt_open: false,
+            codex_overwrite_auto_apply_at: None,
+            codex_overwrite_countdown_paused_at: None,
             codex_overwrite_pending_fingerprint: String::new(),
             codex_overwrite_action_running: false,
             codex_overwrite_decision: ui_preferences.codex_overwrite_decision.clone(),
@@ -3933,6 +3974,7 @@ impl CodexRouterApp {
             usage_error: String::new(),
             usage_return_page: Page::Dashboard,
             usage_refresh_due: None,
+            self_check_quota_refresh_pending: false,
             notified_quota_accounts: BTreeSet::new(),
             monitor_subscription_order: vec![101, 202],
             monitor_api_order: vec![303],
@@ -3975,6 +4017,8 @@ impl CodexRouterApp {
             codex_binding_check_completed: false,
             codex_binding_safe_strip_logged: None,
             codex_overwrite_prompt_open: false,
+            codex_overwrite_auto_apply_at: None,
+            codex_overwrite_countdown_paused_at: None,
             codex_overwrite_pending_fingerprint: String::new(),
             codex_overwrite_action_running: false,
             codex_overwrite_decision: String::new(),
@@ -4968,9 +5012,12 @@ impl CodexRouterApp {
                     }
                 }
                 AppEvent::Complete => {
+                    let restart_codex_after_apply = self.codex_overwrite_action_running;
                     self.applying = false;
                     self.codex_overwrite_action_running = false;
                     self.codex_overwrite_prompt_open = false;
+                    self.codex_overwrite_auto_apply_at = None;
+                    self.codex_overwrite_countdown_paused_at = None;
                     if self.exit_shutdown_in_progress {
                         continue;
                     }
@@ -5013,6 +5060,9 @@ impl CodexRouterApp {
                     } else {
                         "Configuration complete"
                     });
+                    if restart_codex_after_apply {
+                        self.restart_codex_desktop();
+                    }
                     if self.routing_sync_pending {
                         self.routing_sync_pending = false;
                     }
@@ -5054,6 +5104,8 @@ impl CodexRouterApp {
                     let was_router_mode_switching = self.router_mode_switching;
                     self.applying = false;
                     self.codex_overwrite_action_running = false;
+                    self.codex_overwrite_auto_apply_at = None;
+                    self.codex_overwrite_countdown_paused_at = None;
                     if self.exit_shutdown_in_progress {
                         continue;
                     }
@@ -5566,7 +5618,12 @@ impl CodexRouterApp {
                         .retain(|account_id| exhausted_ids.contains(account_id));
                     self.usage_snapshot = Some(snapshot);
                     self.usage_snapshot_profile_key = profile_key;
-                    self.schedule_next_background_usage_refresh(ctx);
+                    if self.self_check_quota_refresh_pending {
+                        self.schedule_usage_refresh();
+                        ctx.request_repaint();
+                    } else {
+                        self.schedule_next_background_usage_refresh(ctx);
+                    }
                     if routing_changed {
                         self.request_routing_sync();
                     }
@@ -5610,7 +5667,12 @@ impl CodexRouterApp {
                             "Usage query failed"
                         }
                     ));
-                    self.schedule_next_background_usage_refresh(ctx);
+                    if self.self_check_quota_refresh_pending {
+                        self.schedule_usage_refresh();
+                        ctx.request_repaint();
+                    } else {
+                        self.schedule_next_background_usage_refresh(ctx);
+                    }
                 }
                 AppEvent::RouterModeDisabled(outcome) => {
                     self.router_mode_switching = false;
@@ -5927,9 +5989,14 @@ impl CodexRouterApp {
                     self.update_downloading = false;
                     let info = *info;
                     let ready_to_install = info.status == "ready_to_install";
+                    let should_download = info.status == "update_available"
+                        && !info.download_url.is_empty()
+                        && !info.asset_name.is_empty();
                     self.update_info = Some(info.clone());
                     self.update_dialog_open = true;
-                    if ready_to_install {
+                    if should_download {
+                        self.download_update(&info, ctx);
+                    } else if ready_to_install {
                         let result = updater::spawn_apply_helper(
                             &self.router_root,
                             Path::new(&info.staged_path),
@@ -6128,6 +6195,45 @@ impl CodexRouterApp {
                 AppEvent::CodexBindingProbeFinished(result) => {
                     self.codex_binding_repair_running = false;
                     match result {
+                        Ok(probe) if probe.binding_repair && (probe.user_layer_bound || probe.system_layer_bound) => {
+                            self.codex_overwrite_prompt_open = false;
+                            self.codex_overwrite_auto_apply_at = None;
+                            if !self.codex_overwrite_decision.is_empty() {
+                                self.codex_overwrite_decision.clear();
+                                self.codex_overwrite_decision_fingerprint.clear();
+                                let _ = self.persist_ui_preferences();
+                            }
+                            self.log(if zh {
+                                "自检发现 Codex 原生配置被覆写，已自动写回 Router 绑定；UserData 未改动".to_owned()
+                            } else {
+                                "Self-check found Codex's native config was overwritten and restored the Router binding automatically. UserData was not changed.".to_owned()
+                            });
+                            if let Some((previous, repaired)) = &probe.model_repair {
+                                let previous = previous
+                                    .as_deref()
+                                    .unwrap_or(if zh { "<未设置>" } else { "<unset>" });
+                                self.log(if zh {
+                                    format!(
+                                        "同时将无效的用户层 model（{previous}）修复为默认模型 {repaired}"
+                                    )
+                                } else {
+                                    format!(
+                                        "Also repaired the invalid user-layer model ({previous}) to the default model {repaired}."
+                                    )
+                                });
+                            }
+                            if let Some(detail) = &probe.system_binding_error {
+                                self.log(if zh {
+                                    format!(
+                                        "用户层绑定已恢复，但系统层写入失败：{detail}。请以管理员权限确认 %ProgramData%\\OpenAI\\Codex\\config.toml"
+                                    )
+                                } else {
+                                    format!(
+                                        "The user-layer binding was restored, but the system-layer write failed: {detail}. Confirm %ProgramData%\\OpenAI\\Codex\\config.toml with administrator rights."
+                                    )
+                                });
+                            }
+                        }
                         Ok(probe) if !probe.user_layer_bound && !probe.system_layer_bound => {
                             let fingerprint = probe.fingerprint;
                             let suppressed = !self.codex_overwrite_decision.is_empty()
@@ -6135,11 +6241,15 @@ impl CodexRouterApp {
                             if !suppressed && !self.codex_overwrite_prompt_open {
                                 self.codex_overwrite_pending_fingerprint = fingerprint;
                                 self.codex_overwrite_prompt_open = true;
+                                self.codex_overwrite_countdown_paused_at = None;
+                                self.codex_overwrite_auto_apply_at = Some(
+                                    std::time::Instant::now() + std::time::Duration::from_secs(3),
+                                );
                                 self.log(if zh {
-                                    "自检发现 Codex 原生配置已被外部程序覆写，请在弹窗中选择处理方式"
+                                    "自检发现 Codex 原生配置已被外部程序覆写。前台将在 3 秒后自动写回 Router 绑定；也可选择保持现状或恢复官方默认"
                                         .to_owned()
                                 } else {
-                                    "Self-check found Codex's native config was overwritten by an external program. Choose how to handle it in the dialog.".to_owned()
+                                    "Self-check found Codex's native config was overwritten. The foreground dialog will write the Router binding back in 3 seconds, or you can keep the file or restore official defaults.".to_owned()
                                 });
                             }
                         }
@@ -6175,6 +6285,7 @@ impl CodexRouterApp {
                             // any earlier keep/factory decision so a fresh
                             // full overwrite prompts again.
                             self.codex_overwrite_prompt_open = false;
+                            self.codex_overwrite_auto_apply_at = None;
                             if !self.codex_overwrite_decision.is_empty() {
                                 self.codex_overwrite_decision.clear();
                                 self.codex_overwrite_decision_fingerprint.clear();
@@ -6201,9 +6312,11 @@ impl CodexRouterApp {
                             self.active_profile_id.clear();
                             self.pending_profile_activation = None;
                             self.router_mode_enabled = false;
+                            self.official_mode_selected = true;
                             self.oauth_recovery_due = None;
                             self.codex_overwrite_decision.clear();
                             self.codex_overwrite_decision_fingerprint.clear();
+                            self.codex_overwrite_auto_apply_at = None;
                             let _ = self.persist_ui_preferences();
                             self.status_text = if auth_available {
                                 if zh {
@@ -6598,6 +6711,7 @@ impl CodexRouterApp {
         self.health_probe_failures = 0;
         self.oauth_recovery_due = None;
         self.usage_refresh_due = None;
+        self.self_check_quota_refresh_pending = false;
         self.apply_settle_until = None;
     }
 
@@ -6618,7 +6732,10 @@ impl CodexRouterApp {
         // explicitly triggered, never from the completion of the same usage
         // query. This prevents a short retry loop when Codex owns the file.
         self.codex_binding_check_completed = false;
-        queue_oauth_catalog_refresh(&mut self.oauth_catalog_refresh_pending);
+        queue_self_check_account_maintenance(
+            &mut self.oauth_catalog_refresh_pending,
+            &mut self.self_check_quota_refresh_pending,
+        );
         // A failed live-route reconciliation is retried by the next self-check.
         // It must not spin in the event loop or wait for a full configuration Apply.
         if self.routing_sync_pending {
@@ -6630,6 +6747,9 @@ impl CodexRouterApp {
             let host = self.config.deploy.sub2api_host.clone();
             let retries = self.config.rate_limit_max_retries;
             logic::responses_gateway::set_max_output_tokens_map(logic::max_output_tokens_map(
+                &self.config,
+            ));
+            logic::responses_gateway::set_context_budget_map(logic::context_budget_map(
                 &self.config,
             ));
             let _ = logic::responses_gateway::ensure_responses_gateway(&host, retries);
@@ -6675,6 +6795,7 @@ impl CodexRouterApp {
     fn observe_codex_binding_state(&mut self) {
         if self.ui_audit_mode
             || !self.router_mode_enabled
+            || self.official_mode_selected
             || !self.runtime_probes_allowed()
             || self.applying
             || self.router_mode_switching
@@ -6703,6 +6824,36 @@ impl CodexRouterApp {
         });
     }
 
+    fn process_codex_overwrite_countdown(&mut self, ctx: &egui::Context) {
+        if !self.codex_overwrite_prompt_open
+            || self.codex_overwrite_action_running
+            || self.applying
+        {
+            self.codex_overwrite_auto_apply_at = None;
+            self.codex_overwrite_countdown_paused_at = None;
+            return;
+        }
+        let foreground_focused = !self.tray_lightweight_mode
+            && ctx.input(|input| {
+                let viewport = input.viewport();
+                viewport.minimized != Some(true)
+                    && viewport.occluded != Some(true)
+                    && viewport.focused == Some(true)
+            });
+        if advance_overwrite_countdown(
+            &mut self.codex_overwrite_auto_apply_at,
+            &mut self.codex_overwrite_countdown_paused_at,
+            std::time::Instant::now(),
+            foreground_focused,
+        ) {
+            self.codex_overwrite_apply_router_config();
+            return;
+        }
+        if self.codex_overwrite_auto_apply_at.is_some() && foreground_focused {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+    }
+
     /// Overwrite prompt option 1: write the CodexRouter standard configuration
     /// back over the externally overwritten file.
     fn codex_overwrite_apply_router_config(&mut self) {
@@ -6712,12 +6863,16 @@ impl CodexRouterApp {
         self.codex_overwrite_action_running = true;
         self.codex_overwrite_decision.clear();
         self.codex_overwrite_decision_fingerprint.clear();
+        self.codex_overwrite_auto_apply_at = None;
+        self.codex_overwrite_countdown_paused_at = None;
         let _ = self.persist_ui_preferences();
         if !self.apply_all_with_backup(true, None, None) {
             self.codex_overwrite_action_running = false;
             return;
         }
         self.codex_overwrite_prompt_open = false;
+        self.codex_overwrite_auto_apply_at = None;
+        self.codex_overwrite_countdown_paused_at = None;
         self.set_status(
             if self.ui_language == "zh" {
                 "正在保存并写入当前 CodexRouter 配置，完成后会自动重启 Codex"
@@ -6754,27 +6909,64 @@ impl CodexRouterApp {
         // as the externally overwritten version.
         let root = self.router_root.clone();
         let cfg = self.config.clone();
+        let tx = self.event_tx.clone();
         std::thread::spawn(move || {
             let catalog_path = crate::user_data::state_root(&root).join("model-catalog.json");
             let local_key = match crate::logic::ensure_local_api_key() {
                 Ok(key) => key,
-                Err(_) => return,
+                Err(error) => {
+                    let detail = crate::runtime_logs::summarize_error_for_display(&error.to_string());
+                    tx.send(AppEvent::Log(if zh {
+                        format!("无法读取本地 Router 密钥，系统层绑定未刷新：{detail}")
+                    } else {
+                        format!("Could not read the local Router credential; system-layer binding was not refreshed: {detail}")
+                    }))
+                    .ok();
+                    return;
+                }
             };
             let base_url = match crate::logic::responses_gateway::responses_gateway_url(
                 &cfg.deploy.sub2api_host,
             ) {
                 Ok(url) => url,
-                Err(_) => return,
+                Err(error) => {
+                    let detail = crate::runtime_logs::summarize_error_for_display(&error.to_string());
+                    tx.send(AppEvent::Log(if zh {
+                        format!("无法解析本地网关地址，系统层绑定未刷新：{detail}")
+                    } else {
+                        format!("Could not resolve the local gateway URL; system-layer binding was not refreshed: {detail}")
+                    }))
+                    .ok();
+                    return;
+                }
             };
             let require_openai_auth = !cfg.auth_mode.trim().eq_ignore_ascii_case("local_api_key");
-            let _ = crate::logic::codex_toml::write_codex_system_binding(
+            match crate::logic::codex_toml::write_codex_system_binding(
                 &catalog_path,
                 &local_key,
                 &base_url,
                 require_openai_auth,
                 false,
                 cfg.rate_limit_max_retries,
-            );
+            ) {
+                Ok(()) => {
+                    tx.send(AppEvent::Log(if zh {
+                        "已刷新 Codex 系统层 Router 绑定，用户层配置保持不变".to_owned()
+                    } else {
+                        "Refreshed the Codex system-layer Router binding; the user-layer config was left unchanged".to_owned()
+                    }))
+                    .ok();
+                }
+                Err(error) => {
+                    let detail = crate::runtime_logs::summarize_error_for_display(&error.to_string());
+                    tx.send(AppEvent::Log(if zh {
+                        format!("刷新 Codex 系统层绑定失败：{detail}。请以管理员权限确认 %ProgramData%\\OpenAI\\Codex\\config.toml")
+                    } else {
+                        format!("Failed to refresh the Codex system-layer binding: {detail}. Confirm %ProgramData%\\OpenAI\\Codex\\config.toml with administrator rights.")
+                    }))
+                    .ok();
+                }
+            }
         });
     }
 
@@ -7011,12 +7203,14 @@ impl CodexRouterApp {
     fn refresh_usage_monitor(&mut self) {
         if self.ui_audit_mode || !self.runtime_probes_allowed() {
             self.usage_loading = false;
+            self.self_check_quota_refresh_pending = false;
             return;
         }
         if self.usage_loading {
             return;
         }
         self.usage_refresh_due = None;
+        self.self_check_quota_refresh_pending = false;
         self.usage_loading = true;
         let generation = next_request_generation(&mut self.usage_request_generation);
         self.usage_error.clear();
@@ -9214,7 +9408,8 @@ mod main_tests {
     use std::io::{Read, Write};
 
     use super::{
-        append_bounded_log, auto_enable_first_oauth_model, auto_import_new_oauth_models, classify_router_health_error,
+        advance_overwrite_countdown, append_bounded_log, auto_enable_first_oauth_model,
+        auto_import_new_oauth_models, classify_router_health_error,
         clear_stale_oauth_account_errors, decode_icon,
         default_oauth_recovery_seconds, deploy_router_config, failover_account_id,
         fallback_transition_notification, fit_window_to_monitor, fit_window_to_work_area,
@@ -9712,6 +9907,21 @@ mod main_tests {
     }
 
     #[test]
+    fn every_self_check_queues_a_subscription_quota_refresh() {
+        let mut catalog_pending = false;
+        let mut quota_pending = false;
+        super::queue_self_check_account_maintenance(
+            &mut catalog_pending,
+            &mut quota_pending,
+        );
+        assert!(catalog_pending);
+        assert!(
+            quota_pending,
+            "a self-check must not drop the per-subscription quota pass"
+        );
+    }
+
+    #[test]
     fn scheduled_oauth_recovery_waits_for_exclusive_admin_access() {
         assert!(scheduled_oauth_recovery_can_start(
             AdminTaskActivity::default()
@@ -9997,6 +10207,44 @@ mod main_tests {
             true,
             false,
             Some(DEFAULT_WINDOW_LOGICAL_SIZE)
+        ));
+    }
+
+    #[test]
+    fn overwrite_countdown_only_advances_while_the_window_has_focus() {
+        let started = std::time::Instant::now();
+        let mut deadline = Some(started + std::time::Duration::from_secs(3));
+        let mut paused_at = None;
+
+        assert!(!advance_overwrite_countdown(
+            &mut deadline,
+            &mut paused_at,
+            started + std::time::Duration::from_secs(1),
+            true,
+        ));
+        assert!(!advance_overwrite_countdown(
+            &mut deadline,
+            &mut paused_at,
+            started + std::time::Duration::from_secs(2),
+            false,
+        ));
+        assert!(!advance_overwrite_countdown(
+            &mut deadline,
+            &mut paused_at,
+            started + std::time::Duration::from_secs(12),
+            false,
+        ));
+        assert!(!advance_overwrite_countdown(
+            &mut deadline,
+            &mut paused_at,
+            started + std::time::Duration::from_secs(12),
+            true,
+        ));
+        assert!(advance_overwrite_countdown(
+            &mut deadline,
+            &mut paused_at,
+            started + std::time::Duration::from_secs(14),
+            true,
         ));
     }
 

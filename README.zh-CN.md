@@ -11,10 +11,10 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.1.2-0969da" alt="版本 2.1.2">
+  <img src="https://img.shields.io/badge/version-2.1.4-0969da" alt="版本 2.1.4">
   <img src="https://img.shields.io/badge/platform-Windows%20%2F%20macOS%20%2F%20Linux-0078d4" alt="Windows / macOS / Linux">
   <img src="https://img.shields.io/badge/architecture-x64-555555" alt="x64">
-  <img src="https://img.shields.io/badge/runtime-portable%20%2B%20installer-2ea44f" alt="便携版与安装版运行时">
+  <img src="https://img.shields.io/badge/default%20build-portable-2ea44f" alt="默认构建便携版">
 </p>
 
 <p align="center">
@@ -67,11 +67,12 @@ CodexRouter 可以将 OAuth 和 API 渠道合并为 Codex 可见的模型目录�
 
 - 支持 OpenAI/ChatGPT、Anthropic/Claude、Google Gemini、Google Antigravity 与 xAI/Grok 的 OAuth 登录入口。
 - 登录后可查看账号套餐、状态、可用额度、重置时间以及平台实际发现的模型。
-- 每次手动或后台自检都会刷新各 OAuth 账号实时声明的可用模型列表。界面只展示该账号实际返回的模型，发现过程不会自动导入，只有用户逐个点击“＋ 模型”后才会加入。
+- 每次手动或后台自检都会刷新各 OAuth 账号实时声明的可用模型列表，并逐个检测当前已选订阅账号的实时额度。界面只展示该账号实际返回的模型，发现过程不会自动导入，只有用户逐个点击“＋ 模型”后才会加入。
 - 已加入的 OAuth 模型可通过右键菜单从当前配置删除。“保存并应用”会尊重删除结果，不会由模型发现重新补回。
 - 每套路由配置独立保存 OAuth 账号选择，只有用户已手动加入并启用的模型才参与当前路由。
 - 开启自动接续时，同名模型优先使用订阅额度，限额或故障时转入较低优先级的 API Key 渠道；关闭时不自动转接，由模型列表中的独立条目决定额度来源。
-- 上游提供重置时间时按实际时间恢复；无法取得重置时间时执行低频保底探测，成功后自动回切。
+- 上游提供重置时间时按实际时间恢复；无法取得可靠实时额度时执行账号级保底探测，成功后自动重新加入号池。Grok 的陈旧 billing 缓存只用于展示，必须由实时额度或当前模型的最小生成确认恢复。
+- Codex 配置被外部更新后，自检会核对用户层与系统层绑定、当前本机网关端口和重试设置。两层都丢失时显示三按钮覆写窗；窗口保持前台焦点累计 3 秒会自动写回并重启 Codex，最小化、托盘或失焦时暂停，不会抢焦点。“恢复默认”会进入粘性官方模式，自检不会再次绑回 Router，直到用户主动重新开启转发。
 - OAuth 令牌由 CLIProxyAPI 管理，不写入 CodexRouter 配置文件，也不提供明文导出。
 
 ### 按模型适配的控制项
@@ -103,7 +104,7 @@ CodexRouter 可以将 OAuth 和 API 渠道合并为 Codex 可见的模型目录�
 
 ## 托盘与性能优化
 
-CodexRouter 可以在 Windows 登录后直接进入轻量托盘模式，不启动额外守护进程。托盘模式暂停日志跟随、界面刷新和高频用量更新，保留每 60 秒一次的原生健康检查、连续失败后的无窗口恢复，以及每 10 分钟一次的统一自检。
+CodexRouter 可以在 Windows 登录后直接进入轻量托盘模式，不启动额外守护进程。托盘模式暂停日志跟随、界面刷新和高频用量更新，保留每 60 秒一次的原生健康检查、连续失败后的无窗口恢复，以及每 3 分钟一次的统一自检。
 
 当前运行时同时保留了内存和后台任务优化。空闲托盘状态下的 CPU、磁盘和网络活动设计为几乎可以忽略；下图展示了测试环境中 CodexRouter 进程处于 0% CPU、0 Mbps 网络占用的空闲状态。
 
@@ -113,15 +114,15 @@ CodexRouter 可以在 Windows 登录后直接进入轻量托盘模式，不启�
 
 ## 下载与首次启动
 
-前往 [GitHub Releases](https://github.com/HernanJiang/CodexRouter/releases/tag/v2.1.2) 下载 Windows x64 版本：
+前往 [GitHub Releases](https://github.com/HernanJiang/CodexRouter/releases/tag/v2.1.4) 下载 Windows x64 版本：
 
-`Codex-Router-Portable-2.1.2-windows-x64.zip`
+`Codex-Router-Portable-2.1.4-windows-x64.zip`
 
-同时提供可选的用户级安装器：`Codex-Router-Setup-2.1.2.exe`。安装时会打开向导，由你选择安装位置、默认创建桌面快捷方式，并在确认后再开始安装。默认路径为 `%LOCALAPPDATA%\Programs\CodexRouter\2.1.2`，不需要管理员权限。
+默认发布与本地交付只构建便携版。用户级 installer 仍保留为可选构建目标，仅在明确需要安装器时单独生成。
 
-本 GitHub Release 发布已验证的 Windows 安装包和便携版。macOS / Linux 理论构建仍可通过仓库 workflow 从源码生成，但未在真实机器上测试。当前受支持的运行时仍是 Windows 10/11 x64。
+macOS / Linux 理论构建仍可通过仓库 workflow 从源码生成，但未在真实机器上测试。当前受支持的运行时仍是 Windows 10/11 x64。
 
-对于 `Upstream request failed` 这类尚未向客户端输出内容的瞬时流错误，Router 默认允许同一账号最多重试 5 次，每次间隔 1.5 秒。已经开始输出模型内容后不会重复回放请求。
+断网、429 或瞬时上游错误默认重试 3 次，退避为 5s / 25s / 125s。每个任务累计等待最多 180 秒；即使自定义为 32 次，也不会进入 625 秒或单步 1 小时等待。Codex 取消任务后 Router 会立即停止该请求的重连；已开始输出后若无法安全续跑，会发送终止事件释放当前任务。
 
 这是一个解压即用的便携包，不要求预装 Python、Node.js、Rust 或独立 VC++ Runtime。请完整解压后启动，不要只把 `Codex-Router.exe` 单独移出目录。
 

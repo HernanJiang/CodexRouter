@@ -11,10 +11,10 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.1.2-0969da" alt="Version 2.1.2">
+  <img src="https://img.shields.io/badge/version-2.1.4-0969da" alt="Version 2.1.4">
   <img src="https://img.shields.io/badge/platform-Windows%20%2F%20macOS%20%2F%20Linux-0078d4" alt="Windows / macOS / Linux">
   <img src="https://img.shields.io/badge/architecture-x64-555555" alt="x64">
-  <img src="https://img.shields.io/badge/runtime-portable%20%2B%20installer-2ea44f" alt="Portable and installer runtime">
+  <img src="https://img.shields.io/badge/default%20build-portable-2ea44f" alt="Portable build by default">
 </p>
 
 <p align="center">
@@ -67,11 +67,12 @@ Switch models directly from the Codex model menu and continue in the same contex
 
 - Supports the OAuth login entries for OpenAI/ChatGPT, Anthropic/Claude, Google Gemini, Google Antigravity, and xAI/Grok.
 - Shows the account plan, status, available capacity, reset information, and models discovered by the upstream platform.
-- Every manual or scheduled self-check refreshes each OAuth account's live available-model list. Only models declared by that account are shown, discovery never imports them automatically, and a model is added only after the user clicks its `+ model` button.
+- Every manual or scheduled self-check refreshes each OAuth account's live available-model list and checks the live quota of every selected subscription account. Only models declared by that account are shown, discovery never imports them automatically, and a model is added only after the user clicks its `+ model` button.
 - An added OAuth model can be removed from the current profile from its right-click menu. Save & apply respects the deletion and does not restore it from discovery.
 - Stores OAuth account selection independently for each routing profile. Only models the user added and enabled participate in that profile.
 - With automatic continuity enabled, prefers subscription capacity for a matching model and falls back to a lower-priority API channel when the subscription is exhausted or unhealthy. With it disabled, no automatic handoff occurs and the selected model entry determines the quota source.
-- Uses the upstream reset time when available. When no reset time is exposed, Router performs a low-frequency recovery probe and automatically returns to the subscription after recovery.
+- Uses the upstream reset time when available. When reliable live quota is unavailable, Router performs an account-scoped recovery probe and returns the account to its pool after success. Stale Grok billing cache is display-only; recovery requires live quota or a minimal generation with the selected model.
+- After an external Codex config update, self-check verifies both binding layers, the active local gateway port, and retry settings. If both layers are lost, a three-choice overwrite dialog appears. Three cumulative seconds of foreground focus restores the binding and restarts Codex; minimization, tray mode, and focus loss pause the countdown without stealing focus. Restore defaults enters a sticky official mode that self-check will not bind back to Router until forwarding is explicitly enabled again.
 - Keeps OAuth tokens under CLIProxyAPI management. Tokens are not written to the CodexRouter configuration file and are not offered as plaintext exports.
 
 ### Model-aware controls
@@ -103,7 +104,7 @@ The view keeps OAuth quota cards and API usage cards visible together, packs car
 
 ## Tray Performance
 
-CodexRouter can start with Windows in a lightweight tray mode without launching an additional daemon. Tray mode pauses log following, UI refresh, and high-frequency usage updates. It retains one native health check every 60 seconds, local-service recovery after consecutive failures, and the unified self-check every 10 minutes.
+CodexRouter can start with Windows in a lightweight tray mode without launching an additional daemon. Tray mode pauses log following, UI refresh, and high-frequency usage updates. It retains one native health check every 60 seconds, local-service recovery after consecutive failures, and the unified self-check every 3 minutes.
 
 The current runtime retains the memory and background-work optimizations. Idle tray CPU, disk, and network activity are designed to be effectively negligible; the screenshot below shows the router process at 0% CPU and 0 Mbps network activity in the tested idle state.
 
@@ -113,15 +114,15 @@ The current runtime retains the memory and background-work optimizations. Idle t
 
 ## Download And First Run
 
-Download the Windows x64 package from [GitHub Releases](https://github.com/HernanJiang/CodexRouter/releases/tag/v2.1.2):
+Download the Windows x64 package from [GitHub Releases](https://github.com/HernanJiang/CodexRouter/releases/tag/v2.1.4):
 
-`Codex-Router-Portable-2.1.2-windows-x64.zip`
+`Codex-Router-Portable-2.1.4-windows-x64.zip`
 
-An optional per-user installer is also provided as `Codex-Router-Setup-2.1.2.exe`. It opens a setup wizard so you can choose the install location, keep a desktop shortcut by default, and confirm before installation starts. The default location is `%LOCALAPPDATA%\Programs\CodexRouter\2.1.2`. No administrator access is required.
+Portable is the default release and local delivery target. The per-user installer remains an optional build and is generated only when explicitly requested.
 
-This GitHub Release publishes the verified Windows installer and portable package. Theoretical macOS / Linux binaries can still be produced from source via the repository workflow; they have not been tested on real machines. The current supported runtime remains Windows 10/11 x64.
+Theoretical macOS / Linux binaries can still be produced from source via the repository workflow; they have not been tested on real machines. The current supported runtime remains Windows 10/11 x64.
 
-For transient pre-output stream failures such as `Upstream request failed`, the router now allows up to five same-account retries by default with a longer 1.5-second interval. The request is never replayed after visible model output has started.
+Network failures, 429 responses, and transient upstream errors retry three times by default with 5s / 25s / 125s backoff. One task may reserve at most 180 seconds of retry wait, so even a custom value of 32 cannot enter 625-second or hour-long sleeps. Router stops reconnecting immediately after Codex cancels the task; after visible output, an unsafe retry closes with a terminal event so the task is released.
 
 The package is portable and does not require Python, Node.js, Rust, or a separately installed VC++ runtime. Extract the complete directory before launching it. Do not move only the GUI executable out of the package.
 

@@ -3819,6 +3819,7 @@ mod tests {
     async fn account_probe_test_state(
         root: &std::path::Path,
         upstream_status: u16,
+        platform: &str,
     ) -> (
         ControlState,
         Arc<Mutex<Vec<Value>>>,
@@ -3843,8 +3844,11 @@ mod tests {
             .with_connection(|connection| {
                 connection.execute(
                     "INSERT INTO accounts(id,platform,account_type,auth_index,auth_file,stable_identity_hmac,status,schedulable,priority,weight,payload)
-                     VALUES(1,'openai','oauth','stale-index','probe.json','probe-identity','error',0,1,1,'{}')",
-                    [],
+                     VALUES(1,?1,'oauth','stale-index','probe.json','probe-identity','error',0,1,1,?2)",
+                    rusqlite::params![
+                        platform,
+                        json!({"credentials":{"base_url":"https://cli-chat-proxy.grok.com/v1"}}).to_string()
+                    ],
                 )?;
                 Ok::<(), anyhow::Error>(())
             })
@@ -4022,7 +4026,7 @@ mod tests {
             "router-account-probe-success-{}",
             uuid::Uuid::now_v7()
         ));
-        let (state, requests, server) = account_probe_test_state(&root, 200).await;
+        let (state, requests, server) = account_probe_test_state(&root, 200, "openai").await;
 
         let response = recover_account_after_probe(&state, 1, "gpt-test").await;
 
@@ -4058,7 +4062,7 @@ mod tests {
             "router-account-probe-failure-{}",
             uuid::Uuid::now_v7()
         ));
-        let (state, _requests, server) = account_probe_test_state(&root, 401).await;
+        let (state, _requests, server) = account_probe_test_state(&root, 401, "openai").await;
 
         let response = recover_account_after_probe(&state, 1, "gpt-test").await;
 
@@ -4088,6 +4092,82 @@ mod tests {
             })
             .unwrap();
         assert_eq!(status, ("error".to_owned(), 0));
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn grok_generation_quota_failure_keeps_account_out_of_the_pool() {
+        let root = std::env::temp_dir().join(format!(
+            "router-grok-recovery-quota-failure-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let (state, requests, server) = account_probe_test_state(&root, 429, "grok").await;
+
+        let response = recover_account_after_probe(&state, 1, "grok-4.6").await;
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let status: (String, i64) = state
+            .store
+            .with_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT status,schedulable FROM accounts WHERE id=1",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(status, ("error".to_owned(), 0));
+        let requests = requests.lock().unwrap_or_else(|error| error.into_inner());
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]["url"],
+            "https://cli-chat-proxy.grok.com/v1/responses"
+        );
+        assert_eq!(requests[0]["method"], "POST");
+        let data: Value = serde_json::from_str(requests[0]["data"].as_str().unwrap()).unwrap();
+        assert_eq!(data["model"], "grok-4.6");
+        drop(requests);
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn grok_successful_minimal_generation_restores_the_pool() {
+        let root = std::env::temp_dir().join(format!(
+            "router-grok-recovery-success-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let (state, requests, server) = account_probe_test_state(&root, 200, "grok").await;
+
+        let response = recover_account_after_probe(&state, 1, "grok-4.6").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let status: (String, i64) = state
+            .store
+            .with_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT status,schedulable FROM accounts WHERE id=1",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(status, ("active".to_owned(), 1));
+        let requests = requests.lock().unwrap_or_else(|error| error.into_inner());
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["method"], "POST");
+        assert_eq!(
+            requests[0]["url"],
+            "https://cli-chat-proxy.grok.com/v1/responses"
+        );
+        drop(requests);
 
         server.abort();
         let _ = std::fs::remove_dir_all(root);

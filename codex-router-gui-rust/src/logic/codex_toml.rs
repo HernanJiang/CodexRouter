@@ -843,7 +843,10 @@ pub(crate) fn repair_codex_router_binding_impl(
     if !super::codex_config_uses_router(&repaired, &codex_public_base_url(cfg)) {
         bail!("CODEX_ROUTER_BINDING_REPAIR_INCOMPLETE");
     }
-    write_codex_system_binding_to(
+    // User-layer repair is enough to restore routing. The system-layer mirror
+    // is best-effort: a missing admin ACL must not roll the probe into a
+    // false "detection failed" and leave the overwrite dialog looping.
+    let _ = write_codex_system_binding_to(
         system_config_path,
         &catalog_path,
         local_api_key,
@@ -851,7 +854,7 @@ pub(crate) fn repair_codex_router_binding_impl(
         settings.require_openai_auth,
         settings.display_openai_provider,
         cfg.rate_limit_max_retries,
-    )?;
+    );
     Ok(true)
 }
 
@@ -893,6 +896,11 @@ pub struct CodexBindingProbe {
     /// rewritten to the Router default model. Repairing only runs while at
     /// least one layer still routes through the local gateway.
     pub model_repair: Option<(Option<String>, String)>,
+    /// True when this probe rewrote a lost user/system Router binding.
+    pub binding_repair: bool,
+    /// Present when the user layer was restored but the `%ProgramData%`
+    /// mirror could not be written (usually missing administrator rights).
+    pub system_binding_error: Option<String>,
 }
 
 pub fn probe_codex_binding_state(
@@ -900,28 +908,62 @@ pub fn probe_codex_binding_state(
     router_root: &Path,
 ) -> anyhow::Result<CodexBindingProbe> {
     let local_api_key = super::ensure_local_api_key()?;
-    let probe = probe_codex_binding_state_with_key(
+    probe_and_repair_codex_binding_state_with_key(
         cfg,
         router_root,
         &local_api_key,
         &codex_system_config_path(),
+    )
+}
+
+pub(crate) fn probe_and_repair_codex_binding_state_with_key(
+    cfg: &RouterConfig,
+    router_root: &Path,
+    local_api_key: &str,
+    system_config_path: &Path,
+) -> anyhow::Result<CodexBindingProbe> {
+    let probe = probe_codex_binding_state_with_key(
+        cfg,
+        router_root,
+        local_api_key,
+        system_config_path,
     )?;
-    if !probe.user_layer_bound
-        && !probe.system_layer_bound
-        && probe
-            .user_model
-            .as_deref()
-            .is_some_and(|model| model.eq_ignore_ascii_case("first"))
-    {
-        repair_codex_router_binding_with_key(cfg, router_root, &local_api_key)?;
-        return probe_codex_binding_state_with_key(
-            cfg,
-            router_root,
-            &local_api_key,
-            &codex_system_config_path(),
-        );
+    if probe.user_layer_bound && probe.system_layer_bound {
+        return Ok(probe);
     }
-    Ok(probe)
+    // Both layers lost: leave them unbound so the UI can show the overwrite
+    // dialog and auto-write after the 3-second countdown. One missing layer
+    // is filled immediately because routing still works through the other.
+    if !probe.user_layer_bound && !probe.system_layer_bound {
+        return Ok(probe);
+    }
+    let repair_result =
+        repair_codex_router_binding_impl(cfg, router_root, local_api_key, system_config_path);
+    let mut repaired = probe_codex_binding_state_with_key(
+        cfg,
+        router_root,
+        local_api_key,
+        system_config_path,
+    )?;
+    match repair_result {
+        Ok(wrote_user) => {
+            repaired.binding_repair = wrote_user
+                || (!probe.user_layer_bound && repaired.user_layer_bound)
+                || (!probe.system_layer_bound && repaired.system_layer_bound);
+            if repaired.user_layer_bound && !repaired.system_layer_bound {
+                repaired.system_binding_error = Some(
+                    "user-layer Router binding is in place, but the system-layer mirror could not be written".to_owned(),
+                );
+            }
+            Ok(repaired)
+        }
+        Err(error) => {
+            repaired.binding_repair = (!probe.user_layer_bound && repaired.user_layer_bound)
+                || (!probe.system_layer_bound && repaired.system_layer_bound);
+            repaired.system_binding_error = Some(error.to_string());
+            Ok(repaired)
+        }
+    }
 }
 
 pub(crate) fn probe_codex_binding_state_with_key(
@@ -966,6 +1008,8 @@ pub(crate) fn probe_codex_binding_state_with_key(
         system_layer_bound,
         user_model,
         model_repair,
+        binding_repair: false,
+        system_binding_error: None,
     })
 }
 
@@ -2168,6 +2212,124 @@ sandbox = "unelevated"
             std::fs::read_to_string(codex_home.join("config.toml")).unwrap(),
             overwritten
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn self_check_rewrites_lost_user_and_system_bindings() {
+        let tmp = std::env::temp_dir().join(format!(
+            "codex-router-probe-auto-repair-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (_root, codex_home, cfg) = probe_fixture(&tmp);
+        let overwritten = "model = \"first\"\nmodel_provider = \"openai\"\n";
+        std::fs::write(codex_home.join("config.toml"), overwritten).unwrap();
+        let system_config = tmp.join("missing-system").join("config.toml");
+        let probe = probe_and_repair_codex_binding_state_with_key(
+            &cfg,
+            &tmp,
+            "fixture-local-router-key",
+            &system_config,
+        )
+        .unwrap();
+        assert!(!probe.binding_repair);
+        assert!(!probe.user_layer_bound);
+        assert!(!probe.system_layer_bound);
+        assert_eq!(
+            std::fs::read_to_string(codex_home.join("config.toml")).unwrap(),
+            overwritten
+        );
+        assert!(
+            repair_codex_router_binding_impl(
+                &cfg,
+                &tmp,
+                "fixture-local-router-key",
+                &system_config
+            )
+            .unwrap()
+        );
+        let repaired = std::fs::read_to_string(codex_home.join("config.toml")).unwrap();
+        assert!(repaired.contains("model_provider = \"codex_router\""));
+        assert!(repaired.contains("request_max_retries"));
+        let system = std::fs::read_to_string(&system_config).unwrap();
+        assert!(system.contains("model_provider = \"codex_router\""));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn self_check_rewrites_lost_user_layer_when_system_still_routes() {
+        let tmp = std::env::temp_dir().join(format!(
+            "codex-router-probe-user-lost-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (root, codex_home, cfg) = probe_fixture(&tmp);
+        let system_config = tmp.join("system").join("config.toml");
+        let catalog = crate::user_data::state_root(&root).join("model-catalog.json");
+        std::fs::create_dir_all(catalog.parent().unwrap()).unwrap();
+        std::fs::write(&catalog, "{}").unwrap();
+        write_codex_system_binding_to(
+            &system_config,
+            &catalog,
+            "fixture-local-router-key",
+            "http://127.0.0.1:18084",
+            true,
+            false,
+            3,
+        )
+        .unwrap();
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "model = \"first\"\nmodel_provider = \"openai\"\n",
+        )
+        .unwrap();
+        let probe = probe_and_repair_codex_binding_state_with_key(
+            &cfg,
+            &root,
+            "fixture-local-router-key",
+            &system_config,
+        )
+        .unwrap();
+        assert!(probe.binding_repair);
+        assert!(probe.user_layer_bound);
+        assert!(probe.system_layer_bound);
+        let repaired = std::fs::read_to_string(codex_home.join("config.toml")).unwrap();
+        assert!(repaired.contains("model_provider = \"codex_router\""));
+        assert!(repaired.contains("request_max_retries"));
+        assert!(repaired.contains("18084"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn self_check_fills_missing_system_layer_when_user_still_routes() {
+        let tmp = std::env::temp_dir().join(format!(
+            "codex-router-probe-system-lost-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (root, _codex_home, cfg) = probe_fixture(&tmp);
+        let system_config = tmp.join("missing-system").join("config.toml");
+        assert!(
+            repair_codex_router_binding_impl(&cfg, &root, "fixture-local-router-key", &system_config)
+                .unwrap()
+        );
+        let _ = std::fs::remove_file(&system_config);
+        let probe = probe_and_repair_codex_binding_state_with_key(
+            &cfg,
+            &root,
+            "fixture-local-router-key",
+            &system_config,
+        )
+        .unwrap();
+        assert!(probe.user_layer_bound);
+        assert!(probe.system_layer_bound);
+        assert!(probe.binding_repair);
+        let system = std::fs::read_to_string(&system_config).unwrap();
+        assert!(system.contains("model_provider = \"codex_router\""));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

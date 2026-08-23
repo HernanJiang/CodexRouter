@@ -758,6 +758,28 @@ pub fn max_output_tokens_map(cfg: &RouterConfig) -> std::collections::HashMap<St
     map
 }
 
+/// Public/catalog model id -> context window and auto-compact point. Fed live
+/// to the gateway so unconfigured max-output cards can spend the remaining
+/// compact budget instead of Codex's unused-percent 5% reserve.
+pub fn context_budget_map(
+    cfg: &RouterConfig,
+) -> std::collections::HashMap<String, ModelContextBudget> {
+    let mut map = std::collections::HashMap::new();
+    for route in catalog::build_route_plan(cfg) {
+        let budget = ModelContextBudget {
+            window: resolve_context_window(&route.model),
+            compact_limit: resolve_auto_compact_token_limit(&route.model),
+        };
+        map.insert(route.public_model_id.clone(), budget);
+        map.insert(route.public_model_id.to_ascii_lowercase(), budget);
+        if route.model.model != route.public_model_id {
+            map.insert(route.model.model.clone(), budget);
+            map.insert(route.model.model.to_ascii_lowercase(), budget);
+        }
+    }
+    map
+}
+
 pub fn normalize_default_model(cfg: &mut RouterConfig) {
     cfg.default_model = resolve_default_model(cfg).unwrap_or_default();
 }
@@ -1589,6 +1611,80 @@ pub fn detect_context_defaults(model_name: &str) -> ContextDefaults {
         source_zh: "未知模型的保守兼容默认值",
         source_en: "conservative fallback for an unknown model",
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MaxOutputDefaults {
+    pub tokens: i64,
+    /// True when `tokens` is an upstream hard cap that must not be exceeded.
+    /// False means a recommended floor/default with no published hard cap.
+    pub hard_cap: bool,
+    pub source_zh: &'static str,
+    pub source_en: &'static str,
+}
+
+/// Official or recommended output caps used when a card left max output at 0.
+/// Codex otherwise sizes `max_output_tokens` as the unused compact percent
+/// (~5% of the full window at 95%), which cuts a turn short of the model cap.
+pub fn detect_max_output_defaults(model_name: &str) -> MaxOutputDefaults {
+    let name = model_name.trim().to_ascii_lowercase();
+    if responses_compat::is_gemini_family_model(model_name) || name.contains("gemini") {
+        return MaxOutputDefaults {
+            tokens: 65_536,
+            hard_cap: true,
+            source_zh: "Gemini 官方输出上限",
+            source_en: "official Gemini output cap",
+        };
+    }
+    if name.contains("deepseek-v4") || name.contains("deepseek") {
+        return MaxOutputDefaults {
+            tokens: 384_000,
+            hard_cap: true,
+            source_zh: "DeepSeek V4 官方输出上限",
+            source_en: "official DeepSeek V4 output cap",
+        };
+    }
+    if name == "k3"
+        || name.contains("kimi-k3")
+        || name.contains("kimi-for-coding")
+        || name.contains("k3-256k")
+        || name.contains("kimi")
+    {
+        return MaxOutputDefaults {
+            tokens: 131_072,
+            hard_cap: true,
+            source_zh: "Kimi 官方默认输出上限",
+            source_en: "official Kimi default output cap",
+        };
+    }
+    if name.contains("claude") {
+        return MaxOutputDefaults {
+            tokens: 128_000,
+            hard_cap: true,
+            source_zh: "Anthropic 官方输出上限",
+            source_en: "official Anthropic output cap",
+        };
+    }
+    if name.contains("grok") {
+        return MaxOutputDefaults {
+            tokens: 128_000,
+            hard_cap: false,
+            source_zh: "xAI 无公开文本输出上限，按剩余压缩预算分配",
+            source_en: "xAI has no published text output cap; spend the remaining compact budget",
+        };
+    }
+    MaxOutputDefaults {
+        tokens: 128_000,
+        hard_cap: false,
+        source_zh: "未知模型无公开硬上限，按剩余压缩预算分配",
+        source_en: "unknown model has no published hard cap; spend the remaining compact budget",
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModelContextBudget {
+    pub window: i64,
+    pub compact_limit: i64,
 }
 
 pub fn resolve_context_window(model: &ModelConfig) -> i64 {
@@ -4297,6 +4393,14 @@ base_url = "https://api.430123.xyz/v1"
             "Ark-Code-Latest"
         );
         assert_eq!(detect_context_defaults("ark-code-latest").window, 262_144);
+        assert_eq!(detect_max_output_defaults("gemini-3.7-flash").tokens, 65_536);
+        assert!(detect_max_output_defaults("gemini-3.7-flash").hard_cap);
+        assert!(!detect_max_output_defaults("grok-4.6").hard_cap);
+        assert_eq!(detect_max_output_defaults("deepseek-v4-pro").tokens, 384_000);
+        assert!(detect_max_output_defaults("deepseek-v4-pro").hard_cap);
+        assert_eq!(detect_max_output_defaults("kimi-k3").tokens, 131_072);
+        assert_eq!(detect_max_output_defaults("claude-sonnet-5").tokens, 128_000);
+        assert!(!detect_max_output_defaults("gpt-5.6-sol").hard_cap);
         let reasoning = detect_reasoning("ark-code-latest");
         assert_eq!(reasoning.default_level, "high");
         assert!(!reasoning.supports_fast);

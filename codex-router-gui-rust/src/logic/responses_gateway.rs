@@ -7,12 +7,14 @@
 
 use super::responses_compat::{
     is_chat_completions_path, is_compact_path, is_exhausted_account_status, is_openai_family_model,
-    is_responses_path, is_xai_family_model, prepare_xai_official_compact_request,
+    is_responses_path, is_xai_family_model,
+    prepare_xai_official_compact_request,
     rewrite_poisoned_upstream_status, is_unsupported_image_error, rewrite_provider_json,
     rewrite_sse_text, sanitize_responses_request, sanitize_responses_request_aggressive,
     should_retry_after_upstream_error, sanitize_responses_request_without_images,
     synthetic_compact_response,
 };
+use super::{detect_context_defaults, detect_max_output_defaults, ModelContextBudget};
 use anyhow::{bail, Context};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -50,6 +52,11 @@ const MAX_RATE_LIMIT_DELAY: Duration = Duration::from_secs(3600);
 /// First retry wait in seconds. Every further retry multiplies the wait by
 /// five: 5s, 25s, 125s, 625s, ... (each step clamped at the ceiling above).
 const RATE_LIMIT_RETRY_BASE_DELAY_SECS: u64 = 5;
+/// Cumulative backoff allowed for one Codex turn. The default three retries
+/// still receive the complete 5s + 25s + 125s ladder, while a high custom
+/// retry count cannot advance into 625-second and hour-long sleeps that leave
+/// the task permanently active after a Router/network interruption.
+const MAX_REQUEST_RETRY_WAIT: Duration = Duration::from_secs(180);
 /// While streaming an agent (non-OpenAI-family) response, the upstream socket
 /// is polled on this cadence so the gateway can keep the Codex session alive
 /// through long provider-side reasoning pauses.
@@ -119,21 +126,104 @@ fn max_output_tokens_for(model: &str) -> Option<i64> {
         .filter(|limit| *limit > 0)
 }
 
-/// Grok/xAI floor used when the user left max output at "model default".
-/// Codex sizes `max_output_tokens` as the unused compact percent
-/// (`window * (100 - percent) / 100`), so a 95% card on a 500k window
-/// becomes ~25k — about 5% of the composer bar — and the stream dies
-/// there without a terminal event. Keep a large enough floor that a
-/// normal Grok turn can finish.
-const GROK_MIN_OUTPUT_TOKENS: i64 = 128_000;
+static CONTEXT_BUDGET: OnceLock<Mutex<HashMap<String, ModelContextBudget>>> = OnceLock::new();
 
-/// Inject the user-configured output token limit into the request body. The
-/// user setting always wins over whatever the client sent; models left at
-/// the default (0) keep the upstream behaviour of not sending the field,
-/// except Grok/xAI where a tiny Codex reserve is raised to
-/// `GROK_MIN_OUTPUT_TOKENS`.
+fn context_budget_slot() -> &'static Mutex<HashMap<String, ModelContextBudget>> {
+    CONTEXT_BUDGET.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn set_context_budget_map(map: HashMap<String, ModelContextBudget>) {
+    *context_budget_slot()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = map;
+}
+
+fn context_budget_for(model: &str) -> Option<ModelContextBudget> {
+    let map = context_budget_slot()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    map.get(model)
+        .copied()
+        .or_else(|| map.get(&model.to_ascii_lowercase()).copied())
+        .filter(|budget| budget.window > 0)
+}
+
+/// Cheap, conservative token estimate used only to size the remaining compact
+/// budget. CJK/fullwidth runs count closer to 1:1; ASCII closer to 4 chars.
+fn estimate_text_tokens(text: &str) -> i64 {
+    let mut tokens = 0_i64;
+    let mut ascii_run = 0_i64;
+    for ch in text.chars() {
+        if ch.is_ascii() {
+            ascii_run += 1;
+            continue;
+        }
+        if ascii_run > 0 {
+            tokens += (ascii_run + 3) / 4;
+            ascii_run = 0;
+        }
+        tokens += 1;
+    }
+    if ascii_run > 0 {
+        tokens += (ascii_run + 3) / 4;
+    }
+    tokens
+}
+
+fn json_text_tokens(value: &Value) -> i64 {
+    match value {
+        Value::Null | Value::Bool(_) => 1,
+        Value::Number(number) => estimate_text_tokens(&number.to_string()),
+        Value::String(text) => estimate_text_tokens(text),
+        Value::Array(items) => items.iter().map(json_text_tokens).sum::<i64>().saturating_add(2),
+        Value::Object(map) => {
+            let nested: i64 = map
+                .iter()
+                .map(|(key, nested)| estimate_text_tokens(key).saturating_add(json_text_tokens(nested)))
+                .sum();
+            nested.saturating_add(2)
+        }
+    }
+}
+
+fn estimate_request_input_tokens(body: &Value) -> i64 {
+    let mut tokens = 0_i64;
+    if let Some(instructions) = body.get("instructions").and_then(Value::as_str) {
+        tokens = tokens.saturating_add(estimate_text_tokens(instructions));
+    }
+    if let Some(input) = body.get("input") {
+        tokens = tokens.saturating_add(json_text_tokens(input));
+    }
+    if let Some(messages) = body.get("messages") {
+        tokens = tokens.saturating_add(json_text_tokens(messages));
+    }
+    tokens.max(1)
+}
+
+fn remaining_compact_budget(model: &str, body: &Value) -> i64 {
+    let budget = context_budget_for(model).unwrap_or_else(|| {
+        let window = detect_context_defaults(model).window;
+        ModelContextBudget {
+            window,
+            compact_limit: window.saturating_mul(95) / 100,
+        }
+    });
+    let compact_limit = if budget.compact_limit > 0 {
+        budget.compact_limit.min(budget.window)
+    } else {
+        budget.window.saturating_mul(95) / 100
+    };
+    let used = estimate_request_input_tokens(body).min(budget.window);
+    compact_limit.saturating_sub(used).max(1)
+}
+
+/// Inject the per-request output token budget.
+///
+/// 1. A card with `max_output_tokens > 0` always wins.
+/// 2. Otherwise size the turn as `min(official/recommended cap, remaining
+///    compact budget)` so Codex's unused-percent 5% reserve is not the cap.
 fn inject_max_output_tokens(path: &str, body: &mut Value) -> bool {
-    let Some(model) = body.get("model").and_then(Value::as_str) else {
+    let Some(model) = body.get("model").and_then(Value::as_str).map(str::to_owned) else {
         return false;
     };
     let field = if is_chat_completions_path(path) {
@@ -142,12 +232,17 @@ fn inject_max_output_tokens(path: &str, body: &mut Value) -> bool {
         "max_output_tokens"
     };
     let current = body.get(field).and_then(Value::as_i64).unwrap_or(0);
-    let limit = match max_output_tokens_for(model) {
+    let limit = match max_output_tokens_for(&model) {
         Some(limit) => limit,
-        None if is_xai_family_model(model) && current < GROK_MIN_OUTPUT_TOKENS => {
-            GROK_MIN_OUTPUT_TOKENS
+        None => {
+            let defaults = detect_max_output_defaults(&model);
+            let remaining = remaining_compact_budget(&model, body);
+            if defaults.hard_cap {
+                remaining.min(defaults.tokens).max(1)
+            } else {
+                remaining.max(1)
+            }
         }
-        None => return false,
     };
     if current == limit {
         return false;
@@ -429,24 +524,43 @@ fn handle_client(
     // Codex client a transparent upstream retry is seamless; afterwards a
     // reconnect would replay the answer from scratch, so late failures
     // surface a clean `response.failed` instead of a retry.
-    let stage_max_retries = rate_limit_max_retries.min(MAX_RATE_LIMIT_RETRIES) as usize;
-    let mut stage_attempt = 0_usize;
+    let mut retry_budget = RequestRetryBudget::new(rate_limit_max_retries);
     let mut sse_prelude_sent = false;
     let mut stream_resume: Option<StreamResume> = None;
     let (status, response_headers_map, response_body) = loop {
-        let response = open_upstream_with_rate_limit_retry(
+        let response = match open_upstream_with_rate_limit_retry(
             upstream,
             &method,
             &path,
             &headers,
             &request_body,
-            rate_limit_max_retries,
-        )?;
+            &mut retry_budget,
+            Some(client),
+        ) {
+            Ok(response) => response,
+            Err(error) => {
+                if sse_prelude_sent {
+                    finish_sse(client, "", false)?;
+                } else {
+                    send_gateway_unavailable(client, &error)?;
+                }
+                return Ok(());
+            }
+        };
         let mut upstream_stream = response.stream;
         let response_headers = response.headers;
         let response_leftover = response.leftover;
         let status = response.status;
         let response_headers_map = response.header_map;
+        if sse_prelude_sent && status >= 400 && is_responses_path(&path) {
+            // The client already accepted one HTTP 200 SSE response. A retry
+            // may fail with 429/5xx, but writing that second HTTP response
+            // into the open event stream corrupts the protocol and leaves
+            // Codex waiting on an invalid active turn. Close the existing SSE
+            // response with its terminal failure event instead.
+            finish_sse(client, "", false)?;
+            return Ok(());
+        }
         if status < 400 || !is_responses_path(&path) {
             if status < 400 && is_responses_path(&path) {
                 let content_type = content_type_of(&response_headers_map);
@@ -472,34 +586,35 @@ fn handle_client(
                             return Ok(());
                         }
                         SseForward::RetryableBeforeFirstEvent => {
-                            if stage_attempt >= stage_max_retries {
+                            let Some(delay) = retry_budget.reserve(None) else {
                                 finish_sse(client, "", false)?;
                                 return Ok(());
-                            }
+                            };
                             gateway_log(
                                 "request.retry",
-                                &format!("{method} {path} pre-content stream retry #{}", stage_attempt + 1),
+                                &format!(
+                                    "{method} {path} pre-content stream retry #{}",
+                                    retry_budget.retries_used
+                                ),
                             );
-                            sleep_for_retry(rate_limit_retry_delay(None, stage_attempt));
-                            stage_attempt += 1;
+                            sleep_for_retry_while_connected(delay, Some(client))?;
                             continue;
                         }
                         SseForward::RetryableWithPrefix(resume) => {
-                            if stage_attempt >= stage_max_retries {
+                            let Some(delay) = retry_budget.reserve(None) else {
                                 finish_sse(client, "", false)?;
                                 return Ok(());
-                            }
+                            };
                             gateway_log(
                                 "request.retry",
                                 &format!(
                                     "{method} {path} mid-stream retry #{} delivered_chars={}",
-                                    stage_attempt + 1,
+                                    retry_budget.retries_used,
                                     resume.prefix.len()
                                 ),
                             );
                             stream_resume = Some(resume);
-                            sleep_for_retry(rate_limit_retry_delay(None, stage_attempt));
-                            stage_attempt += 1;
+                            sleep_for_retry_while_connected(delay, Some(client))?;
                             continue;
                         }
                     }
@@ -518,15 +633,18 @@ fn handle_client(
                             );
                         }
                         Err(error) => {
-                            if stage_attempt >= stage_max_retries {
-                                return Err(error);
-                            }
+                            let Some(delay) = retry_budget.reserve(None) else {
+                                send_gateway_unavailable(client, &error)?;
+                                return Ok(());
+                            };
                             gateway_log(
                                 "request.retry",
-                                &format!("{method} {path} body read retry #{}", stage_attempt + 1),
+                                &format!(
+                                    "{method} {path} body read retry #{}",
+                                    retry_budget.retries_used
+                                ),
                             );
-                            sleep_for_retry(rate_limit_retry_delay(None, stage_attempt));
-                            stage_attempt += 1;
+                            sleep_for_retry_while_connected(delay, Some(client))?;
                             continue;
                         }
                     }
@@ -542,15 +660,18 @@ fn handle_client(
         match read_full_body(&mut upstream_stream, &response_headers_map, response_leftover) {
             Ok(body) => break (status, response_headers_map, body),
             Err(error) => {
-                if stage_attempt >= stage_max_retries {
-                    return Err(error);
-                }
+                let Some(delay) = retry_budget.reserve(None) else {
+                    send_gateway_unavailable(client, &error)?;
+                    return Ok(());
+                };
                 gateway_log(
                     "request.retry",
-                    &format!("{method} {path} error body read retry #{}", stage_attempt + 1),
+                    &format!(
+                        "{method} {path} error body read retry #{}",
+                        retry_budget.retries_used
+                    ),
                 );
-                sleep_for_retry(rate_limit_retry_delay(None, stage_attempt));
-                stage_attempt += 1;
+                sleep_for_retry_while_connected(delay, Some(client))?;
                 continue;
             }
         }
@@ -651,19 +772,19 @@ fn open_upstream_with_rate_limit_retry(
     path: &str,
     headers: &HashMap<String, String>,
     body: &[u8],
-    max_retries: u32,
+    retry_budget: &mut RequestRetryBudget,
+    client: Option<&TcpStream>,
 ) -> anyhow::Result<UpstreamResponse> {
-    let max_retries = max_retries.min(MAX_RATE_LIMIT_RETRIES) as usize;
-    let mut last_error: Option<anyhow::Error> = None;
-    for attempt in 0..=max_retries {
+    loop {
+        ensure_client_connected(client)?;
         let mut stream = match connect_upstream(upstream) {
             Ok(stream) => stream,
             Err(error) => {
-                last_error = Some(error);
-                if attempt >= max_retries {
-                    break;
-                }
-                sleep_for_retry(rate_limit_retry_delay(None, attempt));
+                let Some(delay) = retry_budget.reserve(None) else {
+                    return Err(error);
+                };
+                log_retry_wait(method, path, "connect", retry_budget.retries_used, delay);
+                sleep_for_retry_while_connected(delay, client)?;
                 continue;
             }
         };
@@ -676,21 +797,21 @@ fn open_upstream_with_rate_limit_retry(
             body,
             upstream,
         ) {
-            last_error = Some(error);
-            if attempt >= max_retries {
-                break;
-            }
-            sleep_for_retry(rate_limit_retry_delay(None, attempt));
+            let Some(delay) = retry_budget.reserve(None) else {
+                return Err(error);
+            };
+            log_retry_wait(method, path, "request-write", retry_budget.retries_used, delay);
+            sleep_for_retry_while_connected(delay, client)?;
             continue;
         }
         let (response_headers, mut leftover) = match read_headers(&mut stream) {
             Ok(parts) => parts,
             Err(error) => {
-                last_error = Some(error);
-                if attempt >= max_retries {
-                    break;
-                }
-                sleep_for_retry(rate_limit_retry_delay(None, attempt));
+                let Some(delay) = retry_budget.reserve(None) else {
+                    return Err(error);
+                };
+                log_retry_wait(method, path, "response-header", retry_budget.retries_used, delay);
+                sleep_for_retry_while_connected(delay, client)?;
                 continue;
             }
         };
@@ -709,7 +830,7 @@ fn open_upstream_with_rate_limit_retry(
             false
         };
         let transient_status = matches!(status, 408 | 425 | 502 | 504);
-        if (!rate_limited && !transient_status) || attempt >= max_retries {
+        if !rate_limited && !transient_status {
             return Ok(UpstreamResponse {
                 stream,
                 headers: response_headers,
@@ -718,9 +839,58 @@ fn open_upstream_with_rate_limit_retry(
                 header_map: response_headers_map,
             });
         }
-        sleep_for_retry(rate_limit_retry_delay(Some(&response_headers_map), attempt));
+        let Some(delay) = retry_budget.reserve(Some(&response_headers_map)) else {
+            return Ok(UpstreamResponse {
+                stream,
+                headers: response_headers,
+                leftover,
+                status,
+                header_map: response_headers_map,
+            });
+        };
+        log_retry_wait(method, path, "upstream-status", retry_budget.retries_used, delay);
+        sleep_for_retry_while_connected(delay, client)?;
     }
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("upstream retry budget exhausted")))
+}
+
+fn log_retry_wait(method: &str, path: &str, stage: &str, retry: usize, delay: Duration) {
+    gateway_log(
+        "request.retry",
+        &format!(
+            "{method} {path} stage={stage} retry=#{retry} wait={}s",
+            delay.as_secs()
+        ),
+    );
+}
+
+struct RequestRetryBudget {
+    max_retries: usize,
+    retries_used: usize,
+    reserved_wait: Duration,
+}
+
+impl RequestRetryBudget {
+    fn new(max_retries: u32) -> Self {
+        Self {
+            max_retries: max_retries.min(MAX_RATE_LIMIT_RETRIES) as usize,
+            retries_used: 0,
+            reserved_wait: Duration::ZERO,
+        }
+    }
+
+    fn reserve(&mut self, headers: Option<&HashMap<String, String>>) -> Option<Duration> {
+        if self.retries_used >= self.max_retries {
+            return None;
+        }
+        let delay = rate_limit_retry_delay(headers, self.retries_used);
+        let next_wait = self.reserved_wait.saturating_add(delay);
+        if next_wait > MAX_REQUEST_RETRY_WAIT {
+            return None;
+        }
+        self.retries_used += 1;
+        self.reserved_wait = next_wait;
+        Some(delay)
+    }
 }
 
 /// Read the rest of a small error response so it can be classified and, when
@@ -770,11 +940,41 @@ fn rate_limit_retry_delay(
     Duration::from_secs(staged.max(hinted)).min(MAX_RATE_LIMIT_DELAY)
 }
 
-fn sleep_for_retry(duration: Duration) {
+fn sleep_for_retry_while_connected(
+    duration: Duration,
+    client: Option<&TcpStream>,
+) -> anyhow::Result<()> {
+    ensure_client_connected(client)?;
     if cfg!(test) {
-        return;
+        return Ok(());
     }
-    thread::sleep(duration);
+    let started = Instant::now();
+    while started.elapsed() < duration {
+        let remaining = duration.saturating_sub(started.elapsed());
+        thread::sleep(remaining.min(Duration::from_millis(100)));
+        ensure_client_connected(client)?;
+    }
+    Ok(())
+}
+
+fn ensure_client_connected(client: Option<&TcpStream>) -> anyhow::Result<()> {
+    let Some(client) = client else {
+        return Ok(());
+    };
+    let previous_timeout = client.read_timeout().ok().flatten();
+    client.set_read_timeout(Some(Duration::from_millis(1))).ok();
+    let mut byte = [0_u8; 1];
+    let result = client.peek(&mut byte);
+    client.set_read_timeout(previous_timeout).ok();
+    match result {
+        Ok(0) => bail!(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "Codex client disconnected during upstream retry",
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if stream_read_timed_out(&error) => Ok(()),
+        Err(error) => Err(error).context("could not inspect Codex client during upstream retry"),
+    }
 }
 
 fn write_upstream_request(
@@ -1705,6 +1905,12 @@ fn send_simple(stream: &mut TcpStream, status: u16, body: &[u8]) -> anyhow::Resu
     send_status(stream, status, "text/plain", body)
 }
 
+fn send_gateway_unavailable(stream: &mut TcpStream, error: &anyhow::Error) -> anyhow::Result<()> {
+    gateway_log("request.upstream_unavailable", &format!("{error:#}"));
+    let body = br#"{"error":{"code":"router_upstream_unavailable","message":"Router upstream connection was interrupted. Please retry this task."}}"#;
+    send_status(stream, 502, "application/json", body)
+}
+
 fn send_status(
     stream: &mut TcpStream,
     status: u16,
@@ -1715,6 +1921,7 @@ fn send_status(
         200 => "OK",
         400 => "Bad Request",
         413 => "Payload Too Large",
+        502 => "Bad Gateway",
         _ => "Error",
     };
     let header = format!(
@@ -1885,9 +2092,11 @@ fn force_connection_close_headers(raw_headers: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    static OUTPUT_BUDGET_TEST: Mutex<()> = Mutex::new(());
 
     #[test]
     fn inject_max_output_tokens_honors_the_configured_model_limit() {
+        let _guard = OUTPUT_BUDGET_TEST.lock().unwrap();
         // Unique fixture model ids keep this test isolated from the gateway
         // end-to-end tests that share the process-wide map in parallel.
         set_max_output_tokens_map(HashMap::from([
@@ -1903,38 +2112,120 @@ mod tests {
         assert!(inject_max_output_tokens("/v1/chat/completions", &mut chat));
         assert_eq!(chat["max_tokens"], serde_json::json!(4_096));
 
-        // Unmapped models keep the upstream default: nothing is injected.
+        // Unmapped models still receive the remaining compact budget,
+        // capped at the recommended output floor.
         let mut unmapped = serde_json::json!({"model":"mot-fixture-unmapped"});
-        assert!(!inject_max_output_tokens("/v1/responses", &mut unmapped));
-        assert!(unmapped.get("max_output_tokens").is_none());
+        assert!(inject_max_output_tokens("/v1/responses", &mut unmapped));
+        let unmapped_limit = unmapped["max_output_tokens"].as_i64().unwrap();
+        assert!(unmapped_limit > 0);
+        assert!(unmapped_limit <= detect_context_defaults("mot-fixture-unmapped").window);
 
         set_max_output_tokens_map(HashMap::new());
-        assert!(!inject_max_output_tokens("/v1/responses", &mut body));
+        assert!(inject_max_output_tokens("/v1/responses", &mut body));
+        let recomputed = body["max_output_tokens"].as_i64().unwrap();
+        assert!(recomputed > 8_192);
+        assert!(recomputed <= detect_context_defaults("MOT-Fixture-Sol").window);
     }
 
     #[test]
     fn grok_raises_codex_five_percent_output_cap() {
+        let _guard = OUTPUT_BUDGET_TEST.lock().unwrap();
         set_max_output_tokens_map(HashMap::new());
+        set_context_budget_map(HashMap::from([(
+            "grok-4.6".to_owned(),
+            ModelContextBudget {
+                window: 500_000,
+                compact_limit: 475_000,
+            },
+        )]));
         let mut grok = serde_json::json!({
             "model": "grok-4.6",
             "max_output_tokens": 25_000,
             "input": []
         });
+        let expected = remaining_compact_budget("grok-4.6", &grok);
+        assert!(expected > 25_000);
         assert!(inject_max_output_tokens("/v1/responses", &mut grok));
-        assert_eq!(grok["max_output_tokens"], serde_json::json!(128_000));
+        assert_eq!(grok["max_output_tokens"], serde_json::json!(expected));
 
-        let mut already_large = serde_json::json!({
-            "model": "grok-4.5",
-            "max_output_tokens": 200_000
+        let mut already_at_remaining = serde_json::json!({
+            "model": "grok-4.6",
+            "max_output_tokens": expected,
+            "input": []
         });
-        assert!(!inject_max_output_tokens("/v1/responses", &mut already_large));
-        assert_eq!(already_large["max_output_tokens"], serde_json::json!(200_000));
+        assert!(!inject_max_output_tokens("/v1/responses", &mut already_at_remaining));
+        assert_eq!(already_at_remaining["max_output_tokens"], serde_json::json!(expected));
 
         set_max_output_tokens_map(HashMap::from([("grok-4.6".to_owned(), 8_192)]));
         let mut user_limit = serde_json::json!({"model": "grok-4.6", "max_output_tokens": 25_000});
         assert!(inject_max_output_tokens("/v1/responses", &mut user_limit));
         assert_eq!(user_limit["max_output_tokens"], serde_json::json!(8_192));
         set_max_output_tokens_map(HashMap::new());
+        set_context_budget_map(HashMap::new());
+    }
+
+    #[test]
+    fn gemini_raises_codex_five_percent_output_cap() {
+        let _guard = OUTPUT_BUDGET_TEST.lock().unwrap();
+        set_max_output_tokens_map(HashMap::new());
+        set_context_budget_map(HashMap::new());
+        let mut gemini = serde_json::json!({
+            "model": "gemini-3.7-flash",
+            "max_output_tokens": 52_428,
+            "input": []
+        });
+        assert!(inject_max_output_tokens("/v1/responses", &mut gemini));
+        assert_eq!(gemini["max_output_tokens"], serde_json::json!(65_536));
+
+        let mut already_at_cap = serde_json::json!({
+            "model": "gemini-3.1-pro",
+            "max_output_tokens": 65_536
+        });
+        assert!(!inject_max_output_tokens("/v1/responses", &mut already_at_cap));
+        assert_eq!(already_at_cap["max_output_tokens"], serde_json::json!(65_536));
+
+        set_max_output_tokens_map(HashMap::from([("gemini-3.7-flash".to_owned(), 8_192)]));
+        let mut user_limit = serde_json::json!({
+            "model": "gemini-3.7-flash",
+            "max_output_tokens": 52_428
+        });
+        assert!(inject_max_output_tokens("/v1/responses", &mut user_limit));
+        assert_eq!(user_limit["max_output_tokens"], serde_json::json!(8_192));
+        set_max_output_tokens_map(HashMap::new());
+    }
+
+    #[test]
+    fn remaining_compact_budget_caps_unconfigured_output() {
+        let _guard = OUTPUT_BUDGET_TEST.lock().unwrap();
+        set_max_output_tokens_map(HashMap::new());
+        set_context_budget_map(HashMap::from([(
+            "gemini-3.7-flash".to_owned(),
+            ModelContextBudget {
+                window: 1_048_576,
+                compact_limit: 996_147,
+            },
+        )]));
+        let used = "x".repeat(4 * 400_000);
+        let mut gemini = serde_json::json!({
+            "model": "gemini-3.7-flash",
+            "max_output_tokens": 52_428,
+            "input": [{"content": used}]
+        });
+        assert!(inject_max_output_tokens("/v1/responses", &mut gemini));
+        assert_eq!(gemini["max_output_tokens"], serde_json::json!(65_536));
+
+        let used_near_compact = "x".repeat(4 * 950_000);
+        let mut near = serde_json::json!({
+            "model": "gemini-3.7-flash",
+            "max_output_tokens": 52_428,
+            "input": [{"content": used_near_compact}]
+        });
+        assert!(inject_max_output_tokens("/v1/responses", &mut near));
+        let remaining = near["max_output_tokens"].as_i64().unwrap();
+        assert!(remaining > 0);
+        assert!(remaining < 65_536);
+        assert!(remaining <= 996_147 - 950_000);
+        set_context_budget_map(HashMap::new());
     }
     use super::*;
     use std::net::Ipv4Addr;
@@ -2090,7 +2381,15 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(10));
         };
-        assert_eq!(forwarded, body);
+        let forwarded_json: serde_json::Value = serde_json::from_slice(&forwarded).unwrap();
+        let original_json: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(forwarded_json["model"], original_json["model"]);
+        assert_eq!(forwarded_json["include"], original_json["include"]);
+        assert_eq!(forwarded_json["input"], original_json["input"]);
+        let injected = forwarded_json["max_output_tokens"].as_i64().unwrap();
+        let expected = remaining_compact_budget("gpt-5.6-sol", &original_json);
+        assert_eq!(injected, expected);
+        assert!(injected > 0);
         let text = String::from_utf8_lossy(&response);
         assert!(text.to_ascii_lowercase().contains("connection: close"));
         assert!(text.contains("response.output_text.delta"));
@@ -2267,13 +2566,15 @@ mod tests {
             }
         });
 
+        let mut retry_budget = RequestRetryBudget::new(3);
         let response = open_upstream_with_rate_limit_retry(
             &format!("http://127.0.0.1:{}", upstream_addr.port()),
             "POST",
             "/v1/responses",
             &HashMap::new(),
             b"{}",
-            3,
+            &mut retry_budget,
+            None,
         )
         .unwrap();
         assert_eq!(response.status, 200);
@@ -2309,13 +2610,15 @@ mod tests {
             }
         });
 
+        let mut retry_budget = RequestRetryBudget::new(3);
         let response = open_upstream_with_rate_limit_retry(
             &format!("http://127.0.0.1:{}", upstream_addr.port()),
             "POST",
             "/v1/responses",
             &HashMap::new(),
             b"{}",
-            3,
+            &mut retry_budget,
+            None,
         )
         .unwrap();
         assert_eq!(response.status, 200);
@@ -2344,19 +2647,38 @@ mod tests {
             }
         });
 
+        let mut retry_budget = RequestRetryBudget::new(2);
         let response = open_upstream_with_rate_limit_retry(
             &format!("http://127.0.0.1:{}", upstream_addr.port()),
             "POST",
             "/v1/responses",
             &HashMap::new(),
             b"{}",
-            2,
+            &mut retry_budget,
+            None,
         )
         .unwrap();
         // 1 initial attempt + 2 retries, then the 429 is passed through so the
         // caller can surface a normal rate-limit error to the user.
         assert_eq!(attempts.load(Ordering::Relaxed), 3);
         assert_eq!(response.status, 429);
+    }
+
+    #[test]
+    fn one_request_cannot_wait_through_an_unbounded_retry_ladder() {
+        let (output, attempts) = run_client_against_mock(
+            |_attempt, socket| {
+                socket
+                    .write_all(b"HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: 22\r\nConnection: close\r\n\r\n{\"error\":\"rate limit\"}")
+                    .unwrap();
+            },
+            MAX_RATE_LIMIT_RETRIES,
+        );
+        assert!(output.starts_with("HTTP/1.1 429"));
+        assert!(
+            attempts <= 4,
+            "one Codex turn must stop before the configured 32-retry ladder reaches hour-long waits"
+        );
     }
 
     #[test]
@@ -2495,6 +2817,28 @@ mod tests {
     }
 
     #[test]
+    fn retry_error_after_sse_prelude_closes_with_one_terminal_event() {
+        let (output, attempts) = run_client_against_mock(
+            |attempt, socket| {
+                if attempt == 0 {
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n")
+                        .unwrap();
+                    return;
+                }
+                socket
+                    .write_all(b"HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: 22\r\nConnection: close\r\n\r\n{\"error\":\"rate limit\"}")
+                    .unwrap();
+            },
+            1,
+        );
+        assert_eq!(attempts, 2);
+        assert_eq!(output.matches("HTTP/1.1").count(), 1);
+        assert_eq!(output.matches("response.failed").count(), 2);
+        assert!(output.contains("upstream_stream_interrupted"));
+    }
+
+    #[test]
     fn client_cancellation_errors_are_not_gateway_failures() {
         for kind in [
             std::io::ErrorKind::BrokenPipe,
@@ -2507,6 +2851,73 @@ mod tests {
         }
         let aborted = std::io::Error::from_raw_os_error(10053);
         assert!(client_connection_ended(&anyhow::Error::new(aborted)));
+    }
+
+    #[test]
+    fn cancelled_client_stops_upstream_retry_immediately() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        upstream.set_nonblocking(true).unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        let upstream_worker = thread::spawn(move || {
+            while !stop_clone.load(Ordering::Relaxed) {
+                let (mut socket, _) = match upstream.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(error) => panic!("mock upstream accept failed: {error}"),
+                };
+                let (headers, leftover) = read_headers(&mut socket).unwrap();
+                let length = parse_headers(&String::from_utf8_lossy(&headers))
+                    .get("content-length")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let mut body = leftover;
+                read_exact_more(&mut socket, &mut body, length).unwrap();
+                attempts_clone.fetch_add(1, Ordering::Relaxed);
+                socket
+                    .write_all(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+            }
+        });
+
+        let gateway = TcpListener::bind("127.0.0.1:0").unwrap();
+        let gateway_addr = gateway.local_addr().unwrap();
+        let upstream_url = format!("http://127.0.0.1:{}", upstream_addr.port());
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::sync_channel(0);
+        let (continue_tx, continue_rx) = std::sync::mpsc::sync_channel(0);
+        let gateway_worker = thread::spawn(move || {
+            let (mut stream, _) = gateway.accept().unwrap();
+            accepted_tx.send(()).unwrap();
+            continue_rx.recv().unwrap();
+            handle_client(&mut stream, &upstream_url, 5)
+        });
+
+        let mut client = TcpStream::connect(gateway_addr).unwrap();
+        accepted_rx.recv().unwrap();
+        let body = br#"{"model":"gpt-5.6-sol"}"#;
+        let request = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        client.write_all(request.as_bytes()).unwrap();
+        client.write_all(body).unwrap();
+        client.shutdown(Shutdown::Both).unwrap();
+        drop(client);
+        continue_tx.send(()).unwrap();
+
+        let _ = gateway_worker.join().unwrap();
+        stop.store(true, Ordering::Relaxed);
+        upstream_worker.join().unwrap();
+        assert!(
+            attempts.load(Ordering::Relaxed) <= 1,
+            "a cancelled Codex request must not consume the remaining upstream retry budget"
+        );
     }
 
     #[test]

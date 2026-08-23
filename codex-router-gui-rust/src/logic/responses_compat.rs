@@ -100,6 +100,17 @@ pub fn is_xai_family_model(model: &str) -> bool {
     slug.contains("grok") || slug.starts_with("grok-")
 }
 
+pub fn is_gemini_family_model(model: &str) -> bool {
+    let slug = model
+        .trim()
+        .trim_start_matches('~')
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase();
+    slug.contains("gemini")
+}
+
 fn looks_like_xai_compaction_blob(value: &str) -> bool {
     let token = value.trim();
     !token.is_empty()
