@@ -402,11 +402,10 @@ pub fn build_model_catalog_with_root(cfg: &RouterConfig, router_root: &Path) -> 
         let supports_images = resolve_multimodal(model);
         let context_window = resolve_context_window(model);
         let compact_percent = super::clamp_auto_compact_percent(model.auto_compact_percent);
-        // Codex uses auto_compact_token_limit as the effective window shown to
-        // the user and as the compact trigger. Keep it equal to the physical
-        // window so Grok/ChatGPT see the full documented size; the percent is
-        // only a user-tunable compact trigger relative to that full window.
-        let auto_compact_token_limit = context_window;
+        // Codex Desktop shows `context_window * effective_context_window_percent / 100`
+        // as the composer denominator. Keep auto_compact_token_limit on the same
+        // percent window so Grok 500k @ 95% becomes 475k, not a stale 400k cache.
+        let auto_compact_token_limit = super::resolve_auto_compact_token_limit(model);
         let display_name = route_display_name(route);
 
         let mut entry = template.clone();

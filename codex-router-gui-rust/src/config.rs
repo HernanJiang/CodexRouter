@@ -588,6 +588,11 @@ impl RouterConfig {
         let content = std::fs::read_to_string(path)?;
         let mut value: serde_json::Value = serde_json::from_str(&content)?;
         normalize_legacy_model_numbers(&mut value)?;
+        let incoming_version = value
+            .get("version")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
         let mut cfg: Self = serde_json::from_value(value)?;
         for model in &mut cfg.models {
             if model.model.eq_ignore_ascii_case("gpt-5.6") {
@@ -605,7 +610,15 @@ impl RouterConfig {
         if migrate_legacy_bulk_oauth_catalog(&mut cfg) {
             crate::logic::normalize_default_model(&mut cfg);
         }
+        let compact_migrated =
+            migrate_auto_compact_percent_to_official(&incoming_version, &mut cfg);
+        if compact_migrated {
+            crate::logic::normalize_default_model(&mut cfg);
+        }
         cfg.version = env!("CARGO_PKG_VERSION").to_owned();
+        if compact_migrated {
+            let _ = cfg.save(path);
+        }
         Ok(cfg)
     }
 
@@ -631,6 +644,37 @@ impl RouterConfig {
 }
 
 const LEGACY_BULK_OAUTH_CATALOG_THRESHOLD: usize = 12;
+
+fn version_is_before_official_compact_migrate(version: &str) -> bool {
+    let version = version.trim();
+    if version.is_empty() {
+        return true;
+    }
+    let mut parts = version.split('.');
+    let major = parts.next().and_then(|part| part.parse::<u32>().ok());
+    let minor = parts.next().and_then(|part| part.parse::<u32>().ok());
+    match (major, minor) {
+        (Some(major), Some(minor)) => major < 2 || (major == 2 && minor < 1),
+        (Some(major), None) => major < 2,
+        _ => true,
+    }
+}
+
+fn migrate_auto_compact_percent_to_official(version: &str, cfg: &mut RouterConfig) -> bool {
+    if !version_is_before_official_compact_migrate(version) {
+        return false;
+    }
+    let target = default_auto_compact_percent();
+    let mut changed = false;
+    for model in &mut cfg.models {
+        if model.auto_compact_percent != target {
+            model.auto_compact_percent = target;
+            changed = true;
+        }
+    }
+    changed
+}
+
 
 fn migrate_legacy_bulk_oauth_catalog(cfg: &mut RouterConfig) -> bool {
     if !matches!(cfg.version.trim(), "1.6.4" | "1.6.5" | "1.6.6") {
@@ -874,9 +918,53 @@ mod tests {
         assert_eq!(config.models[0].base_url, "https://example.test/v1");
         assert_eq!(config.models[0].priority, 90);
         assert_eq!(config.models[0].weight, 1);
-        assert_eq!(config.models[0].auto_compact_percent, 80);
+        assert_eq!(config.models[0].auto_compact_percent, 95);
         assert_eq!(config.models[0].context_window, 128_000);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pre_2_1_configs_raise_auto_compact_percent_to_official_95() {
+        let path = std::env::temp_dir().join(format!(
+            "codex-router-compact-migrate-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"version":"2.0.19","models":[{"model":"grok-4.6","autoCompactPercent":80},{"model":"glm-latest","autoCompactPercent":90}]}"#,
+        )
+        .unwrap();
+        let config = RouterConfig::load(&path).unwrap();
+        assert_eq!(config.models[0].auto_compact_percent, 95);
+        assert_eq!(config.models[1].auto_compact_percent, 95);
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["models"][0]["autoCompactPercent"], 95);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn post_2_1_manual_auto_compact_percent_is_preserved() {
+        let path = std::env::temp_dir().join(format!(
+            "codex-router-compact-keep-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"version":"2.1.0","models":[{"model":"grok-4.6","autoCompactPercent":80}]}"#,
+        )
+        .unwrap();
+        let config = RouterConfig::load(&path).unwrap();
+        assert_eq!(config.models[0].auto_compact_percent, 80);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

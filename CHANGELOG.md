@@ -2,6 +2,50 @@
 
 本文件记录面向用户的重要变化。完整技术细节以对应版本的源码和 GitHub Release 为准。
 
+## 2.1.2 - 2026-08-23
+
+### 修复
+
+- 订阅号有额度时会按卡片优先级重新进号池。ChatGPT / Grok 等 OAuth 副本写入 CLI `priority`/`weight`，旧隐藏档（如 P2 写成 2100）折叠回 1–999，不再被第三方 API 抢先。
+- 同一模型的多个订阅号按 P1 / P2 / P3 调度，不再等权轮询。三个 Grok 号会先打高优先级账号。
+- ChatGPT OAuth 只挂到已映射的 GPT 路由，不再误进 Kimi / GLM / DeepSeek 的 openai 池。
+- Coding Plan 同一 Base URL 下每个 Key 各自显示 5 小时 / 周额度条。相同 Key 仍合并。
+
+### 说明
+
+- 同时提供便携包和用户级 installer。
+- 保存并应用后，CLI 号池才会按新的优先级重编译。
+
+## 2.1.1 - 2026-08-22
+
+### 修复
+
+- 订阅页的「上游 429 / 断网自动重试次数」默认 3，可改 0–32；保存并应用后同时写入 Codex `request_max_retries` / `stream_max_retries`。间隔仍是首次 5s，之后每次 ×5（25s / 125s / 625s …，单次封顶 1h）。
+- Codex 进度条分母按 `窗口 × 百分比` 写入 catalog（Grok 500k @ 95% = 475k），不再把 `auto_compact_token_limit` 写成完整窗口。etag 随百分比/压缩窗口变化，保存时删除 `~/.codex/model-catalog.codex-router.json` 陈旧 80%/400k 副本。
+- Grok 在用户未自定义最大输出时，把 Codex 按剩余百分比算出的 `max_output_tokens`（95% 窗口上约 5%/2 万 token）抬到 128k，避免上下文每过约 5% 就断流。
+- 同一 Coding Plan Base URL 的多个 Key 共用一条额度条。两个 Kimi Coding Plan Key 不再各显示一条 5 小时/周额度。
+- 网关在工具调用/推理事件之后断流也会续跑，不再当成交接收工。
+- 同一订阅池只要任一账号选中了某个模型，其余已选账号默认补上同样的模型槽。三个 Grok 号会合成一张「3 · 独立订阅」卡片。
+- 同平台多个 OAuth 账号不再全部写成 P1；Apply / 保存时按账号顺序写成 P1、P2、P3。
+- Grok 官方 `/v1/responses/compact` 透传：强制非 stream、保留 xAI compaction blob；失败立刻降级本地 OpenCode 折叠。ChatGPT 仍走官方 compact，其他第三方仍本地折叠。
+
+### 说明
+
+- 只提供便携包，不提供 installer。
+- 需要保存并应用后，Codex Desktop 才会读到新的重试次数和 Grok compact 开关。
+
+## 2.1.0 - 2026-08-22
+
+### 功能
+
+- 启动时把 2.1.0 之前配置里的模型卡片自动压缩一次性升到官方 95%，并写回 catalog。Codex 进度条分母按 `窗口 × 百分比` 计算，Grok 从 400k 变为约 475k。2.1.0 之后用户手动下调的百分比会保留。
+- ChatGPT 以外的网关压缩改为 OpenCode 式：先截断较早工具输出（约 2000 字），再在 `/compact` 时折叠较早记录并保留近文；摘要使用 Goal / Files / Pending / Current 续跑结构。失败仍降级为本地折叠假成功，避免无限 compact。ChatGPT / OpenAI 家族继续走官方 compact。
+
+### 说明
+
+- 未打开 Grok 官方 `/responses/compact`。
+- 只提供便携包，不提供 installer。
+
 ## 2.0.19 - 2026-08-22
 
 ### 功能

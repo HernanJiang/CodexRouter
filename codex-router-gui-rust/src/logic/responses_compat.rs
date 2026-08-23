@@ -15,6 +15,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const LOCAL_COMPACT_KEEP_LAST: usize = 48;
 const AGGRESSIVE_COMPACT_KEEP_LAST: usize = 16;
 const COMPACT_SNIPPET_CHARS: usize = 180;
+const TOOL_OUTPUT_PRUNE_CHARS: usize = 2_000;
+const RECENT_KEEP_CHARS: usize = 32_000;
+const COMPACT_MIN_KEEP_ITEMS: usize = 8;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SanitizeStats {
@@ -84,6 +87,60 @@ pub fn looks_like_encrypted_token(value: &str) -> bool {
         && token.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'-' | b'_')
         })
+}
+
+pub fn is_xai_family_model(model: &str) -> bool {
+    let slug = model
+        .trim()
+        .trim_start_matches('~')
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase();
+    slug.contains("grok") || slug.starts_with("grok-")
+}
+
+fn looks_like_xai_compaction_blob(value: &str) -> bool {
+    let token = value.trim();
+    !token.is_empty()
+        && !token.starts_with("gAAAA")
+        && token.len() >= 24
+        && !token.chars().any(char::is_whitespace)
+}
+
+pub fn prepare_xai_official_compact_request(body: &mut Value) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    for key in [
+        "stream",
+        "tools",
+        "tool_choice",
+        "temperature",
+        "top_p",
+        "top_k",
+        "stop",
+        "max_output_tokens",
+        "include",
+        "reasoning",
+        "text",
+        "store",
+        "previous_response_id",
+        "conversation",
+        "conversation_id",
+    ] {
+        object.remove(key);
+    }
+}
+
+fn is_official_xai_compaction_item(item: &Map<String, Value>) -> bool {
+    matches!(
+        item_type(&Value::Object(item.clone())).as_str(),
+        "compaction" | "compact"
+    ) && item
+        .get("encrypted_content")
+        .and_then(Value::as_str)
+        .is_some_and(looks_like_xai_compaction_blob)
 }
 
 pub fn is_responses_path(path: &str) -> bool {
@@ -167,6 +224,9 @@ fn strip_include_encrypted(body: &mut Map<String, Value>) -> bool {
 }
 
 fn sanitize_function_output(item: &mut Map<String, Value>, openai_family: bool) -> usize {
+    if is_official_xai_compaction_item(item) {
+        return 0;
+    }
     let Some(encrypted) = item
         .get("encrypted_content")
         .and_then(Value::as_str)
@@ -199,6 +259,9 @@ fn sanitize_reasoning(item: &mut Map<String, Value>, openai_family: bool) -> usi
         return 0;
     };
     if openai_family && looks_like_encrypted_token(encrypted) {
+        return 0;
+    }
+    if is_official_xai_compaction_item(item) {
         return 0;
     }
     item.remove("encrypted_content");
@@ -340,6 +403,9 @@ fn sanitize_grok_item(mut item: Map<String, Value>) -> (Value, usize) {
                 }
             }
             (Value::Object(item), converted)
+        }
+        "compaction" | "compact" if is_official_xai_compaction_item(&item) => {
+            (Value::Object(item), 0)
         }
         _ => (message_from_text(summarize_item(&Value::Object(item))), 1),
     }
@@ -681,15 +747,135 @@ fn extract_workspace_hint(text: &str) -> Option<String> {
     None
 }
 
+fn item_char_len(item: &Value) -> usize {
+    item_text(item)
+        .chars()
+        .count()
+        .max(item.to_string().len().min(64))
+}
+
+fn compact_split_at_chars(items: &[Value], keep_chars: usize) -> usize {
+    if items.is_empty() {
+        return 0;
+    }
+    let mut used = 0usize;
+    let mut split_at = items.len();
+    while split_at > 0 {
+        let idx = split_at - 1;
+        let size = item_char_len(&items[idx]).max(1);
+        if used >= keep_chars && split_at < items.len() {
+            break;
+        }
+        if used + size > keep_chars && split_at < items.len() && used > 0 {
+            break;
+        }
+        used = used.saturating_add(size);
+        split_at -= 1;
+    }
+    while split_at > 0 && is_function_output_item(&items[split_at]) {
+        split_at -= 1;
+    }
+    split_at
+}
+
+fn compact_keep_split(items: &[Value], keep_last: usize) -> usize {
+    if items.len() <= COMPACT_MIN_KEEP_ITEMS {
+        return 0;
+    }
+    let max_keep = keep_last.max(COMPACT_MIN_KEEP_ITEMS);
+    let split_keep_max = compact_split_at(items, COMPACT_MIN_KEEP_ITEMS);
+    let split_keep_min = compact_split_at(items, max_keep);
+    let split_chars = compact_split_at_chars(items, RECENT_KEEP_CHARS);
+    split_chars.clamp(split_keep_min, split_keep_max)
+}
+
+fn truncate_text_value(value: &mut Value, limit: usize) -> bool {
+    let Some(text) = value.as_str() else {
+        return false;
+    };
+    if text.chars().count() <= limit {
+        return false;
+    }
+    let truncated: String = text.chars().take(limit.saturating_sub(1)).collect();
+    *value = Value::String(format!("{truncated}…"));
+    true
+}
+
+fn prune_item_output(item: &mut Value, limit: usize) -> bool {
+    let Some(map) = item.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    if let Some(output) = map.get_mut("output") {
+        changed |= truncate_text_value(output, limit);
+    }
+    if let Some(text) = map.get_mut("text") {
+        changed |= truncate_text_value(text, limit);
+    }
+    if let Some(content) = map.get_mut("content") {
+        match content {
+            Value::String(text) => {
+                if text.chars().count() > limit {
+                    let truncated: String = text.chars().take(limit.saturating_sub(1)).collect();
+                    *text = format!("{truncated}…");
+                    changed = true;
+                }
+            }
+            Value::Array(parts) => {
+                for part in parts {
+                    if let Some(part_text) = part.get_mut("text") {
+                        changed |= truncate_text_value(part_text, limit);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    changed
+}
+
+fn prune_old_tool_outputs(items: &mut [Value]) -> bool {
+    if items.len() <= COMPACT_MIN_KEEP_ITEMS {
+        return false;
+    }
+    let split_at = compact_split_at_chars(items, RECENT_KEEP_CHARS);
+    if split_at == 0 {
+        return false;
+    }
+    let mut changed = false;
+    for item in items.iter_mut().take(split_at) {
+        let kind = item_type(item);
+        let role = item_role(item);
+        if is_function_output_item(item)
+            || matches!(kind.as_str(), "tool" | "function")
+            || role == "tool"
+        {
+            changed |= prune_item_output(item, TOOL_OUTPUT_PRUNE_CHARS);
+        }
+    }
+    changed
+}
+
 fn summarize_dropped_items(items: &[Value]) -> String {
     let mut user_goals = Vec::new();
     let mut tools = Vec::new();
+    let mut files = Vec::new();
     let mut workspace = None;
     for item in items {
         let kind = item_type(item);
         let text = item_text(item);
         if workspace.is_none() {
             workspace = extract_workspace_hint(&text);
+        }
+        for token in text.split_whitespace() {
+            let candidate = token.trim_matches(|c: char| "\"'`[],".contains(c));
+            if (candidate.contains('\\') || candidate.contains('/'))
+                && candidate.chars().count() > 4
+                && files.len() < 8
+                && !files.iter().any(|seen: &String| seen == candidate)
+            {
+                files.push(candidate.to_owned());
+            }
         }
         if item_role(item) == "user" && !text.trim().is_empty() {
             if user_goals.len() < 3 {
@@ -708,31 +894,51 @@ fn summarize_dropped_items(items: &[Value]) -> String {
             }
         }
     }
-    let mut lines = vec![format!(
-        "【本地压缩摘要】已折叠 {} 条较早记录。这不是新任务，也不是任务结束；用户没有要求停止。不要写交接、不要空回复收工，立即从压缩前未完成的那一步继续。",
-        items.len()
-    )];
-    if !user_goals.is_empty() {
-        lines.push(format!("未完成任务：{}", user_goals.join(" / ")));
-    }
-    if !tools.is_empty() {
-        lines.push(format!("已执行工具：{}", tools.join(", ")));
-    }
+    let goal = if user_goals.is_empty() {
+        "继续完成压缩前未完成的用户任务。".to_owned()
+    } else {
+        user_goals.join(" / ")
+    };
+    let pending = user_goals.last().cloned().unwrap_or_else(|| goal.clone());
+    let mut lines = vec![
+        format!(
+            "【本地压缩摘要】已折叠 {} 条较早记录。这不是新任务，也不是任务结束；用户没有要求停止。不要写交接、不要空回复收工，立即从压缩前未完成的那一步继续。",
+            items.len()
+        ),
+        "## Goal".to_owned(),
+        goal,
+        "## Instructions / Constraints".to_owned(),
+        "用户没有换任务。不要输出空回复，不要写 handoff，不要等待新指令。只使用当前对话工作目录；不要读取 CodexRouter / Codex-Router 源码目录，除非它就是当前 cwd。默认用简体中文继续。".to_owned(),
+        "## Discoveries".to_owned(),
+        if tools.is_empty() {
+            "较早回合已折叠；以近文原文和当前工作目录为准。".to_owned()
+        } else {
+            format!("已执行工具：{}", tools.join(", "))
+        },
+        "## Files".to_owned(),
+        if files.is_empty() {
+            workspace
+                .clone()
+                .unwrap_or_else(|| "以当前对话工作目录为准。".to_owned())
+        } else {
+            files.join("\n")
+        },
+        "## Pending".to_owned(),
+        pending,
+        "## Current work".to_owned(),
+        "立刻从摘要里未完成的那一步继续执行，直到原任务完成。".to_owned(),
+    ];
     if let Some(workspace) = workspace {
         lines.push(format!("工作目录提示：{workspace}"));
     }
-    lines.push(
-        "只使用当前对话工作目录。不要读取 CodexRouter / Codex-Router 源码目录，除非它就是当前 cwd。默认用简体中文继续回复。"
-            .to_owned(),
-    );
     lines.join("\n")
 }
 
 fn compact_input(items: &mut Vec<Value>, keep_last: usize) -> bool {
-    if items.len() <= keep_last + 1 {
+    if items.len() <= COMPACT_MIN_KEEP_ITEMS {
         return false;
     }
-    let split_at = compact_split_at(items, keep_last);
+    let split_at = compact_keep_split(items, keep_last);
     if split_at == 0 {
         return false;
     }
@@ -741,6 +947,7 @@ fn compact_input(items: &mut Vec<Value>, keep_last: usize) -> bool {
     items.clear();
     items.push(notice);
     items.extend(kept);
+    let _ = prune_old_tool_outputs(items);
     true
 }
 
@@ -903,7 +1110,9 @@ pub fn sanitize_responses_request(path: &str, body: &mut Value) -> SanitizeStats
                 }
                 stats.converted_items += sanitize_content_parts(&mut map);
                 let kind = item_type(&Value::Object(map.clone()));
-                if unsupported_third_party_item(&kind) {
+                if unsupported_third_party_item(&kind)
+                    && !(is_xai_family_model(&stats.model) && is_official_xai_compaction_item(&map))
+                {
                     replacement.push(message_from_text(summarize_item(&Value::Object(map))));
                     stats.converted_items += 1;
                     continue;
@@ -916,6 +1125,9 @@ pub fn sanitize_responses_request(path: &str, body: &mut Value) -> SanitizeStats
             }
             replacement.push(Value::Object(map));
         }
+        if !stats.openai_family && prune_old_tool_outputs(&mut replacement) {
+            stats.converted_items += 1;
+        }
         if !stats.openai_family && compact_request {
             stats.locally_compacted = compact_input(&mut replacement, LOCAL_COMPACT_KEEP_LAST);
         }
@@ -926,6 +1138,11 @@ pub fn sanitize_responses_request(path: &str, body: &mut Value) -> SanitizeStats
     }
     if !stats.openai_family {
         stats.rewritten_tool_calls += ensure_chat_tool_messages(object);
+        if let Some(messages) = object.get_mut("messages").and_then(Value::as_array_mut) {
+            if prune_old_tool_outputs(messages) {
+                stats.converted_items += 1;
+            }
+        }
     }
 
     stats
@@ -1644,6 +1861,36 @@ mod tests {
     }
 
     #[test]
+    fn grok_official_compaction_blob_is_preserved() {
+        let mut body = json!({
+            "model": "grok-4.6",
+            "stream": true,
+            "tools": [{"type":"function","name":"exec_command"}],
+            "input": [
+                {
+                    "type": "compaction",
+                    "encrypted_content": "xai-compact-blob-abcdefghijklmnopqrstuvwxyz012345"
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "continue"}]
+                }
+            ]
+        });
+        let stats = sanitize_responses_request("/v1/responses", &mut body);
+        assert!(!stats.openai_family);
+        assert_eq!(body["input"][0]["type"], "compaction");
+        assert_eq!(
+            body["input"][0]["encrypted_content"],
+            "xai-compact-blob-abcdefghijklmnopqrstuvwxyz012345"
+        );
+        prepare_xai_official_compact_request(&mut body);
+        assert!(body.get("stream").is_none());
+        assert!(body.get("tools").is_none());
+    }
+
+    #[test]
     fn grok_request_strips_encrypted_reasoning_and_unsupported_items() {
         let mut body = json!({
             "model": "grok-4.6",
@@ -1781,6 +2028,44 @@ mod tests {
     }
 
     #[test]
+    fn third_party_old_tool_outputs_are_pruned_without_full_compact() {
+        let mut input = vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "fix the build"}]
+        })];
+        for index in 0..12 {
+            input.push(json!({
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": format!("c{index}"),
+                "arguments": "{\"cmd\":\"cargo test\"}"
+            }));
+            input.push(json!({
+                "type": "function_call_output",
+                "call_id": format!("c{index}"),
+                "output": "x".repeat(8_000)
+            }));
+        }
+        input.push(json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "continue"}]
+        }));
+        let original_len = input.len();
+        let mut body = json!({ "model": "grok-4.6", "input": input });
+        let stats = sanitize_responses_request("/v1/responses", &mut body);
+        assert!(!stats.locally_compacted);
+        let items = body["input"].as_array().unwrap();
+        assert_eq!(items.len(), original_len);
+        let old_output = items[2]["output"].as_str().unwrap();
+        assert!(old_output.chars().count() <= TOOL_OUTPUT_PRUNE_CHARS);
+        assert!(old_output.ends_with('…'));
+        let latest_output = items[items.len() - 2]["output"].as_str().unwrap();
+        assert_eq!(latest_output.len(), 8_000);
+    }
+
+    #[test]
     fn regular_third_party_history_is_not_auto_compacted() {
         let mut input = Vec::new();
         for index in 0..120 {
@@ -1814,7 +2099,9 @@ mod tests {
         let notice = items[0]["content"][0]["text"].as_str().unwrap();
         assert!(notice.contains("本地压缩摘要"));
         assert!(notice.contains("这不是新任务"));
-        assert!(notice.contains("未完成任务"));
+        assert!(notice.contains("## Goal"));
+        assert!(notice.contains("## Pending"));
+        assert!(notice.contains("turn 0"));
     }
 
     #[test]

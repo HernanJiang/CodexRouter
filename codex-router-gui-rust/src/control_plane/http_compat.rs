@@ -292,6 +292,9 @@ pub async fn sync_backend(state: &ControlState) -> Result<usize> {
             if !oauth_route_provider_matches(&account_platform, &target_platform) {
                 continue;
             }
+            if !oauth_route_model_matches(&payload, &public_model, &upstream_model) {
+                continue;
+            }
             let auth_file_name = std::path::PathBuf::from(&auth_file)
                 .file_name()
                 .map(|name| name.to_owned())
@@ -331,6 +334,8 @@ pub async fn sync_backend(state: &ControlState) -> Result<usize> {
             document["router_replica"] = Value::Bool(true);
             let pool_prefix = config_compiler::pool_prefix(&pool_route_id, &target_platform);
             document["prefix"] = Value::String(pool_prefix.clone());
+            document["priority"] = json!(config_compiler::cli_priority(account_priority as i32));
+            document["weight"] = json!(weight.max(1));
             if !document.get("model_aliases").is_some_and(Value::is_array) {
                 document["model_aliases"] = Value::Array(Vec::new());
             }
@@ -406,7 +411,7 @@ pub async fn sync_backend(state: &ControlState) -> Result<usize> {
             platform: target_platform,
             base_url,
             credential_ref: secret,
-            priority: account_priority as i32,
+            priority: config_compiler::display_priority(account_priority as i32),
             weight: weight as i32,
             proxy_url,
             openai_capabilities,
@@ -3324,6 +3329,19 @@ fn api_route_model_matches(payload: &Value, public_model: &str, upstream_model: 
     })
 }
 
+fn oauth_route_model_matches(payload: &Value, public_model: &str, upstream_model: &str) -> bool {
+    let Some(mapping) = payload
+        .pointer("/credentials/model_mapping")
+        .and_then(Value::as_object)
+    else {
+        return true;
+    };
+    if mapping.is_empty() {
+        return true;
+    }
+    api_route_model_matches(payload, public_model, upstream_model)
+}
+
 fn oauth_replica_alias(auth_type: &str, pool_prefix: &str, public_model: &str) -> String {
     if auth_type.eq_ignore_ascii_case("gemini-cli") {
         format!("{pool_prefix}/{public_model}")
@@ -4549,6 +4567,35 @@ mod tests {
         ));
         assert!(!api_route_model_matches(&kimi, "grok-4.6", "grok-4.6"));
         assert!(!api_route_model_matches(&empty, "k3-256k", "k3-256k"));
+    }
+
+    #[test]
+    fn oauth_accounts_only_join_mapped_model_routes() {
+        let chatgpt = json!({"credentials":{"model_mapping":{
+            "gpt-5.6-sol":"gpt-5.6-sol",
+            "gpt-5.6-terra":"gpt-5.6-terra"
+        }}});
+        let empty = json!({"credentials":{}});
+        assert!(oauth_route_model_matches(
+            &chatgpt,
+            "gpt-5.6-sol",
+            "gpt-5.6-sol"
+        ));
+        assert!(!oauth_route_model_matches(
+            &chatgpt,
+            "kimi-for-coding",
+            "kimi-for-coding"
+        ));
+        assert!(!oauth_route_model_matches(
+            &chatgpt,
+            "glm-latest",
+            "glm-latest"
+        ));
+        assert!(oauth_route_model_matches(
+            &empty,
+            "kimi-for-coding",
+            "kimi-for-coding"
+        ));
     }
 
     #[test]

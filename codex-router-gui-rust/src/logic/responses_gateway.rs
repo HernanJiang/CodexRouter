@@ -7,7 +7,7 @@
 
 use super::responses_compat::{
     is_chat_completions_path, is_compact_path, is_exhausted_account_status, is_openai_family_model,
-    is_responses_path,
+    is_responses_path, is_xai_family_model, prepare_xai_official_compact_request,
     rewrite_poisoned_upstream_status, is_unsupported_image_error, rewrite_provider_json,
     rewrite_sse_text, sanitize_responses_request, sanitize_responses_request_aggressive,
     should_retry_after_upstream_error, sanitize_responses_request_without_images,
@@ -33,9 +33,17 @@ const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Overridable through the Router config. The first retry waits 5s and
 /// every further retry multiplies the wait by five (5s / 25s / 125s / ...).
 pub const DEFAULT_RATE_LIMIT_RETRIES: u32 = 3;
+
+pub fn clamp_rate_limit_retries(value: u32) -> u32 {
+    value.min(MAX_RATE_LIMIT_RETRIES)
+}
+
+pub fn codex_retry_count(value: u32) -> i64 {
+    i64::from(clamp_rate_limit_retries(value))
+}
 /// Hard ceiling for a configured retry count so a typo cannot pin a worker
 /// thread on a sleeping retry loop forever.
-const MAX_RATE_LIMIT_RETRIES: u32 = 32;
+pub const MAX_RATE_LIMIT_RETRIES: u32 = 32;
 /// Ceiling for one backoff step. A `Retry-After` hint above this is clamped
 /// instead of skipping the retry, so the conversation keeps waiting.
 const MAX_RATE_LIMIT_DELAY: Duration = Duration::from_secs(3600);
@@ -111,14 +119,21 @@ fn max_output_tokens_for(model: &str) -> Option<i64> {
         .filter(|limit| *limit > 0)
 }
 
+/// Grok/xAI floor used when the user left max output at "model default".
+/// Codex sizes `max_output_tokens` as the unused compact percent
+/// (`window * (100 - percent) / 100`), so a 95% card on a 500k window
+/// becomes ~25k — about 5% of the composer bar — and the stream dies
+/// there without a terminal event. Keep a large enough floor that a
+/// normal Grok turn can finish.
+const GROK_MIN_OUTPUT_TOKENS: i64 = 128_000;
+
 /// Inject the user-configured output token limit into the request body. The
 /// user setting always wins over whatever the client sent; models left at
-/// the default (0) keep the upstream behaviour of not sending the field.
+/// the default (0) keep the upstream behaviour of not sending the field,
+/// except Grok/xAI where a tiny Codex reserve is raised to
+/// `GROK_MIN_OUTPUT_TOKENS`.
 fn inject_max_output_tokens(path: &str, body: &mut Value) -> bool {
     let Some(model) = body.get("model").and_then(Value::as_str) else {
-        return false;
-    };
-    let Some(limit) = max_output_tokens_for(model) else {
         return false;
     };
     let field = if is_chat_completions_path(path) {
@@ -126,6 +141,17 @@ fn inject_max_output_tokens(path: &str, body: &mut Value) -> bool {
     } else {
         "max_output_tokens"
     };
+    let current = body.get(field).and_then(Value::as_i64).unwrap_or(0);
+    let limit = match max_output_tokens_for(model) {
+        Some(limit) => limit,
+        None if is_xai_family_model(model) && current < GROK_MIN_OUTPUT_TOKENS => {
+            GROK_MIN_OUTPUT_TOKENS
+        }
+        None => return false,
+    };
+    if current == limit {
+        return false;
+    }
     body[field] = Value::from(limit);
     true
 }
@@ -373,7 +399,10 @@ fn handle_client(
             if !openai_family {
                 let stats = sanitize_responses_request(&path, &mut json_body);
                 inject_max_output_tokens(&path, &mut json_body);
-                if is_compact_path(&path) {
+                if is_compact_path(&path) && is_xai_family_model(&stats.model) {
+                    prepare_xai_official_compact_request(&mut json_body);
+                    request_body = serde_json::to_vec(&json_body)?;
+                } else if is_compact_path(&path) {
                     let output = json_body
                         .get("input")
                         .and_then(Value::as_array)
@@ -383,8 +412,9 @@ fn handle_client(
                         serde_json::to_vec(&synthetic_compact_response(&stats.model, &output))?;
                     send_status(client, 200, "application/json", &payload)?;
                     return Ok(());
+                } else {
+                    request_body = serde_json::to_vec(&json_body)?;
                 }
-                request_body = serde_json::to_vec(&json_body)?;
             } else if inject_max_output_tokens(&path, &mut json_body) {
                 // OpenAI-family models pass through unsanitized; only
                 // re-serialize when a configured limit was injected.
@@ -526,6 +556,40 @@ fn handle_client(
         }
     };
     let body_text = String::from_utf8_lossy(&response_body);
+    if is_compact_path(&path)
+        && !is_openai_family_model(
+            serde_json::from_slice::<Value>(&request_body)
+                .ok()
+                .and_then(|body| {
+                    body.get("model")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_default()
+                .as_str(),
+        )
+        && (status >= 400
+            || body_text.to_ascii_lowercase().contains("streaming not supported"))
+    {
+        if let Ok(json_body) = serde_json::from_slice::<Value>(&request_body) {
+            let model = json_body
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or("grok-4.6");
+            let output = json_body
+                .get("input")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            gateway_log(
+                "request.compact_fallback",
+                &format!("{method} {path} status={status} local compact fallback"),
+            );
+            let payload = serde_json::to_vec(&synthetic_compact_response(model, &output))?;
+            send_status(client, 200, "application/json", &payload)?;
+            return Ok(());
+        }
+    }
     if should_retry_after_upstream_error(status, &body_text) {
         if let Ok(mut json_body) = serde_json::from_slice::<Value>(&request_body) {
             if !is_openai_family_model(
@@ -1342,11 +1406,10 @@ impl<'a> SseSink<'a> {
         if !self.sent_events {
             return Ok(SseForward::RetryableBeforeFirstEvent);
         }
-        if self.text_only {
-            return Ok(SseForward::RetryableWithPrefix(self.resume_point()));
-        }
-        self.finish(carry)?;
-        Ok(SseForward::Done)
+        // Tool calls and reasoning items already reached the client, but the
+        // upstream still dropped before a terminal event. Retry with the
+        // delivered prefix so a sudden disconnect does not end the turn.
+        Ok(SseForward::RetryableWithPrefix(self.resume_point()))
     }
 
     fn finish(&mut self, carry: &str) -> anyhow::Result<()> {
@@ -1847,6 +1910,31 @@ mod tests {
 
         set_max_output_tokens_map(HashMap::new());
         assert!(!inject_max_output_tokens("/v1/responses", &mut body));
+    }
+
+    #[test]
+    fn grok_raises_codex_five_percent_output_cap() {
+        set_max_output_tokens_map(HashMap::new());
+        let mut grok = serde_json::json!({
+            "model": "grok-4.6",
+            "max_output_tokens": 25_000,
+            "input": []
+        });
+        assert!(inject_max_output_tokens("/v1/responses", &mut grok));
+        assert_eq!(grok["max_output_tokens"], serde_json::json!(128_000));
+
+        let mut already_large = serde_json::json!({
+            "model": "grok-4.5",
+            "max_output_tokens": 200_000
+        });
+        assert!(!inject_max_output_tokens("/v1/responses", &mut already_large));
+        assert_eq!(already_large["max_output_tokens"], serde_json::json!(200_000));
+
+        set_max_output_tokens_map(HashMap::from([("grok-4.6".to_owned(), 8_192)]));
+        let mut user_limit = serde_json::json!({"model": "grok-4.6", "max_output_tokens": 25_000});
+        assert!(inject_max_output_tokens("/v1/responses", &mut user_limit));
+        assert_eq!(user_limit["max_output_tokens"], serde_json::json!(8_192));
+        set_max_output_tokens_map(HashMap::new());
     }
     use super::*;
     use std::net::Ipv4Addr;
@@ -2732,9 +2820,9 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_partial_stream_is_not_retryable_and_fails_cleanly() {
-        // A partial stream containing tool-call items cannot be reconciled by
-        // text prefix, so it keeps the clean terminal-event behavior.
+    fn tool_call_partial_stream_is_retryable_after_disconnect() {
+        // A sudden drop after a tool-call item must still retry; otherwise
+        // Codex shows "stream disconnected before completion" with no reconnect.
         let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
         let upstream_addr = upstream.local_addr().unwrap();
         thread::spawn(move || {
@@ -2750,15 +2838,15 @@ mod tests {
             let (mut client, _) = client_listener.accept().unwrap();
             let mut sink = SseSink::new(&mut client, None);
             let outcome = forward_plain_sse(&mut sink, &mut upstream_stream, Vec::new()).unwrap();
-            assert_eq!(outcome, SseForward::Done);
+            assert!(matches!(outcome, SseForward::RetryableWithPrefix(_)));
         });
         let mut client = TcpStream::connect(client_addr).unwrap();
         let mut output = String::new();
         client.read_to_string(&mut output).unwrap();
         worker.join().unwrap();
         assert!(output.contains("function_call"));
-        assert!(output.contains("response.failed"));
-        assert!(output.contains("upstream_stream_interrupted"));
+        assert!(!output.contains("response.failed"));
+        assert!(!output.contains("upstream_stream_interrupted"));
     }
 
     #[test]

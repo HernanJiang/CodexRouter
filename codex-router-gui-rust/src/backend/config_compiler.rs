@@ -323,9 +323,24 @@ pub fn parse_cpa_trace_auth_index(trace: &str) -> Option<&str> {
     }
 }
 
+/// Fold historical hidden tiers (P10 -> 2010, P100 -> 2100) back to the
+/// explicit 1..=999 card order before compiling CLI credentials.
+pub fn display_priority(legacy_priority: i32) -> i32 {
+    let folded = if legacy_priority.abs() >= 1000 {
+        legacy_priority.abs() % 1000
+    } else {
+        legacy_priority.abs()
+    };
+    if folded == 0 {
+        1
+    } else {
+        folded.clamp(1, 999)
+    }
+}
+
 /// Sub2API uses smaller numbers first; CLIProxyAPI uses larger numbers first.
 pub fn cli_priority(legacy_priority: i32) -> i32 {
-    (1_000_000i32 - legacy_priority.clamp(1, 999_999)).max(1)
+    (1_000_000i32 - display_priority(legacy_priority)).max(1)
 }
 
 pub fn compile(
@@ -512,6 +527,12 @@ mod tests {
     #[test]
     fn priority_direction_and_pool_prefixes_are_explicit() {
         assert!(cli_priority(1) > cli_priority(10));
+        assert!(cli_priority(1) > cli_priority(2));
+        assert!(cli_priority(2) > cli_priority(3));
+        assert_eq!(display_priority(2100), 100);
+        assert_eq!(display_priority(2010), 10);
+        assert_eq!(cli_priority(100), cli_priority(2100));
+        assert!(cli_priority(1) > cli_priority(2100));
         assert_eq!(pool_prefix("gpt-route", "ChatGPT"), "cr_gpt_route_openai");
         assert_eq!(pool_id("gpt-route", "ChatGPT"), "cr/gpt-route/openai");
     }

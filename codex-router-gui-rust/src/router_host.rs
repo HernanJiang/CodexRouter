@@ -1442,6 +1442,7 @@ async fn data_plane(State(state): State<HostState>, request: Request) -> Respons
     let protocol = protocol_of(&mapped);
     if codex_router_lib::responses_compat::is_compact_path(&mapped)
         && !codex_router_lib::responses_compat::is_openai_family_model(&plan.public_model)
+        && !codex_router_lib::responses_compat::is_xai_family_model(&plan.public_model)
     {
         if let Ok(json_body) = serde_json::from_slice::<Value>(&plan.body) {
             let output = json_body

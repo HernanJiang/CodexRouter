@@ -8,10 +8,9 @@ use anyhow::{bail, Context};
 use std::path::{Path, PathBuf};
 use toml_edit::{DocumentMut, Item};
 
-const CODEX_ROUTER_REQUEST_MAX_RETRIES: i64 = 1;
-// The local gateway owns retry classification and staged backoff. A second
-// Codex retry loop would replay the same request with a fixed UI cadence.
-const CODEX_ROUTER_STREAM_MAX_RETRIES: i64 = 0;
+fn clamped_codex_retries(max_retries: u32) -> i64 {
+    super::responses_gateway::codex_retry_count(max_retries)
+}
 
 const REASONING_LEVELS: &[&str] = &[
     "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
@@ -71,6 +70,7 @@ pub fn generate_codex_router_config(
     fast_mode: bool,
     require_openai_auth: bool,
     display_openai_provider: bool,
+    max_retries: u32,
     permission_source: Option<&str>,
 ) -> anyhow::Result<String> {
     if local_api_key.is_empty() {
@@ -240,6 +240,7 @@ pub fn generate_codex_router_config(
         local_api_key,
         require_openai_auth,
         display_openai_provider,
+        max_retries,
     );
     let model_providers =
         doc["model_providers"].or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
@@ -257,6 +258,7 @@ fn build_codex_router_provider(
     local_api_key: &str,
     require_openai_auth: bool,
     display_openai_provider: bool,
+    max_retries: u32,
 ) -> toml_edit::Table {
     let mut provider = toml_edit::Table::new();
     provider.insert(
@@ -274,14 +276,9 @@ fn build_codex_router_provider(
         toml_edit::value(require_openai_auth),
     );
     provider.insert("experimental_bearer_token", toml_edit::value(local_api_key));
-    provider.insert(
-        "request_max_retries",
-        toml_edit::value(CODEX_ROUTER_REQUEST_MAX_RETRIES),
-    );
-    provider.insert(
-        "stream_max_retries",
-        toml_edit::value(CODEX_ROUTER_STREAM_MAX_RETRIES),
-    );
+    let retries = clamped_codex_retries(max_retries);
+    provider.insert("request_max_retries", toml_edit::value(retries));
+    provider.insert("stream_max_retries", toml_edit::value(retries));
     provider.insert("stream_idle_timeout_ms", toml_edit::value(1_800_000_i64));
     provider.insert("supports_websockets", toml_edit::value(false));
     provider
@@ -415,6 +412,7 @@ pub fn write_codex_router_config(
     fast_mode: bool,
     require_openai_auth: bool,
     display_openai_provider: bool,
+    max_retries: u32,
     permission_source: Option<&str>,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(codex_home)?;
@@ -447,6 +445,7 @@ pub fn write_codex_router_config(
         fast_mode,
         require_openai_auth,
         display_openai_provider,
+        max_retries,
         permission_source.as_deref(),
     )?;
     generated = apply_desktop_overlay_file(&generated, &overlay_path);
@@ -583,6 +582,7 @@ pub(crate) fn write_codex_config_from_router_config_impl(
         settings.fast_mode,
         settings.require_openai_auth,
         settings.display_openai_provider,
+        cfg.rate_limit_max_retries,
         None,
     )?;
     // Mirror the binding into the system layer so a Codex Desktop rewrite of
@@ -594,6 +594,7 @@ pub(crate) fn write_codex_config_from_router_config_impl(
         &codex_public_base_url(cfg),
         settings.require_openai_auth,
         settings.display_openai_provider,
+        cfg.rate_limit_max_retries,
     )?;
     Ok(())
 }
@@ -816,6 +817,7 @@ pub(crate) fn repair_codex_router_binding_impl(
             &codex_public_base_url(cfg),
             login_requires_openai_auth(&codex_home, cfg, &existing),
             false,
+            cfg.rate_limit_max_retries,
         )?;
         return Ok(false);
     }
@@ -832,6 +834,7 @@ pub(crate) fn repair_codex_router_binding_impl(
         settings.fast_mode,
         settings.require_openai_auth,
         settings.display_openai_provider,
+        cfg.rate_limit_max_retries,
         None,
     )?;
 
@@ -847,6 +850,7 @@ pub(crate) fn repair_codex_router_binding_impl(
         &codex_public_base_url(cfg),
         settings.require_openai_auth,
         settings.display_openai_provider,
+        cfg.rate_limit_max_retries,
     )?;
     Ok(true)
 }
@@ -1084,6 +1088,7 @@ pub(crate) fn write_codex_system_binding_to(
     base_url: &str,
     require_openai_auth: bool,
     display_openai_provider: bool,
+    max_retries: u32,
 ) -> anyhow::Result<()> {
     if local_api_key.is_empty() {
         bail!("the local Router credential is required for the Codex system binding");
@@ -1153,6 +1158,7 @@ pub(crate) fn write_codex_system_binding_to(
         local_api_key,
         require_openai_auth,
         display_openai_provider,
+        max_retries,
     );
     let model_providers =
         doc["model_providers"].or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
@@ -1180,6 +1186,7 @@ pub fn write_codex_system_binding(
     base_url: &str,
     require_openai_auth: bool,
     display_openai_provider: bool,
+    max_retries: u32,
 ) -> anyhow::Result<()> {
     write_codex_system_binding_to(
         &codex_system_config_path(),
@@ -1188,6 +1195,7 @@ pub fn write_codex_system_binding(
         base_url,
         require_openai_auth,
         display_openai_provider,
+        max_retries,
     )
 }
 
@@ -1345,6 +1353,7 @@ fn preserve_router_provider_for_history_with_key(
         local_api_key,
         login_requires_openai_auth(&codex_home, cfg, text),
         false,
+        cfg.rate_limit_max_retries,
     );
     let model_providers =
         doc["model_providers"].or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
@@ -1394,8 +1403,8 @@ mod tests {
             settings.fast_mode,
             settings.require_openai_auth,
             settings.display_openai_provider,
-            None,
-        )
+            3,
+            None)
         .unwrap();
         let catalog = crate::logic::catalog::build_model_catalog_with_root(
             &cfg,
@@ -1414,8 +1423,24 @@ mod tests {
         // Preserve Codex's upstream ChatGPT login contract for OAuth profiles.
         assert!(generated.contains("name = \"Codex-Router\""));
         assert!(generated.contains("requires_openai_auth = true"));
-        assert!(generated.contains("request_max_retries = 1"));
-        assert!(generated.contains("stream_max_retries = 0"));
+        assert!(generated.contains("request_max_retries = 3"));
+        assert!(generated.contains("stream_max_retries = 3"));
+        let custom = generate_codex_router_config(
+            "",
+            &settings.model,
+            "C:/isolated/model-catalog.json",
+            "fixture-local-key",
+            "http://127.0.0.1:18082",
+            &settings.reasoning_effort,
+            settings.fast_mode,
+            settings.require_openai_auth,
+            settings.display_openai_provider,
+            6,
+            None,
+        )
+        .unwrap();
+        assert!(custom.contains("request_max_retries = 6"));
+        assert!(custom.contains("stream_max_retries = 6"));
         assert!(!generated.contains("forced_login_method"));
         assert!(generated.contains("model_catalog_json = \"C:/isolated/model-catalog.json\""));
         assert_eq!(
@@ -1492,8 +1517,8 @@ mod tests {
             false,
             true,
             false,
-            None,
-        )
+            3,
+            None)
         .unwrap();
         assert!(text.contains("forced_login_method = \"chatgpt\""));
         assert!(text.contains("requires_openai_auth = true"));
@@ -1511,8 +1536,8 @@ mod tests {
             false,
             false,
             true,
-            None,
-        )
+            3,
+            None)
         .unwrap();
 
         assert!(text.contains("name = \"OpenAI\""));
@@ -1532,8 +1557,8 @@ mod tests {
             false,
             false,
             false,
-            None,
-        )
+            3,
+            None)
         .unwrap();
         assert!(text.contains("model_provider = \"codex_router\""));
         assert!(text.contains("model = \"gpt-5.6-sol\""));
@@ -1569,8 +1594,8 @@ theme = "dark"
             false,
             true,
             false,
-            None,
-        )
+            3,
+            None)
         .unwrap();
         assert!(text.contains("window-layout = \"sidebar-wide\""));
         assert!(text.contains("theme = \"dark\""));
@@ -1595,8 +1620,8 @@ custom_agent_setting = "preserve-me"
             false,
             true,
             false,
-            None,
-        )
+            3,
+            None)
         .unwrap();
         assert!(text.contains("[agents]"));
         assert!(text.contains("default_subagent_model = \"gpt-5.6-sol\""));
@@ -1623,8 +1648,8 @@ custom_agent_setting = "preserve-me"
             false,
             true,
             false,
-            None,
-        )
+            3,
+            None)
         .unwrap();
         assert!(text.contains("custom_agent_setting = \"preserve-me\""));
         assert!(!text.contains("default_subagent_model"));
@@ -1643,8 +1668,8 @@ custom_agent_setting = "preserve-me"
             true,
             true,
             true,
-            None,
-        )
+            3,
+            None)
         .unwrap();
         assert!(text.contains("service_tier = \"fast\""));
         assert!(text.contains("fast_mode = true"));
@@ -1672,8 +1697,8 @@ experimental_bearer_token = "PROXY_MANAGED"
             false,
             true,
             false,
-            None,
-        )
+            3,
+            None)
         .unwrap();
         assert!(!migrated.contains("127.0.0.1:15721"));
         assert!(!migrated.contains("PROXY_MANAGED"));
@@ -1694,8 +1719,8 @@ experimental_bearer_token = "keep-this-provider"
             false,
             true,
             false,
-            None,
-        )
+            3,
+            None)
         .unwrap();
         assert!(preserved.contains("name = \"micu\""));
         assert!(preserved.contains("keep-this-provider"));
@@ -1720,8 +1745,8 @@ sandbox = "unelevated"
             false,
             false,
             false,
-            Some(source),
-        )
+            3,
+            Some(source))
         .unwrap();
         assert!(text.contains("approval_policy = \"always\""));
         assert!(text.contains("sandbox_mode = \"elevated\""));
@@ -1748,8 +1773,8 @@ sandbox = "unelevated"
             false,
             false,
             false,
-            Some(source),
-        )
+            3,
+            Some(source))
         .unwrap();
         let lines: Vec<&str> = text.lines().collect();
         let idx = lines.iter().position(|l| l.trim() == "[windows]").unwrap();
@@ -1781,8 +1806,8 @@ sandbox = "unelevated"
             false,
             false,
             false,
-            None,
-        )
+            3,
+            None)
         .unwrap();
 
         assert!(tmp.join("config.toml").exists());
@@ -1831,8 +1856,8 @@ sandbox = "unelevated"
             false,
             false,
             false,
-            None,
-        )
+            3,
+            None)
         .unwrap();
         let text = std::fs::read_to_string(tmp.join("config.toml")).unwrap();
         assert!(text.contains(r#"approval_policy = "always""#));
@@ -2076,7 +2101,7 @@ sandbox = "unelevated"
             "http://127.0.0.1:18084",
             true,
             false,
-        )
+            3)
         .unwrap();
         std::fs::write(
             codex_home.join("config.toml"),
@@ -2300,7 +2325,7 @@ sandbox = "unelevated"
             "http://127.0.0.1:18082",
             true,
             false,
-        )
+            3)
         .unwrap();
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(written.contains(SYSTEM_BINDING_MARKER));
@@ -2323,7 +2348,7 @@ sandbox = "unelevated"
             "http://127.0.0.1:18082",
             true,
             false,
-        )
+            3)
         .unwrap();
         let rewritten = std::fs::read_to_string(&path).unwrap();
         assert!(rewritten.contains("experimental_bearer_token = \"fixture-local-key-2\""));
@@ -2367,7 +2392,7 @@ sandbox = "unelevated"
             "http://127.0.0.1:18082",
             true,
             false,
-        )
+            3)
         .unwrap_err();
         assert!(error.to_string().contains("enterprise"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
@@ -2391,7 +2416,7 @@ sandbox = "unelevated"
             "http://127.0.0.1:18082",
             true,
             false,
-        )
+            3)
         .unwrap();
         assert!(path.exists());
         assert!(remove_codex_system_binding_from(&path).unwrap());

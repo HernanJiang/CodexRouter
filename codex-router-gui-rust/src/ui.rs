@@ -7841,8 +7841,8 @@ impl CodexRouterApp {
                     egui::Label::new(
                         egui::RichText::new(t(
                             zh,
-                            "上游 429 / 断网自动重试次数（首次 5s，之后每次 ×5：25s / 125s / 625s …，单次封顶 1h）",
-                            "Automatic retries on 429 or network errors (first retry 5s, then x5 each time: 25s / 125s / 625s ..., capped at 1h per step)",
+                            "上游 429 / 断网自动重试次数（默认 3；首次 5s，之后每次 ×5：25s / 125s / 625s …，单次封顶 1h；同时写入 Codex request/stream_max_retries）",
+                            "Automatic retries on 429 or network errors (default 3; first retry 5s, then x5: 25s / 125s / 625s ..., 1h cap; also written to Codex request/stream_max_retries)",
                         ))
                         .small()
                         .color(palette.ink_soft),
@@ -8028,24 +8028,55 @@ impl CodexRouterApp {
                 } else {
                     model.id.clone()
                 };
-            let mut item = ModelConfig {
-                model: imported_model_id,
-                alias: model.display_name,
-                alias_customized: Some(false),
-                base_url: format!("Router OAuth / {}", account.platform),
-                priority: self.config.oauth_fallback.official_priority,
-                source: "oauth".into(),
-                oauth_account_id: account.id,
-                oauth_platform: account.platform,
-                user_selected: true,
-                ..Default::default()
-            };
-            item.multimodal = "auto".into();
-            self.config.models.push(item);
             let ids = self.config.oauth_account_ids.get_or_insert_with(Vec::new);
             if !ids.contains(&account.id) {
                 ids.push(account.id);
             }
+            let provider = subscription_provider_key(&account.platform);
+            let mut targets = self
+                .oauth_accounts
+                .iter()
+                .filter(|peer| {
+                    peer.bound_to_router
+                        && ids.contains(&peer.id)
+                        && subscription_provider_key(&peer.platform) == provider
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if !targets.iter().any(|peer| peer.id == account.id) {
+                targets.push(account.clone());
+            }
+            for peer in targets {
+                let mut item = ModelConfig {
+                    model: imported_model_id.clone(),
+                    alias: model.display_name.clone(),
+                    alias_customized: Some(false),
+                    base_url: format!("Router OAuth / {}", peer.platform),
+                    priority: self.config.oauth_fallback.official_priority,
+                    source: "oauth".into(),
+                    oauth_account_id: peer.id,
+                    oauth_platform: peer.platform,
+                    user_selected: true,
+                    ..Default::default()
+                };
+                item.multimodal = "auto".into();
+                if !self.config.models.iter().any(|existing| {
+                    existing.source == "oauth"
+                        && existing.oauth_account_id == item.oauth_account_id
+                        && super::logic::same_model_identity(&existing.model, &item.model)
+                }) {
+                    self.config.models.push(item);
+                }
+            }
+            super::logic::replicate_oauth_slots_for_accounts(
+                &mut self.config,
+                &self
+                    .oauth_accounts
+                    .iter()
+                    .map(|peer| (peer.id, peer.platform.clone()))
+                    .collect::<Vec<_>>(),
+            );
+            super::logic::assign_sequential_oauth_account_priorities(&mut self.config);
             super::logic::normalize_default_model(&mut self.config);
             self.schedule_usage_refresh();
             self.show_result_dialog(

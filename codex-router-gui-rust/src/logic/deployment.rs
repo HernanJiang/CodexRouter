@@ -496,16 +496,16 @@ where
             .map(|candidate| candidate.priority.max(1))
             .min()
             .unwrap_or(model.priority.max(1));
-        let mut priority = model.priority.max(1);
+        let mut priority = super::display_priority(model.priority);
         if route.is_oauth_fallback {
             let priorities = super::model_oauth_routing_priorities(cfg, &model.model);
-            priority = super::effective_api_priority(
+            priority = super::display_priority(super::effective_api_priority(
                 priority,
-                minimum_priority,
-                priorities.api_priority,
-                priorities.oauth_priority,
+                super::display_priority(minimum_priority),
+                super::display_priority(priorities.api_priority),
+                super::display_priority(priorities.oauth_priority),
                 priorities.prefer_oauth,
-            );
+            ));
         }
         let mut credentials = json!({
             "base_url": target,
@@ -621,17 +621,11 @@ fn sync_oauth_and_stale_accounts(
                 .models
                 .iter()
                 .filter(|model| model.source == "oauth" && model.oauth_account_id == id)
-                .map(|model| model.priority)
-                .filter(|priority| (1..=999).contains(priority))
+                .map(|model| super::display_priority(model.priority))
                 .min();
-            let existing_priority = usage::integer(&detail, "priority") as i32;
-            let priority = configured_priority.unwrap_or_else(|| {
-                if (1..=999).contains(&existing_priority) {
-                    existing_priority
-                } else {
-                    default_priority
-                }
-            });
+            let existing_priority =
+                super::display_priority(usage::integer(&detail, "priority") as i32);
+            let priority = configured_priority.unwrap_or(existing_priority.max(default_priority.min(999)));
             let current_proxy = usage::integer(&detail, "proxy_id");
             let desired_proxy = reconcile_proxy_id(
                 current_proxy,
@@ -663,7 +657,7 @@ fn sync_oauth_and_stale_accounts(
                         .unwrap_or_default();
                     extra.insert(
                         "openai_compact_supported".to_owned(),
-                        Value::Bool(false),
+                        Value::Bool(matches!(platform.as_str(), "grok" | "xai" | "x-ai")),
                     );
                     body["extra"] = Value::Object(extra);
                 }

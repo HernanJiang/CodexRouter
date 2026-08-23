@@ -1,5 +1,6 @@
 use crate::config::{atomic_write, ModelConfig, ReasoningConfig, RouterConfig};
 use anyhow::{bail, Context};
+use sha2::Digest;
 use serde_json::{json, Value};
 #[cfg(test)]
 use std::collections::VecDeque;
@@ -153,6 +154,21 @@ pub fn model_oauth_routing_priorities(
             };
             oauth_routing_priorities(Some(&fallback))
         }
+    }
+}
+
+/// Fold historical hidden tiers (P10 -> 2010, P100 -> 2100) back to the
+/// explicit 1..=999 card order used by CLI scheduling.
+pub fn display_priority(legacy_priority: i32) -> i32 {
+    let folded = if legacy_priority.abs() >= 1000 {
+        legacy_priority.abs() % 1000
+    } else {
+        legacy_priority.abs()
+    };
+    if folded == 0 {
+        1
+    } else {
+        folded.clamp(1, 999)
     }
 }
 
@@ -1640,13 +1656,56 @@ fn model_catalog_path(router_root: &Path) -> PathBuf {
     }
 }
 
+fn catalog_content_etag(models: &[Value]) -> String {
+    let mut fingerprint = String::from(env!("CARGO_PKG_VERSION"));
+    for entry in models {
+        let slug = entry.get("slug").and_then(Value::as_str).unwrap_or("");
+        let window = entry
+            .get("context_window")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let auto_compact = entry
+            .get("auto_compact_token_limit")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let percent = entry
+            .get("effective_context_window_percent")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        fingerprint.push('\n');
+        fingerprint.push_str(slug);
+        fingerprint.push('\t');
+        fingerprint.push_str(&window.to_string());
+        fingerprint.push('\t');
+        fingerprint.push_str(&auto_compact.to_string());
+        fingerprint.push('\t');
+        fingerprint.push_str(&percent.to_string());
+    }
+    let digest = sha2::Sha256::digest(fingerprint.as_bytes());
+    let hex = digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    format!("W/\"codex-router-{}-{}\"", env!("CARGO_PKG_VERSION"), &hex[..16])
+}
+
 fn catalog_document(cfg: &RouterConfig, router_root: &Path) -> Value {
+    let models = build_model_catalog_with_root(cfg, router_root);
+    let etag = catalog_content_etag(&models);
     json!({
         "fetched_at": chrono::Utc::now().to_rfc3339(),
-        "etag": "codex-router-local-v2",
+        "etag": etag,
         "client_version": env!("CARGO_PKG_VERSION"),
-        "models": build_model_catalog_with_root(cfg, router_root),
+        "models": models,
     })
+}
+
+fn stale_codex_home_catalog_path(cfg: &RouterConfig) -> PathBuf {
+    resolve_codex_home(cfg).join("model-catalog.codex-router.json")
+}
+
+fn remove_stale_codex_home_catalog(cfg: &RouterConfig) {
+    let path = stale_codex_home_catalog_path(cfg);
+    if path.is_file() {
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 pub fn write_model_catalog(cfg: &RouterConfig, router_root: &Path) -> anyhow::Result<()> {
@@ -1657,7 +1716,67 @@ pub fn write_model_catalog(cfg: &RouterConfig, router_root: &Path) -> anyhow::Re
     atomic_write(
         &catalog_path,
         &serde_json::to_vec_pretty(&catalog_document(cfg, router_root))?,
-    )
+    )?;
+    remove_stale_codex_home_catalog(cfg);
+    Ok(())
+}
+
+fn catalog_compact_percent_mismatch(doc: &Value, cfg: &RouterConfig) -> bool {
+    let Some(models) = doc.get("models").and_then(Value::as_array) else {
+        return true;
+    };
+    let mut expected = HashMap::new();
+    for model in &cfg.models {
+        expected.insert(
+            model.model.to_ascii_lowercase(),
+            (
+                i64::from(clamp_auto_compact_percent(model.auto_compact_percent)),
+                resolve_auto_compact_token_limit(model),
+            ),
+        );
+    }
+    for entry in models {
+        let slug = entry
+            .get("slug")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let Some(want) = expected.get(&slug) else {
+            continue;
+        };
+        let percent = entry
+            .get("effective_context_window_percent")
+            .and_then(Value::as_i64)
+            .unwrap_or(-1);
+        let auto_compact = entry
+            .get("auto_compact_token_limit")
+            .and_then(Value::as_i64)
+            .unwrap_or(-1);
+        if percent != want.0 || auto_compact != want.1 {
+            return true;
+        }
+    }
+    let etag = doc.get("etag").and_then(Value::as_str).unwrap_or("");
+    etag == "codex-router-local-v2" || etag.is_empty()
+}
+
+pub fn sync_model_catalog_compact_percent(
+    cfg: &RouterConfig,
+    router_root: &Path,
+) -> anyhow::Result<bool> {
+    let path = model_catalog_path(router_root);
+    let needs_rewrite = match std::fs::read_to_string(&path) {
+        Ok(raw) => match serde_json::from_str::<Value>(&raw) {
+            Ok(doc) => catalog_compact_percent_mismatch(&doc, cfg),
+            Err(_) => true,
+        },
+        Err(_) => true,
+    };
+    if !needs_rewrite {
+        return Ok(false);
+    }
+    write_model_catalog(cfg, router_root)?;
+    Ok(true)
 }
 
 pub fn stamp_channel_route_metadata(model: &mut ModelConfig) {
@@ -1703,24 +1822,233 @@ pub fn stamp_channel_route_metadata(model: &mut ModelConfig) {
 }
 
 pub fn sync_account_priorities_from_model_slots(cfg: &mut RouterConfig) {
-    let mut account_priority: std::collections::BTreeMap<i64, i32> = std::collections::BTreeMap::new();
+    replicate_selected_oauth_model_slots(cfg);
+    assign_sequential_oauth_account_priorities(cfg);
+}
+
+fn oauth_platform_key(platform: &str) -> String {
+    match platform.trim().to_ascii_lowercase().as_str() {
+        "openai" | "chatgpt" => "chatgpt".to_owned(),
+        "grok" | "xai" | "x-ai" => "grok".to_owned(),
+        "anthropic" | "claude" => "claude".to_owned(),
+        "gemini" | "google" | "google_one" | "google-one" => "gemini".to_owned(),
+        "antigravity" => "antigravity".to_owned(),
+        value => value.to_owned(),
+    }
+}
+
+/// Same-provider OAuth accounts share the selected model set. If any account
+/// in the pool has grok-4.6 selected, every other selected account in that
+/// pool also gets a grok-4.6 slot so the dashboard folds into one card.
+pub fn replicate_selected_oauth_model_slots(cfg: &mut RouterConfig) {
+    replicate_oauth_slots_for_accounts(cfg, &[]);
+}
+
+pub fn replicate_oauth_slots_for_accounts(
+    cfg: &mut RouterConfig,
+    extra_accounts: &[(i64, String)],
+) {
+    let selected_order: Vec<i64> = cfg
+        .oauth_account_ids
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|id| *id > 0)
+        .collect();
+    let selected: HashSet<i64> = selected_order.iter().copied().collect();
+    if selected.is_empty() {
+        return;
+    }
+
+    #[derive(Clone)]
+    struct SlotTemplate {
+        model: String,
+        alias: String,
+        alias_customized: Option<bool>,
+        base_url: String,
+        extra: String,
+        multimodal: String,
+        context_window: i64,
+        max_output_tokens: i64,
+        auto_compact_percent: i32,
+        reasoning_mode: String,
+        reasoning_levels: Vec<String>,
+        default_reasoning_level: String,
+        fast_supported: bool,
+        fast_mode: bool,
+        platform: String,
+    }
+
+    let mut templates: HashMap<(String, String), SlotTemplate> = HashMap::new();
+    let mut present: HashSet<(i64, String)> = HashSet::new();
     for model in &cfg.models {
         if model.source != "oauth" || model.oauth_account_id <= 0 {
             continue;
         }
-        if !(1..=999).contains(&model.priority) {
+        let canonical = canonical_route_model_id(&model.model);
+        present.insert((model.oauth_account_id, canonical.clone()));
+        if !selected.contains(&model.oauth_account_id) {
             continue;
         }
-        account_priority
-            .entry(model.oauth_account_id)
-            .and_modify(|current| *current = (*current).min(model.priority))
-            .or_insert(model.priority);
+        let key = (
+            oauth_platform_key(&model.oauth_platform),
+            canonical,
+        );
+        templates.entry(key).or_insert_with(|| SlotTemplate {
+            model: model.model.clone(),
+            alias: model.alias.clone(),
+            alias_customized: model.alias_customized,
+            base_url: model.base_url.clone(),
+            extra: model.extra.clone(),
+            multimodal: model.multimodal.clone(),
+            context_window: model.context_window,
+            max_output_tokens: model.max_output_tokens,
+            auto_compact_percent: model.auto_compact_percent,
+            reasoning_mode: model.reasoning_mode.clone(),
+            reasoning_levels: model.reasoning_levels.clone(),
+            default_reasoning_level: model.default_reasoning_level.clone(),
+            fast_supported: model.fast_supported,
+            fast_mode: model.fast_mode,
+            platform: model.oauth_platform.clone(),
+        });
     }
+    if templates.is_empty() {
+        return;
+    }
+
+    let mut account_platform: HashMap<i64, String> = HashMap::new();
+    for (account_id, platform) in extra_accounts {
+        if *account_id > 0 && selected.contains(account_id) {
+            account_platform
+                .entry(*account_id)
+                .or_insert_with(|| platform.clone());
+        }
+    }
+    for model in &cfg.models {
+        if model.source == "oauth" && model.oauth_account_id > 0 {
+            account_platform
+                .entry(model.oauth_account_id)
+                .or_insert_with(|| model.oauth_platform.clone());
+        }
+    }
+
+    let mut additions = Vec::new();
+    for account_id in &selected_order {
+        let Some(platform) = account_platform.get(account_id).cloned() else {
+            continue;
+        };
+        let provider = oauth_platform_key(&platform);
+        for ((template_provider, canonical), template) in &templates {
+            if template_provider != &provider {
+                continue;
+            }
+            if present.contains(&(*account_id, canonical.clone())) {
+                continue;
+            }
+            present.insert((*account_id, canonical.clone()));
+            additions.push(ModelConfig {
+                model: template.model.clone(),
+                alias: template.alias.clone(),
+                alias_customized: template.alias_customized,
+                base_url: if template.base_url.trim().is_empty() {
+                    format!("Router OAuth / {platform}")
+                } else {
+                    template.base_url.clone()
+                },
+                extra: template.extra.clone(),
+                multimodal: template.multimodal.clone(),
+                context_window: template.context_window,
+                max_output_tokens: template.max_output_tokens,
+                auto_compact_percent: template.auto_compact_percent,
+                reasoning_mode: template.reasoning_mode.clone(),
+                reasoning_levels: template.reasoning_levels.clone(),
+                default_reasoning_level: template.default_reasoning_level.clone(),
+                fast_supported: template.fast_supported,
+                fast_mode: template.fast_mode,
+                source: "oauth".to_owned(),
+                oauth_account_id: *account_id,
+                oauth_platform: if platform.is_empty() {
+                    template.platform.clone()
+                } else {
+                    platform.clone()
+                },
+                user_selected: true,
+                priority: 1,
+                ..Default::default()
+            });
+        }
+    }
+    cfg.models.extend(additions);
+}
+
+/// Distinct OAuth accounts on the same provider become P1, P2, P3...
+/// instead of every account inheriting the official subscription P1.
+pub fn assign_sequential_oauth_account_priorities(cfg: &mut RouterConfig) {
+    let mut groups: HashMap<String, Vec<(i64, i32, usize)>> = HashMap::new();
+    for (index, model) in cfg.models.iter().enumerate() {
+        if model.source != "oauth" || model.oauth_account_id <= 0 {
+            continue;
+        }
+        let provider = oauth_platform_key(&model.oauth_platform);
+        let entries = groups.entry(provider).or_default();
+        if let Some(existing) = entries
+            .iter_mut()
+            .find(|(account_id, _, _)| *account_id == model.oauth_account_id)
+        {
+            existing.1 = existing.1.min(model.priority.max(1));
+            existing.2 = existing.2.min(index);
+        } else {
+            entries.push((model.oauth_account_id, model.priority.max(1), index));
+        }
+    }
+
+    let mut assigned: HashMap<i64, i32> = HashMap::new();
+    for entries in groups.values_mut() {
+        let all_same = entries
+            .iter()
+            .map(|(_, priority, _)| *priority)
+            .collect::<HashSet<_>>()
+            .len()
+            <= 1;
+        if all_same && entries.len() > 1 {
+            let selected_order = cfg.oauth_account_ids.clone().unwrap_or_default();
+            entries.sort_by_key(|(account_id, _, index)| {
+                let order = selected_order
+                    .iter()
+                    .position(|id| id == account_id)
+                    .unwrap_or(usize::MAX);
+                (order, *account_id, *index)
+            });
+            for (rank, (account_id, _, _)) in entries.iter().enumerate() {
+                assigned.insert(*account_id, (rank as i32) + 1);
+            }
+        } else {
+            entries.sort_by_key(|(_, priority, index)| (*priority, *index));
+            let mut next = 1_i32;
+            let mut used = HashSet::new();
+            for (account_id, priority, _) in entries.iter() {
+                let mut value = (*priority).clamp(1, 999);
+                while !used.insert(value) {
+                    value = value.saturating_add(1).clamp(1, 999);
+                    if value == 999 && used.contains(&999) {
+                        break;
+                    }
+                }
+                if value < next && !used.contains(&next) {
+                    value = next;
+                    used.insert(value);
+                }
+                next = next.max(value + 1);
+                assigned.insert(*account_id, value);
+            }
+        }
+    }
+
     for model in &mut cfg.models {
         if model.source != "oauth" {
             continue;
         }
-        if let Some(priority) = account_priority.get(&model.oauth_account_id) {
+        if let Some(priority) = assigned.get(&model.oauth_account_id) {
             model.priority = *priority;
         }
     }
@@ -1781,6 +2109,7 @@ pub fn write_all_files(cfg: &mut RouterConfig, router_root: &Path) -> anyhow::Re
             return Err(error).context("配置文件提交失败，已恢复应用前文件");
         }
     }
+    remove_stale_codex_home_catalog(cfg);
     Ok(())
 }
 
@@ -3657,6 +3986,17 @@ mod tests {
     }
 
     #[test]
+    fn display_priority_folds_hidden_tiers_back_to_card_order() {
+        assert_eq!(display_priority(1), 1);
+        assert_eq!(display_priority(2), 2);
+        assert_eq!(display_priority(100), 100);
+        assert_eq!(display_priority(2100), 100);
+        assert_eq!(display_priority(2010), 10);
+        assert_eq!(display_priority(1020), 20);
+        assert_eq!(display_priority(0), 1);
+    }
+
+    #[test]
     fn router_mode_requires_the_selected_provider_and_matching_local_url() {
         let config = r#"model_provider = "codex_router"
 model = "gpt-5.6-sol"
@@ -4571,6 +4911,60 @@ base_url = "https://api.430123.xyz/v1"
     }
 
     #[test]
+    fn selected_grok_accounts_share_every_selected_model_and_get_p1_p2_p3() {
+        let mut config = RouterConfig {
+            oauth_account_ids: Some(vec![42, 43, 44]),
+            models: vec![
+                ModelConfig {
+                    model: "grok-4.6".into(),
+                    source: "oauth".into(),
+                    oauth_account_id: 42,
+                    oauth_platform: "grok".into(),
+                    priority: 1,
+                    ..Default::default()
+                },
+                ModelConfig {
+                    model: "grok-4.5".into(),
+                    source: "oauth".into(),
+                    oauth_account_id: 42,
+                    oauth_platform: "grok".into(),
+                    priority: 1,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        replicate_oauth_slots_for_accounts(
+            &mut config,
+            &[
+                (42, "grok".into()),
+                (43, "grok".into()),
+                (44, "grok".into()),
+            ],
+        );
+        assign_sequential_oauth_account_priorities(&mut config);
+        let mut grok46 = config
+            .models
+            .iter()
+            .filter(|model| model.model == "grok-4.6")
+            .map(|model| (model.oauth_account_id, model.priority))
+            .collect::<Vec<_>>();
+        grok46.sort_by_key(|(id, _)| *id);
+        assert_eq!(grok46, vec![(42, 1), (43, 2), (44, 3)]);
+        let mut grok45 = config
+            .models
+            .iter()
+            .filter(|model| model.model == "grok-4.5")
+            .map(|model| (model.oauth_account_id, model.priority))
+            .collect::<Vec<_>>();
+        grok45.sort_by_key(|(id, _)| *id);
+        assert_eq!(grok45, vec![(42, 1), (43, 2), (44, 3)]);
+        let rows = dashboard_model_rows(&config.models);
+        assert_eq!(rows.iter().find(|row| config.models[row.index].model == "grok-4.6").unwrap().account_count, 3);
+        assert_eq!(rows.iter().find(|row| config.models[row.index].model == "grok-4.5").unwrap().account_count, 3);
+    }
+
+    #[test]
     fn account_priority_is_shared_across_every_slot_for_the_same_oauth_account() {
         let mut config = RouterConfig {
             models: vec![
@@ -5053,8 +5447,9 @@ base_url = "https://api.430123.xyz/v1"
         assert!(catalog["models"][0]["additional_speed_tiers"].is_array());
         assert_eq!(catalog["models"][0]["slug"], "portable-test-model");
         assert_eq!(catalog["models"][0]["context_window"], 128_000);
-        assert_eq!(catalog["models"][0]["auto_compact_token_limit"], 128_000);
+        assert_eq!(catalog["models"][0]["auto_compact_token_limit"], 121_600);
         assert_eq!(catalog["models"][0]["effective_context_window_percent"], 95);
+        assert_ne!(catalog["etag"], "codex-router-local-v2");
         assert_eq!(catalog["models"][0]["input_modalities"], json!(["text"]));
         assert!(!raw.contains("must-not-be-written"));
         // The deployment scripts read the Router config through
@@ -5064,6 +5459,98 @@ base_url = "https://api.430123.xyz/v1"
         assert!(!std::fs::read_to_string(&config_path)
             .unwrap()
             .contains("must-not-be-written"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn catalog_compact_percent_is_rewritten_when_cards_are_raised_to_95() {
+        let root = temporary_test_dir("catalog-compact-sync");
+        let mut config = RouterConfig::default();
+        config.models.push(ModelConfig {
+            model: "grok-4.6".into(),
+            auto_compact_percent: 80,
+            ..Default::default()
+        });
+        write_model_catalog(&config, &root).unwrap();
+        let catalog_path = root.join("config").join("model-catalog.json");
+        let before: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&catalog_path).unwrap()).unwrap();
+        assert_eq!(before["models"][0]["effective_context_window_percent"], 80);
+        assert_eq!(before["models"][0]["auto_compact_token_limit"], 400_000);
+
+        config.models[0].auto_compact_percent = 95;
+        assert!(sync_model_catalog_compact_percent(&config, &root).unwrap());
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&catalog_path).unwrap()).unwrap();
+        assert_eq!(after["models"][0]["effective_context_window_percent"], 95);
+        assert_eq!(after["models"][0]["auto_compact_token_limit"], 475_000);
+        assert_ne!(before["etag"], after["etag"]);
+        assert!(!sync_model_catalog_compact_percent(&config, &root).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn grok_catalog_uses_percent_window_and_busts_fixed_etag() {
+        let root = temporary_test_dir("catalog-grok-475k");
+        let mut config = RouterConfig::default();
+        let codex_home = root.join("codex-home");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        config.deploy.codex_home = codex_home.to_string_lossy().into_owned();
+        config.models.push(ModelConfig {
+            model: "grok-4.6".into(),
+            auto_compact_percent: 95,
+            ..Default::default()
+        });
+        let stale = codex_home.join("model-catalog.codex-router.json");
+        std::fs::write(&stale, r#"{"etag":"codex-router-local-v2"}"#).unwrap();
+
+        write_model_catalog(&config, &root).unwrap();
+        let catalog_path = root.join("config").join("model-catalog.json");
+        let catalog: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&catalog_path).unwrap()).unwrap();
+        assert_eq!(catalog["models"][0]["slug"], "grok-4.6");
+        assert_eq!(catalog["models"][0]["context_window"], 500_000);
+        assert_eq!(catalog["models"][0]["effective_context_window_percent"], 95);
+        assert_eq!(catalog["models"][0]["auto_compact_token_limit"], 475_000);
+        assert_ne!(catalog["etag"], "codex-router-local-v2");
+        assert!(catalog["etag"].as_str().unwrap().contains(env!("CARGO_PKG_VERSION")));
+        assert!(!stale.exists());
+
+        config.models[0].auto_compact_percent = 80;
+        write_model_catalog(&config, &root).unwrap();
+        let lowered: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&catalog_path).unwrap()).unwrap();
+        assert_eq!(lowered["models"][0]["auto_compact_token_limit"], 400_000);
+        assert_ne!(catalog["etag"], lowered["etag"]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn catalog_sync_rewrites_full_window_auto_compact_even_when_percent_is_already_95() {
+        let root = temporary_test_dir("catalog-stale-auto");
+        let mut config = RouterConfig::default();
+        config.models.push(ModelConfig {
+            model: "grok-4.6".into(),
+            auto_compact_percent: 95,
+            ..Default::default()
+        });
+        write_model_catalog(&config, &root).unwrap();
+        let catalog_path = root.join("config").join("model-catalog.json");
+        let mut stale: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&catalog_path).unwrap()).unwrap();
+        stale["etag"] = serde_json::Value::String("codex-router-local-v2".into());
+        stale["models"][0]["auto_compact_token_limit"] = serde_json::json!(500_000);
+        std::fs::write(
+            &catalog_path,
+            serde_json::to_vec_pretty(&stale).unwrap(),
+        )
+        .unwrap();
+        assert!(sync_model_catalog_compact_percent(&config, &root).unwrap());
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&catalog_path).unwrap()).unwrap();
+        assert_eq!(after["models"][0]["auto_compact_token_limit"], 475_000);
+        assert_eq!(after["models"][0]["effective_context_window_percent"], 95);
+        assert_ne!(after["etag"], "codex-router-local-v2");
         std::fs::remove_dir_all(root).unwrap();
     }
 

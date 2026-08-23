@@ -2595,6 +2595,7 @@ fn deploy_router_config<F>(
     router_root: &Path,
     cancel: &AtomicBool,
     zh: bool,
+    extra_oauth_accounts: &[(i64, String)],
     mut on_log: F,
 ) -> anyhow::Result<()>
 where
@@ -2623,6 +2624,8 @@ where
             },
         );
     }
+    logic::replicate_oauth_slots_for_accounts(cfg, extra_oauth_accounts);
+    logic::assign_sequential_oauth_account_priorities(cfg);
     let proxy_runtime =
         logic::resolve_proxy_runtime(cfg).context("ROUTER_CONFIG_RESOLVE_PROXY_FAILED")?;
     let updated_model_keys = logic::store_credentials(cfg, router_root)
@@ -2699,7 +2702,7 @@ where
         return Ok(());
     }
     let mut restored = restored.clone();
-    deploy_router_config(&mut restored, router_root, cancel, zh, on_log)
+    deploy_router_config(&mut restored, router_root, cancel, zh, &[], on_log)
 }
 
 fn rollback_failed_deployment<F>(
@@ -3136,6 +3139,9 @@ impl CodexRouterApp {
             config.ui_theme = "sky".to_owned();
         }
         logic::normalize_default_model(&mut config);
+        if configured {
+            let _ = logic::sync_model_catalog_compact_percent(&config, &router_root);
+        }
         // Upgrade/startup is the safest repair window: reconcile immediately
         // only when the entire Codex package is already stopped. If Codex is
         // running, the background reconciler waits for a later clean exit.
@@ -5229,6 +5235,19 @@ impl CodexRouterApp {
                         self.grok_sso_auto_select_pending = false;
                     }
                     self.oauth_accounts = accounts;
+                    let extra_accounts = self
+                        .oauth_accounts
+                        .iter()
+                        .map(|account| (account.id, account.platform.clone()))
+                        .collect::<Vec<_>>();
+                    let before_slots = self.config.models.len();
+                    logic::replicate_oauth_slots_for_accounts(&mut self.config, &extra_accounts);
+                    logic::assign_sequential_oauth_account_priorities(&mut self.config);
+                    if self.config.models.len() != before_slots {
+                        let _ = self
+                            .config
+                            .save(&crate::user_data::config_path(&self.router_root));
+                    }
                     let should_announce = !imported.is_empty()
                         || discovered_in_flight
                         || (self.oauth_success_pending && !self.result_dialog_open);
@@ -6754,6 +6773,7 @@ impl CodexRouterApp {
                 &base_url,
                 require_openai_auth,
                 false,
+                cfg.rate_limit_max_retries,
             );
         });
     }
@@ -7274,6 +7294,11 @@ impl CodexRouterApp {
         }
         .into();
         let mut cfg = self.config.clone();
+        let oauth_accounts = self
+            .oauth_accounts
+            .iter()
+            .map(|account| (account.id, account.platform.clone()))
+            .collect::<Vec<_>>();
         let root = self.router_root.clone();
         let tx = self.event_tx.clone();
         let apply_cancel = self.apply_cancel.clone();
@@ -7307,7 +7332,7 @@ impl CodexRouterApp {
                     )?;
                     transaction_backup = Some(ApplyTransactionBackup { point, config });
                 }
-                deploy_router_config(&mut cfg, &root, &apply_cancel, zh, |line| {
+                deploy_router_config(&mut cfg, &root, &apply_cancel, zh, &oauth_accounts, |line| {
                     tx.send(AppEvent::Log(line)).ok();
                 })
             })();
@@ -8846,6 +8871,7 @@ fn try_cli_mode() -> Option<anyhow::Result<()>> {
         let mut display_openai_provider = false;
         let mut permission_source_path = None;
         let mut read_local_api_key_from_stdin = false;
+        let mut max_retries = crate::logic::responses_gateway::DEFAULT_RATE_LIMIT_RETRIES;
 
         for argument in &args {
             if let Some(value) = argument.strip_prefix("--codex-home=") {
@@ -8880,6 +8906,8 @@ fn try_cli_mode() -> Option<anyhow::Result<()>> {
                 permission_source_path = Some(value.to_owned());
             } else if argument == "--local-api-key-stdin" {
                 read_local_api_key_from_stdin = true;
+            } else if let Some(value) = argument.strip_prefix("--max-retries=") {
+                max_retries = value.parse().unwrap_or(max_retries);
             }
         }
 
@@ -8918,6 +8946,7 @@ fn try_cli_mode() -> Option<anyhow::Result<()>> {
             fast_mode,
             require_openai_auth,
             display_openai_provider,
+            max_retries,
             permission_source.as_deref(),
         )
     })())
@@ -10406,7 +10435,7 @@ mod main_tests {
         let mut config = RouterConfig::default();
         let cancel = std::sync::atomic::AtomicBool::new(false);
         let mut logs = Vec::new();
-        let error = deploy_router_config(&mut config, &root, &cancel, true, |line| logs.push(line))
+        let error = deploy_router_config(&mut config, &root, &cancel, true, &[], |line| logs.push(line))
             .expect_err("a configuration without models is not deployable");
         let chained = format!("{error:#}");
         assert!(chained.contains("ROUTER_DEPLOY_NO_MODELS"), "{chained}");

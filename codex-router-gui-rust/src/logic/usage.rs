@@ -1981,26 +1981,43 @@ fn credential_pool_digest(names: &[&str]) -> Option<String> {
 
 fn api_quota_pool_key(channel: &ModelConfig) -> String {
     let provider = api_quota_pool_provider(channel);
-    let endpoint = if coding_plan_endpoint(&channel.base_url).is_some() {
-        Url::parse(&channel.base_url)
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
-            .unwrap_or_else(|| channel_base_url(channel).to_ascii_lowercase())
+    let coding_plan = coding_plan_endpoint(&channel.base_url).is_some();
+    let endpoint = if coding_plan {
+        normalized_coding_plan_endpoint(&channel.base_url)
     } else {
         normalized_api_endpoint(&channel.base_url)
     };
-    let credential = if provider == "Volcengine Coding Plan" {
-        credential_pool_digest(&["VolcengineAccessKeyId", "VolcengineSecretAccessKey"])
-    } else {
-        credential_pool_digest(&[&channel.credential_name])
-    }
-    .unwrap_or_else(|| {
+    // Coding Plan still keys the 5-hour / weekly bar on the official endpoint,
+    // but each distinct API key keeps its own quota pool. Same secret against
+    // the same base URL continues to merge.
+    let credential = credential_pool_digest(&[&channel.credential_name]).unwrap_or_else(|| {
         format!(
             "credential:{}",
             channel.credential_name.to_ascii_lowercase()
         )
     });
     format!("{}|{endpoint}|{credential}", provider.to_ascii_lowercase())
+}
+
+fn normalized_coding_plan_endpoint(base_url: &str) -> String {
+    Url::parse(base_url)
+        .ok()
+        .map(|url| {
+            let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+            let path = url.path().trim_end_matches('/').to_ascii_lowercase();
+            if path.is_empty() || path == "/" {
+                host
+            } else {
+                format!("{host}{path}")
+            }
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            channel_base_url(&ModelConfig {
+                base_url: base_url.to_owned(),
+                ..Default::default()
+            })
+        })
 }
 
 fn merge_api_quota_pools(
@@ -3274,6 +3291,57 @@ mod tests {
     }
 
     #[test]
+    fn coding_plan_keys_on_the_same_base_url_keep_separate_quota_pools() {
+        let first = ModelConfig {
+            model: "kimi-for-coding".to_owned(),
+            base_url: "https://api.kimi.com/coding/v1".to_owned(),
+            credential_name: "KimiPrimary".to_owned(),
+            ..Default::default()
+        };
+        let second = ModelConfig {
+            model: "kimi-for-coding".to_owned(),
+            base_url: "https://api.kimi.com/coding/v1/".to_owned(),
+            credential_name: "KimiFallback".to_owned(),
+            ..Default::default()
+        };
+        assert_ne!(api_quota_pool_key(&first), api_quota_pool_key(&second));
+        assert!(api_quota_pool_key(&first).contains("api.kimi.com/coding/v1"));
+        assert!(api_quota_pool_key(&second).contains("api.kimi.com/coding/v1"));
+
+        let first_name = "Codex-Router / Kimi For Coding".to_owned();
+        let second_name = "Codex-Router / Kimi For Coding Fallback".to_owned();
+        let channels = HashMap::from([
+            (first_name.clone(), first),
+            (second_name.clone(), second),
+        ]);
+        let record = |id, name: String| AccountRecord {
+            account: UsageAccount {
+                id,
+                name,
+                kind: "apikey".to_owned(),
+                platform: "kimi".to_owned(),
+                windows: vec![UsageWindow {
+                    kind: "fiveHour".to_owned(),
+                    used_percent: Some(42.0),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            configured_model: "kimi-for-coding".to_owned(),
+            quota_evidence: OAuthQuotaEvidence::Unknown,
+            auto_isolate_on_exhaustion: false,
+            routing_changed: false,
+        };
+        let merged = merge_api_quota_pools(
+            vec![record(1, first_name), record(2, second_name)],
+            &channels,
+        );
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].account.platform, "Kimi Coding Plan");
+        assert_eq!(merged[1].account.platform, "Kimi Coding Plan");
+    }
+
+    #[test]
     fn api_models_with_the_same_real_key_merge_into_one_quota_pool() {
         let nonce = Utc::now().timestamp_nanos_opt().unwrap_or_default();
         let first_credential = format!("Codex-Router-Usage-Pool-A-{nonce}");
@@ -3297,6 +3365,7 @@ mod tests {
                 api_quota_pool_key(&first_channel),
                 api_quota_pool_key(&second_channel)
             );
+            assert!(api_quota_pool_key(&first_channel).contains("api.kimi.com/coding/v1"));
 
             let first_name = "Codex-Router / Kimi For Coding".to_owned();
             let second_name = "Codex-Router / Kimi K3".to_owned();
