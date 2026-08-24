@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.1.4-0969da" alt="Version 2.1.4">
+  <img src="https://img.shields.io/badge/version-3.0.2-0969da" alt="Version 3.0.2">
   <img src="https://img.shields.io/badge/platform-Windows%20%2F%20macOS%20%2F%20Linux-0078d4" alt="Windows / macOS / Linux">
   <img src="https://img.shields.io/badge/architecture-x64-555555" alt="x64">
   <img src="https://img.shields.io/badge/default%20build-portable-2ea44f" alt="Portable build by default">
@@ -74,6 +74,7 @@ Switch models directly from the Codex model menu and continue in the same contex
 - Uses the upstream reset time when available. When reliable live quota is unavailable, Router performs an account-scoped recovery probe and returns the account to its pool after success. Stale Grok billing cache is display-only; recovery requires live quota or a minimal generation with the selected model.
 - After an external Codex config update, self-check verifies both binding layers, the active local gateway port, and retry settings. If both layers are lost, a three-choice overwrite dialog appears. Three cumulative seconds of foreground focus restores the binding and restarts Codex; minimization, tray mode, and focus loss pause the countdown without stealing focus. Restore defaults enters a sticky official mode that self-check will not bind back to Router until forwarding is explicitly enabled again.
 - Keeps OAuth tokens under CLIProxyAPI management. Tokens are not written to the CodexRouter configuration file and are not offered as plaintext exports.
+- Codex Desktop 26.818 concurrently refreshes the ChatGPT refresh token when `requires_openai_auth = true`, which invalidates the token family and forces re-login. From 3.0.2 the local Router provider is `Codex-Router` with `requires_openai_auth = false`: requests still use the local gateway bearer, and Desktop is not asked to refresh ChatGPT OAuth for that provider. The Codex-Router label in the Desktop corner is expected, not a lost login. See [CHANGELOG](CHANGELOG.md).
 
 ### Model-aware controls
 
@@ -114,9 +115,9 @@ The current runtime retains the memory and background-work optimizations. Idle t
 
 ## Download And First Run
 
-Download the Windows x64 package from [GitHub Releases](https://github.com/HernanJiang/CodexRouter/releases/tag/v2.1.4):
+Download the Windows x64 package from [GitHub Releases](https://github.com/HernanJiang/CodexRouter/releases/tag/v2.1.14):
 
-`Codex-Router-Portable-2.1.4-windows-x64.zip`
+`Codex-Router-Portable-2.1.14-windows-x64.zip`
 
 Portable is the default release and local delivery target. The per-user installer remains an optional build and is generated only when explicitly requested.
 

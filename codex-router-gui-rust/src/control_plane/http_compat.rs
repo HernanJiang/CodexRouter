@@ -30,6 +30,9 @@ pub struct BackendPaths {
     pub downstream_key: String,
     pub management_secret: String,
     pub cli_port: u16,
+    /// Codex Desktop's auth file. OpenAI OAuth refresh ownership stays there;
+    /// CLIProxyAPI receives only the current access token.
+    pub desktop_auth_path: PathBuf,
 }
 
 #[derive(Clone)]
@@ -146,6 +149,102 @@ fn read_account_secret(id: i64) -> Option<String> {
         .flatten()
         .map(|secret| secret.to_string())
         .filter(|secret| !secret.trim().is_empty())
+}
+
+fn sync_openai_access_token(document: &mut Value, desktop_auth_path: &std::path::Path) {
+    // Never leave a ChatGPT refresh token in Router-managed files. Desktop is
+    // the sole refresh owner; Router consumes the access token it last wrote.
+    if let Some(object) = document.as_object_mut() {
+        object.remove("refresh_token");
+    }
+    let Ok(text) = std::fs::read_to_string(desktop_auth_path) else {
+        return;
+    };
+    let Ok(auth) = serde_json::from_str::<Value>(&text) else {
+        return;
+    };
+    let Some(tokens) = auth.get("tokens").and_then(Value::as_object) else {
+        return;
+    };
+    let Some(access_token) = tokens
+        .get("access_token")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return;
+    };
+    let Some(object) = document.as_object_mut() else {
+        return;
+    };
+    object.insert(
+        "access_token".to_owned(),
+        Value::String(access_token.to_owned()),
+    );
+    for key in ["id_token", "account_id", "email", "last_refresh", "expired"] {
+        if let Some(value) = tokens.get(key) {
+            object.insert(key.to_owned(), value.clone());
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReplicaSyncStats {
+    pub scanned: usize,
+    pub written: usize,
+    pub skipped: usize,
+}
+
+/// Re-stamp every OpenAI CLI replica with Desktop's current access token.
+/// Codex Desktop rotates its token in place; without this timer the replicas
+/// would age out after the next Desktop refresh until some later backend
+/// sync rewrites them. Identical bytes are skipped inside write_auth_file, so
+/// an unchanged token never wakes CLIProxyAPI's Windows file watcher.
+pub fn sync_desktop_openai_replicas(state: &ControlState) -> anyhow::Result<ReplicaSyncStats> {
+    let Some(backend) = state.backend.clone() else {
+        return Ok(ReplicaSyncStats::default());
+    };
+    if !backend.desktop_auth_path.is_file() {
+        return Ok(ReplicaSyncStats::default());
+    }
+    let entries = std::fs::read_dir(&backend.auth_dir)?;
+    let mut stats = ReplicaSyncStats::default();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("cr-router-oauth-") || !name.ends_with("-codex.json") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(mut document) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        sync_openai_access_token(&mut document, &backend.desktop_auth_path);
+        let Some(stem) = name.strip_suffix(".json") else {
+            continue;
+        };
+        stats.scanned += 1;
+        let before = std::fs::read(&path).ok();
+        write_auth_file(&backend.auth_dir, stem, &document)?;
+        let after = std::fs::read(&path).ok();
+        let wrote = before.as_ref() != after.as_ref();
+        if wrote {
+            stats.written += 1;
+            let _ = state.logger.write(json!({
+                "level":"INFO",
+                "event":"desktop.session.replica_written",
+                "error_code": crate::control_plane::desktop_session::DSK_REPLICA_WRITTEN,
+                "stem":stem,
+                "timestamp": crate::telemetry::structured_log::timestamp(),
+            }));
+        } else {
+            stats.skipped += 1;
+        }
+    }
+    Ok(stats)
 }
 
 /// Deep-merge a partial update into a stored JSON payload. Objects merge
@@ -299,15 +398,47 @@ pub async fn sync_backend(state: &ControlState) -> Result<usize> {
                 .file_name()
                 .map(|name| name.to_owned())
                 .context("OAuth auth file name is missing")?;
-            let source_file = backend.auth_dir.join(auth_file_name);
-            if !source_file.is_file() {
-                continue;
-            }
-            let Ok(text) = std::fs::read_to_string(&source_file) else {
-                continue;
-            };
-            let Ok(mut document) = serde_json::from_str::<Value>(&text) else {
-                continue;
+            let source_file = backend.auth_dir.join(&auth_file_name);
+            let is_openai = config_compiler::normalize_platform(&account_platform) == "openai";
+            let mut document = if is_openai {
+                // Desktop is the sole credential owner for ChatGPT accounts.
+                // Build the replica from the live Desktop login even when the
+                // historical physical auth file was quarantined or removed;
+                // sync_openai_access_token strips any refresh token and only
+                // ever copies the current access token.
+                let mut base = std::fs::read_to_string(&source_file)
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                    .unwrap_or_else(|| json!({}));
+                if base
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_none_or(|value| value.trim().is_empty())
+                {
+                    base["type"] = Value::String("codex".to_owned());
+                }
+                sync_openai_access_token(&mut base, &backend.desktop_auth_path);
+                if base
+                    .get("access_token")
+                    .and_then(Value::as_str)
+                    .is_none_or(|value| value.trim().is_empty())
+                {
+                    // Desktop has no ChatGPT login right now; leave the pool
+                    // empty instead of publishing an unusable credential.
+                    continue;
+                }
+                base
+            } else {
+                if !source_file.is_file() {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&source_file) else {
+                    continue;
+                };
+                let Ok(document) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                document
             };
             let auth_type = document
                 .get("type")
@@ -493,6 +624,7 @@ pub async fn sync_backend(state: &ControlState) -> Result<usize> {
             .cli_index_map
             .write()
             .unwrap_or_else(|error| error.into_inner()) = cli_index_map;
+        quarantine_legacy_openai_auth_files(&backend.auth_dir, &state.logger);
         return Ok(targets.len());
     }
     let registry_ready = if let Err(error) = state
@@ -533,7 +665,31 @@ pub async fn sync_backend(state: &ControlState) -> Result<usize> {
         .cli_index_map
         .write()
         .unwrap_or_else(|error| error.into_inner()) = cli_index_map;
+    quarantine_legacy_openai_auth_files(&backend.auth_dir, &state.logger);
     Ok(targets.len())
+}
+
+fn quarantine_legacy_openai_auth_files(auth_dir: &std::path::Path, logger: &StructuredLogger) {
+    let Ok(entries) = std::fs::read_dir(auth_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("legacy-openai-") || !name.ends_with(".json") {
+            continue;
+        }
+        let quarantined = path.with_file_name(format!("{name}.quarantined"));
+        if std::fs::rename(&path, &quarantined).is_ok() {
+            let _ = logger.write(json!({
+                "level":"INFO",
+                "event":"backend.legacy_openai_quarantined",
+                "reason":"desktop_openai_auth_owner",
+            }));
+        }
+    }
 }
 
 /// Patch the pool prefix of a CLI auth file in place, preserving all other fields.
@@ -603,11 +759,110 @@ pub fn write_auth_file(
         anyhow::bail!("unsafe auth index {auth_index}");
     }
     let path = auth_dir.join(format!("{auth_index}.json"));
-    let temporary = auth_dir.join(format!("{auth_index}.tmp"));
+    let mut document = document.clone();
+    let openai_owned = document
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "codex" | "openai" | "chatgpt"
+            )
+        });
+    if openai_owned {
+        if let Some(object) = document.as_object_mut() {
+            object.remove("refresh_token");
+        }
+    }
+    let bytes = serde_json::to_vec_pretty(&document)?;
     std::fs::create_dir_all(auth_dir)?;
-    std::fs::write(&temporary, serde_json::to_vec_pretty(document)?)?;
-    std::fs::rename(&temporary, &path)?;
+    // Do not recreate an identical watched auth file: each replace wakes
+    // CLIProxyAPI. Overwrite in place (no delete+rename) so the watcher sees
+    // WRITE rather than REMOVE, which previously reprocessed ChatGPT replicas.
+    if std::fs::read(&path).is_ok_and(|existing| existing == bytes) {
+        return Ok(path);
+    }
+    std::fs::write(&path, &bytes)?;
     Ok(path)
+}
+
+pub async fn reconcile_composite_routes(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    Path(group_id): Path<i64>,
+    Json(body): Json<Value>,
+) -> Response {
+    if !authorized(&state, &headers) {
+        return failure(
+            StatusCode::UNAUTHORIZED,
+            "CR-AUT-0002",
+            "admin token required",
+        );
+    }
+    let Some(routes) = body.get("routes").and_then(Value::as_array) else {
+        return failure(
+            StatusCode::BAD_REQUEST,
+            "CR-VAL-0003",
+            "routes array is required",
+        );
+    };
+    let mut desired = Vec::with_capacity(routes.len());
+    for route in routes {
+        let mut route = route.clone();
+        let public_model = json_string(&route, "public_model");
+        let upstream_model = json_string(&route, "upstream_model");
+        let target_platform = json_string(&route, "target_platform");
+        if public_model.trim().is_empty()
+            || upstream_model.trim().is_empty()
+            || target_platform.trim().is_empty()
+        {
+            return failure(
+                StatusCode::BAD_REQUEST,
+                "CR-VAL-0003",
+                "public_model, upstream_model and target_platform are required",
+            );
+        }
+        sanitize_state_payload(&mut route);
+        desired.push((public_model, target_platform, upstream_model, route));
+    }
+    let result = state.store.with_connection(|connection| {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute(
+            "UPDATE composite_routes SET deleted_at=CURRENT_TIMESTAMP WHERE group_id=?1 AND deleted_at IS NULL",
+            rusqlite::params![group_id],
+        )?;
+        for (public_model, target_platform, upstream_model, route) in &desired {
+            let endpoint = json_string(route, "endpoint");
+            let endpoint = if endpoint.trim().is_empty() { "any" } else { endpoint.as_str() };
+            let priority = route.get("priority").and_then(Value::as_i64).unwrap_or(1).clamp(1, 999_999);
+            let enabled = route.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+            transaction.execute(
+                "INSERT INTO composite_routes(group_id,public_model,upstream_model,target_platform,endpoint,priority,enabled,payload)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+                 ON CONFLICT(group_id,public_model,upstream_model,target_platform,endpoint)
+                 DO UPDATE SET priority=excluded.priority,enabled=excluded.enabled,payload=excluded.payload,
+                    deleted_at=NULL,updated_at=CURRENT_TIMESTAMP",
+                rusqlite::params![group_id, public_model, upstream_model, target_platform, endpoint, priority, enabled, route.to_string()],
+            )?;
+        }
+        transaction.commit()?;
+        Ok::<(), anyhow::Error>(())
+    });
+    if result.is_err() {
+        return failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CR-STO-0004",
+            "could not reconcile composite routes",
+        );
+    }
+    match sync_backend(&state).await {
+        Ok(_) => success(json!({"updated": desired.len()})),
+        Err(_) => failure(
+            StatusCode::BAD_GATEWAY,
+            "CR-CFG-0005",
+            "CLI runtime did not apply composite routes",
+        ),
+    }
 }
 // ---------------------------------------------------------------------------
 // Auth and admin basics
@@ -1580,6 +1835,27 @@ fn probe_failure_response(failure_detail: &ProbeFailure) -> Response {
     failure(status, failure_detail.error_code, failure_detail.message)
 }
 
+fn is_desktop_owned_openai(state: &ControlState, id: i64) -> bool {
+    state
+        .store
+        .with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT platform,account_type FROM accounts WHERE id=?1 AND deleted_at IS NULL",
+                    rusqlite::params![id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()
+                .map_err(Into::into)
+        })
+        .ok()
+        .flatten()
+        .is_some_and(|(platform, account_type)| {
+            account_type.eq_ignore_ascii_case("oauth")
+                && config_compiler::normalize_platform(&platform) == "openai"
+        })
+}
+
 async fn probe_account_for_state(
     state: &ControlState,
     id: i64,
@@ -1589,10 +1865,81 @@ async fn probe_account_for_state(
 }
 
 async fn recover_account_after_probe(state: &ControlState, id: i64, model: &str) -> Response {
+    if is_desktop_owned_openai(state, id) {
+        let _ = state.logger.write(json!({
+            "level":"INFO",
+            "event":"control.account_recovery_skipped",
+            "account_id":id,
+            "reason":"desktop_openai_auth_owner",
+        }));
+        return success(json!({
+            "id": id,
+            "skipped": true,
+            "reason": "desktop_openai_auth_owner",
+        }));
+    }
+    // Automated GUI recovery and manual recovery share this endpoint. Never
+    // let either path puncture a 401 cooldown or an explicit operator disable;
+    // a completed OAuth login clears the cooldown before recovery is needed.
+    let recovery_state = state.store.with_connection(|connection| {
+        connection
+            .query_row(
+                "SELECT status,schedulable FROM accounts WHERE id=?1 AND deleted_at IS NULL",
+                rusqlite::params![id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+    });
+    let (previous_status, previous_schedulable) = match recovery_state {
+        Ok(Some((status, _))) if status == "disabled" => {
+            return failure(
+                StatusCode::CONFLICT,
+                "CR-OAU-0008",
+                "disabled OAuth account must be re-authenticated before recovery",
+            );
+        }
+        Ok(Some(state)) => state,
+        Ok(None) => return failure(StatusCode::NOT_FOUND, "CR-STO-0007", "account not found"),
+        Err(_) => {
+            return failure(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "CR-STO-0003",
+                "could not read account recovery state",
+            );
+        }
+    };
+    match crate::router_usage::reauth_cooldown_active(&state.store, id) {
+        Ok(true) => {
+            return failure(
+                StatusCode::CONFLICT,
+                "CR-OAU-0008",
+                "OAuth account is waiting for re-authentication",
+            );
+        }
+        Ok(false) => {}
+        Err(_) => {
+            return failure(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "CR-STO-0003",
+                "could not read account recovery cooldown",
+            );
+        }
+    }
     let result = probe_account_for_state(state, id, model).await;
     let probe = match result {
         Ok(probe) => probe,
         Err(failure_detail) => {
+            if failure_detail.upstream_status == Some(401) {
+                if let Err(error) = crate::router_usage::note_reauth_failure(&state.store, id) {
+                    let _ = state.logger.write(json!({
+                        "level":"ERROR",
+                        "event":"control.reauth_cooldown_write_failed",
+                        "account_id":id,
+                        "error_description":error.to_string(),
+                    }));
+                }
+            }
             let _ = state.logger.write(json!({
                 "level":"INFO",
                 "event":"control.account_recovery_probe_failed",
@@ -1604,6 +1951,19 @@ async fn recover_account_after_probe(state: &ControlState, id: i64, model: &str)
             return probe_failure_response(&failure_detail);
         }
     };
+    if let Err(error) = crate::router_usage::clear_reauth_cooldown(&state.store, id) {
+        let _ = state.logger.write(json!({
+            "level":"ERROR",
+            "event":"control.reauth_cooldown_clear_failed",
+            "account_id":id,
+            "error_description":error.to_string(),
+        }));
+        return failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CR-STO-0006",
+            "account probe succeeded but re-auth cooldown could not be cleared",
+        );
+    }
     let updated = state.store.with_connection(|connection| {
         connection.execute(
             "UPDATE accounts
@@ -1617,6 +1977,14 @@ async fn recover_account_after_probe(state: &ControlState, id: i64, model: &str)
         return failure(StatusCode::NOT_FOUND, "CR-STO-0007", "account not found");
     }
     if let Err(error) = sync_backend(state).await {
+        let _ = state.store.with_connection(|connection| {
+            connection.execute(
+                "UPDATE accounts SET status=?2,schedulable=?3,updated_at=CURRENT_TIMESTAMP
+                 WHERE id=?1 AND deleted_at IS NULL",
+                rusqlite::params![id, previous_status, previous_schedulable],
+            )?;
+            Ok(())
+        });
         let _ = state.logger.write(json!({
             "level":"ERROR",
             "event":"control.account_recovery_sync_failed",
@@ -1643,8 +2011,18 @@ async fn recover_account_after_probe(state: &ControlState, id: i64, model: &str)
 }
 
 async fn account_usage_for_state(state: &ControlState, id: i64) -> Response {
-    match crate::router_usage::query_account_usage(&state.store, &state.cli, &state.logger, id)
-        .await
+    let desktop_auth = state
+        .backend
+        .as_ref()
+        .map(|backend| backend.desktop_auth_path.as_path());
+    match crate::router_usage::query_account_usage(
+        &state.store,
+        &state.cli,
+        &state.logger,
+        desktop_auth,
+        id,
+    )
+    .await
     {
         Ok(crate::router_usage::AccountUsage::Found(value)) => success(value),
         Ok(crate::router_usage::AccountUsage::LiveUnavailable(value)) => {
@@ -1705,6 +2083,20 @@ pub async fn account_action(
         "models" => account_models_for_state(&state, id).await,
         "sync-upstream" => account_models_sync_upstream_for_state(&state, id).await,
         "test" => {
+            if is_desktop_owned_openai(&state, id) {
+                let _ = state.logger.write(json!({
+                    "level":"INFO",
+                    "event":"control.account_test_skipped",
+                    "account_id":id,
+                    "reason":"desktop_openai_auth_owner",
+                }));
+                return success(json!({
+                    "success":true,
+                    "account_id":id,
+                    "skipped":true,
+                    "reason":"desktop_openai_auth_owner",
+                }));
+            }
             let model = requested_probe_model(body.as_ref());
             match probe_account_for_state(&state, id, &model).await {
                 Ok(probe) => success(json!({
@@ -1734,21 +2126,27 @@ pub async fn account_action(
     }
 }
 
-fn account_auth_material(state: &ControlState, id: i64) -> Result<(String, String, Value)> {
+fn account_auth_material(
+    state: &ControlState,
+    id: i64,
+) -> Result<(String, String, String, bool, Value)> {
     state.store.with_connection(|connection| {
         let row = connection.query_row(
-            "SELECT account_type,auth_file,payload FROM accounts WHERE id=?1 AND deleted_at IS NULL",
+            "SELECT account_type,auth_file,status,schedulable,payload
+             FROM accounts WHERE id=?1 AND deleted_at IS NULL",
             rusqlite::params![id],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? != 0,
+                    row.get::<_, String>(4)?,
                 ))
             },
         )?;
-        let payload = serde_json::from_str(&row.2).unwrap_or_else(|_| json!({}));
-        Ok((row.0, row.1, payload))
+        let payload = serde_json::from_str(&row.4).unwrap_or_else(|_| json!({}));
+        Ok((row.0, row.1, row.2, row.3, payload))
     })
 }
 
@@ -1763,10 +2161,25 @@ const MODEL_SYNC_POLL_ATTEMPTS: usize = 20;
 const MODEL_SYNC_POLL_ATTEMPTS: usize = 3;
 
 async fn account_models_for_state(state: &ControlState, id: i64) -> Response {
-    let Ok((account_type, auth_file, payload)) = account_auth_material(state, id) else {
+    let Ok((account_type, auth_file, status, schedulable, payload)) =
+        account_auth_material(state, id)
+    else {
         return failure(StatusCode::NOT_FOUND, "CR-STO-0007", "account not found");
     };
     if account_type == "oauth" {
+        if status != "active"
+            || !schedulable
+            || !matches!(
+                crate::router_usage::reauth_cooldown_active(&state.store, id),
+                Ok(false)
+            )
+        {
+            return failure(
+                StatusCode::CONFLICT,
+                "CR-OAU-0008",
+                "OAuth account is not available for a live model query",
+            );
+        }
         let auth_file = std::path::Path::new(&auth_file)
             .file_name()
             .and_then(|value| value.to_str())
@@ -1776,6 +2189,17 @@ async fn account_models_for_state(state: &ControlState, id: i64) -> Response {
                 StatusCode::BAD_GATEWAY,
                 "CR-OAU-0008",
                 "OAuth account has no auth file",
+            );
+        }
+        if state
+            .backend
+            .as_ref()
+            .is_none_or(|backend| !backend.auth_dir.join(auth_file).is_file())
+        {
+            return failure(
+                StatusCode::BAD_GATEWAY,
+                "CR-CLI-0007",
+                "OAuth auth file is missing",
             );
         }
         return match state.cli.get(&cli_auth_file_models_path(auth_file)).await {
@@ -1799,12 +2223,57 @@ async fn account_models_for_state(state: &ControlState, id: i64) -> Response {
     success(json!({"items": items}))
 }
 
+fn account_platform(state: &ControlState, id: i64) -> Option<String> {
+    state
+        .store
+        .with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT platform FROM accounts WHERE id=?1 AND deleted_at IS NULL",
+                    rusqlite::params![id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(Into::into)
+        })
+        .ok()
+        .flatten()
+}
+
 async fn account_models_sync_upstream_for_state(state: &ControlState, id: i64) -> Response {
-    let Ok((account_type, auth_file, _payload)) = account_auth_material(state, id) else {
+    let Ok((account_type, auth_file, status, schedulable, _payload)) =
+        account_auth_material(state, id)
+    else {
         return failure(StatusCode::NOT_FOUND, "CR-STO-0007", "account not found");
     };
     if account_type != "oauth" {
         return account_models_for_state(state, id).await;
+    }
+    let platform = account_platform(state, id).unwrap_or_default();
+    if config_compiler::normalize_platform(&platform) == "openai" {
+        // Desktop is the sole refresh owner. Touching the replica to wake
+        // CLIProxyAPI's watcher was a remaining login-loop trigger: the CLI
+        // reprocessed the ChatGPT file on every 3-minute GUI self-check.
+        let _ = state.logger.write(json!({
+            "level":"INFO",
+            "event":"control.openai_sync_upstream_skipped",
+            "account_id":id,
+            "reason":"desktop_openai_auth_owner",
+        }));
+        return account_models_for_state(state, id).await;
+    }
+    if status != "active"
+        || !schedulable
+        || !matches!(
+            crate::router_usage::reauth_cooldown_active(&state.store, id),
+            Ok(false)
+        )
+    {
+        return failure(
+            StatusCode::CONFLICT,
+            "CR-OAU-0008",
+            "OAuth account is not available for an upstream model sync",
+        );
     }
     let auth_file = std::path::Path::new(&auth_file)
         .file_name()
@@ -2974,22 +3443,42 @@ fn materialize_oauth_account(
     };
     let identity = stable_identity_hmac(&platform, &format!("{identity_kind}:{identity_value}"));
     let existing_account = state.store.with_connection(|connection| {
-        connection
-            .query_row(
-                "SELECT id,COALESCE(json_extract(payload,'$.credentials.project_id'),'')
+        let mut statement = connection.prepare(
+                "SELECT id,COALESCE(json_extract(payload,'$.credentials.project_id'),''),auth_file,
+                    CASE WHEN stable_identity_hmac=?2 THEN 0 WHEN auth_file=?3 THEN 1 ELSE 2 END AS rank
                  FROM accounts
                  WHERE deleted_at IS NULL AND platform=?1
-                   AND (stable_identity_hmac=?2 OR auth_file=?3)
-                 ORDER BY id LIMIT 1",
-                rusqlite::params![platform, identity, auth_file],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()
-            .map_err(Into::into)
+                   AND (stable_identity_hmac=?2
+                       OR (?4<>'' AND COALESCE(json_extract(payload,'$.credentials.account_id'),
+                           json_extract(payload,'$.credentials.chatgpt_account_id'),'')=?4)
+                       OR (?4='' AND ?5<>'' AND json_extract(payload,'$.credentials.email')=?5)
+                       OR (?4='' AND ?5='' AND auth_file=?3))
+                  ORDER BY rank,id"
+        )?;
+        let matches = statement
+            .query_map(
+                rusqlite::params![platform, identity, auth_file, external_account_id, email],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let Some(best) = matches.first() else {
+            return Ok::<_, anyhow::Error>(None);
+        };
+        if matches.get(1).is_some_and(|next| next.3 == best.3) {
+            anyhow::bail!("OAuth identity matches multiple existing accounts");
+        }
+        Ok(Some((best.0, best.1.clone(), best.2.clone())))
     })?;
     let requested_project_id = json_string(body, "project_id").trim().to_owned();
     let project_id = if platform == "gemini" {
-        if let Some((_, stored_project_id)) = existing_account.as_ref() {
+        if let Some((_, stored_project_id, _)) = existing_account.as_ref() {
             if materialized_project_id.trim().is_empty() {
                 stored_project_id.trim().to_owned()
             } else {
@@ -3053,17 +3542,12 @@ fn materialize_oauth_account(
     let payload_text = payload.to_string();
 
     let (id, reused) = state.store.with_connection(|connection| {
-        let existing: Option<i64> = connection
-            .query_row(
-                "SELECT id FROM accounts WHERE deleted_at IS NULL AND platform=?1 AND (stable_identity_hmac=?2 OR auth_file=?3) ORDER BY id LIMIT 1",
-                rusqlite::params![platform, identity, auth_file],
-                |row| row.get(0),
-            )
-            .optional()?;
+        let existing = existing_account.as_ref().map(|(id, _, _)| *id);
         if let Some(id) = existing {
             connection.execute(
-                "UPDATE accounts SET auth_index=?2,auth_file=?3,status='active',schedulable=1,priority=?4,payload=?5 WHERE id=?1",
-                rusqlite::params![id, auth_index, auth_file, priority, payload_text],
+                "UPDATE accounts SET auth_index=?2,auth_file=?3,stable_identity_hmac=?4,
+                    status='active',schedulable=1,priority=?5,payload=?6 WHERE id=?1",
+                rusqlite::params![id, auth_index, auth_file, identity, priority, payload_text],
             )?;
             sync_account_groups(connection, id, &group_ids)?;
             Ok::<(i64, bool), anyhow::Error>((id, true))
@@ -3077,6 +3561,48 @@ fn materialize_oauth_account(
             Ok::<(i64, bool), anyhow::Error>((id, false))
         }
     })?;
+    if let (Some(backend), Some((_, _, old_auth_file))) =
+        (state.backend.as_ref(), existing_account.as_ref())
+    {
+        if !old_auth_file.eq_ignore_ascii_case(&auth_file) {
+            let shared = state.store.with_connection(|connection| {
+                let count: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM accounts WHERE id<>?1 AND deleted_at IS NULL
+                        AND auth_file=?2 COLLATE NOCASE",
+                    rusqlite::params![id, old_auth_file],
+                    |row| row.get(0),
+                )?;
+                Ok::<bool, anyhow::Error>(count > 0)
+            })?;
+            if !shared {
+                let old_name = std::path::Path::new(old_auth_file)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .context("existing OAuth auth file has no safe name")?;
+                let old_path = backend.auth_dir.join(old_name);
+                if old_path.is_file() {
+                    if let Err(error) = std::fs::remove_file(&old_path) {
+                        let _ = state.store.with_connection(|connection| {
+                            connection.execute(
+                                "UPDATE accounts SET status='error',schedulable=0,
+                                    updated_at=CURRENT_TIMESTAMP WHERE id=?1",
+                                rusqlite::params![id],
+                            )?;
+                            Ok(())
+                        });
+                        let _ = crate::router_usage::note_reauth_failure(&state.store, id);
+                        return Err(error).with_context(|| {
+                            format!("remove replaced OAuth auth file {old_name}")
+                        });
+                    }
+                }
+            }
+        }
+    }
+    // Reaching this point means CLI completed a fresh OAuth exchange and the
+    // resulting auth file was materialized. This is stronger evidence than a
+    // generic account edit that the rejected credential was replaced.
+    crate::router_usage::clear_reauth_cooldown(&state.store, id)?;
 
     let row = (
         id,
@@ -3478,80 +4004,24 @@ pub async fn openai_create_from_oauth(
         Ok(value) => value,
         Err(error) => return failure(StatusCode::BAD_GATEWAY, "CR-OAU-0008", &error.to_string()),
     };
-    let auth_file = json_string(&materialized, "auth_file");
-    let auth_index = json_string(&materialized, "auth_index");
-    let auth_index = if auth_index.is_empty() {
-        auth_file.trim_end_matches(".json").to_owned()
-    } else {
-        auth_index
-    };
-    if auth_index.is_empty() {
-        return failure(
-            StatusCode::BAD_GATEWAY,
-            "CR-OAU-0008",
-            "oauth produced no usable auth file",
-        );
-    }
-    let identity = stable_identity_hmac("openai", &auth_index);
-    let priority = body
-        .get("priority")
-        .and_then(Value::as_i64)
-        .unwrap_or(1)
-        .clamp(1, 999_999);
-    let name = json_string(&body, "name");
-    let name = if name.trim().is_empty() {
-        "ChatGPT OAuth".to_owned()
-    } else {
-        name
-    };
-    let group_ids = group_ids_from(&body);
-    let payload = json!({
-        "name": name,
-        "notes": json_string(&body, "notes"),
-        "extra": body.get("extra").cloned().unwrap_or_else(|| json!({})),
-    });
-    let result = state.store.with_connection(|connection| {
-        connection.execute(
-            "INSERT INTO accounts(platform,account_type,auth_index,auth_file,stable_identity_hmac,status,schedulable,priority,weight,payload) VALUES('openai','oauth',?1,?2,?3,'active',1,?4,1,?5)",
-            rusqlite::params![auth_index, auth_file, identity, priority, payload.to_string()],
-        )?;
-        let id = connection.last_insert_rowid();
-        sync_account_groups(connection, id, &group_ids)?;
-        Ok::<i64, anyhow::Error>(id)
-    });
-    match result {
-        Ok(id) => {
-            let _ = sync_backend(&state).await;
-            success(
-                json!({"id": id, "platform": "openai", "type": "oauth", "name": name, "status": "active"}),
-            )
-        }
-        Err(error) if error.to_string().contains("UNIQUE") => {
-            // Identity already registered: reuse the existing account row.
-            let existing = state.store.with_connection(|connection| {
-                let id: i64 = connection.query_row(
-                    "SELECT id FROM accounts WHERE stable_identity_hmac=?1 AND deleted_at IS NULL",
-                    rusqlite::params![identity],
-                    |row| row.get(0),
-                )?;
-                Ok(id)
-            });
-            match existing {
-                Ok(id) => success(
-                    json!({"id": id, "platform": "openai", "type": "oauth", "name": name, "status": "active", "reused": true}),
-                ),
-                Err(_) => failure(
-                    StatusCode::CONFLICT,
-                    "CR-STO-0008",
-                    "duplicate account identity",
-                ),
+    match materialize_oauth_account(&state, "openai", &body, &materialized) {
+        Ok(account) => match sync_backend(&state).await {
+            Ok(_) => success(account),
+            Err(error) => {
+                let _ = state.logger.write(json!({
+                    "level":"ERROR",
+                    "event":"control.oauth_relogin_sync_failed",
+                    "account_id":account.get("id"),
+                    "error_description":error.to_string(),
+                }));
+                failure(
+                    StatusCode::BAD_GATEWAY,
+                    "CR-CFG-0005",
+                    "OAuth login succeeded but backend sync failed",
+                )
             }
-        }
-        Err(_) => failure(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "CR-STO-0004",
-            "could not create OAuth account",
-        ),
+        },
+        Err(error) => failure(StatusCode::BAD_GATEWAY, "CR-OAU-0008", &error.to_string()),
     }
 }
 
@@ -3743,6 +4213,95 @@ mod tests {
     use axum::Router;
     use std::sync::Mutex;
     use tower::ServiceExt;
+
+    #[test]
+    fn openai_router_replica_consumes_desktop_access_token_without_refresh_token() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-router-openai-token-sync-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let desktop_auth = root.join("auth.json");
+        std::fs::write(
+            &desktop_auth,
+            r#"{"tokens":{"access_token":"desktop-access","refresh_token":"desktop-refresh","account_id":"acct"}}"#,
+        )
+        .unwrap();
+        let mut document = json!({
+            "type":"codex",
+            "access_token":"old-access",
+            "refresh_token":"old-refresh"
+        });
+        sync_openai_access_token(&mut document, &desktop_auth);
+        assert_eq!(document["access_token"], "desktop-access");
+        assert!(document.get("refresh_token").is_none());
+        let auth_dir = root.join("auth");
+        write_auth_file(
+            &auth_dir,
+            "codex-source",
+            &json!({"type":"codex","access_token":"a","refresh_token":"must-not-land"}),
+        )
+        .unwrap();
+        let written: Value =
+            serde_json::from_slice(&std::fs::read(auth_dir.join("codex-source.json")).unwrap())
+                .unwrap();
+        assert_eq!(written["access_token"], "a");
+        assert!(written.get("refresh_token").is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn openai_sync_upstream_does_not_touch_the_replica_file() {
+        let root =
+            std::env::temp_dir().join(format!("router-openai-sync-skip-{}", uuid::Uuid::now_v7()));
+        let auth_dir = root.join("auth");
+        std::fs::create_dir_all(&auth_dir).unwrap();
+        let replica = auth_dir.join("cr-router-oauth-1-1-codex.json");
+        let original = br#"{"type":"codex","access_token":"desktop-access"}"#;
+        std::fs::write(&replica, original).unwrap();
+        let mtime = std::fs::metadata(&replica).unwrap().modified().unwrap();
+        let store = Arc::new(StateStore::open(root.join("router-state.sqlite3")).unwrap());
+        store
+            .with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO accounts(id,platform,account_type,auth_index,auth_file,stable_identity_hmac,status,schedulable,priority,weight,payload) VALUES(1,'openai','oauth','codex','cr-router-oauth-1-1-codex.json','identity','active',1,1,1,'{}')",
+                    [],
+                )?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .unwrap();
+        let state = ControlState {
+            store,
+            cli: CliProxyManagementClient::new("http://127.0.0.1:1", "test-management-secret")
+                .unwrap(),
+            logger: Arc::new(StructuredLogger::open(root.join("router-events.jsonl")).unwrap()),
+            routes: Arc::new(RwLock::new(RouteTable::new(Vec::new()).unwrap())),
+            backend: Some(Arc::new(BackendPaths {
+                config_path: root.join("config.yaml"),
+                auth_dir: auth_dir.clone(),
+                downstream_key: "downstream".to_owned(),
+                management_secret: "test-management-secret".to_owned(),
+                cli_port: 1,
+                desktop_auth_path: root.join("desktop-auth.json"),
+            })),
+            cli_index_map: Arc::new(RwLock::new(HashMap::new())),
+        };
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let _ = account_models_sync_upstream_for_state(&state, 1).await;
+        assert_eq!(std::fs::read(&replica).unwrap(), original);
+        assert_eq!(
+            std::fs::metadata(&replica).unwrap().modified().unwrap(),
+            mtime,
+            "openai sync-upstream must not rewrite the Desktop-owned replica"
+        );
+        let leftover = auth_dir.join("legacy-openai-1.json");
+        std::fs::write(&leftover, br#"{"refresh_token":"dead"}"#).unwrap();
+        quarantine_legacy_openai_auth_files(&auth_dir, &state.logger);
+        assert!(!leftover.is_file());
+        assert!(auth_dir.join("legacy-openai-1.json.quarantined").is_file());
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn update_group_sql_binds_id_as_the_last_placeholder() {
@@ -4026,9 +4585,9 @@ mod tests {
             "router-account-probe-success-{}",
             uuid::Uuid::now_v7()
         ));
-        let (state, requests, server) = account_probe_test_state(&root, 200, "openai").await;
+        let (state, requests, server) = account_probe_test_state(&root, 200, "grok").await;
 
-        let response = recover_account_after_probe(&state, 1, "gpt-test").await;
+        let response = recover_account_after_probe(&state, 1, "grok-test").await;
 
         assert_eq!(response.status(), StatusCode::OK);
         let status: (String, i64) = state
@@ -4044,14 +4603,55 @@ mod tests {
             })
             .unwrap();
         assert_eq!(status, ("active".to_owned(), 1));
+        assert!(!crate::router_usage::reauth_cooldown_active(&state.store, 1).unwrap());
         let requests = requests.lock().unwrap_or_else(|error| error.into_inner());
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0]["auth_index"], "authoritative-probe-index");
         assert_eq!(
             requests[0]["url"],
-            "https://chatgpt.com/backend-api/codex/models?client_version=0.144.1"
+            "https://cli-chat-proxy.grok.com/v1/responses"
         );
 
+        server.abort();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn desktop_openai_recovery_does_not_touch_cli() {
+        let root = std::env::temp_dir().join(format!(
+            "router-openai-recovery-skip-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let (state, requests, server) = account_probe_test_state(&root, 200, "openai").await;
+        let response = recover_account_after_probe(&state, 1, "gpt-test").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["data"]["skipped"], true);
+        assert_eq!(body["data"]["reason"], "desktop_openai_auth_owner");
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .len(),
+            0,
+            "ChatGPT recovery must not send $TOKEN$ through CLIProxyAPI"
+        );
+        let status: (String, i64) = state
+            .store
+            .with_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT status,schedulable FROM accounts WHERE id=1",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(status, ("error".to_owned(), 0));
         server.abort();
         let _ = std::fs::remove_dir_all(root);
     }
@@ -4062,7 +4662,7 @@ mod tests {
             "router-account-probe-failure-{}",
             uuid::Uuid::now_v7()
         ));
-        let (state, _requests, server) = account_probe_test_state(&root, 401, "openai").await;
+        let (state, _requests, server) = account_probe_test_state(&root, 401, "grok").await;
 
         let response = recover_account_after_probe(&state, 1, "gpt-test").await;
 
@@ -4092,7 +4692,28 @@ mod tests {
             })
             .unwrap();
         assert_eq!(status, ("error".to_owned(), 0));
+        assert!(crate::router_usage::reauth_cooldown_active(&state.store, 1).unwrap());
 
+        server.abort();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn reauth_cooldown_blocks_recovery_without_touching_upstream() {
+        let root = std::env::temp_dir().join(format!(
+            "router-account-probe-cooldown-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let (state, requests, server) = account_probe_test_state(&root, 200, "grok").await;
+        crate::router_usage::note_reauth_failure(&state.store, 1).unwrap();
+
+        let response = recover_account_after_probe(&state, 1, "grok-test").await;
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_empty());
         server.abort();
         let _ = std::fs::remove_dir_all(root);
     }
@@ -4323,6 +4944,7 @@ mod tests {
                 downstream_key: "downstream".to_owned(),
                 management_secret: "test-management-secret".to_owned(),
                 cli_port: address.port(),
+                desktop_auth_path: root.join("desktop-auth.json"),
             })),
             cli_index_map: Arc::new(RwLock::new(HashMap::new())),
         };
@@ -4350,6 +4972,25 @@ mod tests {
                 .get("x-codex-router-error-code")
                 .and_then(|value| value.to_str().ok()),
             Some("CR-CLI-0007")
+        );
+
+        state
+            .store
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE accounts SET status='disabled',schedulable=0 WHERE id=1",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        *calls.lock().unwrap_or_else(|error| error.into_inner()) = (0, Some(0));
+        let disabled_response = account_models_sync_upstream_for_state(&state, 1).await;
+        assert_eq!(disabled_response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            calls.lock().unwrap_or_else(|error| error.into_inner()).0,
+            0,
+            "disabled OAuth model sync must not touch CLI"
         );
 
         server.abort();
@@ -4554,10 +5195,21 @@ mod tests {
         assert_eq!(first["credentials"]["project_id"], "selected-project");
         assert_eq!(first["extra"]["oauth_type"], "code_assist");
         assert_eq!(first["extra"]["tier_id"], "gcp_standard");
+        state
+            .store
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE accounts SET status='error',schedulable=0 WHERE id=1",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        crate::router_usage::note_reauth_failure(&state.store, 1).unwrap();
 
         let second_materialized = json!({
             "auth_file": "google-account-gemini-cli.json",
-            "auth_index": "cli-auth-1",
+            "auth_index": "cli-auth-2",
             "email": "user@example.com",
             "account_id": "google-account-1",
             "project_id": "project-2",
@@ -4566,7 +5218,29 @@ mod tests {
             materialize_oauth_account(&state, "gemini", &body, &second_materialized).unwrap();
         assert_eq!(second["id"], 1);
         assert_eq!(second["reused"], true);
+        assert_eq!(second["auth_index"], "cli-auth-2");
         assert_eq!(second["credentials"]["project_id"], "project-2");
+
+        let stored = state
+            .store
+            .with_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT auth_index,status,schedulable FROM accounts WHERE id=1",
+                        [],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, i64>(2)?,
+                            ))
+                        },
+                    )
+                    .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(stored, ("cli-auth-2".to_owned(), "active".to_owned(), 1));
+        assert!(!crate::router_usage::reauth_cooldown_active(&state.store, 1).unwrap());
 
         let count = state
             .store

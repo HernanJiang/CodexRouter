@@ -1,6 +1,6 @@
 [package]
 name = "codex-router"
-version = "2.1.4"
+version = "3.0.2"
 edition = "2021"
 
 [target.'cfg(windows)'.dependencies]
@@ -23,6 +23,7 @@ hmac = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 toml_edit = "0.22"
 zeroize = "1.8"
+zstd = "0.13"
 zip = { version = "4.6", default-features = false, features = ["deflate"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinHttp", "Win32_Networking_WinSock", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
 windows = { version = "0.61", features = ["Win32_System_Com", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
@@ -35,6 +36,7 @@ axum = { version = "0.8", features = ["ws"] }
 hyper = "1"
 hyper-util = { version = "0.1", features = ["tokio"] }
 futures-util = "0.3"
+flate2 = "1.1"
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream", "blocking"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde_yaml = "0.9"

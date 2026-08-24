@@ -178,6 +178,9 @@ fn maybe_recover_misdisabled_account(
 ) -> bool {
     let status = string(&task.account, "status");
     let schedulable = get(&task.account, "schedulable").and_then(Value::as_bool);
+    if status == "disabled" {
+        return false;
+    }
     let currently_disabled = status == "error" || schedulable == Some(false);
     let live_quota_usable = fresh && live_quota_is_usable(windows);
     let may_probe_without_live_quota =
@@ -194,7 +197,7 @@ fn maybe_recover_misdisabled_account(
         return false;
     }
     let recover_path = format!("/api/v1/admin/accounts/{id}/recover-state");
-    if retry_account_read(|| {
+    retry_account_read(|| {
         admin.post(
             &recover_path,
             None,
@@ -202,21 +205,6 @@ fn maybe_recover_misdisabled_account(
         )
     })
     .is_ok_and(|response| admin_action_succeeded(&response))
-    {
-        return true;
-    }
-    if !live_quota_usable {
-        return false;
-    }
-    let schedulable_path = format!("/api/v1/admin/accounts/{id}/schedulable");
-    retry_account_read(|| {
-        admin.post(
-            &schedulable_path,
-            Some(&json!({ "schedulable": true })),
-            remaining(deadline, Duration::from_secs(10))?,
-        )
-    })
-    .is_ok()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -458,6 +446,7 @@ pub(super) fn query_usage(
     profile_name: &str,
     cfg: &RouterConfig,
     deadline: Instant,
+    reconcile_recovery: bool,
 ) -> anyhow::Result<UsageSnapshot> {
     let admin = retry_admin_read(|| AdminClient::connect(router_root, cfg))?;
     let groups = data(retry_admin_read(|| {
@@ -499,6 +488,11 @@ pub(super) fn query_usage(
         let kind = string(account, "type");
         let name = string(account, "name");
         let selected_oauth = kind == "oauth" && oauth_ids.contains(&id);
+        // ChatGPT Desktop owns the OpenAI refresh token. Desktop-owned OpenAI
+        // accounts stay in the polling set, but the Host answers their usage
+        // route with a read-only direct fetch of Desktop's current access
+        // token, so no second refresh path through CLIProxyAPI exists. Other
+        // OAuth pools retain their normal CLIProxyAPI probing behavior.
         let selected_api = kind == "apikey"
             && api_channel_for_account(&api_channels, &name).is_some()
             && (group_id <= 0
@@ -522,7 +516,13 @@ pub(super) fn query_usage(
 
     let cache_path = usage_cache_path(router_root);
     let cache = Arc::new(Mutex::new(read_usage_cache(&cache_path)));
-    let mut records = query_accounts_bounded(tasks, admin.clone(), cache.clone(), deadline);
+    let mut records = query_accounts_bounded(
+        tasks,
+        admin.clone(),
+        cache.clone(),
+        deadline,
+        reconcile_recovery,
+    );
     let seen_api_names = records
         .iter()
         .filter(|record| record.account.kind != "oauth")
@@ -598,6 +598,7 @@ fn query_accounts_bounded(
     admin: AdminClient,
     cache: Arc<Mutex<UsageCache>>,
     deadline: Instant,
+    reconcile_recovery: bool,
 ) -> Vec<AccountRecord> {
     if tasks.is_empty() {
         return Vec::new();
@@ -615,7 +616,7 @@ fn query_accounts_bounded(
                 let task = queue.lock().ok().and_then(|mut queue| queue.pop_front());
                 let Some(task) = task else { break };
                 let fallback = task.clone();
-                let record = query_account(&admin, task, &cache, deadline).unwrap_or_else(|_| {
+                let record = query_account(&admin, task, &cache, deadline, reconcile_recovery).unwrap_or_else(|_| {
                     failed_account_record(&fallback, deadline <= Instant::now())
                 });
                 let _ = sender.send(record);
@@ -631,6 +632,7 @@ fn query_account(
     task: AccountTask,
     cache: &Arc<Mutex<UsageCache>>,
     deadline: Instant,
+    reconcile_recovery: bool,
 ) -> anyhow::Result<AccountRecord> {
     let id = integer(&task.account, "id");
     let kind = string(&task.account, "type");
@@ -639,6 +641,7 @@ fn query_account(
         .as_ref()
         .map(api_quota_pool_provider)
         .unwrap_or_else(|| string(&task.account, "platform")));
+    let desktop_owned_openai = kind == "oauth" && platform == "openai";
     let mut query_note = String::new();
     let stats = match retry_account_read(|| {
         admin.get(
@@ -654,7 +657,11 @@ fn query_account(
     };
     let mut usage = Value::Null;
     let mut grok_quota = Value::Null;
-    if kind == "oauth" {
+    let explicitly_disabled_oauth = kind == "oauth" && string(&task.account, "status") == "disabled";
+    // Desktop-owned OpenAI accounts are polled too: the Host serves this
+    // route with a read-only direct fetch of Desktop's current access token
+    // (never through CLIProxyAPI's refresh-capable $TOKEN$ path).
+    if kind == "oauth" && !explicitly_disabled_oauth {
         let path = if matches!(platform.as_str(), "grok" | "xai" | "x-ai") {
             format!("/api/v1/admin/grok/accounts/{id}/quota")
         } else {
@@ -698,32 +705,6 @@ fn query_account(
     add_standard_window(&mut windows, "monthly", get(&usage, "monthly"), "");
     let mut fresh =
         kind == "oauth" && live_usage_payload_is_fresh(&usage) && !windows.is_empty();
-    if kind == "oauth" && matches!(platform.as_str(), "openai" | "chatgpt") {
-        if let Ok(quota) = retry_account_read(|| {
-            admin.get(
-                &format!("/api/v1/admin/openai/accounts/{id}/quota"),
-                remaining(deadline, Duration::from_secs(10))?,
-            )
-        }) {
-            let quota = data(quota);
-            let quota_is_fresh = live_usage_payload_is_fresh(&quota);
-            if let Some(rate_limit) = get(&quota, "rate_limit") {
-                for name in ["primary_window", "secondary_window"] {
-                    if let Some(window) = get(rate_limit, name) {
-                        let seconds = integer(window, "limit_window_seconds");
-                        let kind = window_kind(seconds, "other");
-                        if let Some(candidate) = standard_window(&kind, window, "") {
-                            windows.retain(|item| item.kind != kind);
-                            windows.push(candidate);
-                            fresh |= quota_is_fresh;
-                        }
-                    }
-                }
-            }
-        } else if query_note.is_empty() {
-            query_note = "OpenAI quota refresh unavailable; showing cached usage.".to_owned();
-        }
-    }
     if kind == "oauth" && matches!(platform.as_str(), "grok" | "xai" | "x-ai") {
         let parsed = normalize_grok(if grok_quota.is_null() {
             &usage
@@ -841,10 +822,14 @@ fn query_account(
     }
     let was_unschedulable = string(&task.account, "status") == "error"
         || get(&task.account, "schedulable").and_then(Value::as_bool) == Some(false);
-    let recovered =
-        maybe_recover_misdisabled_account(admin, &task, &windows, fresh, &query_note, deadline);
-    let isolated =
-        maybe_isolate_exhausted_oauth_account(admin, &task, &windows, fresh, &query_note, deadline);
+    let recovered = reconcile_recovery
+        && !desktop_owned_openai
+        && !explicitly_disabled_oauth
+        && maybe_recover_misdisabled_account(admin, &task, &windows, fresh, &query_note, deadline);
+    let isolated = reconcile_recovery
+        && !desktop_owned_openai
+        && !explicitly_disabled_oauth
+        && maybe_isolate_exhausted_oauth_account(admin, &task, &windows, fresh, &query_note, deadline);
 
     let mut status = string(&task.account, "status");
     let mut schedulable = get(&task.account, "schedulable").and_then(Value::as_bool);
@@ -2626,20 +2611,16 @@ fn recover_oauth_account(
     router_group_id: i64,
     deadline: Instant,
 ) -> anyhow::Result<()> {
-    let _ = retry_account_read(|| {
+    let response = retry_account_read(|| {
         admin.post(
             &format!("/api/v1/admin/accounts/{account_id}/recover-state"),
             None,
             remaining(deadline, Duration::from_secs(10))?,
         )
-    });
-    retry_account_read(|| {
-        admin.post(
-            &format!("/api/v1/admin/accounts/{account_id}/schedulable"),
-            Some(&json!({ "schedulable": true })),
-            remaining(deadline, Duration::from_secs(10))?,
-        )
     })?;
+    if !admin_action_succeeded(&response) {
+        bail!("class=authentication")
+    }
     if router_group_id > 0 {
         let detail = data(retry_account_read(|| {
             admin.get(
@@ -2697,7 +2678,11 @@ fn reconcile_oauth_recovery_observations(
     let now = Utc::now();
     let active_account_ids = records
         .iter()
-        .filter(|record| record.account.kind == "oauth" && record.auto_isolate_on_exhaustion)
+        .filter(|record| {
+            record.account.kind == "oauth"
+                && record.account.status != "disabled"
+                && record.auto_isolate_on_exhaustion
+        })
         .map(|record| record.account.id)
         .collect::<HashSet<_>>();
     let mut observations_changed =
@@ -2706,7 +2691,11 @@ fn reconcile_oauth_recovery_observations(
 
     for record in records
         .iter_mut()
-        .filter(|record| record.account.kind == "oauth" && record.auto_isolate_on_exhaustion)
+        .filter(|record| {
+            record.account.kind == "oauth"
+                && record.account.status != "disabled"
+                && record.auto_isolate_on_exhaustion
+        })
     {
         let account_id = record.account.id;
         let observation_index = observations
@@ -3162,19 +3151,6 @@ pub(super) fn integer(value: &Value, name: &str) -> i64 {
         })
         .unwrap_or_default()
 }
-fn window_kind(seconds: i64, fallback: &str) -> String {
-    if seconds > 0 && seconds <= 21_600 {
-        "fiveHour"
-    } else if seconds > 21_600 && seconds <= 691_200 {
-        "weekly"
-    } else if seconds > 691_200 {
-        "monthly"
-    } else {
-        fallback
-    }
-    .to_owned()
-}
-
 fn volcengine_headers(
     access_key: &str,
     secret: &str,
@@ -3809,14 +3785,14 @@ mod tests {
     }
 
     #[test]
-    fn usable_quota_reenables_account_even_when_recovery_probe_fails() {
+    fn usable_quota_does_not_reenable_account_when_recovery_probe_fails() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_millis(750);
             let mut paths = Vec::new();
-            while Instant::now() < deadline && paths.len() < 2 {
+            while Instant::now() < deadline {
                 let (mut stream, _) = match listener.accept() {
                     Ok(connection) => connection,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -3865,7 +3841,7 @@ mod tests {
             auto_isolate_on_exhaustion: true,
         };
         let windows = vec![coding_window("weekly", 88.0, None, "")];
-        assert!(maybe_recover_misdisabled_account(
+        assert!(!maybe_recover_misdisabled_account(
             &admin,
             &task,
             &windows,
@@ -3875,7 +3851,75 @@ mod tests {
         ));
         let paths = server.join().unwrap();
         assert!(paths.iter().any(|path| path.contains("recover-state")));
-        assert!(paths.iter().any(|path| path.contains("/schedulable")));
+        assert!(paths.iter().all(|path| !path.contains("/schedulable")));
+    }
+
+    #[test]
+    fn disabled_oauth_recovery_batch_never_touches_credential_endpoints() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(500);
+            let mut paths = Vec::new();
+            while Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("mock server accept failed: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                let mut request = [0_u8; 4096];
+                let read = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or_default()
+                    .to_owned();
+                let body = r#"{"data":{"total_tokens":1}}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                paths.push(path);
+            }
+            paths
+        });
+        let admin = AdminClient {
+            client: Client::builder().no_proxy().build().unwrap(),
+            base_url: format!("http://{address}"),
+            bearer: Arc::new(Zeroizing::new("test-token".to_owned())),
+        };
+        let task = AccountTask {
+            account: json!({
+                "id": 1, "type": "oauth", "platform": "openai",
+                "status": "disabled", "schedulable": false
+            }),
+            channel: None,
+            query_provider_usage: false,
+            auto_isolate_on_exhaustion: true,
+        };
+
+        let record = query_account(
+            &admin,
+            task,
+            &Arc::new(Mutex::new(UsageCache::new())),
+            Instant::now() + Duration::from_secs(1),
+            true,
+        )
+        .unwrap();
+        let paths = server.join().unwrap();
+        assert_eq!(record.account.status, "disabled");
+        assert!(!record.routing_changed);
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("/stats"));
     }
 
     #[test]
@@ -4266,6 +4310,7 @@ mod tests {
             task,
             &cache,
             Instant::now() + Duration::from_secs(5),
+            false,
         )
         .unwrap();
         let usage_requests = server.join().unwrap();
@@ -4344,11 +4389,42 @@ mod tests {
             task,
             &Arc::new(Mutex::new(UsageCache::new())),
             Instant::now() + Duration::from_secs(3),
+            false,
         )
         .unwrap();
         let paths = server.join().unwrap();
 
         assert!(paths.iter().all(|path| !path.ends_with("/models")));
+    }
+
+    #[test]
+    fn ordinary_refresh_does_not_mutate_exhausted_oauth_scheduling() {
+        // The recovery worker owns schedulable/recover-state mutations. A
+        // dashboard refresh must remain observational even with live 100%
+        // quota evidence, otherwise every refresh can rebuild fallback routes.
+        let task = AccountTask {
+            account: json!({
+                "id": 42,
+                "type": "oauth",
+                "platform": "grok",
+                "status": "active",
+                "schedulable": true,
+            }),
+            channel: None,
+            query_provider_usage: false,
+            auto_isolate_on_exhaustion: true,
+        };
+        assert!(live_quota_is_exhausted(&[coding_window("weekly", 100.0, None, "")]));
+        // The explicit false flag passed by normal query_usage is asserted by
+        // the query pipeline; direct mutation helpers are reserved for true.
+        assert!(!maybe_isolate_exhausted_oauth_account(
+            &AdminClient::for_test("http://127.0.0.1:1".to_owned()),
+            &task,
+            &[coding_window("weekly", 100.0, None, "")],
+            false,
+            "",
+            Instant::now() + Duration::from_secs(1),
+        ));
     }
 
     #[test]
@@ -4429,6 +4505,7 @@ mod tests {
             task,
             &Arc::new(Mutex::new(UsageCache::new())),
             Instant::now() + Duration::from_secs(2),
+            true,
         )
         .unwrap();
         let paths = server.join().unwrap();
@@ -4509,6 +4586,7 @@ mod tests {
             task,
             &Arc::new(Mutex::new(UsageCache::new())),
             Instant::now() + Duration::from_secs(2),
+            true,
         )
         .unwrap();
         let paths = server.join().unwrap();
@@ -4575,6 +4653,7 @@ mod tests {
             task,
             &Arc::new(Mutex::new(UsageCache::new())),
             Instant::now() + Duration::from_secs(3),
+            false,
         )
         .unwrap();
         server.join().unwrap();
@@ -4636,6 +4715,7 @@ mod tests {
             task,
             &Arc::new(Mutex::new(UsageCache::new())),
             Instant::now() + Duration::from_secs(3),
+            false,
         )
         .unwrap();
         server.join().unwrap();
@@ -4703,6 +4783,7 @@ mod tests {
             "live-acceptance",
             &config,
             Instant::now() + Duration::from_secs(120),
+            false,
         )
         .expect("query the running Router");
         assert!(

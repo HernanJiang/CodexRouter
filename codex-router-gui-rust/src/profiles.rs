@@ -600,7 +600,15 @@ fn restore_full_state(
         &merged_config,
     );
     let config_content = (!merged_config.trim().is_empty()).then(|| merged_config.into_bytes());
-    let auth_content = if manifest.auth_present {
+    // Codex refreshes a live ChatGPT login in place, so auth.json is always
+    // newer than any snapshot of it. Re-feeding a snapshot's stale refresh
+    // token makes OpenAI's strict rotation policy revoke the whole token
+    // family (refresh_token_invalidated) and bounces Codex back to the login
+    // screen within one auth heartbeat. A restore must therefore never
+    // replace a currently valid ChatGPT login; only restore auth when the
+    // live file is absent or not a valid ChatGPT session.
+    let keep_current_auth = read_auth_info(&auth_target).valid_chatgpt;
+    let auth_content = if manifest.auth_present && !keep_current_auth {
         let auth_temp = codex_home.join(format!("{}.json.tmp", timestamp_id("auth-restore")));
         let result = (|| {
             logic::unprotect_file_for_current_user(&source.join("auth.json.dpapi"), &auth_temp)
@@ -619,7 +627,9 @@ fn restore_full_state(
     let original_auth = read_optional(&auth_target)?;
     let commit = (|| -> anyhow::Result<()> {
         replace_optional(&config_target, config_content.as_deref())?;
-        replace_optional(&auth_target, auth_content.as_deref())?;
+        if !keep_current_auth {
+            replace_optional(&auth_target, auth_content.as_deref())?;
+        }
         Ok(())
     })();
     if let Err(error) = commit {
@@ -668,6 +678,10 @@ fn optional_toml_string(document: &DocumentMut, key: &str) -> anyhow::Result<Opt
     }
 }
 
+fn is_router_provider_label(name: Option<&str>) -> bool {
+    matches!(name, Some("Codex-Router") | Some("OpenAI"))
+}
+
 fn router_requires_openai_auth(document: &DocumentMut) -> Option<bool> {
     let provider_id = document.get("model_provider")?.as_str()?;
     let provider = document
@@ -675,7 +689,7 @@ fn router_requires_openai_auth(document: &DocumentMut) -> Option<bool> {
         .as_table_like()?
         .get(provider_id)?
         .as_table_like()?;
-    if provider.get("name").and_then(Item::as_str) != Some("Codex-Router") {
+    if !is_router_provider_label(provider.get("name").and_then(Item::as_str)) {
         return None;
     }
     provider.get("requires_openai_auth")?.as_bool()
@@ -702,7 +716,7 @@ fn prepare_account_mode_config(
         .and_then(|providers| providers.get(&provider_id))
         .and_then(Item::as_table_like)
         .context("当前 Codex Router 模型提供方配置不完整")?;
-    if provider.get("name").and_then(Item::as_str) != Some("Codex-Router") {
+    if !is_router_provider_label(provider.get("name").and_then(Item::as_str)) {
         bail!("当前 Codex 模型提供方不是 Codex-Router，已停止账号切换");
     }
     let base_url = provider
@@ -721,8 +735,9 @@ fn prepare_account_mode_config(
         .and_then(Item::as_str)
         .unwrap_or("")
         .to_owned();
-    let require_openai_auth = current_model.trim().is_empty()
-        || crate::logic::responses_compat::is_openai_family_model(&current_model);
+    let _ = current_model;
+    let (require_openai_auth, display_openai_provider) =
+        crate::logic::codex_toml::legal_codex_provider_identity(false, false);
     let provider = document
         .get_mut("model_providers")
         .and_then(Item::as_table_like_mut)
@@ -732,6 +747,14 @@ fn prepare_account_mode_config(
     provider.insert(
         "requires_openai_auth",
         toml_edit::value(require_openai_auth),
+    );
+    provider.insert(
+        "name",
+        toml_edit::value(if display_openai_provider {
+            "OpenAI"
+        } else {
+            "Codex-Router"
+        }),
     );
 
     match target {
@@ -965,35 +988,23 @@ pub fn restore_official_account_mode(router_root: &Path, cfg: &RouterConfig) -> 
     let document = config
         .parse::<DocumentMut>()
         .context("Codex config.toml 不是有效 TOML")?;
-    let current_auth = read_optional(&auth_path)?;
-    let (auth, forced_login_method, credentials_store) = if read_auth_info(&auth_path).valid_chatgpt
-    {
-        (
-            current_auth.context("Codex 官方登录状态不可读")?,
-            optional_toml_string(&document, "forced_login_method")?,
-            optional_toml_string(&document, "cli_auth_credentials_store")?,
-        )
-    } else {
-        let (auth, manifest) = load_official_auth_snapshot(router_root)?;
-        (
-            auth,
-            manifest.forced_login_method,
-            manifest.credentials_store,
-        )
-    };
+    let forced_login_method = optional_toml_string(&document, "forced_login_method")?;
+    let credentials_store = optional_toml_string(&document, "cli_auth_credentials_store")?;
+    // Never feed a historical auth snapshot back into Desktop: its refresh
+    // token may already be rotated out, and re-presenting it revokes the
+    // account's whole token family (refresh_token_invalidated). Restore the
+    // official-mode config only; if auth.json is not a live ChatGPT session
+    // the user completes one fresh login in Codex.
     let official_config = prepare_account_mode_config(
         &config,
         CodexAccountMode::Official,
         forced_login_method.as_deref(),
         credentials_store.as_deref(),
     )?;
-    replace_codex_account_state(
-        &config_path,
-        official_config.as_bytes(),
-        &auth_path,
-        Some(&auth),
-    )?;
-    if codex_account_mode_status(router_root, cfg).mode != CodexAccountMode::Official {
+    atomic_write(&config_path, official_config.as_bytes())?;
+    if read_auth_info(&auth_path).valid_chatgpt
+        && codex_account_mode_status(router_root, cfg).mode != CodexAccountMode::Official
+    {
         bail!("Codex 官方账号模式提交后校验失败");
     }
     Ok(())
@@ -1129,7 +1140,7 @@ pub(crate) fn merge_codex_route_config(current: &str, target: &str) -> anyhow::R
                     .and_then(Item::as_table_like)
                     .and_then(|provider| provider.get("name"))
                     .and_then(Item::as_str)
-                    == Some("Codex-Router")
+                    .is_some_and(|name| is_router_provider_label(Some(name)))
         })
         .map(str::to_owned);
     for key in [
@@ -1188,7 +1199,7 @@ pub(crate) fn merge_codex_route_config(current: &str, target: &str) -> anyhow::R
                     .as_table_like()
                     .and_then(|table| table.get("name"))
                     .and_then(Item::as_str)
-                    == Some("Codex-Router");
+                    .is_some_and(|name| is_router_provider_label(Some(name)));
             let providers = current_doc
                 .get_mut("model_providers")
                 .and_then(Item::as_table_like_mut)
@@ -1206,7 +1217,7 @@ pub(crate) fn merge_codex_route_config(current: &str, target: &str) -> anyhow::R
                         .and_then(Item::as_table_like)
                         .and_then(|table| table.get("name"))
                         .and_then(Item::as_str)
-                        == Some("Codex-Router");
+                        .is_some_and(|name| is_router_provider_label(Some(name)));
                     if remove_legacy_custom {
                         providers.remove("custom");
                     }
@@ -1276,57 +1287,13 @@ fn restore_snapshot_auth(source: &Path, cfg: &RouterConfig) -> anyhow::Result<()
 /// snapshot. Existing auth state is never replaced, including API or external
 /// auth managed outside Codex-Router.
 pub fn recover_missing_chatgpt_auth(
-    router_root: &Path,
-    cfg: &RouterConfig,
+    _router_root: &Path,
+    _cfg: &RouterConfig,
 ) -> anyhow::Result<bool> {
-    if cfg.auth_mode != "chatgpt_oauth" {
-        return Ok(false);
-    }
-    let auth_target = logic::resolve_codex_home(cfg).join("auth.json");
-    if auth_target.exists() {
-        return Ok(false);
-    }
-
-    if let Ok((auth, _)) = load_official_auth_snapshot(router_root) {
-        atomic_write(&auth_target, &auth)?;
-        return Ok(read_auth_info(&auth_target).valid_chatgpt);
-    }
-
-    let mut candidates = Vec::new();
-    let original = original_root(router_root);
-    if original.join("state.json").is_file() {
-        candidates.push(original);
-    }
-    let history = history_root(router_root);
-    if history.is_dir() {
-        let mut entries = std::fs::read_dir(history)?
-            .filter_map(Result::ok)
-            .filter(|entry| entry.path().join("state.json").is_file())
-            .map(|entry| entry.path())
-            .collect::<Vec<_>>();
-        entries.sort_by(|left, right| right.file_name().cmp(&left.file_name()));
-        candidates.splice(0..0, entries);
-    }
-
-    for source in candidates {
-        let Ok(manifest) = std::fs::read_to_string(source.join("state.json"))
-            .ok()
-            .and_then(|text| serde_json::from_str::<StateManifest>(&text).ok())
-            .ok_or(())
-        else {
-            continue;
-        };
-        if !manifest.auth_present
-            || !read_snapshot_auth_info(&source, &manifest).is_ok_and(|info| info.valid_chatgpt)
-        {
-            continue;
-        }
-        restore_snapshot_auth(&source, cfg)?;
-        if read_auth_info(&auth_target).valid_chatgpt {
-            return Ok(true);
-        }
-        clear_optional_file(&auth_target)?;
-    }
+    // A historical snapshot may contain a refresh token that OpenAI has
+    // already rotated or revoked. Never feed that token back into Desktop;
+    // the user must complete a fresh login in Codex when auth.json is absent.
+    // Router's OpenAI path consumes only Desktop's current access token.
     Ok(false)
 }
 
@@ -1388,7 +1355,7 @@ fn sanitize_router_config(text: &str) -> String {
                     .and_then(Item::as_table_like)
                     .and_then(|provider| provider.get("name"))
                     .and_then(Item::as_str)
-                    == Some("Codex-Router")
+                    .is_some_and(|name| is_router_provider_label(Some(name)))
         })
         .map(str::to_owned);
     let dormant_router_provider = document
@@ -1398,7 +1365,7 @@ fn sanitize_router_config(text: &str) -> String {
         .and_then(Item::as_table_like)
         .and_then(|provider| provider.get("name"))
         .and_then(Item::as_str)
-        == Some("Codex-Router");
+        .is_some_and(|name| is_router_provider_label(Some(name)));
     if active_router_provider.is_none() && !dormant_router_provider {
         return text.to_owned();
     }
@@ -1434,7 +1401,7 @@ fn sanitize_router_config(text: &str) -> String {
             .and_then(Item::as_table_like)
             .and_then(|table| table.get("name"))
             .and_then(Item::as_str)
-            == Some("Codex-Router");
+            .is_some_and(|name| is_router_provider_label(Some(name)));
         if remove_legacy_custom {
             providers.remove("custom");
         }
@@ -2092,7 +2059,7 @@ requires_openai_auth = false
         let restored =
             prepare_account_mode_config(input, CodexAccountMode::Official, None, None).unwrap();
         assert!(restored.contains("name = \"Codex-Router\""));
-        assert!(restored.contains("requires_openai_auth = true"));
+        assert!(restored.contains("requires_openai_auth = false"));
         assert!(!restored.contains("forced_login_method"));
     }
 
@@ -2562,7 +2529,7 @@ experimental_bearer_token = "local-key"
         .unwrap();
         restore_official_account_mode(&root, &cfg).unwrap();
         let restored = std::fs::read_to_string(codex_home.join("config.toml")).unwrap();
-        assert!(restored.contains("requires_openai_auth = true"));
+        assert!(restored.contains("requires_openai_auth = false"));
         assert!(codex_home.join("auth.json").exists());
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -2720,7 +2687,7 @@ experimental_bearer_token = "local-router-secret"
     }
 
     #[test]
-    fn isolated_restore_recovers_snapshot_auth_when_sharing_is_disabled() {
+    fn isolated_restore_keeps_live_chatgpt_login_instead_of_replaying_snapshot() {
         let root = temporary_test_dir("isolated-different-account");
         let codex_home = root.join("codex-home");
         std::fs::create_dir_all(&codex_home).unwrap();
@@ -2759,9 +2726,13 @@ command = "user-mcp.exe"
 
         assert!(!outcome.shared_state_preserved);
         assert!(outcome.account_changed);
+        // A live ChatGPT login is always newer than a snapshot of it.
+        // Replaying the snapshot's stale refresh token makes OpenAI revoke
+        // the token family (refresh_token_invalidated) and bounces Codex
+        // back to the login screen, so the restore keeps the live login.
         assert_eq!(
             std::fs::read_to_string(codex_home.join("auth.json")).unwrap(),
-            account_a
+            account_b
         );
         let restored_config = std::fs::read_to_string(codex_home.join("config.toml")).unwrap();
         assert!(restored_config.contains("model = \"account-a\""));
@@ -2771,6 +2742,42 @@ command = "user-mcp.exe"
         assert!(restored_config.contains("command = \"user-mcp.exe\""));
         assert!(!restored_config.contains("Codex-Router"));
         assert!(!restored_config.contains("router-secret"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn isolated_restore_recovers_snapshot_auth_when_no_live_login_exists() {
+        let root = temporary_test_dir("isolated-no-live-login");
+        let codex_home = root.join("codex-home");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::fs::write(codex_home.join("config.toml"), "model = \"account-a\"\n").unwrap();
+        let account_a =
+            r#"{"auth_mode":"chatgpt","tokens":{"account_id":"account-a","access_token":"old"}}"#;
+        std::fs::write(codex_home.join("auth.json"), account_a).unwrap();
+        let mut cfg = RouterConfig::default();
+        cfg.deploy.codex_home = codex_home.display().to_string();
+        ensure_original_codex_snapshot(&root, &cfg).unwrap();
+
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "model_provider = \"custom\"\nmodel = \"router-model\"\n",
+        )
+        .unwrap();
+        // No live ChatGPT login: restoring the snapshot's login is the only
+        // way back to the official profile, and nothing live can be harmed.
+        std::fs::write(
+            codex_home.join("auth.json"),
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-external"}"#,
+        )
+        .unwrap();
+        let outcome = restore_original_codex(&root, &cfg, false).unwrap();
+
+        assert!(!outcome.shared_state_preserved);
+        assert!(outcome.auth_available);
+        assert_eq!(
+            std::fs::read_to_string(codex_home.join("auth.json")).unwrap(),
+            account_a
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2914,11 +2921,8 @@ command = "user-mcp.exe"
         capture_restore_point(&root, &cfg, "valid ChatGPT login").unwrap();
         std::fs::remove_file(codex_home.join("auth.json")).unwrap();
 
-        assert!(recover_missing_chatgpt_auth(&root, &cfg).unwrap());
-        assert_eq!(
-            std::fs::read_to_string(codex_home.join("auth.json")).unwrap(),
-            auth
-        );
+        assert!(!recover_missing_chatgpt_auth(&root, &cfg).unwrap());
+        assert!(!codex_home.join("auth.json").exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

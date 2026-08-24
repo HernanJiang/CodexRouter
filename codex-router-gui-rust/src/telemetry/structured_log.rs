@@ -147,10 +147,14 @@ impl TerminalSpanGuard {
 impl Drop for TerminalSpanGuard {
     fn drop(&mut self) {
         if let Some(logger) = self.logger.take() {
+            // Client abort, stream drop, and early-return races are common on
+            // the data plane. They are not internal invariant breaks: logging
+            // them as HTTP 500 CR-SYS-0001 made POST /v1/responses look like a
+            // Router crash when Codex had simply closed the socket.
             let _ = logger.write(json!({
                 "schema_version": SCHEMA_VERSION,
                 "timestamp": timestamp(),
-                "level": "ERROR",
+                "level": "INFO",
                 "event": "request.completed",
                 "request_id": self.request_id,
                 "trace_id": self.request_id,
@@ -158,11 +162,11 @@ impl Drop for TerminalSpanGuard {
                 "parent_span_id": "ingress",
                 "interface_name": self.interface,
                 "chain_node": "request_end",
-                "status": "internal_error",
-                "http_status": 500,
+                "status": "cancelled",
+                "http_status": Value::Null,
                 "attempts": 1,
-                "error_code": "CR-SYS-0001",
-                "error_description": "terminal span was not completed explicitly",
+                "error_code": Value::Null,
+                "error_description": "request ended before an explicit terminal span",
                 "retryable": false,
             }));
         }
@@ -385,5 +389,24 @@ mod tests {
         let lines = std::fs::read_to_string(&path).unwrap();
         assert_eq!(lines.lines().count(), 1);
         assert!(lines.contains("\"event\":\"request.completed\""));
+    }
+
+    #[test]
+    fn terminal_guard_drop_is_cancelled_not_internal_error() {
+        let root = std::env::temp_dir().join(format!(
+            "router-log-drop-{}-{uuid}",
+            std::process::id(),
+            uuid = Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("events.jsonl");
+        let logger = Arc::new(StructuredLogger::open(&path).unwrap());
+        drop(TerminalSpanGuard::new(logger.clone(), "req-drop", "test"));
+        let lines = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(lines.lines().count(), 1);
+        assert!(lines.contains("\"status\":\"cancelled\""));
+        assert!(!lines.contains("CR-SYS-0001"));
+        assert!(!lines.contains("internal_error"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

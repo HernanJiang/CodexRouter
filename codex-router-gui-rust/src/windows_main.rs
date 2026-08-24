@@ -61,7 +61,7 @@ const RECOVERY_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_s
 const BACKGROUND_SELF_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3 * 60);
 const OAUTH_RECOVERY_MAX_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(5 * 60 * 60);
-const DEFAULT_ROUTER_REQUIRES_OPENAI_AUTH: bool = true;
+const DEFAULT_ROUTER_REQUIRES_OPENAI_AUTH: bool = false;
 const HEALTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 const API_MODEL_VALIDATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 const EXIT_CONFIG_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -1698,9 +1698,43 @@ where
         share_codex_state,
         router_mode_configured,
     )?;
-    logic::codex_toml::remove_codex_system_binding_from(system_config_path)
-        .map(|_| ())
-        .context("could not remove the system-layer Router binding during exit")
+    persist_legal_system_binding_for_exit(router_root, &stop_config, system_config_path)
+}
+
+fn persist_legal_system_binding_for_exit(
+    router_root: &Path,
+    config: &RouterConfig,
+    system_config_path: &Path,
+) -> anyhow::Result<()> {
+    // Closing Router used to delete %ProgramData%\OpenAI\Codex\config.toml.
+    // Desktop then falls through to ChatGPT OAuth (`requires_openai_auth=true`)
+    // the next time it strips the user file, which is the login loop. Keep a
+    // legal system identity instead; factory restore still removes it.
+    match codex_router_lib::control_plane::desktop_session::repair_provider_identity_file(
+        system_config_path,
+    ) {
+        codex_router_lib::control_plane::desktop_session::IdentityRepair::AlreadyLegal
+        | codex_router_lib::control_plane::desktop_session::IdentityRepair::Repaired => {
+            return Ok(());
+        }
+        codex_router_lib::control_plane::desktop_session::IdentityRepair::Missing
+        | codex_router_lib::control_plane::desktop_session::IdentityRepair::Failed => {}
+    }
+    let local_key = match logic::ensure_local_api_key() {
+        Ok(key) if !key.trim().is_empty() => key,
+        _ => return Ok(()),
+    };
+    let base_url = logic::responses_gateway::responses_gateway_url(&config.deploy.sub2api_host)
+        .unwrap_or_else(|_| config.deploy.sub2api_host.clone());
+    logic::codex_toml::write_codex_system_binding_to(
+        system_config_path,
+        &user_data::state_root(router_root).join("model-catalog.json"),
+        &local_key,
+        &base_url,
+        false,
+        false,
+        config.rate_limit_max_retries,
+    )
 }
 
 fn restore_codex_for_exit(
@@ -6788,7 +6822,9 @@ impl CodexRouterApp {
     }
 
     /// Detect another process overwriting Codex's local Router binding. This
-    /// only probes; the user decides through the overwrite prompt whether the
+    /// only probes and never writes config.toml: a periodic rewrite reloads
+    /// Codex Desktop's OAuth manager and can collide with OpenAI token
+    /// rotation. The user decides through the overwrite prompt whether the
     /// Router standard config is written back, the overwritten file is kept,
     /// or Codex returns to its factory defaults. Never touches auth.json, so
     /// an active ChatGPT account and task remain intact.
@@ -6940,13 +6976,17 @@ impl CodexRouterApp {
                     return;
                 }
             };
-            let require_openai_auth = !cfg.auth_mode.trim().eq_ignore_ascii_case("local_api_key");
+            let display_openai_provider =
+                crate::logic::codex_toml::login_prefers_chatgpt_identity(
+                    &crate::logic::resolve_codex_home(&cfg),
+                    &cfg,
+                );
             match crate::logic::codex_toml::write_codex_system_binding(
                 &catalog_path,
                 &local_key,
                 &base_url,
-                require_openai_auth,
-                false,
+                display_openai_provider,
+                display_openai_provider,
                 cfg.rate_limit_max_retries,
             ) {
                 Ok(()) => {
@@ -9062,7 +9102,7 @@ fn try_cli_mode() -> Option<anyhow::Result<()>> {
         let mut reasoning_effort = "medium".to_owned();
         let mut fast_mode = false;
         let mut require_openai_auth = DEFAULT_ROUTER_REQUIRES_OPENAI_AUTH;
-        let mut display_openai_provider = false;
+        let mut display_openai_provider = DEFAULT_ROUTER_REQUIRES_OPENAI_AUTH;
         let mut permission_source_path = None;
         let mut read_local_api_key_from_stdin = false;
         let mut max_retries = crate::logic::responses_gateway::DEFAULT_RATE_LIMIT_RETRIES;
@@ -9130,6 +9170,11 @@ fn try_cli_mode() -> Option<anyhow::Result<()>> {
             None
         };
 
+        let (require_openai_auth, display_openai_provider) =
+            crate::logic::codex_toml::legal_codex_provider_identity(
+                require_openai_auth,
+                display_openai_provider,
+            );
         crate::logic::codex_toml::write_codex_router_config(
             Path::new(&codex_home),
             &model,
@@ -9142,7 +9187,20 @@ fn try_cli_mode() -> Option<anyhow::Result<()>> {
             display_openai_provider,
             max_retries,
             permission_source.as_deref(),
-        )
+        )?;
+        // CLI write-codex-config used to skip the system layer. Desktop 26.818
+        // still loads %ProgramData%\OpenAI\Codex\config.toml; leaving
+        // requires_openai_auth=true there re-arms getAuthStatus refresh.
+        // A missing admin ACL must not fail the user-layer write.
+        let _ = crate::logic::codex_toml::write_codex_system_binding(
+            Path::new(&catalog),
+            &local_key,
+            &base_url,
+            require_openai_auth,
+            display_openai_provider,
+            max_retries,
+        );
+        Ok(())
     })())
 }
 
@@ -9886,7 +9944,7 @@ mod main_tests {
             next_failed_oauth_recovery(now).duration_since(now),
             std::time::Duration::from_secs(3 * 60)
         );
-        const { assert!(super::DEFAULT_ROUTER_REQUIRES_OPENAI_AUTH) };
+        const { assert!(!super::DEFAULT_ROUTER_REQUIRES_OPENAI_AUTH) };
         assert!(scheduled_usage_refresh_is_due(true, Some(now), now));
         assert_eq!(
             oauth_recovery_schedule_delay(1),
@@ -10529,6 +10587,59 @@ mod main_tests {
             std::fs::read_to_string(&system_binding).unwrap(),
             "model_provider = \"codex_router\"\n"
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exit_keeps_a_legal_system_identity_instead_of_deleting_it() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-router-exit-keep-system-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let codex_home = root.join("codex-home");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let mut config = RouterConfig::default();
+        config.deploy.codex_home = codex_home.to_string_lossy().into_owned();
+        config.deploy.sub2api_host = "http://127.0.0.1:18082".into();
+        config.save(&root.join("codex-router-config.json")).unwrap();
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "model = \"official-before-router\"\n",
+        )
+        .unwrap();
+        super::profiles::ensure_original_codex_snapshot(&root, &config).unwrap();
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "model_provider = \"codex_router\"\nmodel = \"router-model\"\n\
+             [model_providers.codex_router]\nname = \"OpenAI\"\n\
+             base_url = \"http://127.0.0.1:18082/v1\"\n\
+             requires_openai_auth = true\n",
+        )
+        .unwrap();
+        let system_binding = root.join("system-config.toml");
+        std::fs::write(
+            &system_binding,
+            "[model_providers.codex_router]\nname = \"OpenAI\"\nrequires_openai_auth = true\n",
+        )
+        .unwrap();
+
+        restore_codex_and_stop_router_for_exit_with(
+            &root,
+            &config,
+            true,
+            &system_binding,
+            |_, _| Ok(()),
+        )
+        .unwrap();
+
+        let system = std::fs::read_to_string(&system_binding).unwrap();
+        assert!(system.contains("requires_openai_auth = false"));
+        assert!(system.contains("name = \"Codex-Router\""));
+        assert!(system_binding.is_file(), "exit must not delete the system layer");
         std::fs::remove_dir_all(root).unwrap();
     }
 

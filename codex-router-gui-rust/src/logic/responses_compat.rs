@@ -120,6 +120,10 @@ fn looks_like_xai_compaction_blob(value: &str) -> bool {
 }
 
 pub fn prepare_xai_official_compact_request(body: &mut Value) {
+    prepare_official_compact_request(body);
+}
+
+pub fn prepare_official_compact_request(body: &mut Value) {
     let Some(object) = body.as_object_mut() else {
         return;
     };
@@ -127,11 +131,13 @@ pub fn prepare_xai_official_compact_request(body: &mut Value) {
         "stream",
         "tools",
         "tool_choice",
+        "parallel_tool_calls",
         "temperature",
         "top_p",
         "top_k",
         "stop",
         "max_output_tokens",
+        "max_tokens",
         "include",
         "reasoning",
         "text",
@@ -1814,11 +1820,42 @@ pub fn is_unsupported_image_error(body: &str) -> bool {
 }
 
 pub fn rewrite_poisoned_upstream_status(status: u16, body: &str) -> u16 {
+    if status == 401 {
+        // Codex Desktop with requires_openai_auth=true treats a 401 from the
+        // local provider as "ChatGPT login died" and bounces to the login
+        // page. Router requests use an independent bearer; an upstream
+        // ChatGPT 401 must never leak through as an authentication failure.
+        return 503;
+    }
     if should_retry_after_upstream_error(status, body) && matches!(status, 500 | 502 | 503) {
         400
     } else {
         rewrite_exhausted_account_status(status, body)
     }
+}
+
+/// Replace an upstream 401 envelope with a non-auth error so Desktop cannot
+/// escalate it into a forced ChatGPT login. Other statuses are returned
+/// unchanged (body copied).
+pub fn shield_desktop_auth_failure(status: u16, body: &[u8]) -> (u16, Vec<u8>) {
+    if status != 401 {
+        return (status, body.to_vec());
+    }
+    let payload = serde_json::json!({
+        "error": {
+            "message": "model temporarily unavailable",
+            "type": "codex_router_error",
+            "param": null,
+            "code": "CR-UP-0011"
+        }
+    });
+    (
+        503,
+        serde_json::to_vec(&payload).unwrap_or_else(|_| {
+            br#"{"error":{"message":"model temporarily unavailable","type":"codex_router_error","code":"CR-UP-0011"}}"#
+                .to_vec()
+        }),
+    )
 }
 
 pub fn rewrite_exhausted_account_status(status: u16, body: &str) -> u16 {
@@ -1844,11 +1881,36 @@ pub fn is_exhausted_account_status(status: u16, body: &str) -> bool {
         || lower.contains("rate_limit")
         || lower.contains("rate limit")
         || lower.contains("service temporarily unavailable")
+        || lower.contains("model temporarily unavailable")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_auth_shield_rewrites_401_to_non_auth_503() {
+        let (status, body) = shield_desktop_auth_failure(
+            401,
+            br#"{"error":{"message":"unauthenticated","type":"invalid_request_error","code":"invalid_api_key"}}"#,
+        );
+        assert_eq!(status, 503);
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["type"], "codex_router_error");
+        assert_eq!(payload["error"]["code"], "CR-UP-0011");
+        assert_eq!(payload["error"]["message"], "model temporarily unavailable");
+        assert!(!String::from_utf8_lossy(&body)
+            .to_ascii_lowercase()
+            .contains("unauthenticated"));
+        assert!(!String::from_utf8_lossy(&body).contains("401"));
+        assert_eq!(
+            rewrite_poisoned_upstream_status(401, "unauthenticated"),
+            503
+        );
+        let (ok_status, ok_body) = shield_desktop_auth_failure(429, b"rate limit");
+        assert_eq!(ok_status, 429);
+        assert_eq!(ok_body, b"rate limit");
+    }
 
     #[test]
     fn openai_family_detection_covers_chatgpt_slugs() {
@@ -1899,6 +1961,37 @@ mod tests {
         prepare_xai_official_compact_request(&mut body);
         assert!(body.get("stream").is_none());
         assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn chatgpt_official_compact_request_drops_generation_controls() {
+        let mut body = json!({
+            "model": "gpt-5.6-sol",
+            "stream": true,
+            "tools": [{"type":"function","name":"exec_command"}],
+            "tool_choice": "auto",
+            "parallel_tool_calls": true,
+            "include": ["reasoning.encrypted_content"],
+            "max_output_tokens": 128000,
+            "reasoning": {"effort": "high"},
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "compact this"}]
+                }
+            ]
+        });
+        prepare_official_compact_request(&mut body);
+        assert_eq!(body["model"], "gpt-5.6-sol");
+        assert!(body.get("stream").is_none());
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+        assert!(body.get("parallel_tool_calls").is_none());
+        assert!(body.get("include").is_none());
+        assert!(body.get("max_output_tokens").is_none());
+        assert!(body.get("reasoning").is_none());
+        assert_eq!(body["input"][0]["type"], "message");
     }
 
     #[test]

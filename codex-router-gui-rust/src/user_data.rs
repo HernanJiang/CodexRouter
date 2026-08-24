@@ -1,4 +1,49 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+static DIAGNOSTIC_EVENTS: OnceLock<PathBuf> = OnceLock::new();
+
+pub fn set_diagnostic_events_path(path: PathBuf) {
+    let _ = DIAGNOSTIC_EVENTS.set(path);
+}
+
+fn default_diagnostic_events_path() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|root| {
+        PathBuf::from(root)
+            .join("Codex-Router")
+            .join("UserData")
+            .join("logs")
+            .join("router-events.jsonl")
+    })
+}
+
+/// Best-effort JSONL append used by GUI-side writers (config.toml, overlay).
+/// Host already has StructuredLogger; this is the GUI counterpart so Apply
+/// and binding probes show up in the same `router-events.jsonl`.
+pub fn emit_diagnostic_event(event: serde_json::Value) {
+    if cfg!(test) {
+        return;
+    }
+    let path = DIAGNOSTIC_EVENTS
+        .get()
+        .cloned()
+        .or_else(default_diagnostic_events_path);
+    let Some(path) = path else {
+        return;
+    };
+    let Ok(mut line) = serde_json::to_vec(&event) else {
+        return;
+    };
+    line.push(b'\n');
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = file.write_all(&line);
+    }
+}
 
 const LAYOUT_MARKER: &str = ".codex-router-user-data-v1";
 const PACKAGE_VERSION_MARKER: &str = ".codex-router-package-version";

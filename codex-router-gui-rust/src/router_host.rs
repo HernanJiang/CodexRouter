@@ -369,6 +369,10 @@ pub fn public_router(state: HostState) -> Router {
             get(compat::list_composite_routes).post(compat::create_composite_route),
         )
         .route(
+            "/api/v1/admin/groups/{id}/composite-routes/reconcile",
+            put(compat::reconcile_composite_routes),
+        )
+        .route(
             "/api/v1/admin/groups/{group_id}/composite-routes/{id}",
             put(compat::update_composite_route).delete(compat::delete_composite_route),
         )
@@ -1516,10 +1520,25 @@ async fn data_plane(State(state): State<HostState>, request: Request) -> Respons
             return response;
         }
     };
-    let status_u16 = upstream.status().as_u16();
+    let upstream_status = upstream.status().as_u16();
+    let shielded_auth = upstream_status == 401;
+    if shielded_auth {
+        let _ = state.control.logger.write(serde_json::json!({
+            "level": "INFO",
+            "event": "desktop.session.upstream_401_shielded",
+            "error_code": codex_router_lib::control_plane::desktop_session::DSK_UPSTREAM_401_SHIELDED,
+            "request_id": request_id,
+            "public_model": plan.public_model,
+            "upstream_status": 401,
+            "forward_status": 503,
+            "timestamp": structured_log::timestamp(),
+        }));
+    }
+    let status_u16 = if shielded_auth { 503 } else { upstream_status };
     let status = StatusCode::from_u16(status_u16).unwrap_or(StatusCode::BAD_GATEWAY);
     let ledger_account = attribute_account(&state, upstream.headers());
     let mut response_headers = reqwest_to_axum_headers(upstream.headers());
+    response_headers.remove("www-authenticate");
     response_headers.insert(
         "x-request-id",
         HeaderValue::from_str(&request_id).unwrap_or(HeaderValue::from_static("invalid")),
@@ -1599,10 +1618,22 @@ async fn data_plane(State(state): State<HostState>, request: Request) -> Respons
                 annotate_error_body(body, upstream_error_code(status_u16), &request_id);
             }
         }
-        let output = parsed
+        let mut output = parsed
             .as_ref()
             .map(|value| serde_json::to_vec(value).unwrap_or_else(|_| body_bytes.to_vec()))
             .unwrap_or_else(|| body_bytes.to_vec());
+        if shielded_auth {
+            output = serde_json::to_vec(&serde_json::json!({
+                "error": {
+                    "message": "model temporarily unavailable",
+                    "type": "codex_router_error",
+                    "param": null,
+                    "code": "CR-UP-0011"
+                },
+                "request_id": request_id
+            }))
+            .unwrap_or(output);
+        }
         let ledger_status = if status.is_success() {
             "completed"
         } else {
@@ -1854,6 +1885,15 @@ async fn main() -> Result<()> {
     let private_port = argument_value("--cli-port=")
         .and_then(|value| value.parse().ok())
         .unwrap_or(DEFAULT_PRIVATE_PORT);
+    let desktop_auth_path = argument_value("--desktop-auth=")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .map(PathBuf::from)
+                .unwrap_or_default()
+                .join(".codex")
+                .join("auth.json")
+        });
     let no_cli = std::env::args().any(|argument| argument == "--no-cli");
     let logs = state_root.join("logs");
     std::fs::create_dir_all(&logs)?;
@@ -1900,6 +1940,7 @@ async fn main() -> Result<()> {
             downstream_key: local_key.to_string(),
             management_secret: management_secret.to_string(),
             cli_port: private_port,
+            desktop_auth_path,
         })),
     };
     // Compile state-derived routing and configuration before traffic arrives.
@@ -3332,6 +3373,7 @@ mod tests {
             downstream_key: "test-key".to_owned(),
             management_secret: "test-secret".to_owned(),
             cli_port: 1,
+            desktop_auth_path: dir.join("desktop-auth.json"),
         }));
         let control = TestControlState {
             store: Arc::new(store),
@@ -3516,6 +3558,7 @@ mod tests {
             "/api/v1/admin/groups",
             "/api/v1/admin/groups/1",
             "/api/v1/admin/groups/1/composite-routes",
+            "/api/v1/admin/groups/1/composite-routes/reconcile",
             "/api/v1/admin/groups/1/composite-routes/2",
             "/api/v1/admin/accounts",
             "/api/v1/admin/accounts/1",

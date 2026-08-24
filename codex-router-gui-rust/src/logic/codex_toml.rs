@@ -77,6 +77,9 @@ pub fn generate_codex_router_config(
         bail!("the local Router credential is required for Codex integration");
     }
     let base = validate_local_base_url(base_url)?;
+    // Requests always use the local Router bearer. Desktop 26.818 concurrent
+    // getAuthStatus refresh destroys ChatGPT tokens when requires_openai_auth
+    // is true; identity is forced off in build_codex_router_provider.
     let reasoning_effort = normalize_reasoning_effort(reasoning_effort)?;
     let catalog_path = catalog_path.replace('\\', "/");
 
@@ -253,6 +256,23 @@ pub fn generate_codex_router_config(
     Ok(text)
 }
 
+/// Desktop-safe Router provider identity.
+///
+/// Field evidence 2026-08-25 01:33–01:34 on Codex Desktop 26.818.61809:
+/// `requires_openai_auth=true` makes `getAuthStatus` call `Refreshing token`
+/// against `auth.openai.com/oauth/token`. Concurrent heartbeats invalidate
+/// the refresh token (HTTP 401) and Desktop upgrades that to
+/// `account/login/start` — including 28s after a successful login.
+/// Router requests already use `experimental_bearer_token`; they must not
+/// ask Desktop to own OAuth refresh. `auth.json` is never written here.
+pub(crate) fn legal_codex_provider_identity(
+    require_openai_auth: bool,
+    display_openai_provider: bool,
+) -> (bool, bool) {
+    let _ = (require_openai_auth, display_openai_provider);
+    codex_router_lib::control_plane::desktop_session::legal_provider_identity()
+}
+
 fn build_codex_router_provider(
     base: &str,
     local_api_key: &str,
@@ -260,6 +280,8 @@ fn build_codex_router_provider(
     display_openai_provider: bool,
     max_retries: u32,
 ) -> toml_edit::Table {
+    let (require_openai_auth, display_openai_provider) =
+        legal_codex_provider_identity(require_openai_auth, display_openai_provider);
     let mut provider = toml_edit::Table::new();
     provider.insert(
         "name",
@@ -450,7 +472,35 @@ pub fn write_codex_router_config(
     )?;
     generated = apply_desktop_overlay_file(&generated, &overlay_path);
 
-    if !existing.is_empty() && existing.trim() != generated.trim() {
+    // Codex Desktop watches config.toml and reloads its config (and re-arms
+    // its OAuth auth manager) on every change event. Re-writing an identical
+    // file therefore wakes Desktop and re-triggers a token refresh, which
+    // OpenAI's strict rotation can reject as a concurrent reuse
+    // (refresh_token_invalidated) and force the session back to login. Skip
+    // the write when nothing actually changed, exactly like write_auth_file
+    // does for CLIProxyAPI's watched files. Backup only after we know a
+    // real write will happen so overlay round-trips cannot leave stray .bak
+    // files.
+    let write_bytes = generated.as_bytes();
+    let content_hash = {
+        use sha2::Digest;
+        sha2::Sha256::digest(write_bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    if std::fs::read(&config_path).is_ok_and(|bytes| bytes == write_bytes) {
+        crate::user_data::emit_diagnostic_event(serde_json::json!({
+            "level": "INFO",
+            "event": "desktop.session.config_write_skipped",
+            "error_code": codex_router_lib::control_plane::desktop_session::DSK_CONFIG_SKIPPED,
+            "content_hash": content_hash,
+            "reason": "identical_bytes",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        }));
+        return Ok(());
+    }
+    if !existing.is_empty() {
         let id = chrono::Local::now().format("%Y%m%d%H%M%S%3f").to_string();
         let backup_name = format!("config.toml.codex-router-{}.bak", id);
         let backup_path = codex_home.join(&backup_name);
@@ -459,9 +509,18 @@ pub fn write_codex_router_config(
         limit_backups(codex_home, "config.toml.codex-router-*.bak", 3)
             .context("failed to limit Codex config.toml backups")?;
     }
-
-    crate::config::atomic_write(&config_path, generated.as_bytes())
+    crate::config::atomic_write(&config_path, write_bytes)
         .context("failed to write Codex config.toml")?;
+    crate::user_data::emit_diagnostic_event(serde_json::json!({
+        "level": "INFO",
+        "event": "desktop.session.config_written",
+        "error_code": codex_router_lib::control_plane::desktop_session::DSK_CONFIG_WRITTEN,
+        "content_hash": content_hash,
+        "reason": "content_changed",
+        "requires_openai_auth": false,
+        "provider_name": "Codex-Router",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    }));
     Ok(())
 }
 
@@ -508,10 +567,28 @@ fn persist_desktop_overlay_file(path: &Path, existing: &str) {
     }
     let mut document = DocumentMut::new();
     document["desktop"] = toml_edit::Item::Table(overlay);
+    let bytes = document.to_string().into_bytes();
+    if std::fs::read(path).is_ok_and(|existing| existing == bytes) {
+        crate::user_data::emit_diagnostic_event(serde_json::json!({
+            "level": "INFO",
+            "event": "desktop.session.overlay_write_skipped",
+            "error_code": codex_router_lib::control_plane::desktop_session::DSK_OVERLAY_SKIPPED,
+            "reason": "identical_bytes",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        }));
+        return;
+    }
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = crate::config::atomic_write(path, document.to_string().as_bytes());
+    if crate::config::atomic_write(path, &bytes).is_ok() {
+        crate::user_data::emit_diagnostic_event(serde_json::json!({
+            "level": "INFO",
+            "event": "desktop.session.overlay_written",
+            "error_code": codex_router_lib::control_plane::desktop_session::DSK_OVERLAY_WRITTEN,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        }));
+    }
 }
 
 fn apply_desktop_overlay_file(generated: &str, path: &Path) -> String {
@@ -525,7 +602,17 @@ fn apply_desktop_overlay_file(generated: &str, path: &Path) -> String {
         .remove("desktop")
         .and_then(|item| item.into_table().ok())
         .unwrap_or_default();
+    let before: Vec<String> = desktop.iter().map(|(key, _)| key.to_owned()).collect();
     merge_desktop_overlay(&mut desktop, &overlay);
+    let added = desktop
+        .iter()
+        .any(|(key, _)| !before.iter().any(|existing| existing == key));
+    if !added {
+        // Re-serializing an unchanged document via toml_edit is not a byte
+        // identity; that fake "change" used to write config.toml again and
+        // wake Codex Desktop's OAuth manager.
+        return generated.to_owned();
+    }
     document["desktop"] = toml_edit::Item::Table(desktop);
     let mut text = document.to_string();
     if !text.ends_with('\n') {
@@ -568,7 +655,9 @@ pub(crate) fn write_codex_config_from_router_config_impl(
         // Router's default_model.
         codex_router_repair_settings(cfg, &existing)
     };
-    settings.require_openai_auth = login_requires_openai_auth(&codex_home, cfg, &existing);
+    let keep_chatgpt = login_prefers_chatgpt_identity(&codex_home, cfg);
+    settings.display_openai_provider = keep_chatgpt;
+    settings.require_openai_auth = keep_chatgpt;
     let catalog_path = crate::user_data::state_root(router_root).join("model-catalog.json");
     let local_api_key = super::ensure_local_api_key()?;
     persist_desktop_overlay_file(&desktop_overlay_path(router_root), &existing);
@@ -629,7 +718,7 @@ fn codex_router_settings(cfg: &RouterConfig) -> CodexRouterSettings {
         reasoning_effort,
         fast_mode: supports_fast,
         require_openai_auth: !cfg.auth_mode.trim().eq_ignore_ascii_case("local_api_key"),
-        display_openai_provider: false,
+        display_openai_provider: !cfg.auth_mode.trim().eq_ignore_ascii_case("local_api_key"),
     }
 }
 
@@ -699,29 +788,11 @@ fn read_codex_login_kind(codex_home: &Path) -> CodexLoginKind {
     }
 }
 
-fn existing_provider_requires_openai_auth(existing: &str) -> Option<bool> {
-    existing
-        .parse::<DocumentMut>()
-        .ok()?
-        .get("model_providers")?
-        .as_table_like()?
-        .get("codex_router")?
-        .as_table_like()?
-        .get("requires_openai_auth")?
-        .as_bool()
-}
-
-fn login_requires_openai_auth(codex_home: &Path, cfg: &RouterConfig, existing: &str) -> bool {
+pub(crate) fn login_prefers_chatgpt_identity(codex_home: &Path, cfg: &RouterConfig) -> bool {
     match read_codex_login_kind(codex_home) {
         CodexLoginKind::Chatgpt => true,
         CodexLoginKind::ApiKey => false,
-        CodexLoginKind::Unknown => {
-            if cfg.auth_mode.trim().eq_ignore_ascii_case("local_api_key") {
-                false
-            } else {
-                existing_provider_requires_openai_auth(existing).unwrap_or(true)
-            }
-        }
+        CodexLoginKind::Unknown => !cfg.auth_mode.trim().eq_ignore_ascii_case("local_api_key"),
     }
 }
 
@@ -750,19 +821,15 @@ fn codex_router_binding_matches(
     else {
         return false;
     };
-    if provider.get("name").and_then(Item::as_str) != Some("Codex-Router")
+    let (require_openai_auth, display_openai) = legal_codex_provider_identity(false, false);
+    let expected_name = if display_openai { "OpenAI" } else { "Codex-Router" };
+    if provider.get("name").and_then(Item::as_str) != Some(expected_name)
         || provider
             .get("experimental_bearer_token")
             .and_then(Item::as_str)
             != Some(local_api_key)
-        || provider
-            .get("requires_openai_auth")
-            .and_then(Item::as_bool)
-            != Some(login_requires_openai_auth(
-                &resolve_codex_home(cfg),
-                cfg,
-                existing,
-            ))
+        || provider.get("requires_openai_auth").and_then(Item::as_bool)
+            != Some(require_openai_auth)
     {
         return false;
     }
@@ -815,15 +882,17 @@ pub(crate) fn repair_codex_router_binding_impl(
             &catalog_path,
             local_api_key,
             &codex_public_base_url(cfg),
-            login_requires_openai_auth(&codex_home, cfg, &existing),
-            false,
+            login_prefers_chatgpt_identity(&codex_home, cfg),
+            login_prefers_chatgpt_identity(&codex_home, cfg),
             cfg.rate_limit_max_retries,
         )?;
         return Ok(false);
     }
 
     let mut settings = codex_router_repair_settings(cfg, &existing);
-    settings.require_openai_auth = login_requires_openai_auth(&codex_home, cfg, &existing);
+    let keep_chatgpt = login_prefers_chatgpt_identity(&codex_home, cfg);
+    settings.display_openai_provider = keep_chatgpt;
+    settings.require_openai_auth = keep_chatgpt;
     write_codex_router_config(
         &codex_home,
         &settings.model,
@@ -922,48 +991,12 @@ pub(crate) fn probe_and_repair_codex_binding_state_with_key(
     local_api_key: &str,
     system_config_path: &Path,
 ) -> anyhow::Result<CodexBindingProbe> {
-    let probe = probe_codex_binding_state_with_key(
-        cfg,
-        router_root,
-        local_api_key,
-        system_config_path,
-    )?;
-    if probe.user_layer_bound && probe.system_layer_bound {
-        return Ok(probe);
-    }
-    // Both layers lost: leave them unbound so the UI can show the overwrite
-    // dialog and auto-write after the 3-second countdown. One missing layer
-    // is filled immediately because routing still works through the other.
-    if !probe.user_layer_bound && !probe.system_layer_bound {
-        return Ok(probe);
-    }
-    let repair_result =
-        repair_codex_router_binding_impl(cfg, router_root, local_api_key, system_config_path);
-    let mut repaired = probe_codex_binding_state_with_key(
-        cfg,
-        router_root,
-        local_api_key,
-        system_config_path,
-    )?;
-    match repair_result {
-        Ok(wrote_user) => {
-            repaired.binding_repair = wrote_user
-                || (!probe.user_layer_bound && repaired.user_layer_bound)
-                || (!probe.system_layer_bound && repaired.system_layer_bound);
-            if repaired.user_layer_bound && !repaired.system_layer_bound {
-                repaired.system_binding_error = Some(
-                    "user-layer Router binding is in place, but the system-layer mirror could not be written".to_owned(),
-                );
-            }
-            Ok(repaired)
-        }
-        Err(error) => {
-            repaired.binding_repair = (!probe.user_layer_bound && repaired.user_layer_bound)
-                || (!probe.system_layer_bound && repaired.system_layer_bound);
-            repaired.system_binding_error = Some(error.to_string());
-            Ok(repaired)
-        }
-    }
+    // 3.0.0: the 3-minute self-check is observation-only. Desktop 26.818
+    // reloads its OAuth manager on every config.toml change event; filling a
+    // stripped user layer (or rewriting model="first") from this timer was
+    // the remaining Router-side login-loop trigger after identical-byte
+    // skips. Repair stays on user Apply / overwrite confirm / CLI refresh.
+    probe_codex_binding_state_with_key(cfg, router_root, local_api_key, system_config_path)
 }
 
 pub(crate) fn probe_codex_binding_state_with_key(
@@ -998,16 +1031,12 @@ pub(crate) fn probe_codex_binding_state_with_key(
                 .and_then(Item::as_str)
                 .map(str::to_owned)
         });
-    let mut model_repair = None;
-    if (user_layer_bound || system_layer_bound) && !existing.trim().is_empty() {
-        model_repair = repair_codex_user_model_key(cfg, &existing, &config_path)?;
-    }
     Ok(CodexBindingProbe {
         fingerprint: codex_config_fingerprint(&existing),
         user_layer_bound,
         system_layer_bound,
         user_model,
-        model_repair,
+        model_repair: None,
         binding_repair: false,
         system_binding_error: None,
     })
@@ -1214,6 +1243,13 @@ pub(crate) fn write_codex_system_binding_to(
     }
     let text = format!("{SYSTEM_BINDING_MARKER}\n{text}");
     if existing == text {
+        crate::user_data::emit_diagnostic_event(serde_json::json!({
+            "level": "INFO",
+            "event": "desktop.session.system_config_write_skipped",
+            "error_code": codex_router_lib::control_plane::desktop_session::DSK_SYSTEM_SKIPPED,
+            "reason": "identical_bytes",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        }));
         return Ok(());
     }
     if let Some(parent) = path.parent() {
@@ -1221,6 +1257,14 @@ pub(crate) fn write_codex_system_binding_to(
     }
     crate::config::atomic_write(path, text.as_bytes())
         .context("failed to write the system Codex config")?;
+    crate::user_data::emit_diagnostic_event(serde_json::json!({
+        "level": "INFO",
+        "event": "desktop.session.system_config_written",
+        "error_code": codex_router_lib::control_plane::desktop_session::DSK_SYSTEM_WRITTEN,
+        "requires_openai_auth": false,
+        "provider_name": "Codex-Router",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    }));
     Ok(())
 }
 
@@ -1395,8 +1439,8 @@ fn preserve_router_provider_for_history_with_key(
     let provider = build_codex_router_provider(
         &codex_public_base_url(cfg),
         local_api_key,
-        login_requires_openai_auth(&codex_home, cfg, text),
-        false,
+        login_prefers_chatgpt_identity(&codex_home, cfg),
+        login_prefers_chatgpt_identity(&codex_home, cfg),
         cfg.rate_limit_max_retries,
     );
     let model_providers =
@@ -1464,9 +1508,11 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        // Preserve Codex's upstream ChatGPT login contract for OAuth profiles.
+        // Desktop 26.818 force-logins when requires_openai_auth=true because
+        // getAuthStatus refreshes the token. Router requests use the local bearer.
         assert!(generated.contains("name = \"Codex-Router\""));
-        assert!(generated.contains("requires_openai_auth = true"));
+        assert!(generated.contains("requires_openai_auth = false"));
+        assert!(!generated.contains("name = \"OpenAI\""));
         assert!(generated.contains("request_max_retries = 3"));
         assert!(generated.contains("stream_max_retries = 3"));
         let custom = generate_codex_router_config(
@@ -1530,7 +1576,7 @@ mod tests {
         let settings = codex_router_settings(&cfg);
         assert_eq!(settings.model, "gpt-5.6-sol");
         assert!(settings.require_openai_auth);
-        assert!(!settings.display_openai_provider);
+        assert!(settings.display_openai_provider);
     }
 
     #[test]
@@ -1550,7 +1596,7 @@ mod tests {
     }
 
     #[test]
-    fn generate_keeps_chatgpt_forced_login_when_openai_auth_is_required() {
+    fn router_provider_never_forces_chatgpt_login() {
         let text = generate_codex_router_config(
             "forced_login_method = \"chatgpt\"\nmodel = \"gpt-5.6-sol\"\n",
             "gpt-5.6-sol",
@@ -1559,13 +1605,36 @@ mod tests {
             "http://127.0.0.1:18082",
             "medium",
             false,
-            true,
+            false,
             false,
             3,
             None)
         .unwrap();
-        assert!(text.contains("forced_login_method = \"chatgpt\""));
-        assert!(text.contains("requires_openai_auth = true"));
+        assert!(!text.contains("forced_login_method"));
+        assert!(text.contains("requires_openai_auth = false"));
+    }
+
+    #[test]
+    fn chatgpt_login_keeps_openai_auth_on_the_router_provider() {
+        let text = generate_codex_router_config(
+            "",
+            "gpt-5.6-sol",
+            "C:/catalog.json",
+            "sk-local-key",
+            "http://127.0.0.1:18082",
+            "medium",
+            false,
+            true,
+            true,
+            3,
+            None)
+        .unwrap();
+        assert!(text.contains("model_provider = \"codex_router\""));
+        assert!(text.contains("experimental_bearer_token = \"sk-local-key\""));
+        assert!(text.contains("requires_openai_auth = false"));
+        assert!(text.contains("name = \"Codex-Router\""));
+        assert!(!text.contains("name = \"OpenAI\""));
+        assert!(!text.contains("forced_login_method"));
     }
 
     #[test]
@@ -1578,15 +1647,56 @@ mod tests {
             "http://127.0.0.1:18082",
             "medium",
             false,
-            false,
+            true,
             true,
             3,
             None)
         .unwrap();
 
-        assert!(text.contains("name = \"OpenAI\""));
+        assert!(text.contains("name = \"Codex-Router\""));
         assert!(text.contains("requires_openai_auth = false"));
         assert!(!text.contains("forced_login_method"));
+    }
+
+    #[test]
+    fn mixed_provider_identity_flags_are_coerced_to_legal_pairs() {
+        let chatgpt = generate_codex_router_config(
+            "",
+            "gpt-5.6-sol",
+            "C:/catalog.json",
+            "sk-local-key",
+            "http://127.0.0.1:18082",
+            "medium",
+            false,
+            true,
+            false,
+            3,
+            None,
+        )
+        .unwrap();
+        assert!(chatgpt.contains("name = \"Codex-Router\""));
+        assert!(chatgpt.contains("requires_openai_auth = false"));
+        assert!(!chatgpt.contains("name = \"OpenAI\""));
+
+        let api = generate_codex_router_config(
+            "",
+            "gpt-5.6-sol",
+            "C:/catalog.json",
+            "sk-local-key",
+            "http://127.0.0.1:18082",
+            "medium",
+            false,
+            false,
+            true,
+            3,
+            None,
+        )
+        .unwrap();
+        assert!(api.contains("name = \"Codex-Router\""));
+        assert!(api.contains("requires_openai_auth = false"));
+        assert!(!api.contains("name = \"OpenAI\""));
+        assert_eq!(legal_codex_provider_identity(true, false), (false, false));
+        assert_eq!(legal_codex_provider_identity(false, true), (false, false));
     }
 
     #[test]
@@ -1717,10 +1827,10 @@ custom_agent_setting = "preserve-me"
         .unwrap();
         assert!(text.contains("service_tier = \"fast\""));
         assert!(text.contains("fast_mode = true"));
-        assert!(text.contains("requires_openai_auth = true"));
+        assert!(text.contains("requires_openai_auth = false"));
         assert!(!text.contains("forced_login_method"));
-        assert!(text.contains("name = \"OpenAI\""));
-        assert!(!text.contains("name = \"Codex-Router\""));
+        assert!(text.contains("name = \"Codex-Router\""));
+        assert!(!text.contains("name = \"OpenAI\""));
     }
 
     #[test]
@@ -1874,6 +1984,86 @@ sandbox = "unelevated"
     }
 
     #[test]
+    fn identical_rewrite_skips_touching_config_toml() {
+        let tmp = std::env::temp_dir().join(format!("codex-toml-identical-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let catalog = tmp.join("model-catalog.json");
+        std::fs::write(&catalog, "{}").unwrap();
+        // Seed a realistic existing config (with a [desktop] section like the
+        // one Codex Desktop maintains) so the desktop-overlay round trip is
+        // already stable before the identical re-write.
+        std::fs::write(
+            tmp.join("config.toml"),
+            "model = \"grok-4.6\"\nmodel_provider = \"codex_router\"\n\n[desktop]\nfollowUpQueueMode = \"queue\"\nsansFontSize = 17\n\n[model_providers]\n\n[model_providers.codex_router]\nname = \"Codex-Router\"\nbase_url = \"http://127.0.0.1:28085/v1\"\n",
+        )
+        .unwrap();
+
+        write_codex_router_config(
+            &tmp,
+            "grok-4.6",
+            &catalog,
+            "sk-local-key",
+            "http://127.0.0.1:28085",
+            "medium",
+            false,
+            false,
+            false,
+            3,
+            None,
+        )
+        .unwrap();
+        let before = std::fs::read(tmp.join("config.toml")).unwrap();
+        let mtime = std::fs::metadata(tmp.join("config.toml"))
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        // Second write with identical inputs must not rewrite the file:
+        // Codex Desktop watches config.toml and a spurious rewrite reloads
+        // its config and re-arms the OAuth auth manager, which can trigger
+        // refresh_token_invalidated. Keep the bytes and mtime untouched.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        write_codex_router_config(
+            &tmp,
+            "grok-4.6",
+            &catalog,
+            "sk-local-key",
+            "http://127.0.0.1:28085",
+            "medium",
+            false,
+            false,
+            false,
+            3,
+            None,
+        )
+        .unwrap();
+
+        let after = std::fs::read(tmp.join("config.toml")).unwrap();
+        let after_mtime = std::fs::metadata(tmp.join("config.toml"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(before, after, "config.toml bytes must stay identical");
+        assert_eq!(mtime, after_mtime, "config.toml must not be rewritten");
+        let backups: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .unwrap_or("")
+                    .starts_with("config.toml.codex-router-")
+            })
+            .collect();
+        // One backup comes from the first write (the seeded config differed
+        // from the generated Router config); the identical re-write must not
+        // add a second one.
+        assert_eq!(backups.len(), 1, "no extra backup for an identical rewrite");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn permission_settings_from_existing_config_are_preserved_on_first_apply() {
         let tmp = std::env::temp_dir().join(format!("codex-toml-perm-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
@@ -1958,7 +2148,8 @@ sandbox = "unelevated"
         assert!(repaired.contains("model_provider = \"codex_router\""));
         assert!(repaired.contains("model = \"deepseek-v4-flash\""));
         assert!(repaired.contains("model_catalog_json ="));
-        assert!(repaired.contains("requires_openai_auth = true"));
+        assert!(repaired.contains("requires_openai_auth = false"));
+        assert!(repaired.contains("name = \"Codex-Router\""));
         assert!(repaired.contains("experimental_bearer_token = \"fixture-local-router-key\""));
         assert!(repaired.contains("approval_policy = \"never\""));
         assert!(repaired.contains("[mcp_servers.user-tool]"));
@@ -1997,7 +2188,8 @@ sandbox = "unelevated"
         assert!(system.contains("model_provider = \"codex_router\""));
         assert!(system.contains("[model_providers.codex_router]"));
         assert!(system.contains("experimental_bearer_token = \"fixture-local-router-key\""));
-        assert!(system.contains("requires_openai_auth = true"));
+        assert!(system.contains("requires_openai_auth = false"));
+        assert!(system.contains("name = \"Codex-Router\""));
         assert!(system.contains("fast_mode = true"));
         assert_eq!(
             system.matches(SYSTEM_BINDING_MARKER).count(),
@@ -2126,7 +2318,7 @@ sandbox = "unelevated"
     }
 
     #[test]
-    fn binding_probe_repairs_invalid_user_model_when_system_layer_still_routes() {
+    fn binding_probe_does_not_rewrite_invalid_user_model() {
         let tmp = std::env::temp_dir().join(format!(
             "codex-router-probe-repair-{}-{}",
             std::process::id(),
@@ -2147,11 +2339,12 @@ sandbox = "unelevated"
             false,
             3)
         .unwrap();
-        std::fs::write(
-            codex_home.join("config.toml"),
-            "model = \"first\"\nsandbox_mode = \"danger-full-access\"\n\n[desktop]\nsansFontSize = 17\n",
-        )
-        .unwrap();
+        let original = "model = \"first\"\nsandbox_mode = \"danger-full-access\"\n\n[desktop]\nsansFontSize = 17\n";
+        std::fs::write(codex_home.join("config.toml"), original).unwrap();
+        let mtime = std::fs::metadata(codex_home.join("config.toml"))
+            .unwrap()
+            .modified()
+            .unwrap();
 
         let probe = probe_codex_binding_state_with_key(
             &cfg,
@@ -2163,24 +2356,19 @@ sandbox = "unelevated"
         assert!(!probe.user_layer_bound);
         assert!(probe.system_layer_bound);
         assert_eq!(probe.user_model.as_deref(), Some("first"));
+        assert_eq!(probe.model_repair, None);
+        assert!(!probe.binding_repair);
         assert_eq!(
-            probe.model_repair,
-            Some((Some("first".to_owned()), "gpt-5.6-sol".to_owned()))
+            std::fs::read_to_string(codex_home.join("config.toml")).unwrap(),
+            original
         );
-        let repaired = std::fs::read_to_string(codex_home.join("config.toml")).unwrap();
-        assert!(repaired.contains("model = \"gpt-5.6-sol\""));
-        assert!(repaired.contains("sansFontSize = 17"));
-
-        // A second pass sees a valid model and leaves the file untouched.
-        let again = probe_codex_binding_state_with_key(
-            &cfg,
-            &tmp,
-            "fixture-local-router-key",
-            &system_config,
-        )
-        .unwrap();
-        assert_eq!(again.model_repair, None);
-        assert_eq!(again.user_model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(
+            std::fs::metadata(codex_home.join("config.toml"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            mtime
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -2259,7 +2447,7 @@ sandbox = "unelevated"
     }
 
     #[test]
-    fn self_check_rewrites_lost_user_layer_when_system_still_routes() {
+    fn self_check_does_not_rewrite_lost_user_layer_when_system_still_routes() {
         let tmp = std::env::temp_dir().join(format!(
             "codex-router-probe-user-lost-{}-{}",
             std::process::id(),
@@ -2281,11 +2469,8 @@ sandbox = "unelevated"
             3,
         )
         .unwrap();
-        std::fs::write(
-            codex_home.join("config.toml"),
-            "model = \"first\"\nmodel_provider = \"openai\"\n",
-        )
-        .unwrap();
+        let overwritten = "model = \"first\"\nmodel_provider = \"openai\"\n";
+        std::fs::write(codex_home.join("config.toml"), overwritten).unwrap();
         let probe = probe_and_repair_codex_binding_state_with_key(
             &cfg,
             &root,
@@ -2293,18 +2478,18 @@ sandbox = "unelevated"
             &system_config,
         )
         .unwrap();
-        assert!(probe.binding_repair);
-        assert!(probe.user_layer_bound);
+        assert!(!probe.binding_repair);
+        assert!(!probe.user_layer_bound);
         assert!(probe.system_layer_bound);
-        let repaired = std::fs::read_to_string(codex_home.join("config.toml")).unwrap();
-        assert!(repaired.contains("model_provider = \"codex_router\""));
-        assert!(repaired.contains("request_max_retries"));
-        assert!(repaired.contains("18084"));
+        assert_eq!(
+            std::fs::read_to_string(codex_home.join("config.toml")).unwrap(),
+            overwritten
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
-    fn self_check_fills_missing_system_layer_when_user_still_routes() {
+    fn self_check_does_not_write_missing_system_layer() {
         let tmp = std::env::temp_dir().join(format!(
             "codex-router-probe-system-lost-{}-{}",
             std::process::id(),
@@ -2326,10 +2511,9 @@ sandbox = "unelevated"
         )
         .unwrap();
         assert!(probe.user_layer_bound);
-        assert!(probe.system_layer_bound);
-        assert!(probe.binding_repair);
-        let system = std::fs::read_to_string(&system_config).unwrap();
-        assert!(system.contains("model_provider = \"codex_router\""));
+        assert!(!probe.system_layer_bound);
+        assert!(!probe.binding_repair);
+        assert!(!system_config.is_file());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -2366,6 +2550,50 @@ sandbox = "unelevated"
             std::fs::read_to_string(codex_home.join("config.toml")).unwrap(),
             chosen
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn apply_keeps_existing_chatgpt_login_on_the_router_provider() {
+        let tmp = std::env::temp_dir().join(format!(
+            "codex-router-chatgpt-login-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let router_root = tmp.join("router-root");
+        let codex_home = tmp.join("codex-home");
+        std::fs::create_dir_all(&router_root).unwrap();
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let auth = br#"{"auth_mode":"chatgpt","tokens":{"access_token":"fixture-only"}}"#;
+        std::fs::write(codex_home.join("auth.json"), auth).unwrap();
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "model = \"deepseek-v4-flash\"\nmodel_provider = \"codex_router\"\n",
+        )
+        .unwrap();
+        let cfg = RouterConfig {
+            auth_mode: "local_api_key".to_owned(),
+            default_model: "deepseek-v4-flash".to_owned(),
+            models: vec![ModelConfig {
+                source: "apikey".to_owned(),
+                model: "deepseek-v4-flash".to_owned(),
+                ..Default::default()
+            }],
+            deploy: crate::config::DeployConfig {
+                codex_home: codex_home.to_string_lossy().into_owned(),
+                sub2api_host: "http://127.0.0.1:18082".to_owned(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        write_codex_config_from_router_config_impl(&cfg, &router_root, &tmp.join("system.toml"))
+            .unwrap();
+        let written = std::fs::read_to_string(codex_home.join("config.toml")).unwrap();
+        assert!(written.contains("model_provider = \"codex_router\""));
+        assert!(written.contains("requires_openai_auth = false"));
+        assert!(written.contains("name = \"Codex-Router\""));
+        assert!(!written.contains("forced_login_method"));
+        assert_eq!(std::fs::read(codex_home.join("auth.json")).unwrap(), auth);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

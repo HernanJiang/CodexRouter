@@ -924,6 +924,25 @@ fn sync_composite_routes(
     desired: &[CompositeRoute],
 ) -> anyhow::Result<()> {
     let path = format!("/api/v1/admin/groups/{group_id}/composite-routes");
+    let routes = desired
+        .iter()
+        .map(|route| json!({
+            "public_model": route.public_model,
+            "upstream_model": route.upstream_model,
+            "target_platform": route.target_platform,
+            "match_type": "exact",
+            "endpoint": "any",
+            "priority": route.priority,
+            "enabled": true,
+        }))
+        .collect::<Vec<_>>();
+    if admin
+        .put(&format!("{path}/reconcile"), &json!({ "routes": routes }))
+        .is_ok()
+    {
+        return Ok(());
+    }
+    // Compatibility fallback for older Router Hosts during rolling upgrades.
     let existing_body = usage::data(admin.get(&path).unwrap_or(Value::Null));
     let existing = usage::array(usage::get(&existing_body, "items").unwrap_or(&existing_body));
     let mut existing_by_key = HashMap::<String, Vec<Value>>::new();
@@ -1466,13 +1485,14 @@ mod tests {
         );
         let route_update = calls
             .iter()
-            .find(|call| call.method == "PUT" && call.path == format!("{routes_path}/9"))
+            .find(|call| call.method == "PUT" && call.path == format!("{routes_path}/reconcile"))
             .unwrap();
+        let route = &route_update.body.as_ref().unwrap()["routes"][0];
         assert_eq!(
-            route_update.body.as_ref().unwrap()["target_platform"],
+            route["target_platform"],
             "openai"
         );
-        assert_eq!(route_update.body.as_ref().unwrap()["priority"], 100);
+        assert_eq!(route["priority"], 100);
         assert!(calls.iter().all(|call| {
             !call.path.contains("config.toml")
                 && !call.path.contains("lifecycle")
@@ -1856,15 +1876,16 @@ mod tests {
         sync_composite_routes(&admin, 7, &desired).unwrap();
 
         let calls = admin.calls();
-        assert!(calls
-            .iter()
-            .any(|call| call.method == "PUT" && call.path.ends_with("/1")));
-        assert!(calls
-            .iter()
-            .any(|call| call.method == "DELETE" && call.path.ends_with("/2")));
-        assert!(calls
-            .iter()
-            .any(|call| call.method == "DELETE" && call.path.ends_with("/3")));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].method, "PUT");
+        assert_eq!(calls[0].path, format!("{path}/reconcile"));
+        assert_eq!(
+            calls[0].body.as_ref().unwrap()["routes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(calls.iter().all(|call| call.method != "POST"));
     }
 

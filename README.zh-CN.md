@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.1.4-0969da" alt="版本 2.1.4">
+  <img src="https://img.shields.io/badge/version-3.0.2-0969da" alt="版本 3.0.2">
   <img src="https://img.shields.io/badge/platform-Windows%20%2F%20macOS%20%2F%20Linux-0078d4" alt="Windows / macOS / Linux">
   <img src="https://img.shields.io/badge/architecture-x64-555555" alt="x64">
   <img src="https://img.shields.io/badge/default%20build-portable-2ea44f" alt="默认构建便携版">
@@ -74,6 +74,7 @@ CodexRouter 可以将 OAuth 和 API 渠道合并为 Codex 可见的模型目录�
 - 上游提供重置时间时按实际时间恢复；无法取得可靠实时额度时执行账号级保底探测，成功后自动重新加入号池。Grok 的陈旧 billing 缓存只用于展示，必须由实时额度或当前模型的最小生成确认恢复。
 - Codex 配置被外部更新后，自检会核对用户层与系统层绑定、当前本机网关端口和重试设置。两层都丢失时显示三按钮覆写窗；窗口保持前台焦点累计 3 秒会自动写回并重启 Codex，最小化、托盘或失焦时暂停，不会抢焦点。“恢复默认”会进入粘性官方模式，自检不会再次绑回 Router，直到用户主动重新开启转发。
 - OAuth 令牌由 CLIProxyAPI 管理，不写入 CodexRouter 配置文件，也不提供明文导出。
+- Codex Desktop 26.818 在 `requires_openai_auth = true` 时会并发刷新 ChatGPT refresh token，导致登录循环。3.0.2 起本地 Router provider 固定为 `Codex-Router` + `requires_openai_auth = false`：转发仍走本机网关，ChatGPT token 留在 Desktop 的 `auth.json` 中不由 Router 刷新。左下角显示 Codex-Router 是预期行为，不是登录丢失。详情见 [CHANGELOG](CHANGELOG.md)。
 
 ### 按模型适配的控制项
 
@@ -114,9 +115,9 @@ CodexRouter 可以在 Windows 登录后直接进入轻量托盘模式，不启�
 
 ## 下载与首次启动
 
-前往 [GitHub Releases](https://github.com/HernanJiang/CodexRouter/releases/tag/v2.1.4) 下载 Windows x64 版本：
+前往 [GitHub Releases](https://github.com/HernanJiang/CodexRouter/releases/tag/v2.1.14) 下载 Windows x64 版本：
 
-`Codex-Router-Portable-2.1.4-windows-x64.zip`
+`Codex-Router-Portable-2.1.14-windows-x64.zip`
 
 默认发布与本地交付只构建便携版。用户级 installer 仍保留为可选构建目标，仅在明确需要安装器时单独生成。
 

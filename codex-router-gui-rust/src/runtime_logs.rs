@@ -510,6 +510,7 @@ fn is_router_events_diagnostic(line: &str) -> bool {
         || upper.contains(r#""EVENT":"CONFIGURATION""#)
         || router_event_name(line).eq_ignore_ascii_case("ledger.record_failed")
         || upper.contains(r#""EVENT":"LEDGER.RECORD_FAILED""#)
+        || router_event_name(line).ends_with("quota_refresh_failed")
     {
         return false;
     }
@@ -566,8 +567,20 @@ fn format_plain_diagnostic(label: &str, line: &str) -> String {
     output.push('[');
     output.push_str(label);
     output.push_str("] ");
+    let event = router_event_name_from_text(line).filter(|event| {
+        event.len() <= 128
+            && event
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    });
     output.push_str(&summarize_error_for_display(&format!("{label} {line}")));
-    limit_utf8_bytes(&redact_for_display(&output), MAX_RECORD_BYTES)
+    let mut safe = redact_for_display(&output);
+    if safe.contains("event=[REDACTED]") {
+        if let Some(event) = event {
+            safe = safe.replacen("event=[REDACTED]", &format!("event={event}"), 1);
+        }
+    }
+    limit_utf8_bytes(&safe, MAX_RECORD_BYTES)
 }
 
 fn safe_timestamp(text: &str) -> Option<String> {
@@ -1078,6 +1091,12 @@ mod tests {
         .is_none());
         let ledger = r#"{"error_description":"request ledger entry already exists","event":"ledger.record_failed","level":"WARN"}"#;
         assert!(format_diagnostic_line("Router events", LogKind::RouterEvents, ledger).is_none());
+        let quota = r#"{"event":"control.oauth_quota_refresh_failed","error_code":"network_error","level":"WARN"}"#;
+        assert!(format_diagnostic_line("Router events", LogKind::RouterEvents, quota).is_none());
+        let network = r#"{"event":"control.account_recovery_probe_failed","error_code":"network_error","level":"WARN"}"#;
+        let safe = format_diagnostic_line("Router events", LogKind::RouterEvents, network).unwrap();
+        assert!(safe.contains("event=control.account_recovery_probe_failed"), "{safe}");
+        assert!(!safe.contains("event=[REDACTED]"), "{safe}");
     }
 
     #[test]

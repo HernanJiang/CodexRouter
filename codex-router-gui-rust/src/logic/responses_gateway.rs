@@ -7,15 +7,16 @@
 
 use super::responses_compat::{
     is_chat_completions_path, is_compact_path, is_exhausted_account_status, is_openai_family_model,
-    is_responses_path, is_xai_family_model,
-    prepare_xai_official_compact_request,
-    rewrite_poisoned_upstream_status, is_unsupported_image_error, rewrite_provider_json,
-    rewrite_sse_text, sanitize_responses_request, sanitize_responses_request_aggressive,
-    should_retry_after_upstream_error, sanitize_responses_request_without_images,
-    synthetic_compact_response,
+    is_responses_path, is_unsupported_image_error, is_xai_family_model,
+    prepare_official_compact_request, prepare_xai_official_compact_request,
+    rewrite_poisoned_upstream_status, rewrite_provider_json, rewrite_sse_text,
+    sanitize_responses_request, sanitize_responses_request_aggressive,
+    sanitize_responses_request_without_images, should_retry_after_upstream_error,
+    shield_desktop_auth_failure, synthetic_compact_response,
 };
 use super::{detect_context_defaults, detect_max_output_defaults, ModelContextBudget};
 use anyhow::{bail, Context};
+use flate2::read::{DeflateDecoder, GzDecoder};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -464,7 +465,16 @@ fn handle_client(
         return Ok(());
     }
     let mut body = leftover;
-    if let Some(length) = headers
+    let request_chunked = headers
+        .get("transfer-encoding")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"));
+    if request_chunked {
+        // Codex may switch to HTTP chunked framing for large or rapidly
+        // changing Responses bodies. The gateway must decode that framing
+        // before JSON parsing; forwarding chunk headers as body bytes makes
+        // Router Host report "request body is not valid JSON".
+        body = read_chunked_body(client, body)?;
+    } else if let Some(length) = headers
         .get("content-length")
         .and_then(|value| value.parse::<usize>().ok())
     {
@@ -474,6 +484,10 @@ fn handle_client(
         }
         read_exact_more(client, &mut body, length)?;
         body.truncate(length);
+    }
+    if let Some(content_encoding) = headers.get("content-encoding").cloned() {
+        body = decode_request_content_encoding(&content_encoding, &body)?;
+        headers.remove("content-encoding");
     }
 
     gateway_log(
@@ -510,6 +524,13 @@ fn handle_client(
                 } else {
                     request_body = serde_json::to_vec(&json_body)?;
                 }
+            } else if is_compact_path(&path) {
+                // ChatGPT remote compaction v2 expects exactly one
+                // compaction output item. Generation controls such as
+                // max_output_tokens/tools/stream turn this into a normal
+                // response with extra non-compaction items.
+                prepare_official_compact_request(&mut json_body);
+                request_body = serde_json::to_vec(&json_body)?;
             } else if inject_max_output_tokens(&path, &mut json_body) {
                 // OpenAI-family models pass through unsanitized; only
                 // re-serialize when a configured limit was injected.
@@ -734,12 +755,24 @@ fn handle_client(
                         return Ok(());
                     }
                     let retry_text = String::from_utf8_lossy(&retry_body);
+                    let (forward_status, forward_body) =
+                        shield_desktop_auth_failure(retry_status, &retry_body);
+                    if retry_status == 401 {
+                        gateway_log(
+                            "request.desktop_auth_shield",
+                            &format!("{method} {path} upstream 401 remapped to {forward_status}"),
+                        );
+                    }
                     send_raw(
                         client,
                         &rebuild_response(
-                            rewrite_poisoned_upstream_status(retry_status, &retry_text),
+                            if retry_status == 401 {
+                                forward_status
+                            } else {
+                                rewrite_poisoned_upstream_status(retry_status, &retry_text)
+                            },
                             &parse_headers(&String::from_utf8_lossy(&retry_headers)),
-                            &retry_body,
+                            &forward_body,
                         ),
                     )?;
                     return Ok(());
@@ -747,12 +780,23 @@ fn handle_client(
             }
         }
     }
+    let (forward_status, forward_body) = shield_desktop_auth_failure(status, &response_body);
+    if status == 401 {
+        gateway_log(
+            "request.desktop_auth_shield",
+            &format!("{method} {path} upstream 401 remapped to {forward_status}"),
+        );
+    }
     send_raw(
         client,
         &rebuild_response(
-            rewrite_poisoned_upstream_status(status, &body_text),
+            if status == 401 {
+                forward_status
+            } else {
+                rewrite_poisoned_upstream_status(status, &body_text)
+            },
             &response_headers_map,
-            &response_body,
+            &forward_body,
         ),
     )?;
     Ok(())
@@ -821,6 +865,10 @@ fn open_upstream_with_rate_limit_retry(
         // A literal 429 is always retryable. Sub2API also reports an account
         // pool drained by upstream rate limiting as 503; classify it from the
         // (small, fully buffered) error body so it retries like a 429.
+        let auth_rejected = status == 401;
+        if auth_rejected {
+            buffer_error_body(&mut stream, &response_headers_map, &mut leftover);
+        }
         let rate_limited = if status == 429 {
             true
         } else if status == 503 {
@@ -829,7 +877,7 @@ fn open_upstream_with_rate_limit_retry(
         } else {
             false
         };
-        let transient_status = matches!(status, 408 | 425 | 502 | 504);
+        let transient_status = matches!(status, 408 | 425 | 502 | 504) || auth_rejected;
         if !rate_limited && !transient_status {
             return Ok(UpstreamResponse {
                 stream,
@@ -1887,6 +1935,29 @@ fn read_chunked_body(stream: &mut TcpStream, mut raw: Vec<u8>) -> anyhow::Result
     }
 }
 
+fn decode_request_content_encoding(encoding: &str, body: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut decoded = body.to_vec();
+    for coding in encoding
+        .split(',')
+        .map(str::trim)
+        .filter(|coding| !coding.is_empty() && !coding.eq_ignore_ascii_case("identity"))
+        .rev()
+    {
+        let mut output = Vec::new();
+        match coding.to_ascii_lowercase().as_str() {
+            "gzip" => GzDecoder::new(decoded.as_slice()).read_to_end(&mut output)?,
+            "deflate" => DeflateDecoder::new(decoded.as_slice()).read_to_end(&mut output)?,
+            "zstd" => {
+                output = zstd::stream::decode_all(decoded.as_slice())?;
+                output.len()
+            }
+            other => bail!("unsupported request content encoding: {other}"),
+        };
+        decoded = output;
+    }
+    Ok(decoded)
+}
+
 fn forward_rewritten_json_body(
     client: &mut TcpStream,
     headers: &HashMap<String, String>,
@@ -2398,6 +2469,63 @@ mod tests {
     }
 
     #[test]
+    fn chatgpt_compact_request_drops_generation_controls() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let received = std::sync::Arc::new(Mutex::new(None::<Vec<u8>>));
+        let received_clone = received.clone();
+        thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            let (headers, leftover) = read_headers(&mut socket).unwrap();
+            let header_text = String::from_utf8_lossy(&headers);
+            let length = parse_headers(&header_text)
+                .get("content-length")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            let mut body = leftover;
+            read_exact_more(&mut socket, &mut body, length).unwrap();
+            body.truncate(length);
+            *received_clone.lock().unwrap() = Some(body);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"id\":\"cmp_1\",\"output\":[{\"type\":\"compaction\",\"encrypted_content\":\"blob\"}]}")
+                .unwrap();
+        });
+
+        let gateway = TcpListener::bind("127.0.0.1:0").unwrap();
+        let gateway_addr = gateway.local_addr().unwrap();
+        let upstream_url = format!("http://127.0.0.1:{}", upstream_addr.port());
+        thread::spawn(move || {
+            let (mut stream, _) = gateway.accept().unwrap();
+            handle_client(&mut stream, &upstream_url, DEFAULT_RATE_LIMIT_RETRIES).unwrap();
+        });
+
+        let mut client = TcpStream::connect(gateway_addr).unwrap();
+        let body = br#"{"model":"gpt-5.6-sol","stream":true,"tools":[{"type":"function","name":"exec_command"}],"parallel_tool_calls":true,"include":["reasoning.encrypted_content"],"max_output_tokens":128000,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"compact"}]}]}"#;
+        let request = format!(
+            "POST /v1/responses/compact HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        client.write_all(request.as_bytes()).unwrap();
+        client.write_all(body).unwrap();
+        let mut response = Vec::new();
+        client.take(2048).read_to_end(&mut response).ok();
+        let forwarded = loop {
+            if let Some(value) = received.lock().unwrap().clone() {
+                break value;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let forwarded_json: serde_json::Value = serde_json::from_slice(&forwarded).unwrap();
+        assert_eq!(forwarded_json["model"], "gpt-5.6-sol");
+        assert!(forwarded_json.get("stream").is_none());
+        assert!(forwarded_json.get("tools").is_none());
+        assert!(forwarded_json.get("parallel_tool_calls").is_none());
+        assert!(forwarded_json.get("include").is_none());
+        assert!(forwarded_json.get("max_output_tokens").is_none());
+        assert_eq!(forwarded_json["input"][0]["type"], "message");
+    }
+
+    #[test]
     fn sse_events_split_on_crlf_boundaries() {
         let mut carry = "data: one\r\n\r\ndata: two\n\npartial".to_owned();
         assert_eq!(take_sse_event(&mut carry).as_deref(), Some("data: one\r\n\r\n"));
@@ -2579,6 +2707,54 @@ mod tests {
         .unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(attempts.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn upstream_401_retries_then_is_shielded_from_desktop() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+        thread::spawn(move || {
+            for index in 0..3 {
+                let (mut socket, _) = upstream.accept().unwrap();
+                let (headers, leftover) = read_headers(&mut socket).unwrap();
+                let length = parse_headers(&String::from_utf8_lossy(&headers))
+                    .get("content-length")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let mut body = leftover;
+                read_exact_more(&mut socket, &mut body, length).unwrap();
+                attempts_clone.fetch_add(1, Ordering::Relaxed);
+                let response = if index < 2 {
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: 22\r\nConnection: close\r\n\r\n{\"error\":\"unauthenticated\"}"
+                        .as_slice()
+                } else {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                        .as_slice()
+                };
+                socket.write_all(response).unwrap();
+            }
+        });
+
+        let mut retry_budget = RequestRetryBudget::new(3);
+        let response = open_upstream_with_rate_limit_retry(
+            &format!("http://127.0.0.1:{}", upstream_addr.port()),
+            "POST",
+            "/v1/responses",
+            &HashMap::new(),
+            b"{}",
+            &mut retry_budget,
+            None,
+        )
+        .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+
+        let (shielded_status, shielded_body) =
+            shield_desktop_auth_failure(401, br#"{"error":"unauthenticated"}"#);
+        assert_eq!(shielded_status, 503);
+        assert!(!String::from_utf8_lossy(&shielded_body).contains("unauthenticated"));
     }
 
     #[test]
@@ -3087,6 +3263,43 @@ mod tests {
         assert!(!output.contains("partial"));
         assert!(!output.to_ascii_lowercase().contains("transfer-encoding"));
         assert!(output.to_ascii_lowercase().contains("content-length: 11"));
+    }
+
+    #[test]
+    fn chunked_client_request_body_is_decoded_before_json_rewriting() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let (_headers, leftover) = read_headers(&mut socket).unwrap();
+            read_chunked_body(&mut socket, leftover).unwrap()
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .write_all(
+                b"POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n17\r\n{\"model\":\"gpt-5.6-sol\"}\r\n0\r\n\r\n",
+            )
+            .unwrap();
+        let body = worker.join().unwrap();
+        assert_eq!(body, br#"{"model":"gpt-5.6-sol"}"#);
+    }
+
+    #[test]
+    fn gzip_request_body_is_decoded_before_json_rewriting() {
+        let body = br#"{"model":"gpt-5.6-sol","input":[]}"#;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(body).unwrap();
+        let encoded = encoder.finish().unwrap();
+        let decoded = decode_request_content_encoding("gzip", &encoded).unwrap();
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn zstd_request_body_is_decoded_before_json_rewriting() {
+        let body = br#"{"model":"gpt-5.6-sol","input":[]}"#;
+        let encoded = zstd::stream::encode_all(body.as_slice(), 1).unwrap();
+        let decoded = decode_request_content_encoding("zstd", &encoded).unwrap();
+        assert_eq!(decoded, body);
     }
 
     #[test]

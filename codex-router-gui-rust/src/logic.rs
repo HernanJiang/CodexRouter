@@ -2999,7 +2999,7 @@ pub(crate) fn codex_config_uses_router(config_text: &str, router_base_url: &str)
     // Reject third-party profiles that reuse the custom id but point at a local
     // URL while naming themselves something other than Codex-Router.
     match provider.get("name").and_then(Item::as_str) {
-        None | Some("Codex-Router") => true,
+        None | Some("Codex-Router") | Some("OpenAI") => true,
         Some(_) => false,
     }
 }
@@ -3168,8 +3168,13 @@ fn load_oauth_accounts_native(
             }
         };
         let platform = usage::string(&detail, "platform").to_ascii_lowercase();
-        let (models, models_error) =
-            oauth_model_catalog_result(load_live_oauth_models(&admin, account_id, &platform));
+        let live_models_allowed = usage::string(&detail, "status") == "active"
+            && usage::get(&detail, "schedulable").and_then(Value::as_bool) != Some(false);
+        let (models, models_error) = if live_models_allowed {
+            oauth_model_catalog_result(load_live_oauth_models(&admin, account_id, &platform))
+        } else {
+            (Vec::new(), String::new())
+        };
 
         let credentials = usage::get(&detail, "credentials").unwrap_or(&Value::Null);
         let extra = usage::get(&detail, "extra").unwrap_or(&Value::Null);
@@ -3239,6 +3244,14 @@ fn load_live_oauth_models(
     account_id: i64,
     platform: &str,
 ) -> anyhow::Result<Vec<crate::OAuthModelSummary>> {
+    let catalog_path = format!("/api/v1/admin/accounts/{account_id}/models");
+    if platform.eq_ignore_ascii_case("openai") || platform.eq_ignore_ascii_case("chatgpt") {
+        // Desktop-owned ChatGPT: never POST sync-upstream. That path rewrites
+        // the CLI replica to wake the watcher and was a remaining login-loop
+        // trigger on the 3-minute GUI self-check.
+        return usage::retry_account_read(|| admin.get(&catalog_path, Duration::from_secs(15)))
+            .map(|body| oauth_models_from_response(platform, body));
+    }
     let sync_path = format!("/api/v1/admin/accounts/{account_id}/models/sync-upstream");
     let sync_result = admin
         .post(&sync_path, None, Duration::from_secs(15))
@@ -3248,7 +3261,6 @@ fn load_live_oauth_models(
     // return a string array instead of the stable catalog's model objects. The
     // canonical GET endpoint is account-scoped and remains the best UI source
     // after sync has refreshed it.
-    let catalog_path = format!("/api/v1/admin/accounts/{account_id}/models");
     let catalog_result =
         usage::retry_account_read(|| admin.get(&catalog_path, Duration::from_secs(15)))
             .map(|body| oauth_models_from_response(platform, body));
@@ -3530,6 +3542,7 @@ pub fn probe_oauth_recovery(
         "OAuth recovery",
         cfg,
         Instant::now() + Duration::from_secs(120),
+        true,
     )?;
     if cancel.load(std::sync::atomic::Ordering::Acquire) {
         bail!("class=cancelled")
@@ -3566,7 +3579,13 @@ fn load_usage_snapshot_with_timeout(
 ) -> anyhow::Result<crate::UsageSnapshot> {
     let mut last_failure = "class=unclassified_error".to_owned();
     for attempt in 0..USAGE_MONITOR_MAX_ATTEMPTS {
-        match usage::query_usage(router_root, profile_name, cfg, Instant::now() + timeout) {
+        match usage::query_usage(
+            router_root,
+            profile_name,
+            cfg,
+            Instant::now() + timeout,
+            false,
+        ) {
             Ok(snapshot) => return Ok(snapshot),
             Err(error) => last_failure = error.to_string(),
         }
@@ -4698,7 +4717,7 @@ base_url = "https://api.430123.xyz/v1"
         let server = std::thread::spawn(move || {
             let mut requests = Vec::new();
             let deadline = Instant::now() + Duration::from_secs(10);
-            while requests.len() < 2 && Instant::now() < deadline {
+            while requests.is_empty() && Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         let mut request = [0_u8; 4096];
@@ -4739,11 +4758,9 @@ base_url = "https://api.430123.xyz/v1"
         let result = load_live_oauth_models(&admin, 31, "openai");
         let requests = server.join().unwrap();
 
-        assert_eq!(requests.len(), 2);
-        assert!(
-            requests[0].starts_with("POST /api/v1/admin/accounts/31/models/sync-upstream HTTP/1.1")
-        );
-        assert!(requests[1].starts_with("GET /api/v1/admin/accounts/31/models HTTP/1.1"));
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET /api/v1/admin/accounts/31/models HTTP/1.1"));
+        assert!(!requests.iter().any(|line| line.contains("sync-upstream")));
         let models = result.unwrap();
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "gpt-5.6-sol");

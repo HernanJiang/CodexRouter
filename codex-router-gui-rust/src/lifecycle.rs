@@ -582,6 +582,7 @@ fn start_router_host(
     router_root: &Path,
     ports: LifecyclePorts,
     proxy_url: Option<&str>,
+    desktop_auth_path: &Path,
 ) -> anyhow::Result<u32> {
     let data_root = user_data::data_root(router_root);
     let logs = user_data::logs_root(router_root);
@@ -597,6 +598,7 @@ fn start_router_host(
         .arg(format!("--root={}", router_root.display()))
         .arg(format!("--host-port={}", ports.host))
         .arg(format!("--cli-port={}", ports.cli))
+        .arg(format!("--desktop-auth={}", desktop_auth_path.display()))
         .current_dir(router_root.join("app"))
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
@@ -769,6 +771,7 @@ pub fn ensure_services_with_config(
             router_root,
             ports,
             proxy_runtime.settings.proxy_url.as_deref(),
+            &logic::resolve_codex_home(config).join("auth.json"),
         )?;
         if let Err(error) = wait_host_ready(router_root, ports, &base_uri, process_id, cancel) {
             let expected = host_executable(router_root);
@@ -790,6 +793,9 @@ pub fn ensure_services_with_config(
     }
     logic::responses_gateway::set_gateway_log_path(
         user_data::logs_root(router_root).join("gateway-requests.jsonl"),
+    );
+    user_data::set_diagnostic_events_path(
+        user_data::logs_root(router_root).join("router-events.jsonl"),
     );
     logic::responses_gateway::set_max_output_tokens_map(logic::max_output_tokens_map(config));
     logic::responses_gateway::set_context_budget_map(logic::context_budget_map(config));

@@ -17,6 +17,8 @@ struct Material {
     proxy_url: Option<String>,
     project_id: String,
     account_id: String,
+    status: String,
+    schedulable: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -48,7 +50,8 @@ fn material(store: &StateStore, id: i64) -> anyhow::Result<Option<Material>> {
                         COALESCE(p.normalized_url,json_extract(a.payload,'$.proxy_url')),
                         COALESCE(json_extract(a.payload,'$.credentials.project_id'),''),
                         COALESCE(json_extract(a.payload,'$.credentials.chatgpt_account_id'),
-                                 json_extract(a.payload,'$.credentials.account_id'),'')
+                                 json_extract(a.payload,'$.credentials.account_id'),''),
+                        a.status,a.schedulable
                  FROM accounts a
                  LEFT JOIN proxies p ON p.id=COALESCE(a.proxy_id,
                     CAST(json_extract(a.payload,'$.proxy_id') AS INTEGER))
@@ -64,11 +67,78 @@ fn material(store: &StateStore, id: i64) -> anyhow::Result<Option<Material>> {
                         proxy_url: row.get(4)?,
                         project_id: row.get(5)?,
                         account_id: row.get(6)?,
+                        status: row.get(7)?,
+                        schedulable: row.get::<_, i64>(8)? != 0,
                     })
                 },
             )
             .optional()
             .map_err(Into::into)
+    })
+}
+
+/// How long a `needs_reauth` (401 / rotated-out refresh token) OAuth account
+/// stays away from the upstream after the first failed live call. Without the
+/// cooldown every quota poll re-presents the dead refresh token, which makes
+/// the provider invalidate the whole token family — including the Codex
+/// desktop session that shares the account — and spams the event log.
+const REAUTH_COOLDOWN: chrono::Duration = chrono::Duration::hours(1);
+
+fn reauth_cooldown_key(id: i64) -> String {
+    format!("oauth_reauth_cooldown_until.{id}")
+}
+
+pub(crate) fn reauth_cooldown_active(store: &StateStore, id: i64) -> anyhow::Result<bool> {
+    let account_type = store.with_connection(|connection| {
+        connection
+            .query_row(
+                "SELECT account_type FROM accounts WHERE id=?1 AND deleted_at IS NULL",
+                rusqlite::params![id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    })?;
+    if account_type.as_deref() != Some("oauth") {
+        return Ok(false);
+    }
+    let Some(raw) = store.setting(&reauth_cooldown_key(id))? else {
+        return Ok(false);
+    };
+    let text = serde_json::from_str::<String>(&raw).context("decode re-auth cooldown")?;
+    if text.trim().is_empty() {
+        return Ok(false);
+    }
+    let until = chrono::DateTime::parse_from_rfc3339(&text).context("parse re-auth cooldown")?;
+    Ok(until > chrono::Utc::now())
+}
+
+pub(crate) fn note_reauth_failure(store: &StateStore, id: i64) -> anyhow::Result<()> {
+    let is_oauth = store.with_connection(|connection| {
+        connection
+            .query_row(
+                "SELECT account_type='oauth' FROM accounts WHERE id=?1 AND deleted_at IS NULL",
+                rusqlite::params![id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map(|value| value.unwrap_or(false))
+            .map_err(Into::into)
+    })?;
+    if !is_oauth {
+        return Ok(());
+    }
+    let until = chrono::Utc::now() + REAUTH_COOLDOWN;
+    store.set_setting(&reauth_cooldown_key(id), &Value::String(until.to_rfc3339()))
+}
+
+pub(crate) fn clear_reauth_cooldown(store: &StateStore, id: i64) -> anyhow::Result<()> {
+    store.with_connection(|connection| {
+        connection.execute(
+            "DELETE FROM admin_settings WHERE key=?1",
+            rusqlite::params![reauth_cooldown_key(id)],
+        )?;
+        Ok(())
     })
 }
 
@@ -384,11 +454,27 @@ pub(crate) async fn query_account_usage(
     store: &StateStore,
     cli: &CliProxyManagementClient,
     logger: &StructuredLogger,
+    desktop_auth_path: Option<&Path>,
     id: i64,
 ) -> anyhow::Result<AccountUsage> {
     let Some(material) = material(store, id)? else {
         return Ok(AccountUsage::NotFound);
     };
+    // A disabled or isolated OAuth account must never touch its upstream
+    // token: every live call would re-present the credential the operator
+    // deliberately parked.
+    if material.account_type == "oauth" && (!material.schedulable || material.status != "active") {
+        return Ok(AccountUsage::Found(cached(store, id, &material.platform)?));
+    }
+    // After a 401 the refresh token is dead until the user re-authenticates.
+    // Serve the last-good cache during the cooldown instead of hammering the
+    // provider with the rotated-out token on every poll.
+    if material.account_type == "oauth" && reauth_cooldown_active(store, id)? {
+        let mut value = cached(store, id, &material.platform)?;
+        value["error_code"] = Value::String("unauthenticated".to_owned());
+        value["needs_reauth"] = Value::Bool(true);
+        return Ok(AccountUsage::Found(value));
+    }
     if material.platform == "antigravity" && material.account_type == "oauth" {
         match fetch(cli, &material).await {
             Ok(windows) => {
@@ -401,6 +487,9 @@ pub(crate) async fn query_account_usage(
                 return Ok(AccountUsage::Found(payload(&windows, false, "upstream")));
             }
             Err(failure) => {
+                if failure.needs_reauth {
+                    note_reauth_failure(store, id)?;
+                }
                 let mut value = cached(store, id, &material.platform)
                     .unwrap_or_else(|_| payload(&[], true, "cache"));
                 value["error_code"] = Value::String(failure.error_code.to_owned());
@@ -413,30 +502,35 @@ pub(crate) async fn query_account_usage(
             }
         }
     }
-    if material.account_type == "oauth" && matches!(material.platform.as_str(), "openai" | "grok") {
-        let provider = material.platform.as_str();
-        match fetch_provider(cli, &material).await {
+    if material.account_type == "oauth" && material.platform == "openai" {
+        let _ = logger.write(json!({
+            "level":"INFO",
+            "event":"desktop.session.openai_usage_observational",
+            "error_code": crate::control_plane::desktop_session::DSK_USAGE_OBSERVATIONAL,
+            "account_id":id,
+            "reason":"desktop_openai_auth_owner",
+        }));
+        return Ok(AccountUsage::Found(cached(store, id, "openai")?));
+    }
+    if material.account_type == "oauth" && material.platform == "grok" {
+        match fetch_provider(cli, desktop_auth_path, &material).await {
             Ok(windows) => {
-                let _ = persist(store, id, provider, &windows);
-                return Ok(AccountUsage::Found(if provider == "openai" {
-                    openai_payload(&windows, false, "upstream")
-                } else {
-                    grok_payload(&windows, false, "upstream")
-                }));
+                let _ = persist(store, id, "grok", &windows);
+                return Ok(AccountUsage::Found(grok_payload(
+                    &windows, false, "upstream",
+                )));
             }
             Err(failure) => {
-                let mut value = cached(store, id, provider).unwrap_or_else(|_| {
-                    if provider == "openai" {
-                        openai_payload(&[], true, "cache")
-                    } else {
-                        grok_payload(&[], true, "cache")
-                    }
-                });
+                if failure.needs_reauth {
+                    note_reauth_failure(store, id)?;
+                }
+                let mut value =
+                    cached(store, id, "grok").unwrap_or_else(|_| grok_payload(&[], true, "cache"));
                 value["error_code"] = Value::String(failure.error_code.to_owned());
                 value["needs_reauth"] = Value::Bool(failure.needs_reauth);
                 let _ = logger.write(json!({
                     "level":"WARN", "event":"control.oauth_quota_refresh_failed",
-                    "account_id":id, "platform":provider, "error_code":failure.error_code
+                    "account_id":id, "platform":"grok", "error_code":failure.error_code
                 }));
                 return Ok(AccountUsage::Found(value));
             }
@@ -517,16 +611,44 @@ fn used_percent_from(value: &Value) -> Option<f64> {
             "usedPercent",
             "usage_percent",
             "usagePercent",
+            "creditUsagePercent",
+            "credit_usage_percent",
             "utilization",
         ],
     ) {
         return Some(percent.clamp(0.0, 100.0));
     }
-    let used = number_field(value, &["used", "used_credits", "usedCredits"]);
-    let limit = number_field(value, &["limit", "quota", "total", "allowed"]);
+    let used = number_field(
+        value,
+        &[
+            "used",
+            "used_credits",
+            "usedCredits",
+            "credits_used",
+            "creditsUsed",
+        ],
+    );
+    let limit = number_field(
+        value,
+        &[
+            "limit",
+            "quota",
+            "total",
+            "allowed",
+            "total_credits",
+            "totalCredits",
+            "max",
+        ],
+    );
     let remaining = number_field(
         value,
-        &["remaining", "remaining_credits", "remainingCredits"],
+        &[
+            "remaining",
+            "remaining_credits",
+            "remainingCredits",
+            "balance",
+            "left",
+        ],
     );
     match (used, limit, remaining) {
         (Some(used), Some(limit), _) if limit > 0.0 => {
@@ -583,16 +705,24 @@ fn normalize_openai_usage(upstream: &Value) -> Vec<Window> {
 
 fn normalize_grok_usage(upstream: &Value) -> Vec<Window> {
     let sampled_at = chrono::Utc::now().to_rfc3339();
-    let billing = upstream
+    let root = upstream.get("data").unwrap_or(upstream);
+    let billing = root
         .get("billing")
-        .or_else(|| upstream.get("config"))
-        .unwrap_or(upstream);
+        .or_else(|| root.get("config"))
+        .or_else(|| root.get("usage"))
+        .unwrap_or(root);
     let current = billing
         .get("currentPeriod")
         .or_else(|| billing.get("current_period"))
         .unwrap_or(billing);
+    let credits = root
+        .get("credits")
+        .or_else(|| billing.get("credits"))
+        .or_else(|| current.get("credits"));
     let used_percent = used_percent_from(billing)
         .or_else(|| used_percent_from(current))
+        .or_else(|| credits.and_then(used_percent_from))
+        .or_else(|| used_percent_from(root))
         .or_else(|| number_field(billing, &["creditUsagePercent", "credit_usage_percent"]));
     let Some(used_percent) = used_percent else {
         return Vec::new();
@@ -660,51 +790,104 @@ async fn api_call(
     if !(200..300).contains(&status) {
         return Err(classify(status));
     }
-    let Some(body) = response.get("body").and_then(Value::as_str) else {
+    match response.get("body") {
+        Some(Value::String(text)) => serde_json::from_str(text).map_err(|_| LiveFailure {
+            error_code: "invalid_response",
+            needs_reauth: false,
+        }),
+        Some(value) if !value.is_null() => Ok(value.clone()),
+        _ => Err(LiveFailure {
+            error_code: "invalid_response",
+            needs_reauth: false,
+        }),
+    }
+}
+
+/// ChatGPT usage endpoint. Overridable so tests can point the Desktop-owned
+/// quota probe at a loopback mock instead of the real upstream.
+fn openai_usage_endpoint() -> String {
+    std::env::var("CODEX_ROUTER_WHAM_USAGE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "https://chatgpt.com/backend-api/wham/usage".to_owned())
+}
+
+/// Fetch ChatGPT subscription quota for a Desktop-owned OpenAI OAuth account.
+/// Desktop's auth.json is the only credential source and this is a read-only
+/// GET with its current access token. It must never travel through
+/// CLIProxyAPI's `$TOKEN$` machinery: that path lets the CLI side refresh the
+/// credential, and a second refresh client makes OpenAI revoke the whole
+/// token family (refresh_token_invalidated), logging Codex Desktop out.
+async fn fetch_openai_usage_direct(
+    desktop_auth_path: Option<&Path>,
+    material: &Material,
+) -> Result<Vec<Window>, LiveFailure> {
+    let unavailable = || LiveFailure {
+        error_code: "auth_unavailable",
+        needs_reauth: false,
+    };
+    let Some(path) = desktop_auth_path else {
+        return Err(unavailable());
+    };
+    let token = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|auth| {
+            auth.pointer("/tokens/access_token")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        })
+        .ok_or_else(unavailable)?;
+    let mut builder = reqwest::Client::builder()
+        .user_agent("codex_cli_rs")
+        .timeout(std::time::Duration::from_secs(15));
+    if let Some(proxy) = proxy_url(material).filter(|value| !value.trim().is_empty()) {
+        if let Ok(proxy) = reqwest::Proxy::all(proxy.as_str()) {
+            builder = builder.proxy(proxy);
+        }
+    }
+    let client = builder.build().map_err(|_| LiveFailure {
+        error_code: "network_error",
+        needs_reauth: false,
+    })?;
+    let mut request = client
+        .get(openai_usage_endpoint())
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/json");
+    if !material.account_id.trim().is_empty() {
+        request = request.header("ChatGPT-Account-ID", material.account_id.trim());
+    }
+    let response = request.send().await.map_err(|_| LiveFailure {
+        error_code: "network_error",
+        needs_reauth: false,
+    })?;
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(classify(status));
+    }
+    let body: Value = response.json().await.map_err(|_| LiveFailure {
+        error_code: "invalid_response",
+        needs_reauth: false,
+    })?;
+    let windows = normalize_openai_usage(&body);
+    if windows.is_empty() {
         return Err(LiveFailure {
             error_code: "invalid_response",
             needs_reauth: false,
         });
-    };
-    serde_json::from_str(body).map_err(|_| LiveFailure {
-        error_code: "invalid_response",
-        needs_reauth: false,
-    })
+    }
+    Ok(windows)
 }
 
 async fn fetch_provider(
     cli: &CliProxyManagementClient,
+    desktop_auth_path: Option<&Path>,
     material: &Material,
 ) -> Result<Vec<Window>, LiveFailure> {
     match material.platform.as_str() {
-        "openai" => {
-            let mut headers = json!({
-                "Authorization": "Bearer $TOKEN$",
-                "Accept": "application/json",
-                "User-Agent": "codex_cli_rs"
-            });
-            if !material.account_id.trim().is_empty() {
-                headers["ChatGPT-Account-ID"] =
-                    Value::String(material.account_id.trim().to_owned());
-            }
-            let upstream = api_call(
-                cli,
-                material,
-                "GET",
-                "https://chatgpt.com/backend-api/wham/usage",
-                headers,
-                None,
-            )
-            .await?;
-            let windows = normalize_openai_usage(&upstream);
-            if windows.is_empty() {
-                return Err(LiveFailure {
-                    error_code: "invalid_response",
-                    needs_reauth: false,
-                });
-            }
-            Ok(windows)
-        }
+        "openai" => fetch_openai_usage_direct(desktop_auth_path, material).await,
         "grok" => {
             let headers = json!({
                 "Authorization": "Bearer $TOKEN$",
@@ -806,6 +989,15 @@ mod tests {
         assert_eq!(from_config.len(), 1);
         assert_eq!(from_config[0].used_percent, 18.0);
         assert_eq!(from_config[0].model, "weekly");
+        let from_credits = normalize_grok_usage(&json!({
+            "data": {
+                "credits": { "remaining": 250.0, "total": 1000.0 },
+                "currentPeriod": { "type": "month", "end": "2026-09-01T00:00:00Z" }
+            }
+        }));
+        assert_eq!(from_credits.len(), 1);
+        assert_eq!(from_credits[0].used_percent, 75.0);
+        assert_eq!(from_credits[0].model, "monthly");
     }
 
     #[test]
@@ -820,5 +1012,114 @@ mod tests {
                 "grok-account.json"
             ));
         }
+    }
+
+    fn test_store() -> (std::path::PathBuf, StateStore) {
+        let root = std::env::temp_dir().join(format!("router-usage-{}", uuid::Uuid::now_v7()));
+        let store = StateStore::open(root.join("router-state.sqlite3")).unwrap();
+        (root, store)
+    }
+
+    fn insert_openai_oauth_account(store: &StateStore, status: &str, schedulable: i64) {
+        store
+            .with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO accounts(id,platform,account_type,auth_index,auth_file,
+                        stable_identity_hmac,status,schedulable,priority,weight,payload)
+                     VALUES(1,'openai','oauth','stored-index','legacy-openai-1.json',
+                        'usage-account',?1,?2,1,1,
+                        '{\"credentials\":{\"chatgpt_account_id\":\"00000000-0000-4000-8000-000000000001\"}}')",
+                    rusqlite::params![status, schedulable],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn test_logger(root: &std::path::Path) -> StructuredLogger {
+        StructuredLogger::open(root.join("router-events.jsonl")).unwrap()
+    }
+
+    fn unreachable_cli() -> CliProxyManagementClient {
+        CliProxyManagementClient::new("http://127.0.0.1:1", "test-secret").unwrap()
+    }
+
+    #[test]
+    fn reauth_cooldown_set_clear_cycle() {
+        let (_root, store) = test_store();
+        insert_openai_oauth_account(&store, "active", 1);
+        assert!(!reauth_cooldown_active(&store, 1).unwrap());
+        note_reauth_failure(&store, 1).unwrap();
+        assert!(reauth_cooldown_active(&store, 1).unwrap());
+        assert!(!reauth_cooldown_active(&store, 8).unwrap());
+        clear_reauth_cooldown(&store, 1).unwrap();
+        assert!(!reauth_cooldown_active(&store, 1).unwrap());
+    }
+
+    #[tokio::test]
+    async fn disabled_oauth_account_serves_cache_without_touching_upstream() {
+        let (root, store) = test_store();
+        insert_openai_oauth_account(&store, "disabled", 0);
+        let logger = test_logger(&root);
+        let usage = query_account_usage(&store, &unreachable_cli(), &logger, None, 1)
+            .await
+            .unwrap();
+        let AccountUsage::Found(value) = usage else {
+            panic!("disabled accounts must be served from cache");
+        };
+        assert_eq!(value["stale"], true);
+        assert_eq!(value["source"], "cache");
+        assert!(value.get("error_code").is_none());
+    }
+
+    #[tokio::test]
+    async fn cooling_down_account_serves_cache_with_needs_reauth_flag() {
+        let (root, store) = test_store();
+        insert_openai_oauth_account(&store, "active", 1);
+        note_reauth_failure(&store, 1).unwrap();
+        let logger = test_logger(&root);
+        let usage = query_account_usage(&store, &unreachable_cli(), &logger, None, 1)
+            .await
+            .unwrap();
+        let AccountUsage::Found(value) = usage else {
+            panic!("cooling-down accounts must be served from cache");
+        };
+        assert_eq!(value["error_code"], "unauthenticated");
+        assert_eq!(value["needs_reauth"], true);
+    }
+
+    #[tokio::test]
+    async fn desktop_openai_quota_is_observational_and_never_hits_upstream() {
+        let (root, store) = test_store();
+        insert_openai_oauth_account(&store, "active", 1);
+        let logger = test_logger(&root);
+        let usage = query_account_usage(&store, &unreachable_cli(), &logger, None, 1)
+            .await
+            .unwrap();
+        let AccountUsage::Found(value) = usage else {
+            panic!("desktop-owned ChatGPT quota must stay observational");
+        };
+        assert_ne!(value["error_code"], "unauthenticated");
+        assert_ne!(value["needs_reauth"], true);
+        assert!(!reauth_cooldown_active(&store, 1).unwrap());
+        let events = std::fs::read_to_string(logger.path()).unwrap();
+        assert!(events.contains("CR-DSK-0005"));
+        assert!(events.contains("desktop.session.openai_usage_observational"));
+        let _ = root;
+    }
+
+    #[tokio::test]
+    async fn desktop_openai_quota_missing_login_does_not_arm_reauth_cooldown() {
+        let (root, store) = test_store();
+        insert_openai_oauth_account(&store, "active", 1);
+        let logger = test_logger(&root);
+        let usage = query_account_usage(&store, &unreachable_cli(), &logger, None, 1)
+            .await
+            .unwrap();
+        let AccountUsage::Found(_) = usage else {
+            panic!("the account must still resolve to a payload");
+        };
+        assert!(!reauth_cooldown_active(&store, 1).unwrap());
+        let _ = root;
     }
 }

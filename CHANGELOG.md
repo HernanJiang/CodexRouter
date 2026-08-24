@@ -2,6 +2,122 @@
 
 本文件记录面向用户的重要变化。完整技术细节以对应版本的源码和 GitHub Release 为准。
 
+## 3.0.2 - 2026-08-25
+
+### 原因
+
+Codex Desktop 26.818 在活动 provider 为 `requires_openai_auth = true` 时，会把账号心跳 `getAuthStatus` 和在线模型列表 `list_models` **并发**打到 `auth.openai.com/oauth/token`。OpenAI 对 refresh token 使用严格轮换：同一张票同时用两次即整族作废（HTTP 401 `refresh_token_invalidated`），Desktop 再升级为 `account/login/start`。这是客户端行为，不是 Router 不能转发。
+
+旧写法 `name = "OpenAI"` + `requires_openai_auth = true` 能让左下角显示 ChatGPT，但在 26.818 上会触发上述并发刷新。只改显示名为 `OpenAI`、开关仍为 `false`（2.1.10）会被 Desktop 当成未登录的 OpenAI。因此 3.0.1 起固定 `name = Codex-Router` + `requires_openai_auth = false`：ChatGPT token 仍留在用户 `auth.json`，请求走本地 Router bearer，Desktop 不再为这个 provider 刷新 OAuth。左下角显示 Codex-Router 是预期结果。
+
+3.0.1 只改了用户层 `~/.codex/config.toml`。系统层 `%ProgramData%\OpenAI\Codex\config.toml` 仍可能是 `true`；Desktop 周期性剥掉用户层 provider（`model = "first"`）后会回落到系统层，登录循环复现。3.0.2 把系统层一并修掉。
+
+### 修复
+
+- Host 启动时修补非法身份；用户层被剥则从系统层恢复；系统层缺失则从用户层重建合法绑定。之后字节相同不再写文件。
+- CLI `write-codex-config` 同时刷新系统层绑定。
+- 退出 Router 不再删除系统层绑定（否则 Desktop 剥掉用户层后又会回到 ChatGPT OAuth 刷新）。只有「恢复官方配置」才移除系统层。
+- 账号模式切换不再按模型族把 `requires_openai_auth` 写回 `true`。
+
+### 可观测性
+
+- `CR-DSK-0001` 用户 config 写入、`0002` 跳过、`0003` 副本实写、`0004` 会话心跳（用户/系统 config 与 auth.json mtime、身份、副本跳过/写入计数）、`0005` 额度观察、`0006` 上游 401 屏蔽、`0007/0008` overlay 写/跳过、`0009/0010` 系统层写/跳过、`0011` 非法身份、`0012` 就地修复、`0013` 用户层 provider 被 Desktop 剥掉、`0014` 从系统层一次性恢复、`0015` 系统层缺失时从用户层重建。事件写入 `router-events.jsonl`。
+
+## 3.0.1 - 2026-08-25
+
+### 修复
+
+- 现场 `logs_2.sqlite` 证实：`requires_openai_auth=true` 会让 Codex Desktop `getAuthStatus` 调用 `Refreshing token`；登录成功后 28 秒再次刷新并 401 `refresh_token_invalidated`，随即 `account/login/start`。Router provider 现固定 `name=Codex-Router` + `requires_openai_auth=false`，请求仍走本地 bearer，**不再让 Desktop 刷新 ChatGPT token**。
+- ChatGPT 额度改为纯观察缓存，不再直连 `wham/usage`。
+- CLI 副本改为原地写入，避免 watcher 把 delete+rename 当成 REMOVE。
+- 诊断事件：`CR-DSK-0001` 写 config、`CR-DSK-0002` 跳过写入、`CR-DSK-0003` 副本实写、`CR-DSK-0005` 额度观察、`CR-DSK-0006` 上游 401 屏蔽。
+
+## 3.0.0 - 2026-08-25
+
+### 修复
+
+- 彻底消除 ChatGPT「用到一半跳回登录页」的 Router 侧剩余触发点：3 分钟自检改为只观察、不再写 `config.toml`；Desktop overlay 往返幂等，相同内容不再产生多余备份或文件变更事件。
+- 网关和 Host 不再把上游 401 原样回给 Codex Desktop（改成 503「模型暂不可用」），并先按现有阶梯重试以便落到第三方 API。
+- ChatGPT 模型目录同步不再触碰 CLI 副本文件；手动 recover/test 也不再把 ChatGPT 送进 CLI `$TOKEN$`；写入 auth 文件时强制去掉 `refresh_token`；残留 `legacy-openai-*.json` 在后端同步时隔离。
+- 偶发 `CR-SYS-0001 terminal span was not completed explicitly` 改为请求取消/中断记录，不再伪装成 500 内部错误。
+- 放宽 Grok 额度解析（`data`/`credits` 及 JSON 对象 body），减少 `invalid_response`。
+
+### 架构
+
+- 当时仍允许两种身份：`OpenAI` + `requires_openai_auth=true`（ChatGPT 会话外观）或 `Codex-Router` + `requires_openai_auth=false`。**3.0.1 已撤回前者**：Desktop 26.818 在 `true` 时并发刷新 token。
+- `config.toml` 写入统一为「字节相同则跳过」；真实写入才备份，并记录 content hash。
+
+## 2.1.14 - 2026-08-24
+
+### 修复
+
+- 回退 ChatGPT 为 Desktop 单端自检：Router 不再对 ChatGPT 做额度直连、计划探测、恢复或周期性同步；ChatGPT 路由和 API fallback 保留，其他 OAuth 号池不变。
+
+## 2.1.13 - 2026-08-24
+
+### 修复
+
+- ChatGPT 额度查询改用 Desktop `auth.json` 当前 access token 直连，ChatGPT 仍参与订阅额度和 API fallback 调度，但 CLIProxyAPI 不再接触 ChatGPT refresh token；其他 OAuth 供应商继续使用 CLIProxyAPI 号池。
+
+## 2.1.12 - 2026-08-24
+
+### 修复
+
+- ChatGPT OAuth 改为由 Codex Desktop 单独持有并刷新 refresh token；Router 只同步 Desktop 当前 access token，不再在 Router 副本中保存 refresh token。
+
+## 2.1.11 - 2026-08-24
+
+### 修复
+
+- 修复 2.1.10 只把 provider 显示名改成 `OpenAI`、却把 `requires_openai_auth` 写成 `false`，导致 Codex 把已登录的 ChatGPT 会话登出、左下角只剩未登录的 OpenAI。ChatGPT 登录现在保持 ChatGPT 会话：`requires_openai_auth=true`、显示名为 `OpenAI`，请求仍走本地 Router bearer/catalog，不覆盖 `auth.json`。
+- API Key 登录仍保持 API Key：`requires_openai_auth=false`、显示名为 `Codex-Router`。Router 不会再拿死 refresh token 反复打上游。
+- 修复 ChatGPT 远程压缩 v2：`/v1/responses/compact` 不再被注入 `max_output_tokens` / tools / stream，避免官方 compact 返回 2 条普通输出、0 条 compaction item。
+
+## 2.1.10 - 2026-08-24
+
+### 修复
+
+- 拆开 ChatGPT 身份与自动登录弹窗。`codex_router` 请求仍走本地 Router bearer/catalog，`requires_openai_auth` 固定为 `false`，ChatGPT token 失效时 Desktop 不再自动弹出登录窗。
+- 已登录 ChatGPT 或 Router 默认 OAuth 会话时，provider 显示名为 `OpenAI`，左下角不再显示成 Codex-Router 登录；API Key 登录仍显示 `Codex-Router`。不覆盖、不删除 `auth.json`。
+
+## 2.1.9 - 2026-08-24
+
+### 修复
+
+- 修复 2.1.8 把 `codex_router` 一律写成 `requires_openai_auth=false`，导致 Codex Desktop 被强制切到 Router 登录、反复弹出“登录 ChatGPT”的问题。请求仍走本地 Router bearer 与 catalog；登录方式按 Codex 现有会话保留：已登录 ChatGPT 保持 ChatGPT，第三方 API Key 登录保持 API Key，不覆盖 `auth.json`。
+- API Key 登录仍会清掉残留的 `forced_login_method = "chatgpt"`；ChatGPT 登录不再被改成 Router 登录。
+
+## 2.1.8 - 2026-08-24
+
+### 修复
+
+- 修复 Codex 本地 Router provider 被写成 `requires_openai_auth=true`，导致 Desktop 即使全部模型请求都使用 Router 独立 bearer，仍把 ChatGPT 登录视为强制前置条件；当 `getAuthStatus` 刷新收到 `refresh_token_invalidated` 时会自动打开登录窗口。Router provider 现固定为 `requires_openai_auth=false`，不删除、不覆盖 Codex 自己的 `auth.json`，本地模型与 catalog 继续使用 Router bearer。
+- OAuth 模型目录刷新不再访问 disabled、unschedulable、401 冷却或物理 auth 文件缺失的账号，避免隔离后的 `legacy-openai-1.json` 仍被周期性请求 CLI models 端点。
+
+## 2.1.7 - 2026-08-24
+
+### 修复
+
+- 修复 GUI 显示“OAuth 恢复探测完成：healthy=… deferred=… recovered=0”时仍对显式禁用或等待重新认证的 OAuth 账号发起额度/恢复探测，可能重放死 refresh token 并让 Codex 再次弹出 ChatGPT 登录的问题。显式禁用账号现在只读本地统计，GUI 恢复、Host `recover-state` 与定时 scheduler 均不得触达其凭据；401 冷却也不能被恢复端点穿透。
+- OAuth `recover-state` 探测失败不再回退为直接设置 schedulable；CLI 同步失败会恢复账号原状态。OpenAI 恢复批次不再重复调用两个指向同一处理器的 quota 端点。
+
+## 2.1.6 - 2026-08-24
+
+### 修复
+
+- 复合路由改为一次事务批量写入并只触发一次 CLIProxyAPI 全量热加载，避免逐条路由连续推送配置导致 `ROUTER_DEPLOY_COMPOSITE_FAILED` / `CR-CFG-0005`。
+- 未变化的 OAuth 路由副本不再重复发布；变化时先完整写入唯一临时文件再替换，避免 CLI 文件监控器在 Windows 独占写窗口读取失败。
+- OAuth 额度刷新失败保留在原始 JSONL 供诊断，但不再刷活动日志；合法 `control.*` 事件名不再被误显示为 `[REDACTED]`。
+- 修复同一 ChatGPT 账号同时登录 Codex 桌面端和 Router OAuth 渠道时，Router 侧过期 refresh token 被每分钟反复重试、导致 OpenAI 吊销整个令牌族并让 Codex 反复弹出"登录 ChatGPT"的问题：OAuth 账号首次 401 后进入 1 小时重认证冷却，冷却期只展示缓存额度、不再触达上游；手动恢复探测仍为 401 时重新进入完整冷却；被禁用/隔离的 OAuth 账号不再发起实时额度调用；定时探测只对 OAuth 账号执行冷却跳过并在 401 时联动冷却。
+- OAuth 重新登录成功后按上游账号 ID / 邮箱复用并恢复原账号、替换 CLI auth 文件和稳定身份、解除重认证冷却；旧死令牌文件无人共用时立即删除，同级身份命中多个旧账号时拒绝猜测，避免恢复错账号或遗留死令牌继续刷新。普通账号信息保存不再误解除冷却。
+
+## 2.1.5 - 2026-08-24
+
+### 修复
+
+- 普通用量刷新不再执行 OAuth 账号隔离、恢复或路由重建；额度刷新失败只展示 stale/unknown 状态，不再循环触发 `control.oauth_quota_refresh_failed` 和 fallback 重同步。
+- 五小时未知额度保护统一由已有 OAuth 自检执行，只有自检获得真实可用/耗尽证据时才改变调度；网络、权限、认证和无效响应不会被误判为额度耗尽。
+
 ## 2.1.4 - 2026-08-23
 
 ### 功能

@@ -1,15 +1,22 @@
 //! Persistent scheduled account probes.
 
 use super::account_probe::{self, ProbeFailure, ProbeSuccess};
-use super::http_compat::{sync_backend, ControlState};
+use super::desktop_session;
+use super::http_compat::{
+    sync_backend, sync_desktop_openai_replicas, ControlState, ReplicaSyncStats,
+};
 use anyhow::{Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use cron::Schedule;
+use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 use std::str::FromStr;
 use std::time::Duration;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// How often OpenAI CLI replicas are re-stamped from Desktop's auth.json.
+/// Desktop owns the refresh token; Router only re-copies the access token.
+const DESKTOP_TOKEN_SYNC_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 struct ScheduledPlan {
@@ -234,6 +241,91 @@ async fn auto_recover(state: &ControlState, plan: &ScheduledPlan) -> Result<bool
 }
 
 async fn execute_claimed(state: &ControlState, plan: &ScheduledPlan, result_id: i64) {
+    let desktop_owned_openai = state.store.with_connection(|connection| {
+        connection
+            .query_row(
+                "SELECT platform,account_type FROM accounts WHERE id=?1 AND deleted_at IS NULL",
+                rusqlite::params![plan.account_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map(|value| {
+                value.is_some_and(|(platform, account_type)| {
+                    account_type.eq_ignore_ascii_case("oauth")
+                        && platform.eq_ignore_ascii_case("openai")
+                })
+            })
+            .map_err(Into::into)
+    });
+    if matches!(desktop_owned_openai, Ok(true)) {
+        let details = json!({
+            "account_id":plan.account_id,
+            "model":plan.model,
+            "finished_at":Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            "reason":"desktop_openai_auth_owner",
+        });
+        let _ = finish_result(
+            state,
+            plan,
+            result_id,
+            "skipped",
+            Some("desktop_openai_auth_owner"),
+            &details,
+        );
+        return;
+    }
+    let explicitly_disabled = state.store.with_connection(|connection| {
+        connection
+            .query_row(
+                "SELECT status='disabled' FROM accounts WHERE id=?1 AND deleted_at IS NULL",
+                rusqlite::params![plan.account_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map(|value| value.unwrap_or(true))
+            .map_err(Into::into)
+    });
+    if !matches!(explicitly_disabled, Ok(false)) {
+        let reason = if matches!(explicitly_disabled, Ok(true)) {
+            "account_disabled"
+        } else {
+            "account_state_unavailable"
+        };
+        let details = json!({
+            "account_id":plan.account_id,
+            "model":plan.model,
+            "finished_at":Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            "reason":reason,
+        });
+        let _ = finish_result(state, plan, result_id, "skipped", Some(reason), &details);
+        return;
+    }
+    // A 401 already proved this account's refresh token is dead. Probing it
+    // again during the cooldown would re-present the rotated-out token and
+    // can invalidate other sessions of the same account (e.g. Codex desktop).
+    let cooldown = crate::router_usage::reauth_cooldown_active(&state.store, plan.account_id);
+    if !matches!(cooldown, Ok(false)) {
+        let reason = if matches!(cooldown, Ok(true)) {
+            "reauth_cooldown"
+        } else {
+            "reauth_cooldown_unavailable"
+        };
+        let details = json!({
+            "account_id":plan.account_id,
+            "model":plan.model,
+            "finished_at":Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            "reason":reason,
+        });
+        let _ = finish_result(state, plan, result_id, "skipped", Some(reason), &details);
+        let _ = state.logger.write(json!({
+            "level":"INFO",
+            "event":"scheduler.probe_skipped",
+            "plan_id":plan.id,
+            "account_id":plan.account_id,
+            "error_code":reason,
+        }));
+        return;
+    }
     let result = account_probe::probe_account(
         &state.store,
         &state.cli,
@@ -285,6 +377,19 @@ async fn execute_claimed(state: &ControlState, plan: &ScheduledPlan, result_id: 
             }));
         }
         Err(failure) => {
+            if failure.upstream_status == Some(401) || failure.error_code == "unauthenticated" {
+                if let Err(error) =
+                    crate::router_usage::note_reauth_failure(&state.store, plan.account_id)
+                {
+                    let _ = state.logger.write(json!({
+                        "level":"ERROR",
+                        "event":"scheduler.reauth_cooldown_write_failed",
+                        "plan_id":plan.id,
+                        "account_id":plan.account_id,
+                        "error_description":error.to_string(),
+                    }));
+                }
+            }
             let details = result_details_failure(plan, &failure);
             let _ = finish_result(
                 state,
@@ -336,6 +441,8 @@ pub async fn run(state: ControlState) {
             "error_description":error.to_string(),
         }));
     }
+    let mut next_desktop_sync = std::time::Instant::now();
+    let mut repair_user_identity = true;
     loop {
         if let Err(error) = run_due_once(&state).await {
             let _ = state.logger.write(json!({
@@ -343,6 +450,22 @@ pub async fn run(state: ControlState) {
                 "event":"scheduler.tick_failed",
                 "error_description":error.to_string(),
             }));
+        }
+        if std::time::Instant::now() >= next_desktop_sync {
+            next_desktop_sync = std::time::Instant::now() + DESKTOP_TOKEN_SYNC_INTERVAL;
+            let replica_stats = match sync_desktop_openai_replicas(&state) {
+                Ok(stats) => stats,
+                Err(error) => {
+                    let _ = state.logger.write(json!({
+                        "level":"WARN",
+                        "event":"scheduler.desktop_oauth_sync_failed",
+                        "error_description":error.to_string(),
+                    }));
+                    ReplicaSyncStats::default()
+                }
+            };
+            desktop_session::protect_desktop_session(&state, replica_stats, repair_user_identity);
+            repair_user_identity = false;
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
@@ -616,6 +739,135 @@ mod tests {
                     |row| row.get(0),
                 )?;
                 assert_eq!(second_next, "2000-01-01T00:00:00.000Z");
+                Ok(())
+            })
+            .unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reauth_cooldown_skips_the_probe_without_touching_upstream() {
+        let (state, requests, server) = test_state(200).await;
+        state
+            .store
+            .with_connection(|connection| {
+                connection.execute("UPDATE accounts SET account_type='oauth' WHERE id=1", [])?;
+                connection.execute("UPDATE accounts SET platform='grok' WHERE id=1", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let plan_id = insert_due_plan(&state, true, 20);
+        crate::router_usage::note_reauth_failure(&state.store, 1).unwrap();
+
+        assert_eq!(run_due_once(&state).await.unwrap(), 1);
+        assert!(requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_empty());
+        state
+            .store
+            .with_connection(|connection| {
+                let result: (String, Option<String>) = connection.query_row(
+                    "SELECT status,error_code FROM scheduled_test_results WHERE plan_id=?1",
+                    rusqlite::params![plan_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                assert_eq!(
+                    result,
+                    ("skipped".to_owned(), Some("reauth_cooldown".to_owned()))
+                );
+                Ok(())
+            })
+            .unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_probe_failure_arms_the_reauth_cooldown() {
+        let (state, _requests, server) = test_state(401).await;
+        state
+            .store
+            .with_connection(|connection| {
+                connection.execute("UPDATE accounts SET account_type='oauth' WHERE id=1", [])?;
+                connection.execute("UPDATE accounts SET platform='grok' WHERE id=1", [])?;
+                Ok(())
+            })
+            .unwrap();
+        insert_due_plan(&state, true, 20);
+
+        assert_eq!(run_due_once(&state).await.unwrap(), 1);
+        assert!(crate::router_usage::reauth_cooldown_active(&state.store, 1).unwrap());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn api_key_account_ignores_stale_oauth_cooldown_setting() {
+        let (state, requests, server) = test_state(200).await;
+        state
+            .store
+            .with_connection(|connection| {
+                connection.execute("UPDATE accounts SET account_type='apikey' WHERE id=1", [])?;
+                Ok(())
+            })
+            .unwrap();
+        state
+            .store
+            .set_setting(
+                "oauth_reauth_cooldown_until.1",
+                &Value::String((Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+            )
+            .unwrap();
+        insert_due_plan(&state, false, 20);
+
+        assert_eq!(run_due_once(&state).await.unwrap(), 1);
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .len(),
+            1
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn explicitly_disabled_account_is_never_probed_or_recovered() {
+        let (state, requests, server) = test_state(200).await;
+        state
+            .store
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE accounts SET status='disabled',schedulable=0 WHERE id=1",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let plan_id = insert_due_plan(&state, true, 20);
+
+        assert_eq!(run_due_once(&state).await.unwrap(), 1);
+        assert!(requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_empty());
+        state
+            .store
+            .with_connection(|connection| {
+                let account: (String, i64) = connection.query_row(
+                    "SELECT status,schedulable FROM accounts WHERE id=1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                assert_eq!(account, ("disabled".to_owned(), 0));
+                let result: (String, Option<String>) = connection.query_row(
+                    "SELECT status,error_code FROM scheduled_test_results WHERE plan_id=?1",
+                    rusqlite::params![plan_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                assert_eq!(
+                    result,
+                    ("skipped".to_owned(), Some("account_disabled".to_owned()))
+                );
                 Ok(())
             })
             .unwrap();
