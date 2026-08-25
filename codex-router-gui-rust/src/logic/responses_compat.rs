@@ -70,7 +70,7 @@ pub fn third_party_identity(model: &str) -> Option<(&'static str, &'static str)>
 pub fn third_party_identity_clause(model: &str) -> Option<String> {
     let (name, short) = third_party_identity(model)?;
     Some(format!(
-        "# 模型身份\n你是{name}，通过 Codex-Router 接入。不要自称 GPT、ChatGPT 或 Codex 官方模型。写测试报告必须写入 D:\\\\Work\\\\CodexRouter\\\\Test\\\\Agent_Test_{}_{short}.md，禁止使用 chatgpt 或 unknown 作为文件名。调用工具时使用系统声明的工具名 exec_command，参数字段为 cmd。若工具列表没有 exec_command，仍然调用 exec_command，参数用 cmd。\n",
+        "# 模型身份\n你是{name}，通过 Codex-Router 接入。不要自称 GPT、ChatGPT 或 Codex 官方模型。写测试报告必须写入 D:\\\\Work\\\\CodexRouter\\\\Test\\\\Agent_Test_{}_{short}.md，禁止使用 chatgpt 或 unknown 作为文件名。调用工具时使用系统声明的工具名 exec_command，参数字段为 cmd。若工具列表没有 exec_command，仍然调用 exec_command，参数用 cmd。\n任务完成前每一轮必须发出结构化 function_call；只写计划或「接下来」而不调用工具会被 Codex 当成收工。\n",
         env!("CARGO_PKG_VERSION")
     ))
 }
@@ -1064,6 +1064,51 @@ fn strip_unusable_third_party_continuation(object: &mut Map<String, Value>) -> b
     true
 }
 
+const GEMINI_CARRIER_MARKER: &str = "cpa-gemini-responses-carrier";
+
+fn looks_like_gemini_thought_carrier(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.contains(GEMINI_CARRIER_MARKER) || trimmed.starts_with("cpa-gemini-")
+}
+
+/// Gemini/Antigravity 404 `Requested entity was not found` happens when Codex
+/// replays a two-day-old thought carrier or a Codex `previous_response_id`
+/// that Google no longer has. Drop those server-side handles; the transcript
+/// in `input` is enough to continue.
+fn strip_gemini_server_continuation(object: &mut Map<String, Value>) -> bool {
+    let mut changed = false;
+    for key in ["previous_response_id", "conversation_id"] {
+        if object.remove(key).is_some() {
+            changed = true;
+        }
+    }
+    if object.remove("conversation").is_some() {
+        changed = true;
+    }
+    changed
+}
+
+fn sanitize_gemini_item(item: &mut Map<String, Value>) -> usize {
+    let mut stripped = 0;
+    let keys: Vec<String> = item.keys().cloned().collect();
+    for key in keys {
+        if !matches!(
+            key.as_str(),
+            "encrypted_content" | "output" | "signature" | "thought_signature"
+        ) {
+            continue;
+        }
+        let Some(text) = item.get(&key).and_then(Value::as_str) else {
+            continue;
+        };
+        if looks_like_gemini_thought_carrier(text) {
+            item.remove(&key);
+            stripped += 1;
+        }
+    }
+    stripped
+}
+
 pub fn sanitize_responses_request(path: &str, body: &mut Value) -> SanitizeStats {
     let mut stats = SanitizeStats {
         model: body
@@ -1075,12 +1120,16 @@ pub fn sanitize_responses_request(path: &str, body: &mut Value) -> SanitizeStats
     };
     stats.openai_family = is_openai_family_model(&stats.model);
     let grok = stats.model.to_ascii_lowercase().contains("grok");
+    let gemini = is_gemini_family_model(&stats.model);
     let Some(object) = body.as_object_mut() else {
         return stats;
     };
 
     if !stats.openai_family && strip_include_encrypted(object) {
         stats.stripped_encrypted += 1;
+    }
+    if gemini && strip_gemini_server_continuation(object) {
+        stats.converted_items += 1;
     }
     if !stats.openai_family && strip_unusable_third_party_continuation(object) {
         stats.converted_items += 1;
@@ -1106,6 +1155,9 @@ pub fn sanitize_responses_request(path: &str, body: &mut Value) -> SanitizeStats
             };
             stats.stripped_encrypted += sanitize_function_output(&mut map, stats.openai_family);
             stats.stripped_encrypted += sanitize_reasoning(&mut map, stats.openai_family);
+            if gemini {
+                stats.stripped_encrypted += sanitize_gemini_item(&mut map);
+            }
             if !stats.openai_family {
                 if convert_agent_message(&mut map) {
                     stats.converted_items += 1;
@@ -1694,6 +1746,206 @@ pub fn continue_after_local_compact_instructions() -> &'static str {
     "这不是新任务，也不是任务结束。上下文压缩只是把较早记录折成摘要，用户没有要求停止。不要输出交接文档、不要总结后收工、不要等待新指令。立即从压缩前未完成的那一步继续执行，直到用户原任务真正完成。默认使用简体中文。只使用当前对话工作目录，不要读取 CodexRouter 源码目录，除非它就是当前 cwd。"
 }
 
+/// Marker Codex Desktop never writes. The gateway uses it to recognise an
+/// automatic "keep going" nudge it injected after Grok (or another
+/// third-party model) ended an agent turn with commentary and no tool call.
+pub const INCOMPLETE_TURN_CONTINUE_MARKER: &str = "【自动续跑】";
+
+pub fn continue_after_premature_stop_instructions() -> &'static str {
+    "【自动续跑】这不是任务结束。你刚才只写了说明，没有发出结构化 function_call。Codex 会把「纯文字、无工具调用」当成收工。用户没有要求停止。立刻调用系统工具继续执行未完成的步骤，不要再只写计划、不要写「接下来」然后停。若任务其实已经做完，回复一句「任务已完成」并停止。"
+}
+
+fn is_continue_nudge_item(item: &Value) -> bool {
+    item_text(item).contains(INCOMPLETE_TURN_CONTINUE_MARKER)
+}
+
+pub fn request_has_agent_tools(body: &Value) -> bool {
+    body.get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty())
+}
+
+fn item_is_assistant_message(item: &Value) -> bool {
+    item_role(item) == "assistant"
+}
+
+fn item_is_chat_tool_result(item: &Value) -> bool {
+    matches!(item_role(item).as_str(), "tool" | "function")
+}
+
+/// True when the latest real input is a tool result: Codex just fed function
+/// outputs back and is waiting for the model to call more tools or finish.
+pub fn request_is_mid_agent_turn(body: &Value) -> bool {
+    if let Some(items) = body.get("input").and_then(Value::as_array) {
+        for item in items.iter().rev() {
+            if is_continue_nudge_item(item) || item_is_assistant_message(item) {
+                continue;
+            }
+            return is_function_output_item(item);
+        }
+        return false;
+    }
+    if let Some(messages) = body.get("messages").and_then(Value::as_array) {
+        for item in messages.iter().rev() {
+            if is_continue_nudge_item(item) || item_is_assistant_message(item) {
+                continue;
+            }
+            return item_is_chat_tool_result(item);
+        }
+    }
+    false
+}
+
+const INCOMPLETE_STOP_INTENTS: &[&str] = &[
+    "接下来",
+    "我先",
+    "我改用",
+    "让我",
+    "我来",
+    "下一步",
+    "先看",
+    "先读",
+    "先打开",
+    "再看一下",
+    "看图工具",
+    "view_image",
+    "i'll ",
+    "i will ",
+    "let me ",
+    "i am going to",
+    "i'm going to",
+    "next i'll",
+    "now look",
+    "now check",
+    "now read",
+    "now open",
+];
+
+const FINISHED_TURN_MARKERS: &[&str] = &[
+    "任务已完成",
+    "任务完成",
+    "已完成全部",
+    "全部完成",
+    "修复完成",
+    "验收通过",
+    "that's all",
+    "task is complete",
+    "task complete",
+    "all done",
+];
+
+pub fn assistant_text_looks_like_incomplete_stop(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    INCOMPLETE_STOP_INTENTS.iter().any(|marker| {
+        if marker.bytes().all(|byte| byte.is_ascii()) {
+            lower.contains(marker)
+        } else {
+            trimmed.contains(marker)
+        }
+    })
+}
+
+pub fn assistant_text_looks_finished(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    FINISHED_TURN_MARKERS.iter().any(|marker| {
+        if marker.bytes().all(|byte| byte.is_ascii()) {
+            lower.contains(marker)
+        } else {
+            trimmed.contains(marker)
+        }
+    })
+}
+
+/// Codex treats an assistant message with no `function_call` as `task_complete`.
+/// Grok often writes "我先对照…" / "接下来…" after tool results and stops.
+/// Hold that completed event and retry with a continuation nudge when this
+/// returns true.
+pub fn should_continue_incomplete_agent_turn(
+    model: &str,
+    request: &Value,
+    streamed_text: &str,
+    had_function_call: bool,
+) -> bool {
+    if had_function_call || is_openai_family_model(model) || !is_xai_family_model(model) {
+        return false;
+    }
+    if !extract_leaked_tool_calls(streamed_text).1.is_empty() {
+        return false;
+    }
+    let incomplete = assistant_text_looks_like_incomplete_stop(streamed_text);
+    if assistant_text_looks_finished(streamed_text) && !incomplete {
+        return false;
+    }
+    if request_is_mid_agent_turn(request) {
+        let chars = streamed_text.trim().chars().count();
+        return incomplete || streamed_text.trim().is_empty() || chars <= 80;
+    }
+    request_has_agent_tools(request) && incomplete
+}
+
+/// Append this turn's assistant text plus a keep-going user nudge so the
+/// follow-up POST is a full replay (third-party `previous_response_id` is
+/// not usable across the gateway).
+pub fn append_incomplete_turn_continuation(body: &mut Value, assistant_text: &str) -> bool {
+    let Some(object) = body.as_object_mut() else {
+        return false;
+    };
+    object.remove("previous_response_id");
+    let nudge = continue_after_premature_stop_instructions();
+    let assistant = assistant_text.trim();
+    if let Some(items) = object.get_mut("input").and_then(Value::as_array_mut) {
+        if !assistant.is_empty() {
+            items.push(json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": assistant }],
+            }));
+        }
+        items.push(json!({
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": nudge }],
+        }));
+        return true;
+    }
+    if let Some(messages) = object.get_mut("messages").and_then(Value::as_array_mut) {
+        if !assistant.is_empty() {
+            messages.push(json!({
+                "role": "assistant",
+                "content": assistant,
+            }));
+        }
+        messages.push(json!({
+            "role": "user",
+            "content": nudge,
+        }));
+        return true;
+    }
+    let mut items = Vec::new();
+    if !assistant.is_empty() {
+        items.push(json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": assistant }],
+        }));
+    }
+    items.push(json!({
+        "type": "message",
+        "role": "user",
+        "content": [{ "type": "input_text", "text": nudge }],
+    }));
+    object.insert("input".to_owned(), Value::Array(items));
+    true
+}
+
 pub fn strip_think_tags(text: &str) -> String {
     // Remove provider reasoning blocks case-insensitively.
     // Unclosed tags at the end of a truncated provider stream still drop
@@ -1798,7 +2050,17 @@ pub fn strip_think_tags_from_value(value: &mut Value) -> bool {
     }
 }
 
+pub fn is_missing_upstream_entity_error(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("requested entity was not found")
+        || lower.contains("entity was not found")
+        || (lower.contains("not_found") && lower.contains("entity"))
+}
+
 pub fn should_retry_after_upstream_error(status: u16, body: &str) -> bool {
+    if status == 404 {
+        return is_missing_upstream_entity_error(body);
+    }
     if !matches!(status, 400 | 422 | 500 | 502 | 503) {
         return false;
     }
@@ -1866,6 +2128,14 @@ pub fn rewrite_exhausted_account_status(status: u16, body: &str) -> u16 {
     }
 }
 
+/// Hard "this provider has no usable credential". Waiting a 5s/25s/125s
+/// rate-limit ladder will not mint an OAuth token, and Codex disconnects
+/// with "error sending request" while the gateway is still silent.
+pub fn is_missing_provider_auth(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("auth_unavailable") || lower.contains("no auth available")
+}
+
 /// Sub2API reports an account pool drained by upstream rate limiting as 503.
 /// Detecting it here lets the gateway retry it like a literal 429 instead of
 /// passing it straight through and ending the conversation.
@@ -1873,15 +2143,37 @@ pub fn is_exhausted_account_status(status: u16, body: &str) -> bool {
     if status != 503 {
         return false;
     }
+    if is_missing_provider_auth(body) {
+        return false;
+    }
     let lower = body.to_ascii_lowercase();
     lower.contains("no available accounts")
-        || lower.contains("auth_unavailable")
-        || lower.contains("no auth available")
         || lower.contains("too many requests")
         || lower.contains("rate_limit")
         || lower.contains("rate limit")
         || lower.contains("service temporarily unavailable")
         || lower.contains("model temporarily unavailable")
+}
+
+/// Official-subscription 429/cooldown that should fail over to the next
+/// Router pool (API relay) instead of parking the whole public model.
+#[allow(dead_code)] // consumed by the host data plane; the GUI crate shares this module.
+pub fn is_pool_failover_error(status: u16, body: &str) -> bool {
+    if !matches!(status, 429 | 503) {
+        return false;
+    }
+    let lower = body.to_ascii_lowercase();
+    lower.contains("model_cooldown")
+        || lower.contains("cooling down")
+        || lower.contains("usage_limit")
+        || lower.contains("usage limit")
+        || lower.contains("quota")
+        || lower.contains("rate_limit")
+        || lower.contains("rate limit")
+        || lower.contains("too many requests")
+        || lower.contains("resource_exhausted")
+        || lower.contains("payment_required")
+        || is_exhausted_account_status(status, body)
 }
 
 #[cfg(test)]
@@ -2266,6 +2558,135 @@ mod tests {
         assert!(!text.contains("Another language model started"));
     }
 
+    fn grok_mid_agent_body() -> Value {
+        json!({
+            "model": "grok-4.6",
+            "tools": [{"type":"function","name":"exec_command"}],
+            "input": [
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"修登录循环"}]},
+                {"type":"function_call","name":"exec_command","call_id":"c1","arguments":"{\"cmd\":\"ls\"}"},
+                {"type":"function_call_output","call_id":"c1","output":"ok"}
+            ],
+            "previous_response_id": "resp_grok_real",
+        })
+    }
+
+    #[test]
+    fn grok_mid_agent_commentary_without_tools_is_continued() {
+        let body = grok_mid_agent_body();
+        assert!(request_is_mid_agent_turn(&body));
+        assert!(assistant_text_looks_like_incomplete_stop("我先对照 0.2.15 截图"));
+        assert!(should_continue_incomplete_agent_turn(
+            "grok-4.6",
+            &body,
+            "我先对照 0.2.15 截图",
+            false,
+        ));
+        assert!(should_continue_incomplete_agent_turn(
+            "grok-4.6",
+            &body,
+            "我改用看图工具",
+            false,
+        ));
+        assert!(should_continue_incomplete_agent_turn(
+            "grok-4.6",
+            &body,
+            "\n",
+            false,
+        ));
+        assert!(!should_continue_incomplete_agent_turn(
+            "grok-4.6",
+            &body,
+            "我先对照 0.2.15 截图",
+            true,
+        ));
+        assert!(!should_continue_incomplete_agent_turn(
+            "gpt-5.6-sol",
+            &body,
+            "我先对照 0.2.15 截图",
+            false,
+        ));
+        assert!(!should_continue_incomplete_agent_turn(
+            "gemini-3.7-flash",
+            &body,
+            "我先对照 0.2.15 截图",
+            false,
+        ));
+        assert!(!should_continue_incomplete_agent_turn(
+            "deepseek-v4-flash",
+            &body,
+            "\n",
+            false,
+        ));
+        assert!(!should_continue_incomplete_agent_turn(
+            "grok-4.6",
+            &body,
+            "任务已完成。登录循环已按 3.0.2 修好。",
+            false,
+        ));
+    }
+
+    #[test]
+    fn grok_plain_answer_without_tools_is_not_continued() {
+        let body = json!({
+            "model": "grok-4.6",
+            "input": [
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}
+            ]
+        });
+        assert!(!should_continue_incomplete_agent_turn(
+            "grok-4.6",
+            &body,
+            "hello world",
+            false,
+        ));
+        let with_tools = json!({
+            "model": "grok-4.6",
+            "tools": [{"type":"function","name":"exec_command"}],
+            "input": [
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}
+            ]
+        });
+        assert!(should_continue_incomplete_agent_turn(
+            "grok-4.6",
+            &with_tools,
+            "我先看一下仓库结构",
+            false,
+        ));
+        assert!(!should_continue_incomplete_agent_turn(
+            "grok-4.6",
+            &with_tools,
+            "hello world",
+            false,
+        ));
+    }
+
+    #[test]
+    fn incomplete_turn_continuation_appends_nudge_and_drops_previous_response() {
+        let mut body = grok_mid_agent_body();
+        assert!(append_incomplete_turn_continuation(
+            &mut body,
+            "我先对照 0.2.15 截图",
+        ));
+        assert!(body.get("previous_response_id").is_none());
+        let items = body["input"].as_array().unwrap();
+        assert_eq!(items[items.len() - 2]["role"], "assistant");
+        assert!(items[items.len() - 2]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("我先对照"));
+        let nudge = items[items.len() - 1]["content"][0]["text"].as_str().unwrap();
+        assert!(nudge.contains(INCOMPLETE_TURN_CONTINUE_MARKER));
+        assert!(nudge.contains("不是任务结束"));
+        assert!(request_is_mid_agent_turn(&body));
+        assert!(should_continue_incomplete_agent_turn(
+            "grok-4.6",
+            &body,
+            "接下来再看图",
+            false,
+        ));
+    }
+
     #[test]
     fn grok_keeps_same_thread_previous_response_without_compact() {
         let mut body = json!({
@@ -2277,6 +2698,91 @@ mod tests {
         });
         sanitize_responses_request("/v1/responses", &mut body);
         assert_eq!(body["previous_response_id"], "resp_grok_real");
+    }
+
+    #[test]
+    fn gemini_antigravity_drops_stale_server_handles_and_thought_carriers() {
+        let carrier = "cpa-gemini-responses-carrier-v1:next:function:RXRFT0NzNE9BUkZOTWc4aVFsaVY1TjZGTDBuMEc5b3g0QVRRS21GMFRhaXNhdjVPSlZVaDhob3FsblN6WWIwZFo1WUh6RmdTK2RTOVFoVGZONldBUjVqLzUwUWMvRlF4SVBCSDh3VXZLYUNCMWFlOGJ2bVpzajNnVFFWMnZaMVQrSkpzU3VjTFRJODAraExzUy8rSnBIMTVnZmZCZW03QWYxNFQ3NFNucndqbTluMkdSVWJtM2dpbnJjUEEwZUpIK3VGRGtLUWFmNDFPZHRzVFJtcU1uQ1RMcDVqMnoxN2JRN0MxWkROOGlvUWRHb2gyREtpRlpubWRHN3ZFYUNZU0tkcDNrR05JS0dUMFpJYWhMUHJibmdNUE5zbUpaZmZaZitFbVNqcllnYjZXbnJOaGwybmlHY3J4dlpkeGkwdUgrRHUrazVWVnJNL3JxRHpsMVZTbUF3WHFlcmd3WGlOakRCY3QzQ214L0habnF5L0lqQnc2NDNKUm5rKysyd080enZnUmNYMkkyOE5IdGVGclFsdUFaN2YySGo4d0lHemg3UlhaNFFiWTVxMS96anNwOEYyVUtKZGI0TTNZcEIxbUlabFUvTVNUbnM5OE1ldStYa1BnRWxRT1dyanhzM2tveUg1YWJYQ0w5aGdJT0d6Q0RMamo5UUx5YXRwMUN2MU";
+        let mut body = json!({
+            "model": "gemini-3.7-flash",
+            "previous_response_id": "resp_8HuKas2mGpnG0-kPus-UwAM",
+            "conversation_id": "conv_gemini_stale",
+            "conversation": {"id": "conv_gemini_stale"},
+            "input": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_resp_8HuKas2mGpnG0-kPus-UwAM_0",
+                    "encrypted_content": carrier,
+                    "output": carrier,
+                    "summary": [{"type":"summary_text","text":"Analyzing HPC"}]
+                },
+                {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": "c1",
+                    "arguments": "{\"cmd\":\"ls\"}",
+                    "thought_signature": carrier
+                }
+            ]
+        });
+        let stats = sanitize_responses_request("/v1/responses", &mut body);
+        assert!(stats.converted_items >= 1 || stats.stripped_encrypted >= 1);
+        assert!(body.get("previous_response_id").is_none());
+        assert!(body.get("conversation_id").is_none());
+        assert!(body.get("conversation").is_none());
+        let reasoning = &body["input"][0];
+        assert!(reasoning.get("encrypted_content").is_none());
+        assert!(reasoning.get("output").is_none());
+        assert!(reasoning["summary"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Analyzing HPC"));
+        assert!(body["input"][1].get("thought_signature").is_none());
+        assert_eq!(body["input"][1]["name"], "exec_command");
+
+        let mut pooled = json!({
+            "model": "cr_r13_antigravity/gemini-3.7-flash",
+            "previous_response_id": "resp_stale",
+            "input": [{
+                "type": "reasoning",
+                "output": carrier
+            }]
+        });
+        sanitize_responses_request("/v1/responses", &mut pooled);
+        assert!(pooled.get("previous_response_id").is_none());
+        assert!(pooled["input"][0].get("output").is_none());
+    }
+
+    #[test]
+    fn gemini_entity_not_found_is_retryable_without_retrying_missing_routes() {
+        assert!(is_missing_upstream_entity_error(
+            r#"{"error":{"message":"Requested entity was not found.","status":"NOT_FOUND"}}"#
+        ));
+        assert!(should_retry_after_upstream_error(
+            404,
+            r#"{"error":{"message":"Requested entity was not found.","status":"NOT_FOUND"}}"#
+        ));
+        assert!(!should_retry_after_upstream_error(
+            404,
+            r#"{"error":{"code":"CR-RTE-0001","message":"no route for model gemini-3.7-flash"}}"#
+        ));
+    }
+
+    #[test]
+    fn chatgpt_weekly_cooldown_fails_over_to_the_next_pool() {
+        assert!(is_pool_failover_error(
+            429,
+            r#"{"error":{"code":"model_cooldown","message":"All credentials for model cr_r1_openai/gpt-5.6-sol are cooling down","reset_seconds":480804}}"#
+        ));
+        assert!(is_pool_failover_error(
+            429,
+            r#"{"error":{"message":"usage_limit_reached"}}"#
+        ));
+        assert!(!is_pool_failover_error(
+            400,
+            r#"{"error":{"message":"invalid_request"}}"#
+        ));
+        assert!(!is_pool_failover_error(200, "ok"));
     }
 
     #[test]
@@ -2591,6 +3097,10 @@ mod tests {
             422,
             r#"{"error":"data did not match any variant of untagged enum ModelInput"}"#
         ));
+        assert!(should_retry_after_upstream_error(
+            404,
+            "Requested entity was not found."
+        ));
         assert_eq!(
             rewrite_poisoned_upstream_status(
                 502,
@@ -2610,9 +3120,16 @@ mod tests {
             rewrite_poisoned_upstream_status(503, "Service temporarily unavailable"),
             429
         );
+        assert!(!is_exhausted_account_status(
+            503,
+            "auth_unavailable: no auth available (providers=antigravity, model=cr_r13_antigravity/gemini-3.7-flash)"
+        ));
+        assert!(is_missing_provider_auth(
+            "auth_unavailable: no auth available (providers=antigravity, model=cr_r13_antigravity/gemini-3.7-flash)"
+        ));
         assert!(is_exhausted_account_status(
             503,
-            "auth_unavailable: no auth available (providers=openai-compatible-cr_r1_openai)"
+            "no available accounts"
         ));
     }
 }

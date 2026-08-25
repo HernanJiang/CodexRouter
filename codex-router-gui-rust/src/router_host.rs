@@ -22,6 +22,7 @@ use codex_router_lib::state::StateStore;
 use codex_router_lib::telemetry::ledger as usage_ledger;
 use codex_router_lib::telemetry::structured_log::{self, StructuredLogger, TerminalSpanGuard};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -702,6 +703,33 @@ fn error_response(status: StatusCode, code: &str, message: &str, request_id: &st
 
 /// Inject the Router error code into an upstream error envelope without
 /// removing or renaming any legacy field.
+const ANTIGRAVITY_VERIFY_ACCOUNT_MESSAGE: &str = "Google Antigravity requires account verification before this model can run. Open Antigravity or your Google Account, complete verification, then retry.";
+
+fn is_antigravity_account_verification(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("validation_required") || lower.contains("verify your account")
+}
+
+async fn antigravity_blocked_verification_message(state: &HostState) -> Option<String> {
+    let files = state.control.cli.get("/v0/management/auth-files").await.ok()?;
+    let items = files.get("files").cloned().unwrap_or(files);
+    let items = items.as_array()?;
+    for item in items {
+        let provider = item.get("provider").and_then(Value::as_str).unwrap_or("");
+        if !provider.eq_ignore_ascii_case("antigravity") {
+            continue;
+        }
+        let message = item
+            .get("status_message")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if is_antigravity_account_verification(message) {
+            return Some(ANTIGRAVITY_VERIFY_ACCOUNT_MESSAGE.to_owned());
+        }
+    }
+    None
+}
+
 fn annotate_error_body(body: &mut Value, code: &str, request_id: &str) {
     if let Some(error) = body.get_mut("error").and_then(Value::as_object_mut) {
         error
@@ -799,6 +827,7 @@ fn plan_request(
     path_model: Option<&str>,
     provider_constraint: Option<&str>,
     request_path: &str,
+    exclude: &HashSet<String>,
 ) -> std::result::Result<PlanResult, Value> {
     let mut parsed: Value = match serde_json::from_slice(bytes) {
         Ok(value) => value,
@@ -855,6 +884,7 @@ fn plan_request(
         &model,
         continuation_key.as_deref(),
         &bindings,
+        exclude,
     ) {
         Ok(route) => route.clone(),
         Err(_) => {
@@ -1395,6 +1425,9 @@ async fn data_plane(State(state): State<HostState>, request: Request) -> Respons
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.contains("json"));
+    let mut failed_pools = HashSet::new();
+    let request_path = mapped.clone();
+    loop {
     let plan = if is_json
         && !bytes.is_empty()
         && matches!(method, reqwest::Method::POST | reqwest::Method::PUT)
@@ -1403,9 +1436,10 @@ async fn data_plane(State(state): State<HostState>, request: Request) -> Respons
             &state,
             &bytes,
             session_header.as_deref(),
-            extract_v1beta_model(&mapped),
+            extract_v1beta_model(&request_path),
             provider_constraint,
-            &mapped,
+            &request_path,
+            &failed_pools,
         ) {
             Ok(plan) => plan,
             Err(error) => {
@@ -1438,10 +1472,11 @@ async fn data_plane(State(state): State<HostState>, request: Request) -> Respons
     };
     // Gemini v1beta carries the model in the URL path; rewrite it to the
     // internal `{prefix}/{public_model}` form after planning.
-    let mapped = if !plan.internal_model.is_empty() && extract_v1beta_model(&mapped).is_some() {
-        rewrite_v1beta_path_model(&mapped, &plan.internal_model)
+    let mapped = if !plan.internal_model.is_empty() && extract_v1beta_model(&request_path).is_some()
+    {
+        rewrite_v1beta_path_model(&request_path, &plan.internal_model)
     } else {
-        mapped
+        request_path.clone()
     };
     let protocol = protocol_of(&mapped);
     if codex_router_lib::responses_compat::is_compact_path(&mapped)
@@ -1484,14 +1519,14 @@ async fn data_plane(State(state): State<HostState>, request: Request) -> Respons
     let url = format!("{}{}", state.cli_base, mapped);
     let upstream_response = state
         .cli_data
-        .request(method, &url)
-        .headers(forward_headers)
+        .request(method.clone(), &url)
+        .headers(forward_headers.clone())
         .header(
             "authorization",
             format!("Bearer {}", state.local_key.as_str()),
         )
         .header("x-request-id", &request_id)
-        .body(plan.body)
+        .body(plan.body.clone())
         .send()
         .await;
     let upstream = match upstream_response {
@@ -1534,7 +1569,7 @@ async fn data_plane(State(state): State<HostState>, request: Request) -> Respons
             "timestamp": structured_log::timestamp(),
         }));
     }
-    let status_u16 = if shielded_auth { 503 } else { upstream_status };
+    let mut status_u16 = if shielded_auth { 503 } else { upstream_status };
     let status = StatusCode::from_u16(status_u16).unwrap_or(StatusCode::BAD_GATEWAY);
     let ledger_account = attribute_account(&state, upstream.headers());
     let mut response_headers = reqwest_to_axum_headers(upstream.headers());
@@ -1567,9 +1602,9 @@ async fn data_plane(State(state): State<HostState>, request: Request) -> Respons
         for (name, value) in response_headers.iter() {
             builder = builder.header(name, value);
         }
-        builder
+        return builder
             .body(Body::from_stream(stream))
-            .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+            .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
     } else {
         let body_bytes = match read_complete_response_body(upstream).await {
             Ok(body) => body,
@@ -1597,7 +1632,61 @@ async fn data_plane(State(state): State<HostState>, request: Request) -> Respons
                 );
             }
         };
+        let failover_text = String::from_utf8_lossy(&body_bytes);
+        if !plan.public_model.is_empty()
+            && codex_router_lib::responses_compat::is_pool_failover_error(
+                upstream_status,
+                &failover_text,
+            )
+        {
+            failed_pools.insert(plan.pool_id.clone());
+            let table = state
+                .control
+                .routes
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            if codex_router_lib::routing::has_fallback_pool(
+                &table,
+                &plan.public_model,
+                &failed_pools,
+            ) {
+                let _ = state.control.logger.write(serde_json::json!({
+                    "level": "INFO",
+                    "event": "request.pool_failover",
+                    "from_pool": plan.pool_id,
+                    "public_model": plan.public_model,
+                    "upstream_status": upstream_status,
+                    "request_id": request_id,
+                    "timestamp": structured_log::timestamp(),
+                }));
+                continue;
+            }
+        }
         let mut parsed: Option<Value> = serde_json::from_slice(&body_bytes).ok();
+        if status_u16 == 503 {
+            let missing_auth = parsed
+                .as_ref()
+                .and_then(|body| body.pointer("/error/message"))
+                .and_then(Value::as_str)
+                .is_some_and(codex_router_lib::responses_compat::is_missing_provider_auth);
+            if missing_auth {
+                if let Some(hint) = antigravity_blocked_verification_message(&state).await {
+                    if let Some(body) = parsed.as_mut() {
+                        if let Some(error) = body.get_mut("error").and_then(Value::as_object_mut)
+                        {
+                            error.insert("message".to_owned(), Value::String(hint));
+                            error.insert(
+                                "code".to_owned(),
+                                Value::String("CR-UP-0003".to_owned()),
+                            );
+                        }
+                    }
+                    status_u16 = 403;
+                }
+            }
+        }
+        let status = StatusCode::from_u16(status_u16).unwrap_or(status);
         if let Some(body) = parsed.as_mut() {
             if !plan.public_model.is_empty() {
                 let table = state
@@ -1672,9 +1761,10 @@ async fn data_plane(State(state): State<HostState>, request: Request) -> Respons
         for (name, value) in response_headers.iter() {
             builder = builder.header(name, value);
         }
-        builder
+        return builder
             .body(Body::from(output))
-            .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+            .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
+    }
     }
 }
 
@@ -2066,7 +2156,7 @@ fn select_available_pool(
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .clone();
-    codex_router_lib::routing::select_pool(&table, model, None, &bindings)
+    codex_router_lib::routing::select_pool(&table, model, None, &bindings, &HashSet::new())
         .cloned()
         .map_err(|_| {
             (
@@ -3311,6 +3401,16 @@ mod tests {
     use std::collections::HashMap as StdHashMap;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tower::ServiceExt;
+
+    #[test]
+    fn google_verification_errors_are_detected_without_leaking_account_fields() {
+        assert!(is_antigravity_account_verification(
+            r#"{"error":{"reason":"VALIDATION_REQUIRED","message":"Verify your account to continue."}}"#
+        ));
+        assert!(!is_antigravity_account_verification(
+            "auth_unavailable: no auth available"
+        ));
+    }
 
     #[test]
     fn zip_entry_names_are_sanitized_against_path_traversal() {

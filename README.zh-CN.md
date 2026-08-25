@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-3.0.2-0969da" alt="版本 3.0.2">
+  <img src="https://img.shields.io/badge/version-3.0.7-0969da" alt="版本 3.0.7">
   <img src="https://img.shields.io/badge/platform-Windows%20%2F%20macOS%20%2F%20Linux-0078d4" alt="Windows / macOS / Linux">
   <img src="https://img.shields.io/badge/architecture-x64-555555" alt="x64">
   <img src="https://img.shields.io/badge/default%20build-portable-2ea44f" alt="默认构建便携版">
@@ -75,6 +75,11 @@ CodexRouter 可以将 OAuth 和 API 渠道合并为 Codex 可见的模型目录�
 - Codex 配置被外部更新后，自检会核对用户层与系统层绑定、当前本机网关端口和重试设置。两层都丢失时显示三按钮覆写窗；窗口保持前台焦点累计 3 秒会自动写回并重启 Codex，最小化、托盘或失焦时暂停，不会抢焦点。“恢复默认”会进入粘性官方模式，自检不会再次绑回 Router，直到用户主动重新开启转发。
 - OAuth 令牌由 CLIProxyAPI 管理，不写入 CodexRouter 配置文件，也不提供明文导出。
 - Codex Desktop 26.818 在 `requires_openai_auth = true` 时会并发刷新 ChatGPT refresh token，导致登录循环。3.0.2 起本地 Router provider 固定为 `Codex-Router` + `requires_openai_auth = false`：转发仍走本机网关，ChatGPT token 留在 Desktop 的 `auth.json` 中不由 Router 刷新。左下角显示 Codex-Router 是预期行为，不是登录丢失。详情见 [CHANGELOG](CHANGELOG.md)。
+- 3.0.3：Grok 等第三方模型若在工具回合里只写「接下来…」不发 `function_call`，Codex 会当成任务结束。网关会扣住 `response.completed` 并自动续跑最多两次。登录身份不变。
+- 3.0.4：长对话不再把 Grok 的 `max_output_tokens` 压成 1（那会触发 `Incomplete response returned, reason: max_output_tokens`）。输出保底为窗口 5% / Grok 128k。
+- 3.0.5：Antigravity/Gemini 续跑旧线程时剥掉过期 thought carrier 和 `previous_response_id`，避免 Google 404 `Requested entity was not found`。
+- 3.0.6：不再把 `no auth available` 空等 125 秒；那会让 Desktop 报 `error sending request` 并拖死所有模型。自动续跑仅限 Grok。
+- 3.0.7：Antigravity 网页授权成功后，不再因为 `www.googleapis.com` userinfo TLS 超时丢掉 token（`CR-OAU-0008` / `exchange-code`）。ChatGPT 官方额度用尽时按优先级立刻改走中转，不再把整条 Sol 线路一起冷却。
 
 ### 按模型适配的控制项
 

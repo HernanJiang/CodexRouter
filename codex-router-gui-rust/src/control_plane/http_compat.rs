@@ -302,7 +302,7 @@ pub async fn sync_backend(state: &ControlState) -> Result<usize> {
         let mut statement = connection.prepare(
             "SELECT r.id, r.public_model, r.upstream_model, r.target_platform, r.priority,
                     a.id, a.platform, a.account_type, a.priority, a.weight, a.payload, a.auth_index,
-                    a.auth_file, a.schedulable, p.normalized_url
+                    a.auth_file, a.schedulable, a.status, p.normalized_url
              FROM composite_routes r
              JOIN account_groups ag ON ag.group_id = r.group_id
              JOIN accounts a ON a.id = ag.account_id
@@ -328,7 +328,8 @@ pub async fn sync_backend(state: &ControlState) -> Result<usize> {
                 row.get::<_, String>(11)?,
                 row.get::<_, String>(12)?,
                 row.get::<_, i64>(13)?,
-                row.get::<_, Option<String>>(14)?,
+                row.get::<_, String>(14)?,
+                row.get::<_, Option<String>>(15)?,
             ))
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -341,6 +342,36 @@ pub async fn sync_backend(state: &ControlState) -> Result<usize> {
     let mut seen_pools = std::collections::HashSet::new();
     let mut pool_available: std::collections::HashMap<String, bool> =
         std::collections::HashMap::new();
+    let mut oauth_routes = std::collections::HashSet::new();
+    for (
+        route_id,
+        _public_model,
+        upstream_model,
+        target_platform,
+        _route_priority,
+        _account_id,
+        account_platform,
+        account_type,
+        _account_priority,
+        _weight,
+        payload,
+        _auth_index,
+        _auth_file,
+        _schedulable,
+        _status,
+        _joined_proxy_url,
+    ) in &rows
+    {
+        if account_type != "oauth" {
+            continue;
+        }
+        let payload: Value = serde_json::from_str(payload).unwrap_or_else(|_| json!({}));
+        if oauth_route_provider_matches(account_platform, target_platform)
+            && oauth_route_model_matches(&payload, _public_model, upstream_model)
+        {
+            oauth_routes.insert(*route_id);
+        }
+    }
     for (
         route_id,
         public_model,
@@ -356,11 +387,14 @@ pub async fn sync_backend(state: &ControlState) -> Result<usize> {
         _auth_index,
         auth_file,
         schedulable,
+        status,
         joined_proxy_url,
     ) in rows
     {
-        let pool_route_id = format!("r{route_id}");
-        let account_available = schedulable != 0;
+        let route_has_oauth = oauth_routes.contains(&route_id);
+        let is_fallback_pool = route_has_oauth && account_type != "oauth";
+        let pool_route_id = pool_route_id_for_account(route_id, &account_type, route_has_oauth);
+        let account_available = account_is_cli_eligible(schedulable, &status);
         if seen_pools.insert(pool_route_id.clone()) {
             pool_routes.push(PoolRoute {
                 pool_id: config_compiler::pool_id(&pool_route_id, &target_platform),
@@ -368,14 +402,18 @@ pub async fn sync_backend(state: &ControlState) -> Result<usize> {
                 public_model: public_model.clone(),
                 upstream_model: upstream_model.clone(),
                 provider: config_compiler::normalize_platform(&target_platform),
-                priority: route_priority as i32,
+                priority: if is_fallback_pool {
+                    fallback_pool_priority(route_priority)
+                } else {
+                    route_priority as i32
+                },
                 enabled: true,
                 available: false,
             });
         }
         if !account_available {
-            // Disabled accounts never reach the CLI candidate set; the Router
-            // availability gate above is what reports CR-RTE-0002 to callers.
+            // Disabled / error / unschedulable accounts never reach the CLI
+            // candidate set; the Router availability gate reports CR-RTE-0002.
             continue;
         }
         let payload: Value = serde_json::from_str(&payload).unwrap_or_else(|_| json!({}));
@@ -748,14 +786,21 @@ pub fn build_auth_file(provider: &str, credentials: &Value, prefix: Option<&str>
     oauth_credentials::build_auth_file(OAuthProvider::parse(provider)?, credentials, prefix)
 }
 
+pub fn auth_index_is_safe(auth_index: &str) -> bool {
+    let trimmed = auth_index.trim();
+    !trimmed.is_empty()
+        && trimmed.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '-' | '_' | '.' | '@' | '+')
+        })
+}
+
 pub fn write_auth_file(
     auth_dir: &std::path::Path,
     auth_index: &str,
     document: &Value,
 ) -> Result<PathBuf> {
-    if auth_index.chars().any(|character| {
-        !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
-    }) {
+    if !auth_index_is_safe(auth_index) {
         anyhow::bail!("unsafe auth index {auth_index}");
     }
     let path = auth_dir.join(format!("{auth_index}.json"));
@@ -3076,7 +3121,7 @@ fn cli_oauth_provider_name(provider: &str) -> String {
 
 fn cli_oauth_auth_url_path(provider: &str) -> Option<String> {
     let endpoint = cli_oauth_endpoint(provider)?;
-    if matches!(provider, "openai" | "anthropic" | "antigravity") {
+    if matches!(provider, "openai" | "anthropic") {
         Some(format!("{endpoint}?is_webui=true"))
     } else {
         Some(endpoint.to_owned())
@@ -3292,7 +3337,9 @@ async fn finish_oauth_session(
                 if completed_file.is_some() {
                     break;
                 }
-                anyhow::bail!("oauth session failed: {message}");
+                anyhow::bail!(
+                    "oauth session failed: {message}. If the browser already showed success, Google userinfo likely timed out after the code was consumed."
+                );
             }
             _ => tokio::time::sleep(std::time::Duration::from_secs(2)).await,
         }
@@ -3425,9 +3472,7 @@ fn materialize_oauth_account(
             candidate
         }
     };
-    if auth_index.chars().any(|character| {
-        !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
-    }) {
+    if !auth_index_is_safe(&auth_index) {
         anyhow::bail!("oauth returned an unsafe auth index");
     }
 
@@ -3696,6 +3741,9 @@ async fn oauth_exchange_code(state: &ControlState, provider: &str, body: &Value)
         Ok(body) => body,
         Err(error) => return failure(StatusCode::BAD_REQUEST, "CR-VAL-0003", &error.to_string()),
     };
+    if provider == "antigravity" && !code.trim().is_empty() {
+        return complete_antigravity_oauth(state, &effective_body, &code).await;
+    }
     // Manual-code providers forward the pasted code into the CLI callback.
     if !code.trim().is_empty() {
         let callback = json!({
@@ -3737,6 +3785,83 @@ async fn oauth_exchange_code(state: &ControlState, provider: &str, body: &Value)
                 // complete OAuth without exposing an auth-file record yet.
                 success(materialized)
             }
+        }
+        Err(error) => failure(StatusCode::BAD_GATEWAY, "CR-OAU-0008", &error.to_string()),
+    }
+}
+
+fn cli_runtime_proxy_url(state: &ControlState) -> Option<String> {
+    let path = state.backend.as_ref()?.config_path.clone();
+    let text = std::fs::read_to_string(path).ok()?;
+    config_compiler::from_yaml(&text)
+        .ok()?
+        .proxy_url
+        .filter(|value| !value.trim().is_empty())
+}
+
+async fn complete_antigravity_oauth(state: &ControlState, body: &Value, code: &str) -> Response {
+    let proxy_url = cli_runtime_proxy_url(state);
+    let code = code.to_owned();
+    let exchanged = match tokio::task::spawn_blocking(move || {
+        super::antigravity_oauth::exchange_authorization_code(&code, proxy_url.as_deref())
+    })
+    .await
+    {
+        Ok(Ok(tokens)) => tokens,
+        Ok(Err(error)) => {
+            let _ = state.logger.write(json!({
+                "level":"ERROR",
+                "event":"control.antigravity_oauth_exchange_failed",
+                "error_code":"CR-OAU-0007",
+                "error_description":error.to_string(),
+            }));
+            return failure(
+                StatusCode::BAD_GATEWAY,
+                "CR-OAU-0007",
+                &format!("Antigravity token exchange failed: {error}"),
+            );
+        }
+        Err(_) => {
+            return failure(
+                StatusCode::BAD_GATEWAY,
+                "CR-OAU-0008",
+                "Antigravity token exchange task failed",
+            );
+        }
+    };
+    let Some(backend) = state.backend.as_ref() else {
+        return failure(
+            StatusCode::BAD_GATEWAY,
+            "CR-CLI-0007",
+            "auth directory is unavailable",
+        );
+    };
+    let stem = super::antigravity_oauth::auth_file_stem(&exchanged.email);
+    let document = super::antigravity_oauth::auth_document(&exchanged);
+    if let Err(error) = write_auth_file(&backend.auth_dir, &stem, &document) {
+        return failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CR-OAU-0011",
+            &format!("could not write Antigravity auth file: {error}"),
+        );
+    }
+    let _ = state.logger.write(json!({
+        "level":"INFO",
+        "event":"control.antigravity_oauth_completed",
+        "email_source":exchanged.email_source,
+        "has_project":!exchanged.project_id.trim().is_empty(),
+    }));
+    let materialized = json!({
+        "auth_file": format!("{stem}.json"),
+        "auth_index": stem,
+        "email": exchanged.email,
+        "account_id": "",
+        "project_id": exchanged.project_id,
+    });
+    match materialize_oauth_account(state, "antigravity", body, &materialized) {
+        Ok(account) => {
+            let _ = sync_backend(state).await;
+            success(account)
         }
         Err(error) => failure(StatusCode::BAD_GATEWAY, "CR-OAU-0008", &error.to_string()),
     }
@@ -3874,6 +3999,31 @@ fn oauth_replica_alias(auth_type: &str, pool_prefix: &str, public_model: &str) -
     } else {
         public_model.to_owned()
     }
+}
+
+fn account_is_cli_eligible(schedulable: i64, status: &str) -> bool {
+    if schedulable == 0 {
+        return false;
+    }
+    !matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "disabled" | "error"
+    )
+}
+
+/// OAuth and API-key fallback must not share a CLIProxy prefix: a ChatGPT
+/// usage-limit 429 cools every credential in that prefix, including the relay.
+fn pool_route_id_for_account(route_id: i64, account_type: &str, route_has_oauth: bool) -> String {
+    if route_has_oauth && !account_type.eq_ignore_ascii_case("oauth") {
+        format!("r{route_id}f")
+    } else {
+        format!("r{route_id}")
+    }
+}
+
+fn fallback_pool_priority(route_priority: i64) -> i32 {
+    let base = route_priority.max(1) as i32;
+    base.saturating_add(99).clamp(1, 999)
 }
 
 async fn sync_existing_oauth_accounts(state: &ControlState) -> Result<usize> {
@@ -4213,6 +4363,17 @@ mod tests {
     use axum::Router;
     use std::sync::Mutex;
     use tower::ServiceExt;
+
+    #[test]
+    fn oauth_and_relay_get_separate_pool_ids() {
+        assert_eq!(pool_route_id_for_account(1, "oauth", true), "r1");
+        assert_eq!(pool_route_id_for_account(1, "apikey", true), "r1f");
+        assert_eq!(pool_route_id_for_account(3, "apikey", false), "r3");
+        assert_eq!(fallback_pool_priority(1), 100);
+        assert!(!account_is_cli_eligible(1, "disabled"));
+        assert!(!account_is_cli_eligible(0, "active"));
+        assert!(account_is_cli_eligible(1, "active"));
+    }
 
     #[test]
     fn openai_router_replica_consumes_desktop_access_token_without_refresh_token() {
@@ -5405,8 +5566,10 @@ mod tests {
         );
         assert_eq!(
             cli_oauth_auth_url_path("antigravity").as_deref(),
-            Some("/v0/management/antigravity-auth-url?is_webui=true")
+            Some("/v0/management/antigravity-auth-url")
         );
+        assert!(auth_index_is_safe("antigravity-user@example.com"));
+        assert!(!auth_index_is_safe("../secret"));
         assert_eq!(
             cli_oauth_auth_url_path("grok").as_deref(),
             Some("/v0/management/xai-auth-url")

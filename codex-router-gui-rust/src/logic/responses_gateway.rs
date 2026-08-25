@@ -6,13 +6,13 @@
 //! loop or a router-wide 502.
 
 use super::responses_compat::{
-    is_chat_completions_path, is_compact_path, is_exhausted_account_status, is_openai_family_model,
-    is_responses_path, is_unsupported_image_error, is_xai_family_model,
-    prepare_official_compact_request, prepare_xai_official_compact_request,
-    rewrite_poisoned_upstream_status, rewrite_provider_json, rewrite_sse_text,
-    sanitize_responses_request, sanitize_responses_request_aggressive,
-    sanitize_responses_request_without_images, should_retry_after_upstream_error,
-    shield_desktop_auth_failure, synthetic_compact_response,
+    append_incomplete_turn_continuation, extract_leaked_tool_calls, is_chat_completions_path,
+    is_compact_path, is_exhausted_account_status, is_openai_family_model, is_responses_path,
+    is_unsupported_image_error, is_xai_family_model, prepare_official_compact_request,
+    prepare_xai_official_compact_request, rewrite_poisoned_upstream_status, rewrite_provider_json,
+    rewrite_sse_text, sanitize_responses_request, sanitize_responses_request_aggressive,
+    sanitize_responses_request_without_images, should_continue_incomplete_agent_turn,
+    should_retry_after_upstream_error, shield_desktop_auth_failure, synthetic_compact_response,
 };
 use super::{detect_context_defaults, detect_max_output_defaults, ModelContextBudget};
 use anyhow::{bail, Context};
@@ -58,6 +58,10 @@ const RATE_LIMIT_RETRY_BASE_DELAY_SECS: u64 = 5;
 /// retry count cannot advance into 625-second and hour-long sleeps that leave
 /// the task permanently active after a Router/network interruption.
 const MAX_REQUEST_RETRY_WAIT: Duration = Duration::from_secs(180);
+/// Before any HTTP/SSE headers reach Codex, a long retry sleep looks like a
+/// hung connect. Desktop then reports "error sending request" and storms
+/// new connections. Keep the silent wait inside Codex's request budget.
+const MAX_PRECONTENT_RETRY_WAIT: Duration = Duration::from_secs(8);
 /// While streaming an agent (non-OpenAI-family) response, the upstream socket
 /// is polled on this cadence so the gateway can keep the Codex session alive
 /// through long provider-side reasoning pauses.
@@ -71,6 +75,12 @@ const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(300);
 /// Drain window used while half-closing the Codex socket so reqwest sees a
 /// FIN instead of a Windows RST ("error decoding response body").
 const CLIENT_CLOSE_DRAIN: Duration = Duration::from_millis(50);
+/// How many extra upstream POSTs the gateway will issue when a third-party
+/// model ends an in-progress agent turn with commentary and no tool call.
+/// Codex treats that shape as `task_complete`; two nudges is enough to
+/// recover the live Grok "我先对照…" / "我改用看图工具" stops without looping.
+const MAX_INCOMPLETE_CONTINUES: u32 = 2;
+const STR_INCOMPLETE_CONTINUE: &str = "CR-STR-0010";
 
 struct GatewayState {
     stop: std::sync::Arc<AtomicBool>,
@@ -151,7 +161,13 @@ fn context_budget_for(model: &str) -> Option<ModelContextBudget> {
 
 /// Cheap, conservative token estimate used only to size the remaining compact
 /// budget. CJK/fullwidth runs count closer to 1:1; ASCII closer to 4 chars.
+/// Long base64 / data-URL / encrypted blobs are not tokenizer-equivalent to
+/// their byte length (a screenshot is thousands of tokens, not millions).
 fn estimate_text_tokens(text: &str) -> i64 {
+    let trimmed = text.trim();
+    if looks_like_binary_blob(trimmed) {
+        return ((trimmed.len() as i64 / 1_024) + 256).min(4_096);
+    }
     let mut tokens = 0_i64;
     let mut ascii_run = 0_i64;
     for ch in text.chars() {
@@ -169,6 +185,33 @@ fn estimate_text_tokens(text: &str) -> i64 {
         tokens += (ascii_run + 3) / 4;
     }
     tokens
+}
+
+fn looks_like_binary_blob(text: &str) -> bool {
+    if text.len() < 256 {
+        return false;
+    }
+    if text.starts_with("data:image")
+        || text.starts_with("data:application")
+        || text.starts_with("gAAAA")
+    {
+        return true;
+    }
+    let mut sample_len = text.len().min(512);
+    while sample_len > 0 && !text.is_char_boundary(sample_len) {
+        sample_len -= 1;
+    }
+    if sample_len < 256 {
+        return false;
+    }
+    let sample = &text[..sample_len];
+    let b64ish = sample
+        .bytes()
+        .filter(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'-' | b'_')
+        })
+        .count();
+    !sample.bytes().any(|byte| byte.is_ascii_whitespace()) && b64ish * 100 / sample_len >= 90
 }
 
 fn json_text_tokens(value: &Value) -> i64 {
@@ -201,14 +244,18 @@ fn estimate_request_input_tokens(body: &Value) -> i64 {
     tokens.max(1)
 }
 
-fn remaining_compact_budget(model: &str, body: &Value) -> i64 {
-    let budget = context_budget_for(model).unwrap_or_else(|| {
+fn context_budget_for_model(model: &str) -> ModelContextBudget {
+    context_budget_for(model).unwrap_or_else(|| {
         let window = detect_context_defaults(model).window;
         ModelContextBudget {
             window,
             compact_limit: window.saturating_mul(95) / 100,
         }
-    });
+    })
+}
+
+fn remaining_compact_budget(model: &str, body: &Value) -> i64 {
+    let budget = context_budget_for_model(model);
     let compact_limit = if budget.compact_limit > 0 {
         budget.compact_limit.min(budget.window)
     } else {
@@ -218,11 +265,47 @@ fn remaining_compact_budget(model: &str, body: &Value) -> i64 {
     compact_limit.saturating_sub(used).max(1)
 }
 
+/// Tokens Codex leaves for output when auto-compact is at 95%: 5% of the
+/// window. A long transcript must not collapse this to 1.
+fn compact_output_reserve(model: &str) -> i64 {
+    let budget = context_budget_for_model(model);
+    if budget.window <= 0 {
+        return 1;
+    }
+    let reserved = if budget.compact_limit > 0 && budget.compact_limit < budget.window {
+        budget.window - budget.compact_limit
+    } else {
+        budget.window.saturating_mul(5) / 100
+    };
+    reserved.max(1)
+}
+
+fn auto_output_token_limit(model: &str, body: &Value) -> i64 {
+    let defaults = detect_max_output_defaults(model);
+    let remaining = remaining_compact_budget(model, body);
+    let reserve = compact_output_reserve(model);
+    // Keep enough room for a real Grok/Gemini reasoning+tool turn even when
+    // the cheap input estimate thinks the compact budget is exhausted.
+    let floor = if defaults.hard_cap {
+        reserve.max(32_768).min(defaults.tokens)
+    } else {
+        reserve.max(32_768).max(defaults.tokens)
+    }
+    .max(1);
+    let mut limit = remaining.max(floor);
+    if defaults.hard_cap {
+        limit = limit.min(defaults.tokens);
+    }
+    limit.max(1)
+}
+
 /// Inject the per-request output token budget.
 ///
 /// 1. A card with `max_output_tokens > 0` always wins.
-/// 2. Otherwise size the turn as `min(official/recommended cap, remaining
-///    compact budget)` so Codex's unused-percent 5% reserve is not the cap.
+/// 2. Otherwise raise Codex's unused-percent 5% reserve toward the remaining
+///    compact budget / model cap, but never shrink it below the 5% reserve
+///    (or the recommended Grok default). Long agent threads used to inject 1
+///    token and Grok then died with `reason: max_output_tokens`.
 fn inject_max_output_tokens(path: &str, body: &mut Value) -> bool {
     let Some(model) = body.get("model").and_then(Value::as_str).map(str::to_owned) else {
         return false;
@@ -237,17 +320,28 @@ fn inject_max_output_tokens(path: &str, body: &mut Value) -> bool {
         Some(limit) => limit,
         None => {
             let defaults = detect_max_output_defaults(&model);
-            let remaining = remaining_compact_budget(&model, body);
-            if defaults.hard_cap {
-                remaining.min(defaults.tokens).max(1)
-            } else {
-                remaining.max(1)
+            let mut auto = auto_output_token_limit(&model, body);
+            if current > 0 {
+                auto = auto.max(current);
+                if defaults.hard_cap {
+                    auto = auto.min(defaults.tokens);
+                }
             }
+            auto
         }
     };
     if current == limit {
         return false;
     }
+    gateway_log(
+        "request.max_output",
+        &format!(
+            "CR-STR-0011 model={model} field={field} from={current} to={limit} remaining={} reserve={} used={}",
+            remaining_compact_budget(&model, body),
+            compact_output_reserve(&model),
+            estimate_request_input_tokens(body)
+        ),
+    );
     body[field] = Value::from(limit);
     true
 }
@@ -499,6 +593,8 @@ fn handle_client(
     client.set_read_timeout(Some(CLIENT_IO_TIMEOUT)).ok();
     client.set_write_timeout(Some(CLIENT_IO_TIMEOUT)).ok();
     let mut request_body = body;
+    let mut continue_body: Option<Value> = None;
+    let mut hold_text_completed = false;
     if method == "POST" && (is_responses_path(&path) || is_chat_completions_path(&path)) {
         if let Ok(mut json_body) = serde_json::from_slice::<Value>(&request_body) {
             let openai_family = json_body
@@ -522,6 +618,10 @@ fn handle_client(
                     send_status(client, 200, "application/json", &payload)?;
                     return Ok(());
                 } else {
+                    if is_responses_path(&path) && is_xai_family_model(&stats.model) {
+                        hold_text_completed = true;
+                        continue_body = Some(json_body.clone());
+                    }
                     request_body = serde_json::to_vec(&json_body)?;
                 }
             } else if is_compact_path(&path) {
@@ -548,7 +648,15 @@ fn handle_client(
     let mut retry_budget = RequestRetryBudget::new(rate_limit_max_retries);
     let mut sse_prelude_sent = false;
     let mut stream_resume: Option<StreamResume> = None;
+    let mut continue_point: Option<ContinuePoint> = None;
+    let mut continue_attempts: u32 = 0;
+    let mut last_held_completed: Option<String> = None;
     let (status, response_headers_map, response_body) = loop {
+        retry_budget.set_max_wait(if sse_prelude_sent {
+            MAX_REQUEST_RETRY_WAIT
+        } else {
+            MAX_PRECONTENT_RETRY_WAIT
+        });
         let response = match open_upstream_with_rate_limit_retry(
             upstream,
             &method,
@@ -560,6 +668,10 @@ fn handle_client(
         ) {
             Ok(response) => response,
             Err(error) => {
+                if let Some(held) = last_held_completed.take() {
+                    write_all_socket(client, held.as_bytes())?;
+                    return Ok(());
+                }
                 if sse_prelude_sent {
                     finish_sse(client, "", false)?;
                 } else {
@@ -579,6 +691,10 @@ fn handle_client(
             // into the open event stream corrupts the protocol and leaves
             // Codex waiting on an invalid active turn. Close the existing SSE
             // response with its terminal failure event instead.
+            if let Some(held) = last_held_completed.take() {
+                write_all_socket(client, held.as_bytes())?;
+                return Ok(());
+            }
             finish_sse(client, "", false)?;
             return Ok(());
         }
@@ -597,6 +713,8 @@ fn handle_client(
                         &response_headers_map,
                         response_leftover,
                         stream_resume.take(),
+                        continue_point.clone(),
+                        hold_text_completed,
                     )? {
                         SseForward::Done => return Ok(()),
                         SseForward::ReconcileFailed => {
@@ -608,6 +726,10 @@ fn handle_client(
                         }
                         SseForward::RetryableBeforeFirstEvent => {
                             let Some(delay) = retry_budget.reserve(None) else {
+                                if let Some(held) = last_held_completed.take() {
+                                    write_all_socket(client, held.as_bytes())?;
+                                    return Ok(());
+                                }
                                 finish_sse(client, "", false)?;
                                 return Ok(());
                             };
@@ -623,6 +745,10 @@ fn handle_client(
                         }
                         SseForward::RetryableWithPrefix(resume) => {
                             let Some(delay) = retry_budget.reserve(None) else {
+                                if let Some(held) = last_held_completed.take() {
+                                    write_all_socket(client, held.as_bytes())?;
+                                    return Ok(());
+                                }
                                 finish_sse(client, "", false)?;
                                 return Ok(());
                             };
@@ -637,6 +763,52 @@ fn handle_client(
                             stream_resume = Some(resume);
                             sleep_for_retry_while_connected(delay, Some(client))?;
                             continue;
+                        }
+                        SseForward::IncompleteAgentTurn(turn) => {
+                            last_held_completed = Some(turn.held_completed.clone());
+                            let model = continue_body
+                                .as_ref()
+                                .and_then(|body| body.get("model"))
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned();
+                            let should = continue_body.as_ref().is_some_and(|body| {
+                                should_continue_incomplete_agent_turn(
+                                    &model,
+                                    body,
+                                    &turn.delivered_text,
+                                    false,
+                                )
+                            });
+                            if should && continue_attempts < MAX_INCOMPLETE_CONTINUES {
+                                if let Some(body) = continue_body.as_mut() {
+                                    continue_attempts += 1;
+                                    let append_text = if continue_attempts == 1 {
+                                        turn.delivered_text.as_str()
+                                    } else {
+                                        turn.turn_text.as_str()
+                                    };
+                                    append_incomplete_turn_continuation(body, append_text);
+                                    request_body = serde_json::to_vec(body)?;
+                                    continue_point = Some(ContinuePoint {
+                                        response_id: turn.response_id.clone(),
+                                        new_response_id: None,
+                                    });
+                                    stream_resume = None;
+                                    gateway_log(
+                                        "request.incomplete_continue",
+                                        &format!(
+                                            "{STR_INCOMPLETE_CONTINUE} {method} {path} model={model} attempt={continue_attempts} chars={} turn_chars={}",
+                                            turn.delivered_text.chars().count(),
+                                            turn.turn_text.chars().count()
+                                        ),
+                                    );
+                                    let _ = send_sse_keepalive(client);
+                                    continue;
+                                }
+                            }
+                            write_all_socket(client, turn.held_completed.as_bytes())?;
+                            return Ok(());
                         }
                     }
                 }
@@ -915,6 +1087,7 @@ struct RequestRetryBudget {
     max_retries: usize,
     retries_used: usize,
     reserved_wait: Duration,
+    max_wait: Duration,
 }
 
 impl RequestRetryBudget {
@@ -923,7 +1096,12 @@ impl RequestRetryBudget {
             max_retries: max_retries.min(MAX_RATE_LIMIT_RETRIES) as usize,
             retries_used: 0,
             reserved_wait: Duration::ZERO,
+            max_wait: MAX_REQUEST_RETRY_WAIT,
         }
+    }
+
+    fn set_max_wait(&mut self, max_wait: Duration) {
+        self.max_wait = max_wait;
     }
 
     fn reserve(&mut self, headers: Option<&HashMap<String, String>>) -> Option<Duration> {
@@ -932,7 +1110,7 @@ impl RequestRetryBudget {
         }
         let delay = rate_limit_retry_delay(headers, self.retries_used);
         let next_wait = self.reserved_wait.saturating_add(delay);
-        if next_wait > MAX_REQUEST_RETRY_WAIT {
+        if next_wait > self.max_wait {
             return None;
         }
         self.retries_used += 1;
@@ -1250,12 +1428,30 @@ struct StreamResume {
 /// a retry can resume by suppressing the duplicated prefix. `ReconcileFailed`
 /// means the retry diverged from the delivered text; nothing extra was
 /// forwarded, so the caller can still close with a clean terminal event.
+/// `IncompleteAgentTurn` means the model ended with commentary and no tool
+/// call; `response.completed` was held so the caller can nudge a follow-up.
 #[derive(Debug, PartialEq, Eq)]
 enum SseForward {
     Done,
     RetryableBeforeFirstEvent,
     RetryableWithPrefix(StreamResume),
     ReconcileFailed,
+    IncompleteAgentTurn(IncompleteTurn),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IncompleteTurn {
+    delivered_text: String,
+    turn_text: String,
+    response_id: Option<String>,
+    item_id: Option<String>,
+    held_completed: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ContinuePoint {
+    response_id: Option<String>,
+    new_response_id: Option<String>,
 }
 
 enum SseFlow {
@@ -1283,10 +1479,15 @@ struct SseSink<'a> {
     terminal: bool,
     sent_events: bool,
     delivered_text: String,
+    turn_text: String,
     text_only: bool,
+    had_tool_call: bool,
+    hold_text_completed: bool,
+    held_completed: Option<String>,
     response_id: Option<String>,
     item_id: Option<String>,
     reconcile: Option<ReconcileState>,
+    continue_point: Option<ContinuePoint>,
 }
 
 /// Event types a mid-stream text retry can reproduce or suppress safely.
@@ -1354,6 +1555,25 @@ fn sse_error_code_and_message(event: &str) -> (String, String) {
 /// closes the SSE body before a terminal event. That is a dropped stream,
 /// not a model/business failure, so the gateway must retry instead of
 /// showing Codex "upstream stream ended before a terminal event".
+fn sse_event_has_tool_call(event: &str) -> bool {
+    if matches!(
+        sse_event_item_type(event).as_deref(),
+        Some(
+            "function_call"
+                | "custom_tool_call"
+                | "local_shell_call"
+                | "computer_call"
+                | "apply_patch_call"
+        )
+    ) {
+        return true;
+    }
+    matches!(
+        sse_event_type(event).as_deref(),
+        Some("response.function_call_arguments.delta" | "response.function_call_arguments.done")
+    )
+}
+
 fn sse_event_is_retryable_interrupt(event: &str) -> bool {
     if sse_event_type(event).as_deref() != Some("response.failed") {
         return false;
@@ -1414,21 +1634,38 @@ fn forward_event_with_rewrites(
 }
 
 impl<'a> SseSink<'a> {
+    #[cfg(test)]
     fn new(client: &'a mut TcpStream, resume: Option<StreamResume>) -> SseSink<'a> {
+        Self::with_policy(client, resume, None, false)
+    }
+
+    fn with_policy(
+        client: &'a mut TcpStream,
+        resume: Option<StreamResume>,
+        continue_point: Option<ContinuePoint>,
+        hold_text_completed: bool,
+    ) -> SseSink<'a> {
         let delivered = resume
             .as_ref()
             .map(|resume| resume.prefix.clone())
             .unwrap_or_default();
+        let response_id = continue_point
+            .as_ref()
+            .and_then(|point| point.response_id.clone())
+            .or_else(|| resume.as_ref().and_then(|resume| resume.response_id.clone()));
+        let item_id = resume.as_ref().and_then(|resume| resume.item_id.clone());
         SseSink {
             client,
             terminal: false,
             sent_events: false,
             delivered_text: delivered,
+            turn_text: String::new(),
             text_only: true,
-            response_id: resume
-                .as_ref()
-                .and_then(|resume| resume.response_id.clone()),
-            item_id: resume.as_ref().and_then(|resume| resume.item_id.clone()),
+            had_tool_call: false,
+            hold_text_completed,
+            held_completed: None,
+            response_id,
+            item_id,
             reconcile: resume.map(|resume| ReconcileState {
                 resume,
                 regenerated: String::new(),
@@ -1436,6 +1673,19 @@ impl<'a> SseSink<'a> {
                 retry_response_id: None,
                 retry_item_id: None,
             }),
+            continue_point,
+        }
+    }
+
+    fn continue_rewrites(&self) -> Vec<(String, String)> {
+        match (
+            self.continue_point
+                .as_ref()
+                .and_then(|point| point.new_response_id.clone()),
+            self.response_id.clone(),
+        ) {
+            (Some(from), Some(to)) if from != to => vec![(from, to)],
+            _ => Vec::new(),
         }
     }
 
@@ -1456,15 +1706,59 @@ impl<'a> SseSink<'a> {
             // retry/reconcile path can recover.
             return Ok(SseFlow::Continue);
         }
+        if sse_event_has_tool_call(event) {
+            self.had_tool_call = true;
+            self.text_only = false;
+        }
+        if let Some(json) = sse_event_data(event) {
+            if let Some(delta) = json.get("delta").and_then(Value::as_str) {
+                if !extract_leaked_tool_calls(delta).1.is_empty() {
+                    self.had_tool_call = true;
+                }
+            }
+        }
+        if self.continue_point.is_some() {
+            match kind.as_deref() {
+                Some("response.created") => {
+                    if let Some(point) = self.continue_point.as_mut() {
+                        point.new_response_id = sse_event_data(event)
+                            .and_then(|json| json.get("response").cloned())
+                            .and_then(|response| {
+                                response.get("id").and_then(Value::as_str).map(str::to_owned)
+                            });
+                    }
+                    return Ok(SseFlow::Continue);
+                }
+                Some("response.in_progress") => return Ok(SseFlow::Continue),
+                _ => {}
+            }
+        }
+        let hold_completed = self.hold_text_completed
+            && kind.as_deref() == Some("response.completed")
+            && !self.had_tool_call;
+        if hold_completed && self.reconcile.is_none() {
+            let mut held = rewrite_sse_text(event);
+            for (from, to) in self.continue_rewrites() {
+                held = held.replace(&from, &to);
+            }
+            self.held_completed = Some(held);
+            return Ok(SseFlow::Continue);
+        }
+        let self_continue_rewrites = self.continue_rewrites();
         let SseSink {
             client,
             terminal,
             sent_events,
             delivered_text,
+            turn_text,
             text_only,
+            had_tool_call: _,
+            hold_text_completed: _,
+            held_completed,
             response_id,
             item_id,
             reconcile,
+            continue_point: _,
         } = self;
         if let Some(recon) = reconcile {
             let Some(kind) = kind else {
@@ -1504,6 +1798,7 @@ impl<'a> SseSink<'a> {
                     }
                     if recon.caught_up {
                         delivered_text.push_str(delta);
+                        turn_text.push_str(delta);
                         let mut rewrites = Vec::new();
                         if let (Some(from), Some(to)) = (&recon.retry_response_id, response_id.as_ref()) {
                             rewrites.push((from.clone(), to.clone()));
@@ -1516,6 +1811,7 @@ impl<'a> SseSink<'a> {
                         return Ok(SseFlow::Continue);
                     }
                     let new_regenerated = format!("{}{delta}", recon.regenerated);
+                    turn_text.push_str(delta);
                     if new_regenerated.len() <= recon.resume.prefix.len() {
                         if !recon.resume.prefix.starts_with(&new_regenerated) {
                             return Ok(SseFlow::AbortReconcile);
@@ -1552,7 +1848,6 @@ impl<'a> SseSink<'a> {
                         // forward a mismatched completion.
                         return Ok(SseFlow::AbortReconcile);
                     }
-                    *terminal = true;
                     let mut rewrites = Vec::new();
                     if let (Some(from), Some(to)) = (&recon.retry_response_id, response_id.as_ref()) {
                         rewrites.push((from.clone(), to.clone()));
@@ -1560,6 +1855,15 @@ impl<'a> SseSink<'a> {
                     if let (Some(from), Some(to)) = (&recon.retry_item_id, item_id.as_ref()) {
                         rewrites.push((from.clone(), to.clone()));
                     }
+                    if hold_completed {
+                        let mut held = rewrite_sse_text(event);
+                        for (from, to) in &rewrites {
+                            held = held.replace(from.as_str(), to.as_str());
+                        }
+                        *held_completed = Some(held);
+                        return Ok(SseFlow::Continue);
+                    }
+                    *terminal = true;
                     forward_event_with_rewrites(client, event, &rewrites)?;
                     *sent_events = true;
                     Ok(SseFlow::Continue)
@@ -1621,6 +1925,7 @@ impl<'a> SseSink<'a> {
                         if let Some(json) = sse_event_data(event) {
                             if let Some(delta) = json.get("delta").and_then(Value::as_str) {
                                 delivered_text.push_str(delta);
+                                turn_text.push_str(delta);
                             }
                             if item_id.is_none() {
                                 *item_id = json
@@ -1634,7 +1939,7 @@ impl<'a> SseSink<'a> {
                 }
             }
             *terminal |= sse_event_is_terminal(event);
-            write_all_socket(client, rewrite_sse_text(event).as_bytes())?;
+            forward_event_with_rewrites(client, event, &self_continue_rewrites)?;
             *sent_events = true;
             Ok(SseFlow::Continue)
         }
@@ -1642,8 +1947,37 @@ impl<'a> SseSink<'a> {
 
     /// Upstream ended (EOF, read error, silence cap, or corrupt frame).
     fn eof_outcome(&mut self, carry: &str) -> anyhow::Result<SseForward> {
+        if let Some(held) = self.held_completed.take() {
+            if !carry.is_empty() {
+                write_all_socket(self.client, rewrite_sse_text(carry).as_bytes())?;
+            }
+            return Ok(SseForward::IncompleteAgentTurn(IncompleteTurn {
+                delivered_text: self.delivered_text.clone(),
+                turn_text: self.turn_text.clone(),
+                response_id: self.response_id.clone(),
+                item_id: self.item_id.clone(),
+                held_completed: held,
+            }));
+        }
         if self.terminal {
             self.finish(carry)?;
+            return Ok(SseForward::Done);
+        }
+        if self.continue_point.is_some() && self.sent_events {
+            if !carry.is_empty() {
+                write_all_socket(self.client, rewrite_sse_text(carry).as_bytes())?;
+            }
+            let payload = serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "id": self.response_id.clone().unwrap_or_default(),
+                    "status": "completed",
+                }
+            });
+            write_all_socket(
+                self.client,
+                format!("data: {payload}\n\n").as_bytes(),
+            )?;
             return Ok(SseForward::Done);
         }
         if self.reconcile.is_some() {
@@ -1836,6 +2170,8 @@ fn forward_agent_sse(
     headers: &HashMap<String, String>,
     leftover: Vec<u8>,
     resume: Option<StreamResume>,
+    continue_point: Option<ContinuePoint>,
+    hold_text_completed: bool,
 ) -> anyhow::Result<SseForward> {
     // The SSE prelude is written by the caller, once per client connection,
     // so a transparent retry never duplicates response headers. A mid-stream
@@ -1851,7 +2187,7 @@ fn forward_agent_sse(
     let chunked = headers
         .get("transfer-encoding")
         .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"));
-    let mut sink = SseSink::new(client, resume);
+    let mut sink = SseSink::with_policy(client, resume, continue_point, hold_text_completed);
     if chunked {
         decode_chunked_to_sse(&mut sink, upstream, leftover)
     } else {
@@ -2227,6 +2563,24 @@ mod tests {
         assert!(!inject_max_output_tokens("/v1/responses", &mut already_at_remaining));
         assert_eq!(already_at_remaining["max_output_tokens"], serde_json::json!(expected));
 
+        // A huge transcript used to inject 1 token because remaining compact
+        // budget underflowed. Grok must still receive the recommended floor.
+        let huge = "x".repeat(4 * 600_000);
+        let mut packed = serde_json::json!({
+            "model": "grok-4.6",
+            "max_output_tokens": 25_000,
+            "input": [{"content": huge}]
+        });
+        assert!(inject_max_output_tokens("/v1/responses", &mut packed));
+        let packed_limit = packed["max_output_tokens"].as_i64().unwrap();
+        assert!(packed_limit >= 128_000);
+        assert!(packed_limit >= 25_000);
+
+        let screenshot = format!("data:image/png;base64,{}", "A".repeat(3_000_000));
+        assert!(estimate_text_tokens(&screenshot) <= 4_096);
+        let chinese = "用".repeat(300);
+        assert!(estimate_text_tokens(&chinese) > 0);
+
         set_max_output_tokens_map(HashMap::from([("grok-4.6".to_owned(), 8_192)]));
         let mut user_limit = serde_json::json!({"model": "grok-4.6", "max_output_tokens": 25_000});
         assert!(inject_max_output_tokens("/v1/responses", &mut user_limit));
@@ -2291,11 +2645,12 @@ mod tests {
             "max_output_tokens": 52_428,
             "input": [{"content": used_near_compact}]
         });
-        assert!(inject_max_output_tokens("/v1/responses", &mut near));
-        let remaining = near["max_output_tokens"].as_i64().unwrap();
-        assert!(remaining > 0);
-        assert!(remaining < 65_536);
-        assert!(remaining <= 996_147 - 950_000);
+        // Near the compact point the leftover input budget is ~46k, but the
+        // 5% output reserve (and Codex's 52_428) must not be shrunk.
+        inject_max_output_tokens("/v1/responses", &mut near);
+        let near_limit = near["max_output_tokens"].as_i64().unwrap();
+        assert!(near_limit >= 52_428);
+        assert!(near_limit <= 65_536);
         set_context_budget_map(HashMap::new());
     }
     use super::*;
@@ -3592,5 +3947,156 @@ mod tests {
         assert!(!output.contains("r2"));
         assert!(!output.contains("i2"));
         assert_eq!(output.matches("HTTP/1.1 200").count(), 1);
+    }
+
+    fn run_agent_body_against_mock<F>(
+        body: &str,
+        answer: F,
+        max_retries: u32,
+    ) -> (String, usize, Vec<Vec<u8>>)
+    where
+        F: Fn(usize, &[u8], &mut TcpStream) + Send + 'static,
+    {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+        let received = std::sync::Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let received_clone = received.clone();
+        thread::spawn(move || {
+            while let Ok((mut socket, _)) = upstream.accept() {
+                let (headers, leftover) = match read_headers(&mut socket) {
+                    Ok(parts) => parts,
+                    Err(_) => continue,
+                };
+                let length = parse_headers(&String::from_utf8_lossy(&headers))
+                    .get("content-length")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let mut request_body = leftover;
+                if read_exact_more(&mut socket, &mut request_body, length).is_err() {
+                    continue;
+                }
+                request_body.truncate(length);
+                received_clone.lock().unwrap().push(request_body.clone());
+                let attempt = attempts_clone.fetch_add(1, Ordering::Relaxed);
+                answer(attempt, &request_body, &mut socket);
+            }
+        });
+        let client_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client_addr = client_listener.local_addr().unwrap();
+        let upstream_url = format!("http://127.0.0.1:{}", upstream_addr.port());
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = client_listener.accept().unwrap();
+            handle_client(&mut stream, &upstream_url, max_retries).unwrap();
+        });
+        let mut client = TcpStream::connect(client_addr).unwrap();
+        let request = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        client.write_all(request.as_bytes()).unwrap();
+        let mut output = String::new();
+        client.read_to_string(&mut output).unwrap();
+        worker.join().unwrap();
+        let captured = received.lock().unwrap().clone();
+        (output, attempts.load(Ordering::Relaxed), captured)
+    }
+
+    fn grok_mid_agent_request() -> String {
+        serde_json::json!({
+            "model": "grok-4.6",
+            "tools": [{"type":"function","name":"exec_command","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}],
+            "input": [
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"修登录循环"}]},
+                {"type":"function_call","name":"exec_command","call_id":"c1","arguments":"{\"cmd\":\"ls\"}"},
+                {"type":"function_call_output","call_id":"c1","output":"ok"}
+            ]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn grok_commentary_without_tools_is_continued_into_a_function_call() {
+        let body = grok_mid_agent_request();
+        let (output, attempts, requests) = run_agent_body_against_mock(
+            &body,
+            |attempt, _request, socket| {
+                if attempt == 0 {
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\n\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"i1\",\"type\":\"message\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"\\u6211\\u5148\\u5bf9\\u7167 0.2.15 \\u622a\\u56fe\",\"item_id\":\"i1\"}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"i1\",\"type\":\"message\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\"}}\n\n")
+                        .unwrap();
+                    return;
+                }
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r2\"}}\n\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"f1\",\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"c2\",\"arguments\":\"{\\\"cmd\\\":\\\"Get-Content shot.png\\\"}\"}}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"f1\",\"type\":\"function_call\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r2\"}}\n\n")
+                    .unwrap();
+            },
+            3,
+        );
+        assert_eq!(attempts, 2);
+        assert_eq!(requests.len(), 2);
+        let follow_up: Value = serde_json::from_slice(&requests[1]).unwrap();
+        let follow_text = follow_up.to_string();
+        assert!(follow_text.contains("\\u81ea\\u52a8\\u7eed\\u8dd1") || follow_text.contains("自动续跑"));
+        assert_eq!(output.matches("response.completed").count(), 1);
+        assert!(!output.contains("\"id\":\"r2\""));
+        assert!(output.contains("function_call"));
+        assert!(output.contains("exec_command"));
+        assert!(!output.contains("response.failed"));
+        assert_eq!(output.matches("HTTP/1.1 200").count(), 1);
+    }
+
+    #[test]
+    fn grok_finished_mid_agent_answer_is_not_continued() {
+        let body = grok_mid_agent_request();
+        let (output, attempts, requests) = run_agent_body_against_mock(
+            &body,
+            |_attempt, _request, socket| {
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"\\u4efb\\u52a1\\u5df2\\u5b8c\\u6210\\u3002\\u767b\\u5f55\\u5faa\\u73af\\u5df2\\u4fee\\u597d\\u3002\"}\n\ndata: {\"type\":\"response.completed\"}\n\n")
+                    .unwrap();
+            },
+            3,
+        );
+        assert_eq!(attempts, 1);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(output.matches("response.completed").count(), 1);
+        assert!(!output.contains("response.failed"));
+    }
+
+    #[test]
+    fn grok_plain_chat_without_tools_is_not_continued() {
+        let body = r#"{"model":"grok-4.6","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}"#;
+        let (output, attempts, _) = run_agent_body_against_mock(
+            body,
+            |_attempt, _request, socket| {
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\ndata: {\"type\":\"response.completed\"}\n\n")
+                    .unwrap();
+            },
+            3,
+        );
+        assert_eq!(attempts, 1);
+        assert_eq!(output.matches("response.completed").count(), 1);
+    }
+
+    #[test]
+    fn grok_incomplete_continue_stops_after_two_nudges() {
+        let body = grok_mid_agent_request();
+        let (output, attempts, requests) = run_agent_body_against_mock(
+            &body,
+            |_attempt, _request, socket| {
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"rx\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"\\u6211\\u5148\\u770b\\u4e00\\u4e0b\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"rx\"}}\n\n")
+                    .unwrap();
+            },
+            3,
+        );
+        // Original + two continuation POSTs, then the held completed is flushed.
+        assert_eq!(attempts, 3);
+        assert_eq!(requests.len(), 3);
+        assert_eq!(output.matches("response.completed").count(), 1);
+        assert!(!output.contains("response.failed"));
     }
 }

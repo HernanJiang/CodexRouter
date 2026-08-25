@@ -2,6 +2,80 @@
 
 本文件记录面向用户的重要变化。完整技术细节以对应版本的源码和 GitHub Release 为准。
 
+## 3.0.7 - 2026-08-25
+
+### 原因
+
+浏览器里 Google 已经显示 Antigravity 授权成功，Router 仍报 `CR-OAU-0008` `http=502` `path=/api/v1/admin/antigravity/oauth/exchange-code`。CLIProxyAPI 7.2.135 换完 token 之后**还必须**访问 `www.googleapis.com/oauth2/v2/userinfo` 才能写 auth 文件。现场日志是 `TLS handshake timeout`：`oauth2.googleapis.com/token` 已经成功，userinfo 超时就把内存里的 token 扔掉。账号进不了号池，订阅额度自然读不到。这和订阅本身是否有效无关。
+
+另外 ChatGPT 官方订阅额度用尽后，Desktop 选 `gpt-5.6-sol` 会立刻 429 `model_cooldown`。官方 OAuth 和第三方中转被编进同一个 CLIProxy 前缀，官方周额度冷却会把中转一起停掉，看起来像中转也挂了。
+
+### 修复
+
+- Antigravity 回调改由 Router 占用 Google 注册的 `51121`，不再把 code 交给 CLIProxy 那条「userinfo 失败则整段作废」的路径。
+- Host 在同一台已通的 `oauth2.googleapis.com` 上换 token，邮箱优先从 id_token / tokeninfo 取；userinfo 失败仍保存账号。
+- 项目 ID 拉取失败不再阻断登录。
+- ChatGPT 官方订阅和同名中转拆成两条优先级线路：官方优先；官方 429 / 额度用尽 / 冷却时立刻改走中转，互不连坐。
+
+## 3.0.6 - 2026-08-25
+
+### 原因
+
+`stream disconnected before completion: error sending request for url (http://127.0.0.1:28085/v1/responses)` 会打在所有模型上。3.0.4 估算 token 时按 512 **字节**切片，中文指令（「你是Grok/Gemini…」）正好切在汉字中间，工作线程 panic，连接被 RST。Desktop 报发送失败，然后狂重试。
+
+另外 Antigravity `503 auth_unavailable` 被当成限流空等 5s/25s/125s，第一个字节都没有，加重断连。3.0.3 还把自动续跑套到了所有第三方模型。
+
+### 修复
+
+- 二进制 blob 探测按字符边界取样，中文请求不再 panic。
+- `no auth available` 不再当 429 重试，立刻把 503 交回 Desktop。
+- 第一个字节到达前，重试等待上限 8 秒。
+- 自动续跑只对 Grok/xAI。
+
+## 3.0.5 - 2026-08-25
+
+### 原因
+
+Antigravity / Gemini 续跑旧线程时，Codex 会把 CLIProxyAPI 写入的 `cpa-gemini-responses-carrier-v1` thought 和 `previous_response_id` 原样送回 Google。Google 侧实体过期或换号后返回 HTTP 404 `Requested entity was not found.`，Desktop 显示 `url: http://127.0.0.1:28085/v1/responses`。现场线程 `01a02cf4`：983 条 input 里有 323 条 carrier。
+
+### 修复
+
+- Gemini 族请求去掉 `previous_response_id` / `conversation_id`，并剥掉 reasoning/function_call 上的 Gemini thought carrier（`encrypted_content` 和 `output`）。对话正文仍在 `input` 里，可以继续跑。
+- 上游 404 且正文是 `Requested entity was not found` 时按损坏续接重试；`CR-RTE-0001` 这种「没有这条模型路由」的 404 不重试。
+
+## 3.0.4 - 2026-08-25
+
+### 原因
+
+Grok 长任务会出现 `stream disconnected before completion: Incomplete response returned, reason: max_output_tokens`。3.0.x 把「压缩点还剩多少输入额度」当成输出上限。对话一大（现场网关日志有 3.5MB～14MB 的 `/v1/responses`），估算一过头，剩余额度变成 **1**，网关就写入 `max_output_tokens: 1`。Grok 一开口就撞上限，Desktop 显示截断。这和「按上下文自动调节」的本意相反：越到后半段越需要输出，额度却被压没了。
+
+### 修复
+
+- 未配置卡片上限时：输出预算至少保留窗口的 5%（Grok 再保底推荐的 128k），**不会**因为长上下文压成 1。
+- 不把 Codex 已带的 `max_output_tokens` 再往下压。
+- 截图/base64/加密 blob 不再按字节当 token 估算。
+- 卡片上手动填的上限仍然优先。
+
+### 可观测性
+
+- `CR-STR-0011` `request.max_output`：from/to、remaining、reserve、used。
+
+## 3.0.3 - 2026-08-25
+
+### 原因
+
+Codex 的 agent 循环把「助手只写正文、没有 `function_call`」当成 `task_complete`。Grok（以及其他第三方模型）经常在工具结果之后只写「我先对照…」「接下来…」「我改用看图工具」就结束 SSE，HTTP 仍是 200。用户看到的就是「没做完就自己停了」。这不是 Desktop 截断，也不是网关超时。
+
+### 修复
+
+- 第三方 `/v1/responses` 流若在未完成的 agent 回合里以纯文字结束，网关会先扣住 `response.completed`，再最多自动续跑 2 次（写入 `【自动续跑】` 提示，要求立刻发工具调用）。续跑若产生 `function_call`，拼进同一轮再交给 Codex。
+- 已写「任务已完成」或普通问答（没有工具、没有「接下来」这类话）不会误续。
+- 模型指令补了一句：只写计划不调用工具会被当成收工。登录身份仍是 3.0.2 的 `Codex-Router` + `requires_openai_auth=false`，没有改回去。
+
+### 可观测性
+
+- `CR-STR-0010`：`gateway-requests.jsonl` / 网关日志 `request.incomplete_continue`（model、第几次续跑、已输出字数）。
+
 ## 3.0.2 - 2026-08-25
 
 ### 原因

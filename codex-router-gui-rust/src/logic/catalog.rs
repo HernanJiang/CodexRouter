@@ -11,9 +11,9 @@ use std::path::Path;
 
 /// Simple instructions for non-OpenAI OAuth models that cannot consume Codex's
 /// native multi-agent protocol metadata.
-const RESTRICTED_OAUTH_INSTRUCTIONS: &str = "你是编程助手。请完整遵循用户指令。\n默认使用简体中文回复，不要在中英文之间无序切换。仅在用户明确要求其他语言，或必须引用英文标识符、代码、命令、路径、日志时使用英文。\n以当前工作目录为准完成任务。若 cwd 是 CodexRouter 项目或其子目录，可以按需要读取该项目文件（包括 Test/）。若 cwd 不是 CodexRouter，不要去扫描 D:\\\\Work\\\\CodexRouter 源码树。不要把其他对话的内容混入本轮。\n调用工具时必须使用系统提供的结构化 tool_calls。执行命令的工具名是 exec_command，参数字段是 cmd。禁止在正文中输出 functions__exec、functions.exec 或任何纯文本函数标记。\n不要输出协议元数据、控制 JSON、reasoning 信封或 {\"type\":\"reasoning_text\"} 这类内部标签。工具成功后必须继续完成用户任务，不要把单次命令成功当成对话结束。";
+const RESTRICTED_OAUTH_INSTRUCTIONS: &str = "你是编程助手。请完整遵循用户指令。\n默认使用简体中文回复，不要在中英文之间无序切换。仅在用户明确要求其他语言，或必须引用英文标识符、代码、命令、路径、日志时使用英文。\n以当前工作目录为准完成任务。若 cwd 是 CodexRouter 项目或其子目录，可以按需要读取该项目文件（包括 Test/）。若 cwd 不是 CodexRouter，不要去扫描 D:\\\\Work\\\\CodexRouter 源码树。不要把其他对话的内容混入本轮。\n调用工具时必须使用系统提供的结构化 tool_calls。执行命令的工具名是 exec_command，参数字段是 cmd。禁止在正文中输出 functions__exec、functions.exec 或任何纯文本函数标记。\n不要输出协议元数据、控制 JSON、reasoning 信封或 {\"type\":\"reasoning_text\"} 这类内部标签。工具成功后必须继续完成用户任务，不要把单次命令成功当成对话结束。\nCodex 把「只有正文、没有 function_call」当成任务结束。任务完成前每一轮都必须发出结构化工具调用，不要只写计划或「接下来」然后停。";
 
-const LANGUAGE_AND_ISOLATION_CLAUSE: &str = "\n\n# 输出语言与会话隔离\n默认使用简体中文回复。不要在中英文之间无序切换。仅当用户明确要求其他语言，或必须引用英文标识符、代码、命令、路径、日志时，才使用英文。\n以当前工作目录为准完成任务。若 cwd 是 CodexRouter 项目或其子目录，可以按需要读取该项目文件（包括 Test/）。若 cwd 不是 CodexRouter，不要去扫描 D:\\\\Work\\\\CodexRouter 源码树。不要把其他对话的内容混入本轮。\n调用工具时必须使用系统提供的结构化 tool_calls。执行命令的工具名是 exec_command，参数字段是 cmd。禁止在正文中输出 functions__exec、functions.exec 或任何纯文本函数标记。\n工具成功后必须继续完成用户任务，不要把单次命令成功当成对话结束。";
+const LANGUAGE_AND_ISOLATION_CLAUSE: &str = "\n\n# 输出语言与会话隔离\n默认使用简体中文回复。不要在中英文之间无序切换。仅当用户明确要求其他语言，或必须引用英文标识符、代码、命令、路径、日志时，才使用英文。\n以当前工作目录为准完成任务。若 cwd 是 CodexRouter 项目或其子目录，可以按需要读取该项目文件（包括 Test/）。若 cwd 不是 CodexRouter，不要去扫描 D:\\\\Work\\\\CodexRouter 源码树。不要把其他对话的内容混入本轮。\n调用工具时必须使用系统提供的结构化 tool_calls。执行命令的工具名是 exec_command，参数字段是 cmd。禁止在正文中输出 functions__exec、functions.exec 或任何纯文本函数标记。\n工具成功后必须继续完成用户任务，不要把单次命令成功当成对话结束。\nCodex 把「只有正文、没有 function_call」当成任务结束。任务完成前每一轮都必须发出结构化工具调用，不要只写计划或「接下来」然后停。";
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -341,7 +341,7 @@ fn model_identity_clause(model: &ModelConfig) -> Option<String> {
         return None;
     }
     Some(
-        "# 模型身份\n你是当前路由模型，通过 Codex-Router 接入。不要自称 GPT、ChatGPT 或 Codex 官方模型。调用工具时使用系统声明的工具名 exec_command，参数字段为 cmd。\n"
+        "# 模型身份\n你是当前路由模型，通过 Codex-Router 接入。不要自称 GPT、ChatGPT 或 Codex 官方模型。调用工具时使用系统声明的工具名 exec_command，参数字段为 cmd。\n任务完成前每一轮必须发出结构化 function_call；只写计划或「接下来」而不调用工具会被 Codex 当成收工。\n"
             .to_owned(),
     )
 }

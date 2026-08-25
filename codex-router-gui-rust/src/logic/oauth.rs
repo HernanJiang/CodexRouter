@@ -47,13 +47,14 @@ impl Provider {
     }
 
     fn router_owns_callback(self) -> bool {
-        matches!(self, Self::Grok)
+        matches!(self, Self::Antigravity | Self::Grok)
     }
 
     fn callback_port(self) -> Option<u16> {
         match self {
             Self::OpenAi => Some(1455),
-            Self::Antigravity => Some(8085),
+            // Must match Google's registered Antigravity redirect, not 8085.
+            Self::Antigravity => Some(51121),
             Self::Grok => Some(56121),
             Self::Anthropic | Self::Gemini => None,
         }
@@ -269,11 +270,14 @@ where
         };
     }
 
-    let listeners = provider
-        .router_owns_callback()
-        .then(|| provider.callback_port())
-        .flatten()
-        .and_then(|port| CallbackListeners::bind(port).ok());
+    let listeners = if provider.router_owns_callback() {
+        let port = provider
+            .callback_port()
+            .context("ROUTER_OAUTH_CALLBACK_PORT: class=configuration")?;
+        Some(CallbackListeners::bind(port)?)
+    } else {
+        None
+    };
     let cli_callback_unavailable = provider.automatic_callback()
         && !provider.router_owns_callback()
         && provider
@@ -1101,7 +1105,8 @@ mod tests {
     #[test]
     fn provider_contracts_keep_callback_ports_and_manual_modes_stable() {
         assert_eq!(Provider::OpenAi.callback_port(), Some(1455));
-        assert_eq!(Provider::Antigravity.callback_port(), Some(8085));
+        assert_eq!(Provider::Antigravity.callback_port(), Some(51121));
+        assert!(Provider::Antigravity.router_owns_callback());
         assert_eq!(Provider::Grok.callback_port(), Some(56121));
         assert_eq!(Provider::Anthropic.callback_port(), None);
         assert_eq!(Provider::Gemini.callback_port(), None);

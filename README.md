@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-3.0.2-0969da" alt="Version 3.0.2">
+  <img src="https://img.shields.io/badge/version-3.0.7-0969da" alt="Version 3.0.7">
   <img src="https://img.shields.io/badge/platform-Windows%20%2F%20macOS%20%2F%20Linux-0078d4" alt="Windows / macOS / Linux">
   <img src="https://img.shields.io/badge/architecture-x64-555555" alt="x64">
   <img src="https://img.shields.io/badge/default%20build-portable-2ea44f" alt="Portable build by default">
@@ -75,6 +75,11 @@ Switch models directly from the Codex model menu and continue in the same contex
 - After an external Codex config update, self-check verifies both binding layers, the active local gateway port, and retry settings. If both layers are lost, a three-choice overwrite dialog appears. Three cumulative seconds of foreground focus restores the binding and restarts Codex; minimization, tray mode, and focus loss pause the countdown without stealing focus. Restore defaults enters a sticky official mode that self-check will not bind back to Router until forwarding is explicitly enabled again.
 - Keeps OAuth tokens under CLIProxyAPI management. Tokens are not written to the CodexRouter configuration file and are not offered as plaintext exports.
 - Codex Desktop 26.818 concurrently refreshes the ChatGPT refresh token when `requires_openai_auth = true`, which invalidates the token family and forces re-login. From 3.0.2 the local Router provider is `Codex-Router` with `requires_openai_auth = false`: requests still use the local gateway bearer, and Desktop is not asked to refresh ChatGPT OAuth for that provider. The Codex-Router label in the Desktop corner is expected, not a lost login. See [CHANGELOG](CHANGELOG.md).
+- 3.0.3: if Grok (or another third-party model) ends an in-progress agent turn with commentary and no `function_call`, Codex treats that as `task_complete`. The gateway now holds `response.completed` and continues at most twice. Login identity is unchanged.
+- 3.0.4: long Grok threads no longer inject `max_output_tokens: 1` (that produced `Incomplete response returned, reason: max_output_tokens`). Output is floored at 5% of the window / 128k for Grok.
+- 3.0.5: Antigravity/Gemini continuations drop stale thought carriers and `previous_response_id` so Google 404 `Requested entity was not found` no longer kills the turn.
+- 3.0.6: do not sleep 125s on `no auth available`; that made Desktop report `error sending request` and stalled every model. Auto-continue is Grok-only.
+- 3.0.7: Antigravity login no longer dies on `www.googleapis.com` userinfo TLS timeouts after the browser already showed success (`CR-OAU-0008` / `exchange-code`). Official ChatGPT quota exhaustion now fails over to the configured relay by priority instead of cooling the whole Sol route.
 
 ### Model-aware controls
 

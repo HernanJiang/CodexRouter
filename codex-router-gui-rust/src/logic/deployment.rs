@@ -747,6 +747,7 @@ fn oauth_should_isolate(account: &Value) -> bool {
     )
     .to_ascii_lowercase();
     status == "error"
+        || status == "disabled"
         || schedulable == Some(false)
         || [
             "quota",
@@ -1619,6 +1620,22 @@ mod tests {
                 .unwrap();
             assert_eq!(update.body.unwrap()["group_ids"], json!([8]));
         }
+    }
+
+    #[test]
+    fn disabled_oauth_account_is_isolated_like_quota_exhaustion() {
+        assert!(oauth_should_isolate(&json!({
+            "status": "disabled",
+            "schedulable": true,
+            "error_message": "",
+            "temp_unschedulable_reason": ""
+        })));
+        assert!(!oauth_should_isolate(&json!({
+            "status": "active",
+            "schedulable": true,
+            "error_message": "",
+            "temp_unschedulable_reason": ""
+        })));
     }
 
     #[test]

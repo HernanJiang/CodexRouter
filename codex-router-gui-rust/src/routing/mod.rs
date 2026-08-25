@@ -229,30 +229,43 @@ pub fn select_pool<'a>(
     public_model: &str,
     continuation_key: Option<&str>,
     bindings: &ContinuationBindings,
+    exclude: &HashSet<String>,
 ) -> Result<&'a PoolRoute> {
     let pools = table.pools(public_model);
     if pools.is_empty() {
         bail!("public model {public_model} has no route");
     }
+    let eligible = |route: &&PoolRoute| route.available && !exclude.contains(&route.pool_id);
     if let Some(key) = continuation_key {
         if let Some(pool_id) = bindings.pool(key) {
-            match pools.iter().find(|route| route.pool_id == pool_id) {
-                Some(route) if route.available => return Ok(route),
-                // Bound pool still exists but every credential is paused:
-                // fall through to exactly one explainable rebind below.
-                Some(_) => {}
-                // Same thread switched public model. The owner is still in the
-                // table, just not for this model — rebind instead of 409.
-                None if table.routes().iter().any(|route| route.pool_id == pool_id) => {}
-                None => bail!("continuation owner {pool_id} was removed"),
+            if !exclude.contains(pool_id) {
+                match pools.iter().find(|route| route.pool_id == pool_id) {
+                    Some(route) if route.available => return Ok(route),
+                    // Bound pool still exists but every credential is paused:
+                    // fall through to exactly one explainable rebind below.
+                    Some(_) => {}
+                    // Same thread switched public model. The owner is still in
+                    // the table, just not for this model — rebind instead of 409.
+                    None if table.routes().iter().any(|route| route.pool_id == pool_id) => {}
+                    None => bail!("continuation owner {pool_id} was removed"),
+                }
             }
         }
     }
     pools
         .iter()
-        .find(|route| route.available)
         .copied()
+        .find(eligible)
         .ok_or_else(|| anyhow::anyhow!("no available credential pool for {public_model}"))
+}
+
+/// True when another enabled, available pool for this public model remains
+/// after `exclude` (failed pools) is applied.
+pub fn has_fallback_pool(table: &RouteTable, public_model: &str, exclude: &HashSet<String>) -> bool {
+    table
+        .pools(public_model)
+        .into_iter()
+        .any(|route| route.available && !exclude.contains(&route.pool_id))
 }
 
 pub fn should_drop_previous_response(
@@ -342,14 +355,14 @@ mod tests {
             Duration::from_secs(60),
         );
         assert_eq!(
-            select_pool(&table, "public", Some(&key), &bindings)
+            select_pool(&table, "public", Some(&key), &bindings, &HashSet::new())
                 .unwrap()
                 .provider,
             "openai"
         );
         bindings.bind(key.clone(), "cr/model/openai".into(), Duration::ZERO);
         assert_eq!(
-            select_pool(&table, "public", Some(&key), &bindings)
+            select_pool(&table, "public", Some(&key), &bindings, &HashSet::new())
                 .unwrap()
                 .provider,
             "openai"
@@ -383,7 +396,9 @@ mod tests {
             "cr/gpt-5.6-sol/openai".into(),
             Duration::from_secs(60),
         );
-        let selected = select_pool(&table, "deepseek-v4-flash", Some(&key), &bindings).unwrap();
+        let selected =
+            select_pool(&table, "deepseek-v4-flash", Some(&key), &bindings, &HashSet::new())
+                .unwrap();
         assert_eq!(selected.provider, "deepseek");
         assert!(should_drop_previous_response(
             &table,
@@ -407,7 +422,8 @@ mod tests {
             "cr/gpt-5.6-sol/openai".into(),
             Duration::from_secs(60),
         );
-        let selected = select_pool(&table, "gpt-5.6-luna", Some(&key), &bindings).unwrap();
+        let selected =
+            select_pool(&table, "gpt-5.6-luna", Some(&key), &bindings, &HashSet::new()).unwrap();
         assert_eq!(selected.provider, "openai");
         assert!(!should_drop_previous_response(
             &table,
@@ -430,9 +446,15 @@ mod tests {
             "cr/gone/openai".into(),
             Duration::from_secs(60),
         );
-        let error = select_pool(&table, "deepseek-v4-flash", Some(&key), &bindings)
-            .unwrap_err()
-            .to_string();
+        let error = select_pool(
+            &table,
+            "deepseek-v4-flash",
+            Some(&key),
+            &bindings,
+            &HashSet::new(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("continuation owner"), "{error}");
     }
 
@@ -443,5 +465,67 @@ mod tests {
         assert!(budget.consume().is_ok());
         assert!(budget.consume().is_err());
         assert_eq!(budget.remaining(), 0);
+    }
+
+    fn openai_pools() -> (PoolRoute, PoolRoute) {
+        let oauth = PoolRoute {
+            pool_id: "cr/r1/openai".into(),
+            prefix: "cr_r1_openai".into(),
+            public_model: "gpt-5.6-sol".into(),
+            upstream_model: "gpt-5.6-sol".into(),
+            provider: "openai".into(),
+            priority: 1,
+            enabled: true,
+            available: true,
+        };
+        let relay = PoolRoute {
+            pool_id: "cr/r1f/openai".into(),
+            prefix: "cr_r1f_openai".into(),
+            public_model: "gpt-5.6-sol".into(),
+            upstream_model: "gpt-5.6-sol".into(),
+            provider: "openai".into(),
+            priority: 100,
+            enabled: true,
+            available: true,
+        };
+        (oauth, relay)
+    }
+
+    #[test]
+    fn same_public_model_keeps_oauth_ahead_of_relay() {
+        let (oauth, relay) = openai_pools();
+        let table = RouteTable::new(vec![relay.clone(), oauth.clone()]).unwrap();
+        let pools = table.pools("gpt-5.6-sol");
+        assert_eq!(pools[0].pool_id, oauth.pool_id);
+        assert_eq!(pools[1].pool_id, relay.pool_id);
+        let selected = select_pool(
+            &table,
+            "gpt-5.6-sol",
+            None,
+            &ContinuationBindings::new(),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(selected.pool_id, oauth.pool_id);
+    }
+
+    #[test]
+    fn excluded_oauth_pool_falls_through_to_relay() {
+        let (oauth, relay) = openai_pools();
+        let table = RouteTable::new(vec![oauth.clone(), relay.clone()]).unwrap();
+        let mut bindings = ContinuationBindings::new();
+        let key = table
+            .continuation_key(None, Some("resp-sol"), None, None)
+            .unwrap();
+        bindings.bind(key.clone(), oauth.pool_id.clone(), Duration::from_secs(60));
+        let exclude = HashSet::from([oauth.pool_id.clone()]);
+        let selected = select_pool(&table, "gpt-5.6-sol", Some(&key), &bindings, &exclude).unwrap();
+        assert_eq!(selected.pool_id, relay.pool_id);
+        assert!(has_fallback_pool(&table, "gpt-5.6-sol", &HashSet::new()));
+        assert!(!has_fallback_pool(
+            &table,
+            "gpt-5.6-sol",
+            &HashSet::from([oauth.pool_id, relay.pool_id])
+        ));
     }
 }
