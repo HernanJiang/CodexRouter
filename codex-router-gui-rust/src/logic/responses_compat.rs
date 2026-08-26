@@ -428,6 +428,142 @@ fn sanitize_grok_item(mut item: Map<String, Value>) -> (Value, usize) {
     }
 }
 
+fn grok_safe_function_parameters() -> Value {
+    json!({
+        "type": "object",
+        "properties": {},
+        "additionalProperties": true
+    })
+}
+
+fn is_grok_hang_schema_tool(name: &str, namespace: &str) -> bool {
+    let name = name.trim();
+    let lower = name.to_ascii_lowercase();
+    if lower == "automation_update" || lower.ends_with("__automation_update") {
+        return true;
+    }
+    let ns = namespace.trim().to_ascii_lowercase();
+    (ns == "codex_app" || ns == "mcp__codex_app" || ns.ends_with("codex_app"))
+        && lower == "automation_update"
+}
+
+fn grok_root_schema_rejected(params: &Value) -> bool {
+    let Some(object) = params.as_object() else {
+        return !params.is_null();
+    };
+    object.contains_key("oneOf")
+        || object.contains_key("anyOf")
+        || object.contains_key("allOf")
+        || object.contains_key("$ref")
+        || object.contains_key("$defs")
+        || object.contains_key("definitions")
+}
+
+fn simplify_grok_function_parameters(params: &mut Value, force_safe: bool) -> bool {
+    if force_safe {
+        *params = grok_safe_function_parameters();
+        return true;
+    }
+    if !grok_root_schema_rejected(params) {
+        return false;
+    }
+    if let Some(object) = params.as_object_mut() {
+        if object.get("type").and_then(Value::as_str) == Some("object")
+            && object.contains_key("properties")
+        {
+            object.remove("oneOf");
+            object.remove("anyOf");
+            object.remove("allOf");
+            object.remove("$ref");
+            object.remove("$defs");
+            object.remove("definitions");
+            object.remove("not");
+            return true;
+        }
+    }
+    *params = grok_safe_function_parameters();
+    true
+}
+
+fn grok_function_parameters_mut(tool: &mut Map<String, Value>) -> Option<&mut Value> {
+    if tool.contains_key("parameters") {
+        return tool.get_mut("parameters");
+    }
+    tool.get_mut("function")
+        .and_then(Value::as_object_mut)
+        .and_then(|function| function.get_mut("parameters"))
+}
+
+fn sanitize_grok_tool_list(tools: &mut [Value], namespace: &str) -> usize {
+    let mut changed = 0;
+    for tool in tools.iter_mut() {
+        let Some(object) = tool.as_object_mut() else {
+            continue;
+        };
+        let typ = object
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("function")
+            .to_owned();
+        if typ == "namespace" {
+            let child_ns = object
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            if let Some(children) = object.get_mut("tools").and_then(Value::as_array_mut) {
+                changed += sanitize_grok_tool_list(children, &child_ns);
+            }
+            continue;
+        }
+        if typ != "function" && typ != "custom" {
+            continue;
+        }
+        let name = tool_declared_name(&Value::Object(object.clone()));
+        let force_safe = is_grok_hang_schema_tool(&name, namespace);
+        if let Some(params) = grok_function_parameters_mut(object) {
+            if simplify_grok_function_parameters(params, force_safe) {
+                changed += 1;
+            }
+        } else if force_safe {
+            object.insert("parameters".to_owned(), grok_safe_function_parameters());
+            changed += 1;
+        }
+    }
+    changed
+}
+
+fn sanitize_grok_request(body: &mut Map<String, Value>) -> usize {
+    let mut changed = 0;
+    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+        changed += sanitize_grok_tool_list(tools, "");
+    }
+    let drop_text = body
+        .get_mut("text")
+        .and_then(Value::as_object_mut)
+        .map(|text| {
+            let removed = text.remove("verbosity").is_some();
+            (removed, text.is_empty())
+        });
+    if let Some((removed, empty)) = drop_text {
+        if removed {
+            changed += 1;
+        }
+        if empty {
+            body.remove("text");
+        }
+    }
+    if let Some(reasoning) = body.get_mut("reasoning").and_then(Value::as_object_mut) {
+        if reasoning.remove("summary").is_some() {
+            changed += 1;
+        }
+        if reasoning.remove("generate_summary").is_some() {
+            changed += 1;
+        }
+    }
+    changed
+}
+
 fn unsupported_third_party_item(kind: &str) -> bool {
     matches!(
         kind,
@@ -1143,6 +1279,9 @@ pub fn sanitize_responses_request(path: &str, body: &mut Value) -> SanitizeStats
         } else if tools_are_degraded(object) {
             stats.rewritten_tool_calls += simplify_chat_agent_tools(object);
         }
+        if grok {
+            stats.rewritten_tool_calls += sanitize_grok_request(object);
+        }
     }
     let compact_request = looks_like_compact_request(path, &Value::Object(object.clone()));
 
@@ -1752,7 +1891,7 @@ pub fn continue_after_local_compact_instructions() -> &'static str {
 pub const INCOMPLETE_TURN_CONTINUE_MARKER: &str = "【自动续跑】";
 
 pub fn continue_after_premature_stop_instructions() -> &'static str {
-    "【自动续跑】这不是任务结束。你刚才只写了说明，没有发出结构化 function_call。Codex 会把「纯文字、无工具调用」当成收工。用户没有要求停止。立刻调用系统工具继续执行未完成的步骤，不要再只写计划、不要写「接下来」然后停。若任务其实已经做完，回复一句「任务已完成」并停止。"
+    "【自动续跑】这不是任务结束。你刚才只写了说明，没有发出结构化 function_call。Codex 会把「纯文字、无工具调用」当成收工。用户没有要求停止。立刻调用系统工具继续执行未完成的步骤，不要再只写计划、不要写「接下来」然后停。不要回复「任务已完成」。"
 }
 
 fn is_continue_nudge_item(item: &Value) -> bool {
@@ -1828,11 +1967,16 @@ const FINISHED_TURN_MARKERS: &[&str] = &[
     "全部完成",
     "修复完成",
     "验收通过",
+    "verdict",
     "that's all",
     "task is complete",
     "task complete",
     "all done",
 ];
+
+/// Short "我先对照…" / "接下来…" commentary is a premature stop. A 1000-char
+/// Debugger report that happens to say "下一步：Coder 做 T02" is not.
+const SUBSTANTIAL_ANSWER_CHARS: usize = 200;
 
 pub fn assistant_text_looks_like_incomplete_stop(text: &str) -> bool {
     let trimmed = text.trim();
@@ -1880,13 +2024,19 @@ pub fn should_continue_incomplete_agent_turn(
     if !extract_leaked_tool_calls(streamed_text).1.is_empty() {
         return false;
     }
-    let incomplete = assistant_text_looks_like_incomplete_stop(streamed_text);
-    if assistant_text_looks_finished(streamed_text) && !incomplete {
+    let trimmed = streamed_text.trim();
+    let chars = trimmed.chars().count();
+    // A finished write-up wins even if it also contains "下一步" / "接下来".
+    if assistant_text_looks_finished(streamed_text) {
         return false;
     }
+    // Long answers are reports, not the short plan-only stops this retry exists for.
+    if chars > SUBSTANTIAL_ANSWER_CHARS {
+        return false;
+    }
+    let incomplete = assistant_text_looks_like_incomplete_stop(streamed_text);
     if request_is_mid_agent_turn(request) {
-        let chars = streamed_text.trim().chars().count();
-        return incomplete || streamed_text.trim().is_empty() || chars <= 80;
+        return incomplete || trimmed.is_empty() || chars <= 80;
     }
     request_has_agent_tools(request) && incomplete
 }
@@ -2157,8 +2307,12 @@ pub fn is_exhausted_account_status(status: u16, body: &str) -> bool {
 
 /// Official-subscription 429/cooldown that should fail over to the next
 /// Router pool (API relay) instead of parking the whole public model.
+/// Grok SuperGrok quota arrives as HTTP 402 `Payment Required`.
 #[allow(dead_code)] // consumed by the host data plane; the GUI crate shares this module.
 pub fn is_pool_failover_error(status: u16, body: &str) -> bool {
+    if status == 402 {
+        return true;
+    }
     if !matches!(status, 429 | 503) {
         return false;
     }
@@ -2173,6 +2327,7 @@ pub fn is_pool_failover_error(status: u16, body: &str) -> bool {
         || lower.contains("too many requests")
         || lower.contains("resource_exhausted")
         || lower.contains("payment_required")
+        || lower.contains("payment required")
         || is_exhausted_account_status(status, body)
 }
 
@@ -2324,6 +2479,73 @@ mod tests {
         assert_eq!(body["input"][1]["output"], "the tool printed hello");
         assert_eq!(body["input"][2]["type"], "message");
         assert_eq!(body["input"][3]["content"][0]["text"], "continue");
+    }
+
+    #[test]
+    fn grok_request_simplifies_codex_app_automation_schema() {
+        let mut body = json!({
+            "model": "cr_r10_xai/grok-4.6",
+            "reasoning": {"effort": "high", "summary": "detailed"},
+            "text": {"verbosity": "low"},
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}}
+                    }
+                },
+                {
+                    "type": "namespace",
+                    "name": "mcp__codex_app",
+                    "tools": [{
+                        "type": "function",
+                        "name": "automation_update",
+                        "parameters": {
+                            "type": "object",
+                            "oneOf": [{"type": "object"}, {"type": "null"}],
+                            "$defs": {"__schema0": {"type": "object"}},
+                            "properties": {"mode": {"type": "string"}}
+                        }
+                    }]
+                },
+                {
+                    "type": "function",
+                    "name": "mcp__codex_app__automation_update",
+                    "parameters": {
+                        "type": "object",
+                        "oneOf": [{"type": "object"}, {"type": "null"}],
+                        "$defs": {"x": {"$ref": "#/$defs/x"}},
+                        "properties": {"mode": {"type": "string"}}
+                    }
+                },
+                {"type": "web_search"}
+            ],
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hi"}]
+            }]
+        });
+        let stats = sanitize_responses_request("/v1/responses", &mut body);
+        assert!(stats.rewritten_tool_calls >= 1);
+        let safe = json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": true
+        });
+        assert_eq!(body["tools"][1]["tools"][0]["parameters"], safe);
+        assert_eq!(body["tools"][2]["parameters"], safe);
+        assert_eq!(body["tools"][0]["name"], "exec_command");
+        assert_eq!(
+            body["tools"][0]["parameters"]["properties"]["cmd"]["type"],
+            "string"
+        );
+        assert_eq!(body["tools"][3]["type"], "web_search");
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert!(body["reasoning"].get("summary").is_none());
+        assert!(body.get("text").is_none() || body["text"].get("verbosity").is_none());
     }
 
     #[test]
@@ -2575,7 +2797,9 @@ mod tests {
     fn grok_mid_agent_commentary_without_tools_is_continued() {
         let body = grok_mid_agent_body();
         assert!(request_is_mid_agent_turn(&body));
-        assert!(assistant_text_looks_like_incomplete_stop("我先对照 0.2.15 截图"));
+        assert!(assistant_text_looks_like_incomplete_stop(
+            "我先对照 0.2.15 截图"
+        ));
         assert!(should_continue_incomplete_agent_turn(
             "grok-4.6",
             &body,
@@ -2589,10 +2813,7 @@ mod tests {
             false,
         ));
         assert!(should_continue_incomplete_agent_turn(
-            "grok-4.6",
-            &body,
-            "\n",
-            false,
+            "grok-4.6", &body, "\n", false,
         ));
         assert!(!should_continue_incomplete_agent_turn(
             "grok-4.6",
@@ -2675,14 +2896,44 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("我先对照"));
-        let nudge = items[items.len() - 1]["content"][0]["text"].as_str().unwrap();
+        let nudge = items[items.len() - 1]["content"][0]["text"]
+            .as_str()
+            .unwrap();
         assert!(nudge.contains(INCOMPLETE_TURN_CONTINUE_MARKER));
         assert!(nudge.contains("不是任务结束"));
+        assert!(nudge.contains("不要回复「任务已完成」"));
+        assert!(!nudge.contains("若任务其实已经做完"));
         assert!(request_is_mid_agent_turn(&body));
         assert!(should_continue_incomplete_agent_turn(
             "grok-4.6",
             &body,
             "接下来再看图",
+            false,
+        ));
+    }
+
+    #[test]
+    fn grok_long_verdict_with_next_step_is_not_continued() {
+        let body = grok_mid_agent_body();
+        let verdict = "**Verdict：T01 ACCEPT，Feature 不能 PASS。**\n\nCoder 报告只交付了 v0.3/T01。Debugger 不能把整 Feature 关掉。T02–T09 还没做。\n\n## 独立核过什么\n\n- 对照 manager T01：Interface + fake app-server\n- 独立跑：3 files / 22 tests passed\n- CodeGraph 已 sync\n\n## 文档\n\n- debugger_0.3.0.md\n- PROJECT_STATUS.md\n\n下一步：Coder 做 v0.3/T02，直接连官方 codex app-server。整 Feature 在 T09 cutover 前都不会 Feature PASS。";
+        assert!(verdict.chars().count() > 200);
+        assert!(assistant_text_looks_like_incomplete_stop(verdict));
+        assert!(assistant_text_looks_finished(verdict));
+        assert!(!should_continue_incomplete_agent_turn(
+            "grok-4.6", &body, verdict, false,
+        ));
+        let fail_report = "**Verdict：`FAIL`。** v0.3.0 Feature 不能 Closeout。\n\n独立验收看到的是 mock JSON-RPC，不是官方 app-server。没有真实 round-trip，不能 Feature PASS。\n\n阻断 Findings：方法未锁到官方协议；model/list 失败时静默返回内置 GPT 列表。\n\n下一步：Coder 做 Fix Cycle v0.3.1。先对齐官方 V2 协议，再给一份非 synthetic 的真实握手证据。";
+        assert!(fail_report.chars().count() > 200);
+        assert!(!should_continue_incomplete_agent_turn(
+            "grok-4.6",
+            &body,
+            fail_report,
+            false,
+        ));
+        assert!(should_continue_incomplete_agent_turn(
+            "grok-4.6",
+            &body,
+            "下一步我打开那个文件",
             false,
         ));
     }
@@ -2783,6 +3034,10 @@ mod tests {
             r#"{"error":{"message":"invalid_request"}}"#
         ));
         assert!(!is_pool_failover_error(200, "ok"));
+        assert!(is_pool_failover_error(
+            402,
+            r#"{"error":{"message":"Payment Required","type":"invalid_request_error"}}"#
+        ));
     }
 
     #[test]
@@ -3127,9 +3382,6 @@ mod tests {
         assert!(is_missing_provider_auth(
             "auth_unavailable: no auth available (providers=antigravity, model=cr_r13_antigravity/gemini-3.7-flash)"
         ));
-        assert!(is_exhausted_account_status(
-            503,
-            "no available accounts"
-        ));
+        assert!(is_exhausted_account_status(503, "no available accounts"));
     }
 }

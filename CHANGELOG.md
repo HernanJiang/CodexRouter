@@ -2,6 +2,43 @@
 
 本文件记录面向用户的重要变化。完整技术细节以对应版本的源码和 GitHub Release 为准。
 
+## 3.0.10 - 2026-08-26
+
+### 原因
+
+Grok 长线程和压缩后的短重试都返回 HTTP 400 `{"code":"invalid-argument"}`（现场 `01a038a7`、`01a02c3a`）。请求体里的 message / function_call 已经合法，CLIProxy 把 5 个 Codex `namespace` 拍成 43 个 function 之后，把 `mcp__codex_app__automation_update` 原样送给 `cli-chat-proxy.grok.com`。这个工具的 parameters 根上是 `oneOf` + `$defs`/`$ref`，xAI 拒收（和 CLIProxy `#4343` 同类，但 7.2.135 只修了 `codex_app__automation_update`，没修 MCP 前缀名）。同时网关把 `max_output_tokens` 抬到剩余压缩预算（现场 297543），超过 Grok 兼容上限。
+
+### 修复
+
+- Grok 请求在进 CLIProxy 之前：把 `automation_update`（含 `mcp__codex_app__*` / 拍平名）的 schema 换成空 object；去掉其它工具根上的 `oneOf`/`$defs`。`web_search` 和普通 function 保留。
+- 去掉 Grok 的 `text.verbosity` 和 `reasoning.summary`，只保留 `reasoning.effort`。
+- Grok `max_output_tokens` 硬上限 128000，长对话不再写成 20 万+。
+
+## 3.0.9 - 2026-08-26
+
+### 原因
+
+Grok 上游返回 HTTP 402 `Payment Required`（SuperGrok 额度用尽）。Router 的池故障转移只认 429/503，Desktop 直接看到 402。另外 Grok 登录把 code 交给 CLIProxy 的 `xai-auth-url`，回调 URI 对不上 xAI 注册的 `http://127.0.0.1:56121/callback`，授权页一直 pending、拿不到 token。
+
+### 修复
+
+- 402 视为额度用尽：立刻换下一个 Grok/中转池。没有下一池时改成 429 `usage_limit`，不再把 Payment Required 打给 Desktop。
+- Grok 登录改由 Host 自己做 PKCE：授权 URL 固定回调 `http://127.0.0.1:56121/callback`，在 `auth.x.ai` 换 token 并写入 `xai-{email}.json`。不再依赖 CLIProxy 消费一次性 code。
+
+## 3.0.8 - 2026-08-26
+
+### 原因
+
+Grok 4.6 在 Debugger 已经写完整份 `Verdict` 之后，还会再冒出一句「任务已完成」。3.0.3 的自动续跑把报告里的「下一步：Coder 做 T02」当成提前停机，提示词又教模型「若已做完，回复一句任务已完成」。Grok 按口令复读，Codex 把这一轮摘要盖成五个字。
+
+同时，Antigravity `claude-opus-4-6-thinking` 没有推理档位可选；Grok 4.6 官方有 `xhigh`，目录里却只给了 low/medium/high。
+
+### 修复
+
+- 超过约 200 字的长篇结论、或带 `Verdict` / 「任务已完成」的收工正文，不再自动续跑。短的「我先对照…」「接下来…」仍会续。
+- 续跑提示改为「不要回复任务已完成」，不再把这五个字当成停止口令。
+- 推理档位：Grok 4.6 增加 `xhigh`（4.5 官方仍是三档）；Claude 4.6 Thinking 为 low/medium/high/max；Claude 5 / 4.7+ 保留 xhigh；GLM-5.2 为 high/max。
+
 ## 3.0.7 - 2026-08-25
 
 ### 原因

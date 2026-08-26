@@ -387,6 +387,21 @@ impl ReasoningSpec {
     }
 }
 
+fn claude_reasoning_includes_xhigh(name: &str) -> bool {
+    name.contains("claude-opus-5")
+        || name.contains("claude-sonnet-5")
+        || name.contains("claude-fable-5")
+        || name.contains("claude-mythos")
+        || name.contains("claude-opus-4-8")
+        || name.contains("claude-opus-4.8")
+        || name.contains("claude-sonnet-4-8")
+        || name.contains("claude-sonnet-4.8")
+        || name.contains("claude-opus-4-7")
+        || name.contains("claude-opus-4.7")
+        || name.contains("claude-sonnet-4-7")
+        || name.contains("claude-sonnet-4.7")
+}
+
 pub fn detect_reasoning(model_name: &str) -> ReasoningSpec {
     let name = model_name.trim().to_ascii_lowercase();
     if name.contains("gpt-5.6-sol") {
@@ -433,18 +448,26 @@ pub fn detect_reasoning(model_name: &str) -> ReasoningSpec {
             "Official OpenAI and Codex documentation",
         );
     }
-    if name.contains("claude-opus-5")
-        || name.contains("claude-sonnet-5")
-        || name.contains("claude-fable-5")
-    {
+    if claude_reasoning_includes_xhigh(&name) {
         return ReasoningSpec::new(
             &["low", "medium", "high", "xhigh", "max"],
             "high",
             false,
-            "Anthropic Claude 5",
-            "Anthropic Claude 5",
-            "Anthropic 官方 Effort 文档；复杂编程默认 high",
-            "Official Anthropic effort guide; high is the default for complex coding",
+            "Anthropic Claude 5 / 4.7+",
+            "Anthropic Claude 5 / 4.7+",
+            "Anthropic 官方 Effort 文档；xhigh 仅 Fable 5 / Opus 5 / Sonnet 5 / Opus 4.7+ 可用",
+            "Official Anthropic effort guide; xhigh is on Fable 5, Opus 5, Sonnet 5, and Opus 4.7+",
+        );
+    }
+    if name.contains("claude") {
+        return ReasoningSpec::new(
+            &["low", "medium", "high", "max"],
+            "high",
+            false,
+            "Anthropic Claude 4.6",
+            "Anthropic Claude 4.6",
+            "Anthropic 官方 Effort 文档；Opus 4.6 / Sonnet 4.6 为 low/medium/high/max，无 xhigh",
+            "Official Anthropic effort guide; Opus 4.6 and Sonnet 4.6 support low/medium/high/max, not xhigh",
         );
     }
     if name.contains("gemini-3") {
@@ -524,6 +547,17 @@ pub fn detect_reasoning(model_name: &str) -> ReasoningSpec {
             "Official DeepSeek Thinking Mode documentation",
         );
     }
+    if name.contains("glm-5") || name.contains("glm-latest") {
+        return ReasoningSpec::new(
+            &["high", "max"],
+            "high",
+            false,
+            "Zhipu GLM-5",
+            "Zhipu GLM-5",
+            "GLM 官方 Thinking Mode：high / max；默认 high 避免 max 意外烧额度",
+            "Official GLM thinking mode: high / max; default high to avoid surprise max spend",
+        );
+    }
     if name.contains("grok-4.5") {
         return ReasoningSpec::new(
             &["low", "medium", "high"],
@@ -531,19 +565,19 @@ pub fn detect_reasoning(model_name: &str) -> ReasoningSpec {
             false,
             "xAI Grok 4.5",
             "xAI Grok 4.5",
-            "xAI 官方模型文档",
-            "Official xAI model documentation",
+            "xAI 官方 reasoning_effort：low / medium / high；xhigh 会被上游当成 high",
+            "Official xAI reasoning_effort: low / medium / high; xhigh is coerced to high",
         );
     }
     if name.contains("grok") {
         return ReasoningSpec::new(
-            &["low", "medium", "high"],
-            "medium",
+            &["low", "medium", "high", "xhigh"],
+            "high",
             false,
-            "xAI Grok",
-            "xAI Grok",
-            "xAI 官方模型文档；采用保守兼容档位",
-            "Official xAI model documentation; conservative compatible levels",
+            "xAI Grok 4.6+",
+            "xAI Grok 4.6+",
+            "xAI 官方 reasoning_effort：low / medium / high（默认）/ xhigh；xhigh 自 grok-4.6 起可用",
+            "Official xAI reasoning_effort: low / medium / high (default) / xhigh; xhigh starts at grok-4.6",
         );
     }
     ReasoningSpec::new(
@@ -1409,6 +1443,7 @@ pub fn recommended_model_display_name(model_id: &str) -> String {
         ("deepseek-r1", "DeepSeek-R1"),
         ("deepseek-reasoner", "DeepSeek-Reasoner"),
         ("deepseek-chat", "DeepSeek-Chat"),
+        ("grok-4.6", "Grok-4.6"),
         ("grok-4.5", "Grok-4.5"),
         ("cursor-composer-2.5", "Composer-2.5"),
         ("composer-2.5", "Composer-2.5"),
@@ -1668,9 +1703,9 @@ pub fn detect_max_output_defaults(model_name: &str) -> MaxOutputDefaults {
     if name.contains("grok") {
         return MaxOutputDefaults {
             tokens: 128_000,
-            hard_cap: false,
-            source_zh: "xAI 无公开文本输出上限，按剩余压缩预算分配",
-            source_en: "xAI has no published text output cap; spend the remaining compact budget",
+            hard_cap: true,
+            source_zh: "xAI 兼容输出上限，避免超大 max_output_tokens 被拒绝",
+            source_en: "compatibility output cap so Grok does not reject oversized max_output_tokens",
         };
     }
     MaxOutputDefaults {
@@ -4414,7 +4449,8 @@ base_url = "https://api.430123.xyz/v1"
         assert_eq!(detect_context_defaults("ark-code-latest").window, 262_144);
         assert_eq!(detect_max_output_defaults("gemini-3.7-flash").tokens, 65_536);
         assert!(detect_max_output_defaults("gemini-3.7-flash").hard_cap);
-        assert!(!detect_max_output_defaults("grok-4.6").hard_cap);
+        assert!(detect_max_output_defaults("grok-4.6").hard_cap);
+        assert_eq!(detect_max_output_defaults("grok-4.6").tokens, 128_000);
         assert_eq!(detect_max_output_defaults("deepseek-v4-pro").tokens, 384_000);
         assert!(detect_max_output_defaults("deepseek-v4-pro").hard_cap);
         assert_eq!(detect_max_output_defaults("kimi-k3").tokens, 131_072);
@@ -5428,13 +5464,44 @@ base_url = "https://api.430123.xyz/v1"
                 false,
             ),
             (
+                "claude-fable-5",
+                vec!["low", "medium", "high", "xhigh", "max"],
+                "high",
+                false,
+            ),
+            (
+                "claude-opus-4-7",
+                vec!["low", "medium", "high", "xhigh", "max"],
+                "high",
+                false,
+            ),
+            (
+                "claude-opus-4-6-thinking",
+                vec!["low", "medium", "high", "max"],
+                "high",
+                false,
+            ),
+            (
+                "claude-sonnet-4-6",
+                vec!["low", "medium", "high", "max"],
+                "high",
+                false,
+            ),
+            (
                 "gemini-3.6-flash",
+                vec!["minimal", "low", "medium", "high"],
+                "high",
+                false,
+            ),
+            (
+                "gemini-3.7-flash",
                 vec!["minimal", "low", "medium", "high"],
                 "high",
                 false,
             ),
             ("kimi-k3", vec!["low", "high", "max"], "high", false),
             ("k3-256k", vec!["low", "high", "max"], "high", false),
+            ("Kimi-K3", vec!["low", "high", "max"], "high", false),
             ("kimi-for-coding", vec!["high"], "high", false),
             (
                 "deepseek-v4-flash",
@@ -5442,8 +5509,22 @@ base_url = "https://api.430123.xyz/v1"
                 "high",
                 false,
             ),
+            (
+                "deepseek-v4-pro",
+                vec!["none", "low", "high", "max"],
+                "high",
+                false,
+            ),
             ("mimo-v2.5-pro", vec!["high"], "high", false),
+            ("GLM-5.2", vec!["high", "max"], "high", false),
+            ("glm-latest", vec!["high", "max"], "high", false),
             ("grok-4.5", vec!["low", "medium", "high"], "high", false),
+            (
+                "grok-4.6",
+                vec!["low", "medium", "high", "xhigh"],
+                "high",
+                false,
+            ),
             ("unknown-provider-model", vec!["medium"], "medium", false),
         ];
         for (model, levels, default_level, fast) in cases {
@@ -5456,6 +5537,50 @@ base_url = "https://api.430123.xyz/v1"
             assert_eq!(spec.supports_fast, fast, "wrong Fast support for {model}");
             assert!(spec.levels.contains(&spec.default_level));
         }
+    }
+
+    #[test]
+    fn live_configured_models_are_not_generic_medium_only() {
+        // Snapshot of models the user actually has configured. A new SKU that
+        // still falls through to the generic medium-only preset is an adapter gap.
+        let models = [
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "glm-latest",
+            "GLM-5.2",
+            "deepseek-v4-pro",
+            "deepseek-v4-flash",
+            "kimi-for-coding",
+            "k3-256k",
+            "Kimi-K3",
+            "grok-4.6",
+            "grok-4.5",
+            "claude-opus-4-6-thinking",
+            "gemini-3.7-flash",
+        ];
+        for model in models {
+            let spec = detect_reasoning(model);
+            assert_ne!(
+                spec.family_en, "Generic OpenAI-compatible model",
+                "{model} still uses the unknown-model fallback"
+            );
+            assert!(!spec.levels.is_empty(), "{model} has empty reasoning levels");
+        }
+        let grok46 = detect_reasoning("grok-4.6");
+        assert!(
+            grok46.levels.iter().any(|level| level == "xhigh"),
+            "grok-4.6 must expose official xhigh"
+        );
+        let opus46 = detect_reasoning("claude-opus-4-6-thinking");
+        assert!(
+            opus46.levels.iter().any(|level| level == "max"),
+            "Antigravity Opus 4.6 Thinking must expose max"
+        );
+        assert!(
+            !opus46.levels.iter().any(|level| level == "xhigh"),
+            "Opus 4.6 does not support xhigh"
+        );
     }
 
     #[test]

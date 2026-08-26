@@ -2550,21 +2550,22 @@ mod tests {
             "max_output_tokens": 25_000,
             "input": []
         });
-        let expected = remaining_compact_budget("grok-4.6", &grok);
-        assert!(expected > 25_000);
+        let remaining = remaining_compact_budget("grok-4.6", &grok);
+        assert!(remaining > 25_000);
         assert!(inject_max_output_tokens("/v1/responses", &mut grok));
-        assert_eq!(grok["max_output_tokens"], serde_json::json!(expected));
+        assert_eq!(grok["max_output_tokens"], serde_json::json!(128_000));
 
-        let mut already_at_remaining = serde_json::json!({
+        let mut already_at_cap = serde_json::json!({
             "model": "grok-4.6",
-            "max_output_tokens": expected,
+            "max_output_tokens": 128_000,
             "input": []
         });
-        assert!(!inject_max_output_tokens("/v1/responses", &mut already_at_remaining));
-        assert_eq!(already_at_remaining["max_output_tokens"], serde_json::json!(expected));
+        assert!(!inject_max_output_tokens("/v1/responses", &mut already_at_cap));
+        assert_eq!(already_at_cap["max_output_tokens"], serde_json::json!(128_000));
 
         // A huge transcript used to inject 1 token because remaining compact
-        // budget underflowed. Grok must still receive the recommended floor.
+        // budget underflowed. Grok must still receive a usable floor, never
+        // above the 128k compatibility cap that cli-chat-proxy rejects past.
         let huge = "x".repeat(4 * 600_000);
         let mut packed = serde_json::json!({
             "model": "grok-4.6",
@@ -2573,7 +2574,8 @@ mod tests {
         });
         assert!(inject_max_output_tokens("/v1/responses", &mut packed));
         let packed_limit = packed["max_output_tokens"].as_i64().unwrap();
-        assert!(packed_limit >= 128_000);
+        assert!(packed_limit >= 32_768);
+        assert!(packed_limit <= 128_000);
         assert!(packed_limit >= 25_000);
 
         let screenshot = format!("data:image/png;base64,{}", "A".repeat(3_000_000));

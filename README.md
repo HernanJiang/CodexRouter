@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-3.0.7-0969da" alt="Version 3.0.7">
+  <img src="https://img.shields.io/badge/version-3.0.10-0969da" alt="Version 3.0.10">
   <img src="https://img.shields.io/badge/platform-Windows%20%2F%20macOS%20%2F%20Linux-0078d4" alt="Windows / macOS / Linux">
   <img src="https://img.shields.io/badge/architecture-x64-555555" alt="x64">
   <img src="https://img.shields.io/badge/default%20build-portable-2ea44f" alt="Portable build by default">
@@ -80,6 +80,9 @@ Switch models directly from the Codex model menu and continue in the same contex
 - 3.0.5: Antigravity/Gemini continuations drop stale thought carriers and `previous_response_id` so Google 404 `Requested entity was not found` no longer kills the turn.
 - 3.0.6: do not sleep 125s on `no auth available`; that made Desktop report `error sending request` and stalled every model. Auto-continue is Grok-only.
 - 3.0.7: Antigravity login no longer dies on `www.googleapis.com` userinfo TLS timeouts after the browser already showed success (`CR-OAU-0008` / `exchange-code`). Official ChatGPT quota exhaustion now fails over to the configured relay by priority instead of cooling the whole Sol route.
+- 3.0.8: Grok no longer parrot-replies 「任务已完成」 after a finished Verdict; auto-continue ignores long reports that only mention 「下一步」. Reasoning menus: Grok 4.6 adds `xhigh`, Claude 4.6 Thinking gets low/medium/high/max, GLM-5.2 gets high/max.
+- 3.0.9: Grok 402 Payment Required fails over to the next account/pool. Grok login is Host-owned PKCE on `127.0.0.1:56121/callback`, so the UI can actually receive xAI tokens.
+- 3.0.10: Grok 400 `invalid-argument` was Codex Desktop's `mcp__codex_app__automation_update` schema (`oneOf`/`$ref`) plus `max_output_tokens` above 128k. Router now simplifies that tool schema before CLIProxy and caps Grok output at 128k.
 
 ### Model-aware controls
 

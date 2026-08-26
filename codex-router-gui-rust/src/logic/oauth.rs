@@ -1108,6 +1108,7 @@ mod tests {
         assert_eq!(Provider::Antigravity.callback_port(), Some(51121));
         assert!(Provider::Antigravity.router_owns_callback());
         assert_eq!(Provider::Grok.callback_port(), Some(56121));
+        assert!(Provider::Grok.router_owns_callback());
         assert_eq!(Provider::Anthropic.callback_port(), None);
         assert_eq!(Provider::Gemini.callback_port(), None);
     }

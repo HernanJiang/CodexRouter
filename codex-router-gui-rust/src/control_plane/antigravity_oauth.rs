@@ -112,7 +112,10 @@ pub fn email_from_profile_json(body: &str) -> Option<String> {
 
 pub fn fallback_email(refresh_token: &str) -> String {
     let digest = Sha256::digest(refresh_token.trim().as_bytes());
-    let hex = digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    let hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
     format!("antigravity-{}@oauth.invalid", &hex[..12])
 }
 
@@ -263,7 +266,9 @@ fn http_client(proxy_url: Option<&str>) -> Result<reqwest::blocking::Client> {
     if let Some(proxy) = proxy_url.map(str::trim).filter(|value| !value.is_empty()) {
         builder = builder.proxy(reqwest::Proxy::all(proxy).context("invalid proxy URL")?);
     }
-    builder.build().context("build antigravity OAuth HTTP client")
+    builder
+        .build()
+        .context("build antigravity OAuth HTTP client")
 }
 
 fn post_form(
@@ -291,7 +296,10 @@ fn post_form(
         }
         return serde_json::from_str(&body).context("decode token JSON");
     }
-    bail!("{}", last_error.unwrap_or_else(|| "token request failed".to_owned()))
+    bail!(
+        "{}",
+        last_error.unwrap_or_else(|| "token request failed".to_owned())
+    )
 }
 
 fn truncate_error(body: &str) -> String {
@@ -411,7 +419,10 @@ mod tests {
         assert_eq!(document["disabled"], false);
         let expired = document["expired"].as_str().unwrap();
         assert!(chrono::DateTime::parse_from_rfc3339(expired).is_ok());
-        assert!(!expired.contains('.'), "Go RFC3339 rejects fractional seconds: {expired}");
+        assert!(
+            !expired.contains('.'),
+            "Go RFC3339 rejects fractional seconds: {expired}"
+        );
     }
 
     #[test]
@@ -420,10 +431,7 @@ mod tests {
             extract_project_id(&json!({"cloudaicompanionProject":{"id":"abc"}})),
             "abc"
         );
-        assert_eq!(
-            extract_project_id(&json!({"projectId":"direct"})),
-            "direct"
-        );
+        assert_eq!(extract_project_id(&json!({"projectId":"direct"})), "direct");
     }
 
     fn base64url(bytes: &[u8]) -> String {

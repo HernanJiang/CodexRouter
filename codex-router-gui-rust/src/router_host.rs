@@ -711,7 +711,12 @@ fn is_antigravity_account_verification(body: &str) -> bool {
 }
 
 async fn antigravity_blocked_verification_message(state: &HostState) -> Option<String> {
-    let files = state.control.cli.get("/v0/management/auth-files").await.ok()?;
+    let files = state
+        .control
+        .cli
+        .get("/v0/management/auth-files")
+        .await
+        .ok()?;
     let items = files.get("files").cloned().unwrap_or(files);
     let items = items.as_array()?;
     for item in items {
@@ -1428,137 +1433,137 @@ async fn data_plane(State(state): State<HostState>, request: Request) -> Respons
     let mut failed_pools = HashSet::new();
     let request_path = mapped.clone();
     loop {
-    let plan = if is_json
-        && !bytes.is_empty()
-        && matches!(method, reqwest::Method::POST | reqwest::Method::PUT)
-    {
-        match plan_request(
-            &state,
-            &bytes,
-            session_header.as_deref(),
-            extract_v1beta_model(&request_path),
-            provider_constraint,
-            &request_path,
-            &failed_pools,
-        ) {
-            Ok(plan) => plan,
-            Err(error) => {
-                let status = StatusCode::from_u16(
-                    error.get("status").and_then(Value::as_u64).unwrap_or(400) as u16,
-                )
-                .unwrap_or(StatusCode::BAD_REQUEST);
-                let code = error
-                    .get("code")
-                    .and_then(Value::as_str)
-                    .unwrap_or("CR-REQ-0006");
-                let message = error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("invalid request");
-                let response = error_response(status, code, message, &request_id);
-                let _ = terminal.complete("rejected", Some(status.as_u16()), Some(code), 1);
-                return response;
+        let plan = if is_json
+            && !bytes.is_empty()
+            && matches!(method, reqwest::Method::POST | reqwest::Method::PUT)
+        {
+            match plan_request(
+                &state,
+                &bytes,
+                session_header.as_deref(),
+                extract_v1beta_model(&request_path),
+                provider_constraint,
+                &request_path,
+                &failed_pools,
+            ) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    let status = StatusCode::from_u16(
+                        error.get("status").and_then(Value::as_u64).unwrap_or(400) as u16,
+                    )
+                    .unwrap_or(StatusCode::BAD_REQUEST);
+                    let code = error
+                        .get("code")
+                        .and_then(Value::as_str)
+                        .unwrap_or("CR-REQ-0006");
+                    let message = error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("invalid request");
+                    let response = error_response(status, code, message, &request_id);
+                    let _ = terminal.complete("rejected", Some(status.as_u16()), Some(code), 1);
+                    return response;
+                }
+            }
+        } else {
+            PlanResult {
+                body: bytes.to_vec(),
+                public_model: String::new(),
+                pool_id: String::new(),
+                pool_prefix: String::new(),
+                upstream_model: String::new(),
+                internal_model: String::new(),
+            }
+        };
+        // Gemini v1beta carries the model in the URL path; rewrite it to the
+        // internal `{prefix}/{public_model}` form after planning.
+        let mapped =
+            if !plan.internal_model.is_empty() && extract_v1beta_model(&request_path).is_some() {
+                rewrite_v1beta_path_model(&request_path, &plan.internal_model)
+            } else {
+                request_path.clone()
+            };
+        let protocol = protocol_of(&mapped);
+        if codex_router_lib::responses_compat::is_compact_path(&mapped)
+            && !codex_router_lib::responses_compat::is_openai_family_model(&plan.public_model)
+            && !codex_router_lib::responses_compat::is_xai_family_model(&plan.public_model)
+        {
+            if let Ok(json_body) = serde_json::from_slice::<Value>(&plan.body) {
+                let output = json_body
+                    .get("input")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let payload = codex_router_lib::responses_compat::synthetic_compact_response(
+                    &plan.public_model,
+                    &output,
+                );
+                record_ledger(
+                    &state,
+                    &usage_ledger::LedgerInput {
+                        request_id: &request_id,
+                        model: &plan.public_model,
+                        pool_id: &plan.pool_id,
+                        protocol: "responses",
+                        status: "completed",
+                        elapsed_ms: started.elapsed().as_millis() as i64,
+                        ..Default::default()
+                    },
+                );
+                let _ = terminal.complete("completed", Some(200), None, 1);
+                let json_bytes = serde_json::to_vec(&payload).unwrap_or_default();
+                let res = axum::response::Response::builder()
+                    .status(StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .header("x-request-id", &request_id)
+                    .body(axum::body::Body::from(json_bytes))
+                    .unwrap_or_else(|_| (StatusCode::OK, "{}").into_response());
+                return res;
             }
         }
-    } else {
-        PlanResult {
-            body: bytes.to_vec(),
-            public_model: String::new(),
-            pool_id: String::new(),
-            pool_prefix: String::new(),
-            upstream_model: String::new(),
-            internal_model: String::new(),
-        }
-    };
-    // Gemini v1beta carries the model in the URL path; rewrite it to the
-    // internal `{prefix}/{public_model}` form after planning.
-    let mapped = if !plan.internal_model.is_empty() && extract_v1beta_model(&request_path).is_some()
-    {
-        rewrite_v1beta_path_model(&request_path, &plan.internal_model)
-    } else {
-        request_path.clone()
-    };
-    let protocol = protocol_of(&mapped);
-    if codex_router_lib::responses_compat::is_compact_path(&mapped)
-        && !codex_router_lib::responses_compat::is_openai_family_model(&plan.public_model)
-        && !codex_router_lib::responses_compat::is_xai_family_model(&plan.public_model)
-    {
-        if let Ok(json_body) = serde_json::from_slice::<Value>(&plan.body) {
-            let output = json_body
-                .get("input")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let payload = codex_router_lib::responses_compat::synthetic_compact_response(
-                &plan.public_model,
-                &output,
-            );
-            record_ledger(
-                &state,
-                &usage_ledger::LedgerInput {
-                    request_id: &request_id,
-                    model: &plan.public_model,
-                    pool_id: &plan.pool_id,
-                    protocol: "responses",
-                    status: "completed",
-                    elapsed_ms: started.elapsed().as_millis() as i64,
-                    ..Default::default()
-                },
-            );
-            let _ = terminal.complete("completed", Some(200), None, 1);
-            let json_bytes = serde_json::to_vec(&payload).unwrap_or_default();
-            let res = axum::response::Response::builder()
-                .status(StatusCode::OK)
-                .header(axum::http::header::CONTENT_TYPE, "application/json")
-                .header("x-request-id", &request_id)
-                .body(axum::body::Body::from(json_bytes))
-                .unwrap_or_else(|_| (StatusCode::OK, "{}").into_response());
-            return res;
-        }
-    }
-    let url = format!("{}{}", state.cli_base, mapped);
-    let upstream_response = state
-        .cli_data
-        .request(method.clone(), &url)
-        .headers(forward_headers.clone())
-        .header(
-            "authorization",
-            format!("Bearer {}", state.local_key.as_str()),
-        )
-        .header("x-request-id", &request_id)
-        .body(plan.body.clone())
-        .send()
-        .await;
-    let upstream = match upstream_response {
-        Ok(upstream) => upstream,
-        Err(_) => {
-            record_ledger(
-                &state,
-                &usage_ledger::LedgerInput {
-                    request_id: &request_id,
-                    model: &plan.public_model,
-                    pool_id: &plan.pool_id,
-                    protocol,
-                    status: "failed",
-                    elapsed_ms: started.elapsed().as_millis() as i64,
-                    error_code: Some("CR-CLI-0004"),
-                    ..Default::default()
-                },
-            );
-            let response = error_response(
-                StatusCode::BAD_GATEWAY,
-                "CR-CLI-0004",
-                "CLIProxyAPI failed while handling the request",
-                &request_id,
-            );
-            let _ = terminal.complete("upstream_error", Some(502), Some("CR-CLI-0004"), 1);
-            return response;
-        }
-    };
-    let upstream_status = upstream.status().as_u16();
-    let shielded_auth = upstream_status == 401;
-    if shielded_auth {
-        let _ = state.control.logger.write(serde_json::json!({
+        let url = format!("{}{}", state.cli_base, mapped);
+        let upstream_response = state
+            .cli_data
+            .request(method.clone(), &url)
+            .headers(forward_headers.clone())
+            .header(
+                "authorization",
+                format!("Bearer {}", state.local_key.as_str()),
+            )
+            .header("x-request-id", &request_id)
+            .body(plan.body.clone())
+            .send()
+            .await;
+        let upstream = match upstream_response {
+            Ok(upstream) => upstream,
+            Err(_) => {
+                record_ledger(
+                    &state,
+                    &usage_ledger::LedgerInput {
+                        request_id: &request_id,
+                        model: &plan.public_model,
+                        pool_id: &plan.pool_id,
+                        protocol,
+                        status: "failed",
+                        elapsed_ms: started.elapsed().as_millis() as i64,
+                        error_code: Some("CR-CLI-0004"),
+                        ..Default::default()
+                    },
+                );
+                let response = error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "CR-CLI-0004",
+                    "CLIProxyAPI failed while handling the request",
+                    &request_id,
+                );
+                let _ = terminal.complete("upstream_error", Some(502), Some("CR-CLI-0004"), 1);
+                return response;
+            }
+        };
+        let upstream_status = upstream.status().as_u16();
+        let shielded_auth = upstream_status == 401;
+        if shielded_auth {
+            let _ = state.control.logger.write(serde_json::json!({
             "level": "INFO",
             "event": "desktop.session.upstream_401_shielded",
             "error_code": codex_router_lib::control_plane::desktop_session::DSK_UPSTREAM_401_SHIELDED,
@@ -1568,203 +1573,219 @@ async fn data_plane(State(state): State<HostState>, request: Request) -> Respons
             "forward_status": 503,
             "timestamp": structured_log::timestamp(),
         }));
-    }
-    let mut status_u16 = if shielded_auth { 503 } else { upstream_status };
-    let status = StatusCode::from_u16(status_u16).unwrap_or(StatusCode::BAD_GATEWAY);
-    let ledger_account = attribute_account(&state, upstream.headers());
-    let mut response_headers = reqwest_to_axum_headers(upstream.headers());
-    response_headers.remove("www-authenticate");
-    response_headers.insert(
-        "x-request-id",
-        HeaderValue::from_str(&request_id).unwrap_or(HeaderValue::from_static("invalid")),
-    );
-    let is_sse = upstream
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.contains("text/event-stream"));
-    let elapsed = started.elapsed().as_millis() as i64;
-    if is_sse {
-        let rewriter =
-            SseRewriter::new(&plan.pool_prefix, &plan.public_model, &plan.upstream_model);
-        let context = SseContext {
-            state: state.clone(),
-            request_id: request_id.clone(),
-            public_model: plan.public_model.clone(),
-            pool_id: plan.pool_id.clone(),
-            protocol: protocol.to_owned(),
-            status_u16,
-            account_id: ledger_account,
-            terminal: Some(terminal),
-        };
-        let stream = wrap_sse_stream(upstream.bytes_stream(), rewriter, context, started);
-        let mut builder = Response::builder().status(status);
-        for (name, value) in response_headers.iter() {
-            builder = builder.header(name, value);
         }
-        return builder
-            .body(Body::from_stream(stream))
-            .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
-    } else {
-        let body_bytes = match read_complete_response_body(upstream).await {
-            Ok(body) => body,
-            Err(_) => {
-                record_ledger(
-                    &state,
-                    &usage_ledger::LedgerInput {
-                        request_id: &request_id,
-                        model: &plan.public_model,
-                        pool_id: &plan.pool_id,
-                        account_id: ledger_account,
-                        protocol,
-                        status: "failed",
-                        elapsed_ms: elapsed,
-                        error_code: Some("CR-UP-0014"),
-                        ..Default::default()
-                    },
-                );
-                let _ = terminal.complete("upstream_error", Some(502), Some("CR-UP-0014"), 1);
-                return error_response(
-                    StatusCode::BAD_GATEWAY,
-                    "CR-UP-0014",
-                    "upstream response body was interrupted",
-                    &request_id,
-                );
+        let mut status_u16 = if shielded_auth { 503 } else { upstream_status };
+        let status = StatusCode::from_u16(status_u16).unwrap_or(StatusCode::BAD_GATEWAY);
+        let ledger_account = attribute_account(&state, upstream.headers());
+        let mut response_headers = reqwest_to_axum_headers(upstream.headers());
+        response_headers.remove("www-authenticate");
+        response_headers.insert(
+            "x-request-id",
+            HeaderValue::from_str(&request_id).unwrap_or(HeaderValue::from_static("invalid")),
+        );
+        let is_sse = upstream_status < 400
+            && upstream
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.contains("text/event-stream"));
+        let elapsed = started.elapsed().as_millis() as i64;
+        if is_sse {
+            let rewriter =
+                SseRewriter::new(&plan.pool_prefix, &plan.public_model, &plan.upstream_model);
+            let context = SseContext {
+                state: state.clone(),
+                request_id: request_id.clone(),
+                public_model: plan.public_model.clone(),
+                pool_id: plan.pool_id.clone(),
+                protocol: protocol.to_owned(),
+                status_u16,
+                account_id: ledger_account,
+                terminal: Some(terminal),
+            };
+            let stream = wrap_sse_stream(upstream.bytes_stream(), rewriter, context, started);
+            let mut builder = Response::builder().status(status);
+            for (name, value) in response_headers.iter() {
+                builder = builder.header(name, value);
             }
-        };
-        let failover_text = String::from_utf8_lossy(&body_bytes);
-        if !plan.public_model.is_empty()
-            && codex_router_lib::responses_compat::is_pool_failover_error(
-                upstream_status,
-                &failover_text,
-            )
-        {
-            failed_pools.insert(plan.pool_id.clone());
-            let table = state
-                .control
-                .routes
-                .read()
-                .unwrap_or_else(|error| error.into_inner())
-                .clone();
-            if codex_router_lib::routing::has_fallback_pool(
-                &table,
-                &plan.public_model,
-                &failed_pools,
-            ) {
-                let _ = state.control.logger.write(serde_json::json!({
-                    "level": "INFO",
-                    "event": "request.pool_failover",
-                    "from_pool": plan.pool_id,
-                    "public_model": plan.public_model,
-                    "upstream_status": upstream_status,
-                    "request_id": request_id,
-                    "timestamp": structured_log::timestamp(),
-                }));
-                continue;
-            }
-        }
-        let mut parsed: Option<Value> = serde_json::from_slice(&body_bytes).ok();
-        if status_u16 == 503 {
-            let missing_auth = parsed
-                .as_ref()
-                .and_then(|body| body.pointer("/error/message"))
-                .and_then(Value::as_str)
-                .is_some_and(codex_router_lib::responses_compat::is_missing_provider_auth);
-            if missing_auth {
-                if let Some(hint) = antigravity_blocked_verification_message(&state).await {
-                    if let Some(body) = parsed.as_mut() {
-                        if let Some(error) = body.get_mut("error").and_then(Value::as_object_mut)
-                        {
-                            error.insert("message".to_owned(), Value::String(hint));
-                            error.insert(
-                                "code".to_owned(),
-                                Value::String("CR-UP-0003".to_owned()),
-                            );
-                        }
-                    }
-                    status_u16 = 403;
+            return builder
+                .body(Body::from_stream(stream))
+                .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
+        } else {
+            let body_bytes = match read_complete_response_body(upstream).await {
+                Ok(body) => body,
+                Err(_) => {
+                    record_ledger(
+                        &state,
+                        &usage_ledger::LedgerInput {
+                            request_id: &request_id,
+                            model: &plan.public_model,
+                            pool_id: &plan.pool_id,
+                            account_id: ledger_account,
+                            protocol,
+                            status: "failed",
+                            elapsed_ms: elapsed,
+                            error_code: Some("CR-UP-0014"),
+                            ..Default::default()
+                        },
+                    );
+                    let _ = terminal.complete("upstream_error", Some(502), Some("CR-UP-0014"), 1);
+                    return error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "CR-UP-0014",
+                        "upstream response body was interrupted",
+                        &request_id,
+                    );
                 }
-            }
-        }
-        let status = StatusCode::from_u16(status_u16).unwrap_or(status);
-        if let Some(body) = parsed.as_mut() {
-            if !plan.public_model.is_empty() {
+            };
+            let failover_text = String::from_utf8_lossy(&body_bytes);
+            if !plan.public_model.is_empty()
+                && codex_router_lib::responses_compat::is_pool_failover_error(
+                    upstream_status,
+                    &failover_text,
+                )
+            {
+                failed_pools.insert(plan.pool_id.clone());
                 let table = state
                     .control
                     .routes
                     .read()
                     .unwrap_or_else(|error| error.into_inner())
                     .clone();
-                if let Some(route) = table
-                    .routes()
-                    .iter()
-                    .find(|route| route.prefix == plan.pool_prefix)
-                {
-                    table.rewrite_response_model(body, route);
+                if codex_router_lib::routing::has_fallback_pool(
+                    &table,
+                    &plan.public_model,
+                    &failed_pools,
+                ) {
+                    let _ = state.control.logger.write(serde_json::json!({
+                        "level": "INFO",
+                        "event": "request.pool_failover",
+                        "from_pool": plan.pool_id,
+                        "public_model": plan.public_model,
+                        "upstream_status": upstream_status,
+                        "request_id": request_id,
+                        "timestamp": structured_log::timestamp(),
+                    }));
+                    continue;
                 }
             }
-            if !status.is_success() {
-                annotate_error_body(body, upstream_error_code(status_u16), &request_id);
+            if upstream_status == 402 {
+                status_u16 = 429;
             }
-        }
-        let mut output = parsed
-            .as_ref()
-            .map(|value| serde_json::to_vec(value).unwrap_or_else(|_| body_bytes.to_vec()))
-            .unwrap_or_else(|| body_bytes.to_vec());
-        if shielded_auth {
-            output = serde_json::to_vec(&serde_json::json!({
-                "error": {
-                    "message": "model temporarily unavailable",
-                    "type": "codex_router_error",
-                    "param": null,
-                    "code": "CR-UP-0011"
-                },
-                "request_id": request_id
-            }))
-            .unwrap_or(output);
-        }
-        let ledger_status = if status.is_success() {
-            "completed"
-        } else {
-            "failed"
-        };
-        let error_code = if status.is_success() {
-            None
-        } else {
-            Some(upstream_error_code(status_u16))
-        };
-        record_ledger(
-            &state,
-            &usage_ledger::LedgerInput {
-                request_id: &request_id,
-                model: &plan.public_model,
-                pool_id: &plan.pool_id,
-                account_id: ledger_account,
-                protocol,
-                status: ledger_status,
-                body: parsed.as_ref(),
-                elapsed_ms: elapsed,
-                error_code,
-            },
-        );
-        let _ = terminal.complete(
-            if status.is_success() {
-                "ok"
+            let mut parsed: Option<Value> = serde_json::from_slice(&body_bytes).ok();
+            if upstream_status == 402 {
+                if let Some(body) = parsed.as_mut() {
+                    if let Some(error) = body.get_mut("error").and_then(Value::as_object_mut) {
+                        error.insert(
+                            "message".to_owned(),
+                            Value::String("usage limit reached".to_owned()),
+                        );
+                        error.insert("code".to_owned(), Value::String("usage_limit".to_owned()));
+                    }
+                }
+            }
+            if status_u16 == 503 {
+                let missing_auth = parsed
+                    .as_ref()
+                    .and_then(|body| body.pointer("/error/message"))
+                    .and_then(Value::as_str)
+                    .is_some_and(codex_router_lib::responses_compat::is_missing_provider_auth);
+                if missing_auth {
+                    if let Some(hint) = antigravity_blocked_verification_message(&state).await {
+                        if let Some(body) = parsed.as_mut() {
+                            if let Some(error) =
+                                body.get_mut("error").and_then(Value::as_object_mut)
+                            {
+                                error.insert("message".to_owned(), Value::String(hint));
+                                error.insert(
+                                    "code".to_owned(),
+                                    Value::String("CR-UP-0003".to_owned()),
+                                );
+                            }
+                        }
+                        status_u16 = 403;
+                    }
+                }
+            }
+            let status = StatusCode::from_u16(status_u16).unwrap_or(status);
+            if let Some(body) = parsed.as_mut() {
+                if !plan.public_model.is_empty() {
+                    let table = state
+                        .control
+                        .routes
+                        .read()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .clone();
+                    if let Some(route) = table
+                        .routes()
+                        .iter()
+                        .find(|route| route.prefix == plan.pool_prefix)
+                    {
+                        table.rewrite_response_model(body, route);
+                    }
+                }
+                if !status.is_success() {
+                    annotate_error_body(body, upstream_error_code(status_u16), &request_id);
+                }
+            }
+            let mut output = parsed
+                .as_ref()
+                .map(|value| serde_json::to_vec(value).unwrap_or_else(|_| body_bytes.to_vec()))
+                .unwrap_or_else(|| body_bytes.to_vec());
+            if shielded_auth {
+                output = serde_json::to_vec(&serde_json::json!({
+                    "error": {
+                        "message": "model temporarily unavailable",
+                        "type": "codex_router_error",
+                        "param": null,
+                        "code": "CR-UP-0011"
+                    },
+                    "request_id": request_id
+                }))
+                .unwrap_or(output);
+            }
+            let ledger_status = if status.is_success() {
+                "completed"
             } else {
-                "upstream_error"
-            },
-            Some(status_u16),
-            error_code,
-            1,
-        );
-        let mut builder = Response::builder().status(status);
-        for (name, value) in response_headers.iter() {
-            builder = builder.header(name, value);
+                "failed"
+            };
+            let error_code = if status.is_success() {
+                None
+            } else {
+                Some(upstream_error_code(status_u16))
+            };
+            record_ledger(
+                &state,
+                &usage_ledger::LedgerInput {
+                    request_id: &request_id,
+                    model: &plan.public_model,
+                    pool_id: &plan.pool_id,
+                    account_id: ledger_account,
+                    protocol,
+                    status: ledger_status,
+                    body: parsed.as_ref(),
+                    elapsed_ms: elapsed,
+                    error_code,
+                },
+            );
+            let _ = terminal.complete(
+                if status.is_success() {
+                    "ok"
+                } else {
+                    "upstream_error"
+                },
+                Some(status_u16),
+                error_code,
+                1,
+            );
+            let mut builder = Response::builder().status(status);
+            for (name, value) in response_headers.iter() {
+                builder = builder.header(name, value);
+            }
+            return builder
+                .body(Body::from(output))
+                .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
         }
-        return builder
-            .body(Body::from(output))
-            .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
-    }
     }
 }
 

@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-3.0.7-0969da" alt="版本 3.0.7">
+  <img src="https://img.shields.io/badge/version-3.0.10-0969da" alt="版本 3.0.10">
   <img src="https://img.shields.io/badge/platform-Windows%20%2F%20macOS%20%2F%20Linux-0078d4" alt="Windows / macOS / Linux">
   <img src="https://img.shields.io/badge/architecture-x64-555555" alt="x64">
   <img src="https://img.shields.io/badge/default%20build-portable-2ea44f" alt="默认构建便携版">
@@ -80,6 +80,9 @@ CodexRouter 可以将 OAuth 和 API 渠道合并为 Codex 可见的模型目录�
 - 3.0.5：Antigravity/Gemini 续跑旧线程时剥掉过期 thought carrier 和 `previous_response_id`，避免 Google 404 `Requested entity was not found`。
 - 3.0.6：不再把 `no auth available` 空等 125 秒；那会让 Desktop 报 `error sending request` 并拖死所有模型。自动续跑仅限 Grok。
 - 3.0.7：Antigravity 网页授权成功后，不再因为 `www.googleapis.com` userinfo TLS 超时丢掉 token（`CR-OAU-0008` / `exchange-code`）。ChatGPT 官方额度用尽时按优先级立刻改走中转，不再把整条 Sol 线路一起冷却。
+- 3.0.8：Grok 写完整份 Verdict 后不再复读「任务已完成」；长篇报告里的「下一步」不再触发自动续跑。推理档位：Grok 4.6 增加 `xhigh`，Claude 4.6 Thinking 为 low/medium/high/max，GLM-5.2 为 high/max。
+- 3.0.9：Grok 402 Payment Required 立刻换下一个账号/池。Grok 登录改由 Host 在 `127.0.0.1:56121/callback` 做 PKCE 换 token，授权页能真正拿到 xAI 登录。
+- 3.0.10：Grok 400 `invalid-argument` 是 Codex Desktop 的 `mcp__codex_app__automation_update` schema（根上 `oneOf`/`$ref`）再加上 `max_output_tokens` 超过 128k。进 CLIProxy 前先把该工具 schema 换成空 object，Grok 输出硬上限 128k。
 
 ### 按模型适配的控制项
 

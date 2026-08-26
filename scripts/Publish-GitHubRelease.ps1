@@ -54,8 +54,11 @@ if ($cargoManifest -notmatch '(?m)^version\s*=\s*"([^"]+)"' -or $Matches[1] -ne 
 }
 
 $repoInfo = gh repo view $repository --json visibility,isPrivate,nameWithOwner | ConvertFrom-Json
-if ($LASTEXITCODE -ne 0 -or -not [bool]$repoInfo.isPrivate) {
-    throw 'The release repository must remain private during this publishing phase.'
+if ($LASTEXITCODE -ne 0) {
+    throw 'Could not inspect the GitHub repository.'
+}
+if ([string]$repoInfo.nameWithOwner -ne $repository) {
+    throw 'GitHub repository identity does not match.'
 }
 $branch = (git branch --show-current).Trim()
 if ([string]::IsNullOrWhiteSpace($branch)) { throw 'A local Git branch is required.' }
@@ -177,7 +180,7 @@ try {
 
 [ordered]@{
     repository = $repository
-    visibility = 'private'
+    visibility = if ($null -ne $repoInfo.visibility) { [string]$repoInfo.visibility } else { 'unknown' }
     tag = $tag
     commit = $head
     assets = $publishedAssets

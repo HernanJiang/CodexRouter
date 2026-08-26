@@ -790,8 +790,7 @@ pub fn auth_index_is_safe(auth_index: &str) -> bool {
     let trimmed = auth_index.trim();
     !trimmed.is_empty()
         && trimmed.chars().all(|character| {
-            character.is_ascii_alphanumeric()
-                || matches!(character, '-' | '_' | '.' | '@' | '+')
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '@' | '+')
         })
 }
 
@@ -3180,6 +3179,9 @@ fn oauth_session_metadata(state: &ControlState, session_state: &str) -> Result<O
 }
 
 async fn oauth_auth_url(state: &ControlState, provider: &str, body: Option<&Value>) -> Response {
+    if provider == "grok" {
+        return grok_auth_url(state).await;
+    }
     let Some(endpoint) = cli_oauth_auth_url_path(provider) else {
         return failure(
             StatusCode::BAD_REQUEST,
@@ -3744,6 +3746,9 @@ async fn oauth_exchange_code(state: &ControlState, provider: &str, body: &Value)
     if provider == "antigravity" && !code.trim().is_empty() {
         return complete_antigravity_oauth(state, &effective_body, &code).await;
     }
+    if provider == "grok" && !code.trim().is_empty() {
+        return complete_grok_oauth(state, &effective_body, &session_state, &code).await;
+    }
     // Manual-code providers forward the pasted code into the CLI callback.
     if !code.trim().is_empty() {
         let callback = json!({
@@ -3797,6 +3802,138 @@ fn cli_runtime_proxy_url(state: &ControlState) -> Option<String> {
         .ok()?
         .proxy_url
         .filter(|value| !value.trim().is_empty())
+}
+
+async fn grok_auth_url(state: &ControlState) -> Response {
+    let session = super::grok_oauth::new_pkce_session();
+    let url = super::grok_oauth::authorization_url(&session);
+    let started_at = chrono::Utc::now().to_rfc3339();
+    let expires = (chrono::Utc::now() + chrono::Duration::minutes(30)).to_rfc3339();
+    let state_hmac = sha256_hex(session.state.as_bytes());
+    let metadata = json!({
+        "started_at": started_at,
+        "code_verifier": session.code_verifier,
+        "nonce": session.nonce,
+        "redirect_uri": super::grok_oauth::REDIRECT_URI,
+    });
+    if state
+        .store
+        .with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO oauth_sessions(state_hmac,provider,status,expires_at,metadata) VALUES(?1,'grok','pending',?2,?3)
+                 ON CONFLICT(state_hmac) DO UPDATE SET status='pending',expires_at=excluded.expires_at,metadata=excluded.metadata",
+                rusqlite::params![state_hmac, expires, metadata.to_string()],
+            )?;
+            Ok(())
+        })
+        .is_err()
+    {
+        return failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CR-OAU-0003",
+            "could not store Grok OAuth session",
+        );
+    }
+    success(json!({
+        "auth_url": url,
+        "url": url,
+        "session_id": session.state,
+        "state": session.state,
+        "expires_in": 1800,
+    }))
+}
+
+async fn complete_grok_oauth(
+    state: &ControlState,
+    body: &Value,
+    session_state: &str,
+    code: &str,
+) -> Response {
+    let verifier = match oauth_session_metadata(state, session_state) {
+        Ok(Some(metadata)) => metadata
+            .get("code_verifier")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        Ok(None) => String::new(),
+        Err(error) => {
+            return failure(
+                StatusCode::BAD_GATEWAY,
+                "CR-OAU-0006",
+                &format!("Grok OAuth session is unreadable: {error}"),
+            );
+        }
+    };
+    if verifier.trim().is_empty() {
+        return failure(
+            StatusCode::BAD_REQUEST,
+            "CR-OAU-0006",
+            "Grok OAuth session is missing the PKCE verifier; start login again",
+        );
+    }
+    let proxy_url = cli_runtime_proxy_url(state);
+    let code = code.to_owned();
+    let exchanged = match tokio::task::spawn_blocking(move || {
+        super::grok_oauth::exchange_authorization_code(&code, &verifier, proxy_url.as_deref())
+    })
+    .await
+    {
+        Ok(Ok(tokens)) => tokens,
+        Ok(Err(error)) => {
+            let _ = state.logger.write(json!({
+                "level":"ERROR",
+                "event":"control.grok_oauth_exchange_failed",
+                "error_code":"CR-OAU-0007",
+                "error_description":error.to_string(),
+            }));
+            return failure(
+                StatusCode::BAD_GATEWAY,
+                "CR-OAU-0007",
+                &format!("Grok token exchange failed: {error}"),
+            );
+        }
+        Err(_) => {
+            return failure(
+                StatusCode::BAD_GATEWAY,
+                "CR-OAU-0008",
+                "Grok token exchange task failed",
+            );
+        }
+    };
+    let Some(backend) = state.backend.as_ref() else {
+        return failure(
+            StatusCode::BAD_GATEWAY,
+            "CR-CLI-0007",
+            "auth directory is unavailable",
+        );
+    };
+    let stem = super::grok_oauth::auth_file_stem(&exchanged.email);
+    let document = super::grok_oauth::auth_document(&exchanged);
+    if let Err(error) = write_auth_file(&backend.auth_dir, &stem, &document) {
+        return failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CR-OAU-0011",
+            &format!("could not write Grok auth file: {error}"),
+        );
+    }
+    let _ = state.logger.write(json!({
+        "level":"INFO",
+        "event":"control.grok_oauth_completed",
+        "has_email":!exchanged.email.trim().is_empty(),
+    }));
+    let materialized = json!({
+        "auth_file": format!("{stem}.json"),
+        "auth_index": stem,
+        "email": exchanged.email,
+        "account_id": exchanged.sub,
+    });
+    match materialize_oauth_account(state, "grok", body, &materialized) {
+        Ok(account) => {
+            let _ = sync_backend(state).await;
+            success(account)
+        }
+        Err(error) => failure(StatusCode::BAD_GATEWAY, "CR-OAU-0008", &error.to_string()),
+    }
 }
 
 async fn complete_antigravity_oauth(state: &ControlState, body: &Value, code: &str) -> Response {
@@ -5574,5 +5711,40 @@ mod tests {
             cli_oauth_auth_url_path("grok").as_deref(),
             Some("/v0/management/xai-auth-url")
         );
+    }
+
+    #[tokio::test]
+    async fn grok_auth_url_is_host_owned_pkce_and_pins_loopback_callback() {
+        let root = std::env::temp_dir().join(format!("router-grok-auth-{}", uuid::Uuid::now_v7()));
+        let store = Arc::new(StateStore::open(root.join("router-state.sqlite3")).unwrap());
+        let state = ControlState {
+            store,
+            cli: CliProxyManagementClient::new("http://127.0.0.1:1", "test-secret").unwrap(),
+            logger: Arc::new(StructuredLogger::open(root.join("router-events.jsonl")).unwrap()),
+            routes: Arc::new(RwLock::new(RouteTable::new(Vec::new()).unwrap())),
+            backend: None,
+            cli_index_map: Arc::new(RwLock::new(HashMap::new())),
+        };
+        let response = grok_auth_url(&state).await;
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["success"], true);
+        let data = &payload["data"];
+        let url = data["auth_url"].as_str().unwrap();
+        let session_id = data["session_id"].as_str().unwrap();
+        assert!(url.contains("https://auth.x.ai/oauth2/authorize"));
+        assert!(url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A56121%2Fcallback"));
+        assert!(url.contains(&format!("state={session_id}")));
+        assert!(!url.contains("localhost"));
+        let metadata = oauth_session_metadata(&state, session_id)
+            .unwrap()
+            .expect("stored grok session");
+        assert!(!metadata["code_verifier"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -261,7 +261,11 @@ pub fn select_pool<'a>(
 
 /// True when another enabled, available pool for this public model remains
 /// after `exclude` (failed pools) is applied.
-pub fn has_fallback_pool(table: &RouteTable, public_model: &str, exclude: &HashSet<String>) -> bool {
+pub fn has_fallback_pool(
+    table: &RouteTable,
+    public_model: &str,
+    exclude: &HashSet<String>,
+) -> bool {
     table
         .pools(public_model)
         .into_iter()
@@ -396,9 +400,14 @@ mod tests {
             "cr/gpt-5.6-sol/openai".into(),
             Duration::from_secs(60),
         );
-        let selected =
-            select_pool(&table, "deepseek-v4-flash", Some(&key), &bindings, &HashSet::new())
-                .unwrap();
+        let selected = select_pool(
+            &table,
+            "deepseek-v4-flash",
+            Some(&key),
+            &bindings,
+            &HashSet::new(),
+        )
+        .unwrap();
         assert_eq!(selected.provider, "deepseek");
         assert!(should_drop_previous_response(
             &table,
@@ -422,8 +431,14 @@ mod tests {
             "cr/gpt-5.6-sol/openai".into(),
             Duration::from_secs(60),
         );
-        let selected =
-            select_pool(&table, "gpt-5.6-luna", Some(&key), &bindings, &HashSet::new()).unwrap();
+        let selected = select_pool(
+            &table,
+            "gpt-5.6-luna",
+            Some(&key),
+            &bindings,
+            &HashSet::new(),
+        )
+        .unwrap();
         assert_eq!(selected.provider, "openai");
         assert!(!should_drop_previous_response(
             &table,

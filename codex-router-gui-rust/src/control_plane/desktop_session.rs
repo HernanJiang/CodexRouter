@@ -227,8 +227,8 @@ pub fn restore_system_from_home(home: &str) -> Option<String> {
     if let Some(catalog) = home_doc.get("model_catalog_json") {
         document.insert("model_catalog_json", catalog.clone());
     }
-    let providers = document["model_providers"]
-        .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+    let providers =
+        document["model_providers"].or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
     providers.as_table_mut()?["codex_router"] = toml_edit::Item::Table(provider);
     let mut text = format!("{SYSTEM_BINDING_MARKER}\n{}", document);
     if !text.ends_with('\n') {
