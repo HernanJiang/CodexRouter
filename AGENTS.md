@@ -39,7 +39,7 @@ D:\Work\CodexRouter\          稳定 main：源码直接展开在仓库根，不
 
 ## 每一版都必须打包 exe（默认）
 
-在 `dev` 完成一版可测改动后，**必须立刻打包 Windows 便携 exe，停掉旧实例，打开新包给用户测试**。不要只改源码、只跑 `cargo test` 就收工。
+在 `dev` 完成一版可测改动后，**必须立刻打包 Windows 便携 exe，并把新包的完整路径交给用户自行启动和切换**。不得因为打包或验收而擅自停止、重启、接管正在运行的旧实例；不要只改源码、只跑 `cargo test` 就收工。
 
 1. 升高 `dev\codex-router-gui-rust\Cargo.toml` 版本。
 2. 从 `dev` 打包（测试包，不是上传包）：
@@ -50,7 +50,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File D:\Work\CodexRouter\dev\scri
 
 3. 产物必须是：
    `D:\Work\CodexRouter\dev\Release\<version>\Codex-Router-Portable-<version>-windows-x64\Codex-Router.exe`
-4. 停掉本机所有 `Codex-Router.exe` / `codex-router-host.exe` / `cli-proxy-api.exe`，**立刻用新包的 `Codex-Router.exe` 打开 GUI 窗口**（`Start-Process`，工作目录为便携包根目录），把窗口恢复并置顶到用户桌面。只起 Host 进程、不弹出窗口，不算完成。确认 Host 健康检查通过且只有这一套进程。
+4. **不得停止或重启**本机任何 `Codex-Router.exe` / `codex-router-host.exe` / `cli-proxy-api.exe`，也不得替换正在运行的实例。打包后只需提供新包的完整路径和健康检查命令，由用户自行用新包的 `Codex-Router.exe` 启动 GUI 并切换。只有用户明确授权时，才可以执行停止、重启或接管；只起 Host 进程、不弹出窗口，不算用户已完成切换。
 5. 测试包可以含本机构建痕迹，但仍然禁止打进 UserData、OAuth、API Key。它**不是**可公开发布包。
 6. 用户说「先别切 / 不要重启」时：仍然打包到 `dev\Release\`，但不替换正在跑的实例，并明确告诉用户测试包路径。
 
@@ -63,7 +63,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File D:\Work\CodexRouter\dev\scri
 - 用**根目录** `scripts\Build-PortableRelease.ps1` 打包到
   `D:\Work\CodexRouter\Release\<version>\Codex-Router-Portable-<version>-windows-x64`。
 - 产物必须是**不含用户个人信息**、可公开发布的便携包：全树敏感信息扫描必须通过；不打进 UserData、OAuth、API Key、本机绝对路径。
-- 停掉本机所有 Router 进程，打开新的 `Release` 包，确认健康检查。
+- 不得停掉或替换本机正在运行的 Router 进程；构建完成后提供新的 `Release` 包完整路径和健康检查命令，由用户自行打开并切换。只有用户明确授权时，才可以执行停止、重启或接管。
 - 删除已被替代的旧 `Release\<旧版本>\`，避免再双开。不要删 `dev\Release\` 里用户还在测的包，除非用户说可以删。
 
 可上传包命令（从仓库根，即稳定 main）：
@@ -84,4 +84,4 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\Build-PortableRele
 
 ## 关闭与端口
 
-关闭应用必须停掉同名 `codex-router-host.exe` / `cli-proxy-api.exe` 占用的 18080、28080 段端口，不能把旧便携版 Host 留在后台。
+只有用户明确要求关闭、重启或切换实例时，才停止同名 `codex-router-host.exe` / `cli-proxy-api.exe` 及其占用的 18080、28080 段端口；日常构建、验收和发布不得触碰正在运行的旧便携版 Host，避免中断用户会话。
