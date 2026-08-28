@@ -2,6 +2,16 @@
 
 本文件记录面向用户的重要变化。完整技术细节以对应版本的源码和 GitHub Release 为准。
 
+## 3.1.4 - 2026-08-29
+
+### 修复
+
+- 修复 Gemini、Muse 等 Chat Completions 兼容流把 `reasoning_content`、`reasoning`、`thinking` 和 `<think>` 内容误当普通正文输出的问题；现在会实时转换为 Codex Responses reasoning summary delta。
+- 修复分块 `tool_calls` 被缓冲到最终事件的问题；工具调用首个分块到达时立即转换为 `response.output_item.added` 和 `response.function_call_arguments.delta`，结束时补齐 `done` 与唯一的 `response.completed`。
+- 修复兼容流在网关边界转换后被误判为没有终止事件的问题，避免有效的 Chat Completions `[DONE]` 流被当成断流重试。
+
+说明：Router 只能转发模型实际产生的 reasoning 和工具调用；如果 Gemini/Muse 本身没有生成可执行动作，Router 不会凭空制造 ReAct 步骤。
+
 ## 3.1.3 - 2026-08-28
 
 ### 原因

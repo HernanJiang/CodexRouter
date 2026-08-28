@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-3.1.3-0969da" alt="版本 3.1.3">
+  <img src="https://img.shields.io/badge/version-3.1.4-0969da" alt="版本 3.1.4">
   <img src="https://img.shields.io/badge/platform-Windows%20%2F%20macOS%20%2F%20Linux-0078d4" alt="Windows / macOS / Linux">
   <img src="https://img.shields.io/badge/architecture-x64-555555" alt="x64">
   <img src="https://img.shields.io/badge/default%20build-portable-2ea44f" alt="默认构建便携版">
@@ -132,9 +132,9 @@ CodexRouter 可以在 Windows 登录后直接进入轻量托盘模式，不启�
 
 ## 下载与首次启动
 
-前往 [GitHub Releases](https://github.com/HernanJiang/CodexRouter/releases/tag/v2.1.14) 下载 Windows x64 版本：
+前往 [GitHub Releases](https://github.com/HernanJiang/CodexRouter/releases/tag/v3.1.4) 下载 Windows x64 版本：
 
-`Codex-Router-Portable-2.1.14-windows-x64.zip`
+`Codex-Router-Portable-3.1.4-windows-x64.zip`
 
 默认发布与本地交付只构建便携版。用户级 installer 仍保留为可选构建目标，仅在明确需要安装器时单独生成。
 

@@ -12,7 +12,7 @@
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const LOCAL_COMPACT_KEEP_LAST: usize = 48;
@@ -2175,6 +2175,24 @@ pub struct SseThinkState {
     item_id: String,
     output_index: u64,
     next_item: u64,
+    chat_mode: bool,
+    chat_response_id: String,
+    chat_message_id: String,
+    chat_message_output_index: u64,
+    chat_message_open: bool,
+    chat_visible_text: String,
+    chat_next_output_index: u64,
+    chat_tool_calls: BTreeMap<u64, ChatToolCallState>,
+    chat_completed: bool,
+}
+
+#[derive(Debug, Default)]
+struct ChatToolCallState {
+    id: String,
+    name: String,
+    arguments: String,
+    output_index: u64,
+    item_started: bool,
 }
 
 impl SseThinkState {
@@ -2376,7 +2394,12 @@ fn ensure_reasoning_open(state: &mut SseThinkState, out: &mut String) {
     }
     state.next_item = state.next_item.saturating_add(1);
     state.item_id = format!("rs_cr_think_{}", state.next_item);
-    state.output_index = 0;
+    if state.chat_mode {
+        state.output_index = state.chat_next_output_index;
+        state.chat_next_output_index = state.chat_next_output_index.saturating_add(1);
+    } else {
+        state.output_index = 0;
+    }
     state.reasoning_open = true;
     out.push_str(&sse_data_line(&json!({
         "type": "response.output_item.added",
@@ -2455,7 +2478,9 @@ fn emit_think_pieces(
             ThinkPiece::Visible(text) if text.is_empty() => {}
             ThinkPiece::Visible(text) => {
                 close_reasoning(state, out);
-                if let Some(orig) = original_text_event {
+                if state.chat_mode {
+                    emit_chat_visible_delta(state, out, &text);
+                } else if let Some(orig) = original_text_event {
                     let mut ev = orig.clone();
                     ev["delta"] = Value::String(text);
                     out.push_str(&sse_data_line(&ev));
@@ -2515,6 +2540,268 @@ fn event_may_need_think_rewrite(state: &SseThinkState, event: &str) -> bool {
     event.contains("output_text.delta") || event.contains("output_text.done")
 }
 
+fn chat_completion_chunk(json: &Value) -> bool {
+    json.get("choices").and_then(Value::as_array).is_some()
+}
+
+fn ensure_chat_started(state: &mut SseThinkState, json: &Value, out: &mut String) {
+    if state.chat_mode {
+        return;
+    }
+    state.chat_mode = true;
+    state.chat_response_id = json
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .unwrap_or("resp_compat_chat")
+        .to_owned();
+    out.push_str(&sse_data_line(&json!({
+        "type": "response.created",
+        "response": {
+            "id": state.chat_response_id,
+            "object": "response",
+            "status": "in_progress",
+            "output": []
+        }
+    })));
+    out.push_str(&sse_data_line(&json!({
+        "type": "response.in_progress",
+        "response": { "id": state.chat_response_id, "status": "in_progress" }
+    })));
+}
+
+fn emit_chat_visible_delta(state: &mut SseThinkState, out: &mut String, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    close_reasoning(state, out);
+    if !state.chat_message_open {
+        state.chat_message_id = format!("msg_cr_chat_{}", state.next_item.saturating_add(1));
+        state.chat_message_output_index = state.chat_next_output_index;
+        state.chat_next_output_index = state.chat_next_output_index.saturating_add(1);
+        state.chat_message_open = true;
+        out.push_str(&sse_data_line(&json!({
+            "type": "response.output_item.added",
+            "output_index": state.chat_message_output_index,
+            "item": {
+                "id": state.chat_message_id,
+                "type": "message",
+                "status": "in_progress",
+                "role": "assistant",
+                "content": []
+            }
+        })));
+        out.push_str(&sse_data_line(&json!({
+            "type": "response.content_part.added",
+            "item_id": state.chat_message_id,
+            "output_index": state.chat_message_output_index,
+            "content_index": 0,
+            "part": { "type": "output_text", "text": "", "annotations": [] }
+        })));
+    }
+    state.chat_visible_text.push_str(text);
+    out.push_str(&sse_data_line(&json!({
+        "type": "response.output_text.delta",
+        "item_id": state.chat_message_id,
+        "output_index": state.chat_message_output_index,
+        "content_index": 0,
+        "delta": text
+    })));
+}
+
+fn emit_chat_tool_delta(
+    state: &mut SseThinkState,
+    out: &mut String,
+    index: u64,
+    call_id: Option<&str>,
+    name: Option<&str>,
+    arguments: Option<&str>,
+) {
+    close_reasoning(state, out);
+    close_chat_message(state, out);
+    let next_output_index = state.chat_next_output_index;
+    let (id, tool_name, output_index, item_started, argument_delta) = {
+        let tool = state
+            .chat_tool_calls
+            .entry(index)
+            .or_insert_with(|| ChatToolCallState {
+                id: format!("call_compat_{index}"),
+                output_index: next_output_index,
+                ..ChatToolCallState::default()
+            });
+        if let Some(call_id) = call_id.filter(|id| !id.is_empty()) {
+            tool.id = call_id.to_owned();
+        }
+        if let Some(name) = name.filter(|name| !name.is_empty()) {
+            tool.name = remap_tool_name(name);
+        }
+        let argument_delta = arguments.unwrap_or_default().to_owned();
+        tool.arguments.push_str(&argument_delta);
+        let started = tool.item_started;
+        tool.item_started = true;
+        (
+            tool.id.clone(),
+            tool.name.clone(),
+            tool.output_index,
+            started,
+            argument_delta,
+        )
+    };
+    if !item_started {
+        state.chat_next_output_index = state.chat_next_output_index.saturating_add(1);
+        out.push_str(&sse_data_line(&json!({
+            "type": "response.output_item.added",
+            "output_index": output_index,
+            "item": {
+                "id": id,
+                "type": "function_call",
+                "status": "in_progress",
+                "call_id": id,
+                "name": tool_name,
+                "arguments": ""
+            }
+        })));
+    }
+    if !argument_delta.is_empty() {
+        out.push_str(&sse_data_line(&json!({
+            "type": "response.function_call_arguments.delta",
+            "item_id": id,
+            "output_index": output_index,
+            "delta": argument_delta
+        })));
+    }
+}
+
+fn close_chat_message(state: &mut SseThinkState, out: &mut String) {
+    if !state.chat_message_open {
+        return;
+    }
+    out.push_str(&sse_data_line(&json!({
+        "type": "response.output_text.done",
+        "item_id": state.chat_message_id,
+        "output_index": state.chat_message_output_index,
+        "content_index": 0,
+        "text": state.chat_visible_text
+    })));
+    out.push_str(&sse_data_line(&json!({
+        "type": "response.content_part.done",
+        "item_id": state.chat_message_id,
+        "output_index": state.chat_message_output_index,
+        "content_index": 0,
+        "part": { "type": "output_text", "text": state.chat_visible_text, "annotations": [] }
+    })));
+    out.push_str(&sse_data_line(&json!({
+        "type": "response.output_item.done",
+        "output_index": state.chat_message_output_index,
+        "item": {
+            "id": state.chat_message_id,
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": state.chat_visible_text, "annotations": [] }]
+        }
+    })));
+    state.chat_message_open = false;
+}
+
+fn close_chat_tools(state: &mut SseThinkState, out: &mut String) {
+    for tool in state.chat_tool_calls.values_mut() {
+        if !tool.item_started {
+            continue;
+        }
+        out.push_str(&sse_data_line(&json!({
+            "type": "response.function_call_arguments.done",
+            "item_id": tool.id,
+            "output_index": tool.output_index,
+            "arguments": tool.arguments
+        })));
+        out.push_str(&sse_data_line(&json!({
+            "type": "response.output_item.done",
+            "output_index": tool.output_index,
+            "item": {
+                "id": tool.id,
+                "type": "function_call",
+                "status": "completed",
+                "call_id": tool.id,
+                "name": tool.name,
+                "arguments": tool.arguments
+            }
+        })));
+        tool.item_started = false;
+    }
+}
+
+fn finish_chat_response(state: &mut SseThinkState, out: &mut String) {
+    if !state.chat_mode || state.chat_completed {
+        return;
+    }
+    flush_think_state(state, out);
+    close_chat_message(state, out);
+    close_chat_tools(state, out);
+    out.push_str(&sse_data_line(&json!({
+        "type": "response.completed",
+        "response": {
+            "id": state.chat_response_id,
+            "object": "response",
+            "status": "completed"
+        }
+    })));
+    state.chat_completed = true;
+}
+
+fn rewrite_chat_completion_event(
+    state: &mut SseThinkState,
+    json: &Value,
+    out: &mut String,
+) -> bool {
+    if json.as_str() == Some("[DONE]") {
+        finish_chat_response(state, out);
+        return true;
+    }
+    if !chat_completion_chunk(json) {
+        return false;
+    }
+    ensure_chat_started(state, json, out);
+    let choice = json
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first());
+    let Some(choice) = choice else {
+        return true;
+    };
+    let delta = choice.get("delta").unwrap_or(&Value::Null);
+    for field in ["reasoning_content", "reasoning", "thinking"] {
+        if let Some(text) = delta.get(field).and_then(Value::as_str) {
+            emit_think_delta(state, out, text);
+        }
+    }
+    if let Some(content) = delta.get("content").and_then(Value::as_str) {
+        let pieces = state.scan.push(content);
+        emit_think_pieces(state, pieces, None, out);
+    }
+    if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+        for call in tool_calls {
+            let index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
+            let function = call.get("function").unwrap_or(&Value::Null);
+            emit_chat_tool_delta(
+                state,
+                out,
+                index,
+                call.get("id").and_then(Value::as_str),
+                function.get("name").and_then(Value::as_str),
+                function.get("arguments").and_then(Value::as_str),
+            );
+        }
+    }
+    if matches!(
+        choice.get("finish_reason").and_then(Value::as_str),
+        Some("stop" | "tool_calls" | "function_call" | "length" | "content_filter")
+    ) {
+        finish_chat_response(state, out);
+    }
+    true
+}
+
 #[allow(dead_code)]
 pub fn rewrite_sse_text(chunk: &str) -> String {
     let mut state = SseThinkState::default();
@@ -2542,16 +2829,27 @@ fn rewrite_sse_event(state: &mut SseThinkState, event: &str) -> String {
     let has_leak = find_leaked_tool_start(event).is_some();
     let restore = tool_name_restore_active();
     let think = event_may_need_think_rewrite(state, event);
-    if !has_leak && !restore && !think {
-        return event.to_owned();
-    }
     let mut out = String::new();
     let mut extracted_tools = Vec::new();
     let mut converted_text_delta = false;
     for line in event.split_inclusive('\n') {
-        if let Some(data) = line.strip_prefix("data:") {
+        if let Some(data) = line.trim_start().strip_prefix("data:") {
             let trimmed = data.trim();
+            if trimmed == "[DONE]" && !state.disabled && state.chat_mode {
+                finish_chat_response(state, &mut out);
+                continue;
+            }
             if let Ok(mut json) = serde_json::from_str::<Value>(trimmed) {
+                if !state.disabled
+                    && (chat_completion_chunk(&json) || json.as_str() == Some("[DONE]"))
+                {
+                    rewrite_chat_completion_event(state, &json, &mut out);
+                    continue;
+                }
+                if !has_leak && !restore && !think {
+                    out.push_str(line);
+                    continue;
+                }
                 if restore {
                     rewrite_tool_names_in_json(&mut json);
                 }
@@ -4290,6 +4588,98 @@ mod tests {
         let raw = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"<think>secret</think>hello\"}\n\n";
         let sse = rewrite_sse_text_with(&mut state, raw);
         assert_eq!(sse, raw);
+    }
+
+    #[test]
+    fn chat_completion_reasoning_content_becomes_responses_reasoning_delta() {
+        let raw = "data: {\"id\":\"chatcmpl-reasoning\",\"choices\":[{\"delta\":{\"reasoning_content\":\"先读取文件\"}}]}\n\n";
+        let output = rewrite_sse_text(raw);
+        assert!(output.contains("response.reasoning_summary_text.delta"));
+        assert!(output.contains("先读取文件"));
+    }
+
+    #[test]
+    fn chat_completion_reasoning_aliases_are_streamed() {
+        for field in ["reasoning", "thinking"] {
+            let mut delta = serde_json::Map::new();
+            delta.insert(field.to_owned(), json!("检查工具"));
+            let raw = format!(
+                "data: {}\n\n",
+                json!({"id":"chatcmpl-reasoning","choices":[{"delta":delta}]})
+            );
+            let output = rewrite_sse_text(&raw);
+            assert!(output.contains("response.reasoning_summary_text.delta"));
+            assert!(output.contains("检查工具"));
+        }
+    }
+
+    #[test]
+    fn chat_completion_content_delta_is_rewritten_as_responses_text() {
+        let raw = "data: {\"id\":\"chatcmpl-content\",\"choices\":[{\"delta\":{\"content\":\"正文\"}}]}\n\n";
+        let output = rewrite_sse_text(raw);
+        assert!(output.contains("response.output_text.delta"));
+        assert!(output.contains("正文"));
+    }
+
+    #[test]
+    fn chat_completion_think_tags_become_reasoning_and_visible_text() {
+        let think_text = ["<", "think>先读取文件</", "think>正文"].concat();
+        let value = json!({
+            "id": "chatcmpl-think",
+            "choices": [{"delta": {"content": think_text}}]
+        });
+        let output = rewrite_sse_text(&format!("data: {value}\n\n"));
+        assert!(output.contains("response.reasoning_summary_text.delta"));
+        assert!(output.contains("先读取文件"));
+        assert!(output.contains("response.output_text.delta"));
+        assert!(output.contains("正文"));
+    }
+
+    #[test]
+    fn chat_completion_tool_calls_stream_as_responses_function_calls() {
+        let first_json = json!({
+            "id": "chatcmpl-tool",
+            "choices": vec![json!({
+                "delta": json!({
+                    "tool_calls": vec![json!({
+                        "index": 0,
+                        "id": "call_1",
+                        "function": json!({
+                            "name": "exec_command",
+                            "arguments": "{\"cmd\":\"Get-"
+                        })
+                    })]
+                })
+            })]
+        });
+        let first = rewrite_sse_text(&format!("data: {first_json}\n\n"));
+        assert!(first.contains("response.output_item.added"));
+        assert!(first.contains("response.function_call_arguments.delta"));
+        assert!(first.contains("Get-"));
+
+        let mut state = SseThinkState::default();
+        let _ = rewrite_sse_text_with(&mut state, &format!("data: {first_json}\n\n"));
+        let second_json = json!({
+            "id": "chatcmpl-tool",
+            "choices": vec![json!({
+                "delta": json!({
+                    "tool_calls": vec![json!({
+                        "index": 0,
+                        "function": json!({"arguments": "Date\"}"})
+                    })]
+                })
+            })]
+        });
+        let second = rewrite_sse_text_with(&mut state, &format!("data: {second_json}\n\n"));
+        assert!(second.contains("Date"));
+        let done_json = json!({
+            "id": "chatcmpl-tool",
+            "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
+        });
+        let done = rewrite_sse_text_with(&mut state, &format!("data: {done_json}\n\n"));
+        assert!(done.contains("response.function_call_arguments.done"));
+        assert!(done.contains("response.output_item.done"));
+        assert!(done.contains("response.completed"));
     }
 
     #[test]

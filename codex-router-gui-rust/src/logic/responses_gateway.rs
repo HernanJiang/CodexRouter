@@ -1733,6 +1733,59 @@ fn sse_event_has_tool_call(event: &str) -> bool {
     )
 }
 
+fn sse_block_has_tool_call(block: &str) -> bool {
+    let mut rest = block.to_owned();
+    while let Some(event) = take_sse_event(&mut rest) {
+        if sse_event_has_tool_call(&event) {
+            return true;
+        }
+    }
+    if !rest.trim().is_empty() {
+        sse_event_has_tool_call(&rest)
+    } else {
+        false
+    }
+}
+
+fn update_resume_ids_from_sse_block(
+    block: &str,
+    response_id: &mut Option<String>,
+    item_id: &mut Option<String>,
+) {
+    let mut rest = block.to_owned();
+    loop {
+        let event = match take_sse_event(&mut rest) {
+            Some(event) => event,
+            None => {
+                if !rest.trim().is_empty() {
+                    update_resume_ids_from_sse_event(&rest, response_id, item_id);
+                }
+                break;
+            }
+        };
+        update_resume_ids_from_sse_event(&event, response_id, item_id);
+    }
+}
+
+fn update_resume_ids_from_sse_event(
+    event: &str,
+    response_id: &mut Option<String>,
+    item_id: &mut Option<String>,
+) {
+    match sse_event_type(event).as_deref() {
+        Some("response.created") if response_id.is_none() => {
+            *response_id = sse_event_data(event)
+                .and_then(|json| json.get("response").cloned())
+                .and_then(|response| response.get("id").and_then(Value::as_str).map(str::to_owned));
+        }
+        Some("response.output_text.delta") if item_id.is_none() => {
+            *item_id = sse_event_data(event)
+                .and_then(|json| json.get("item_id").and_then(Value::as_str).map(str::to_owned));
+        }
+        _ => {}
+    }
+}
+
 fn sse_event_is_retryable_interrupt(event: &str) -> bool {
     if sse_event_type(event).as_deref() != Some("response.failed") {
         return false;
@@ -1961,7 +2014,7 @@ impl<'a> SseSink<'a> {
             delivered_text,
             turn_text,
             text_only,
-            had_tool_call: _,
+            had_tool_call,
             hold_text_completed: _,
             held_completed,
             response_id,
@@ -2148,11 +2201,22 @@ impl<'a> SseSink<'a> {
             }
             *terminal |= sse_event_is_terminal(event);
             let rewritten = apply_sse_rewrites(event, &self_continue_rewrites, think);
+            // A third-party Chat Completions stream is converted by the
+            // compatibility layer into Responses events. The raw chunk has
+            // no `type`, so terminal/tool/text bookkeeping must inspect the
+            // rewritten event as well or EOF will be misclassified as a
+            // dropped stream after a valid `[DONE]`.
+            update_resume_ids_from_sse_block(&rewritten, response_id, item_id);
+            if sse_block_has_tool_call(&rewritten) {
+                *had_tool_call = true;
+                *text_only = false;
+            }
+            *terminal |= sse_event_is_terminal(&rewritten);
             if sse_block_has_reasoning(&rewritten) {
                 *text_only = false;
             }
-            if kind.as_deref() == Some("response.output_text.delta") {
-                let visible = sse_visible_output_text(&rewritten);
+            let visible = sse_visible_output_text(&rewritten);
+            if !visible.is_empty() {
                 delivered_text.push_str(&visible);
                 turn_text.push_str(&visible);
             }
@@ -4506,6 +4570,66 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(output.matches("response.completed").count(), 1);
         assert!(!output.contains("response.failed"));
+    }
+
+    #[test]
+    fn chat_completion_sse_is_converted_at_the_gateway_boundary() {
+        let body = serde_json::json!({
+            "model": "gemini-3.7-flash",
+            "stream": true,
+            "tools": [{
+                "type": "function",
+                "name": "exec_command",
+                "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}
+            }],
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "读取状态"}]}]
+        })
+        .to_string();
+        let (output, attempts, _requests) = run_agent_body_against_mock(
+            &body,
+            |_attempt, _request, socket| {
+                let reasoning = serde_json::json!({
+                    "id": "chatcmpl-gateway",
+                    "choices": [{"delta": {"reasoning_content": "先检查工具"}}]
+                });
+                let first_tool = serde_json::json!({
+                    "id": "chatcmpl-gateway",
+                    "choices": [{"delta": {"tool_calls": [{
+                        "index": 0,
+                        "id": "call_gateway",
+                        "function": {"name": "exec_command", "arguments": "{\"cmd\":\"Get-"}
+                    }]}}]
+                });
+                let second_tool = serde_json::json!({
+                    "id": "chatcmpl-gateway",
+                    "choices": [{"delta": {"tool_calls": [{
+                        "index": 0,
+                        "function": {"arguments": "Date\"}"}
+                    }]}}]
+                });
+                let finished = serde_json::json!({
+                    "id": "chatcmpl-gateway",
+                    "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
+                });
+                let stream = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {reasoning}\n\ndata: {first_tool}\n\ndata: {second_tool}\n\ndata: {finished}\n\ndata: [DONE]\n\n"
+                );
+                socket.write_all(stream.as_bytes()).unwrap();
+            },
+            1,
+        );
+        assert_eq!(attempts, 1);
+        assert!(output.contains("response.reasoning_summary_text.delta"));
+        assert!(output.contains("先检查工具"));
+        assert!(output.contains("response.output_item.added"));
+        assert!(output.contains("response.function_call_arguments.delta"));
+        assert!(output.contains("Get-"));
+        assert!(output.contains("Date"));
+        assert!(output.contains("response.function_call_arguments.done"));
+        assert!(output.contains("response.output_item.done"));
+        assert_eq!(output.matches("response.completed").count(), 1);
+        assert!(!output.contains("response.failed"));
+        assert!(!output.contains("[DONE]"));
     }
 
     #[test]
