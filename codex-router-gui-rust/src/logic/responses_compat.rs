@@ -10,6 +10,9 @@
 //!    "Encrypted function output content could not be decrypted or decoded".
 
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const LOCAL_COMPACT_KEEP_LAST: usize = 48;
@@ -18,6 +21,37 @@ const COMPACT_SNIPPET_CHARS: usize = 180;
 const TOOL_OUTPUT_PRUNE_CHARS: usize = 2_000;
 const RECENT_KEEP_CHARS: usize = 32_000;
 const COMPACT_MIN_KEEP_ITEMS: usize = 8;
+/// OpenAI-compatible Chat Completions / Meta Muse reject function `name` > 64.
+const OPENAI_COMPAT_TOOL_NAME_MAX: usize = 64;
+
+thread_local! {
+    static TOOL_NAME_RESTORE: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+}
+
+/// Clears shortened-tool-name aliases when a gateway request thread exits.
+pub struct ToolNameRestoreGuard;
+
+impl Drop for ToolNameRestoreGuard {
+    fn drop(&mut self) {
+        clear_tool_name_restore();
+    }
+}
+
+fn clear_tool_name_restore() {
+    TOOL_NAME_RESTORE.with(|slot| slot.borrow_mut().clear());
+}
+
+fn set_tool_name_restore(map: HashMap<String, String>) {
+    TOOL_NAME_RESTORE.with(|slot| *slot.borrow_mut() = map);
+}
+
+fn tool_name_restore_active() -> bool {
+    TOOL_NAME_RESTORE.with(|slot| !slot.borrow().is_empty())
+}
+
+fn restore_short_tool_name(name: &str) -> Option<String> {
+    TOOL_NAME_RESTORE.with(|slot| slot.borrow().get(name).cloned())
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SanitizeStats {
@@ -109,6 +143,17 @@ pub fn is_gemini_family_model(model: &str) -> bool {
         .unwrap_or(model)
         .to_ascii_lowercase();
     slug.contains("gemini")
+}
+
+pub fn is_claude_family_model(model: &str) -> bool {
+    let slug = model
+        .trim()
+        .trim_start_matches('~')
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase();
+    slug.contains("claude") || slug.contains("fable") || slug.contains("mythos")
 }
 
 fn looks_like_xai_compaction_blob(value: &str) -> bool {
@@ -857,6 +902,37 @@ fn ensure_tool_call_outputs(items: &mut Vec<Value>) -> usize {
     inserted
 }
 
+/// Gemini / Antigravity reject a `functionResponse` whose call id has no
+/// matching `functionCall` earlier in the same request. Cross-thread agent
+/// history (a forked sub-agent carrying the parent's function responses
+/// without the originating calls) produces exactly this orphaned output, and
+/// the upstream answers 400 `invalid Gemini function call history`. Dropping
+/// the unmatched output -- keeping its payload as a plain text message so the
+/// context survives -- lets the conversation continue on the new pool.
+fn prune_unmatched_tool_outputs(items: &mut Vec<Value>) -> usize {
+    let mut pruned = 0;
+    let mut seen_calls: std::collections::HashSet<String> = Default::default();
+    let mut output = Vec::with_capacity(items.len());
+    for item in items.drain(..) {
+        let call_id = item_call_id(&item);
+        if is_function_call_item(&item) {
+            if !call_id.is_empty() {
+                seen_calls.insert(call_id);
+            }
+            output.push(item);
+            continue;
+        }
+        if is_function_output_item(&item) && !call_id.is_empty() && !seen_calls.contains(&call_id) {
+            output.push(message_from_text(summarize_item(&item)));
+            pruned += 1;
+            continue;
+        }
+        output.push(item);
+    }
+    *items = output;
+    pruned
+}
+
 fn compact_split_at(items: &[Value], keep_last: usize) -> usize {
     if items.len() <= keep_last {
         return 0;
@@ -1246,6 +1322,7 @@ fn sanitize_gemini_item(item: &mut Map<String, Value>) -> usize {
 }
 
 pub fn sanitize_responses_request(path: &str, body: &mut Value) -> SanitizeStats {
+    clear_tool_name_restore();
     let mut stats = SanitizeStats {
         model: body
             .get("model")
@@ -1282,6 +1359,7 @@ pub fn sanitize_responses_request(path: &str, body: &mut Value) -> SanitizeStats
         if grok {
             stats.rewritten_tool_calls += sanitize_grok_request(object);
         }
+        stats.rewritten_tool_calls += clamp_openai_compat_tool_names(object);
     }
     let compact_request = looks_like_compact_request(path, &Value::Object(object.clone()));
 
@@ -1341,6 +1419,9 @@ pub fn sanitize_responses_request(path: &str, body: &mut Value) -> SanitizeStats
         }
         if !stats.openai_family {
             stats.rewritten_tool_calls += ensure_tool_call_outputs(&mut replacement);
+        }
+        if gemini {
+            stats.rewritten_tool_calls += prune_unmatched_tool_outputs(&mut replacement);
         }
         object.insert("input".to_owned(), Value::Array(replacement));
     }
@@ -1486,16 +1567,295 @@ pub fn remap_tool_name(name: &str) -> String {
     }
 }
 
+#[cfg(test)]
+pub fn shorten_openai_compat_tool_name(name: &str) -> String {
+    shorten_openai_compat_tool_name_unique(name, &HashSet::new())
+}
+
+fn shorten_openai_compat_tool_name_unique(name: &str, used: &HashSet<String>) -> String {
+    let name = remap_tool_name(name);
+    let chars: Vec<char> = name.chars().collect();
+    if chars.len() <= OPENAI_COMPAT_TOOL_NAME_MAX {
+        return name;
+    }
+    let digest = Sha256::digest(name.as_bytes());
+    let hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let mut take = 8;
+    loop {
+        let suffix = format!("_{}", &hex[..take]);
+        let keep = OPENAI_COMPAT_TOOL_NAME_MAX.saturating_sub(suffix.len());
+        let prefix: String = chars.iter().take(keep).collect();
+        let candidate = format!("{prefix}{suffix}");
+        if !used.contains(&candidate) {
+            return candidate;
+        }
+        take = (take + 2).min(hex.len());
+        if take >= hex.len() {
+            return candidate;
+        }
+    }
+}
+
 fn remap_tool_name_value(value: &mut Value) -> bool {
     let Some(name) = value.as_str().map(str::to_owned) else {
         return false;
     };
-    let remapped = remap_tool_name(&name);
+    let mut remapped = remap_tool_name(&name);
+    if let Some(original) = restore_short_tool_name(&remapped) {
+        remapped = original;
+    }
     if remapped == name {
         return false;
     }
     *value = Value::String(remapped);
     true
+}
+
+fn set_json_string_name(value: &mut Value, name: &str) -> bool {
+    if value.as_str() == Some(name) {
+        return false;
+    }
+    if value.as_str().is_none() {
+        return false;
+    }
+    *value = Value::String(name.to_owned());
+    true
+}
+
+fn annotate_shortened_tool_description(tool: &mut Map<String, Value>, original: &str, short: &str) {
+    if original == short {
+        return;
+    }
+    let note = format!("Original Codex tool name: {original}. ");
+    let insert_note = |desc: &mut Value| {
+        if let Some(text) = desc.as_str() {
+            if text.contains(original) {
+                return;
+            }
+            *desc = Value::String(format!("{note}{text}"));
+        }
+    };
+    if let Some(desc) = tool.get_mut("description") {
+        insert_note(desc);
+    }
+    if let Some(function) = tool.get_mut("function").and_then(Value::as_object_mut) {
+        if let Some(desc) = function.get_mut("description") {
+            insert_note(desc);
+        }
+    }
+}
+
+fn qualify_namespace_tool_name(namespace: &str, child: &str) -> String {
+    let child = child.trim();
+    let namespace = namespace.trim();
+    if child.is_empty() {
+        return String::new();
+    }
+    if namespace.is_empty() || child.starts_with("mcp__") || child.starts_with(namespace) {
+        return child.to_owned();
+    }
+    if namespace.ends_with("__") {
+        format!("{namespace}{child}")
+    } else {
+        format!("{namespace}__{child}")
+    }
+}
+
+fn shorten_to_char_len(name: &str, max: usize, used: &HashSet<String>) -> String {
+    let chars: Vec<char> = name.chars().collect();
+    if max == 0 {
+        return String::new();
+    }
+    if chars.len() <= max && !used.contains(name) {
+        return name.to_owned();
+    }
+    let digest = Sha256::digest(name.as_bytes());
+    let hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let mut take = 8.min(hex.len());
+    loop {
+        let suffix = format!("_{}", &hex[..take]);
+        if suffix.len() >= max {
+            let clipped: String = suffix.chars().take(max).collect();
+            if !used.contains(&clipped) {
+                return clipped;
+            }
+        }
+        let keep = max.saturating_sub(suffix.len());
+        let prefix: String = chars.iter().take(keep).collect();
+        let candidate = format!("{prefix}{suffix}");
+        if !used.contains(&candidate) {
+            return candidate;
+        }
+        if take >= hex.len() {
+            return candidate;
+        }
+        take = (take + 2).min(hex.len());
+    }
+}
+
+fn local_name_for_qualified_chat(
+    namespace: &str,
+    original_local: &str,
+    short_chat: &str,
+) -> String {
+    if namespace.is_empty()
+        || original_local.starts_with("mcp__")
+        || original_local.starts_with(namespace)
+    {
+        return short_chat.to_owned();
+    }
+    let prefix = if namespace.ends_with("__") {
+        namespace.to_owned()
+    } else {
+        format!("{namespace}__")
+    };
+    short_chat
+        .strip_prefix(&prefix)
+        .unwrap_or(short_chat)
+        .to_owned()
+}
+
+fn clamp_declared_tool_name(
+    tool: &mut Map<String, Value>,
+    namespace: &str,
+    used: &mut HashSet<String>,
+    forward: &mut HashMap<String, String>,
+    restore: &mut HashMap<String, String>,
+) -> usize {
+    let original_local = tool_declared_name(&Value::Object(tool.clone()));
+    if original_local.is_empty() {
+        return 0;
+    }
+    let chat = qualify_namespace_tool_name(namespace, &original_local);
+    let short_chat = if let Some(existing) = forward.get(&chat) {
+        existing.clone()
+    } else if chat.chars().count() <= OPENAI_COMPAT_TOOL_NAME_MAX {
+        used.insert(chat.clone());
+        forward.insert(chat.clone(), chat.clone());
+        chat.clone()
+    } else {
+        let prefix = if namespace.is_empty()
+            || original_local.starts_with("mcp__")
+            || original_local.starts_with(namespace)
+        {
+            String::new()
+        } else if namespace.ends_with("__") {
+            namespace.to_owned()
+        } else {
+            format!("{namespace}__")
+        };
+        let max_local = OPENAI_COMPAT_TOOL_NAME_MAX.saturating_sub(prefix.chars().count());
+        let short = if prefix.is_empty() || max_local < 12 {
+            shorten_openai_compat_tool_name_unique(&chat, used)
+        } else {
+            let local_short = shorten_to_char_len(&original_local, max_local, used);
+            format!("{prefix}{local_short}")
+        };
+        used.insert(short.clone());
+        forward.insert(chat.clone(), short.clone());
+        restore.insert(short.clone(), original_local.clone());
+        if short != original_local {
+            restore.insert(
+                local_name_for_qualified_chat(namespace, &original_local, &short),
+                original_local.clone(),
+            );
+        }
+        short
+    };
+    let new_local = local_name_for_qualified_chat(namespace, &original_local, &short_chat);
+    let mut changed = 0;
+    if let Some(name) = tool.get_mut("name") {
+        if set_json_string_name(name, &new_local) {
+            changed += 1;
+        }
+    }
+    if let Some(function) = tool.get_mut("function").and_then(Value::as_object_mut) {
+        if let Some(name) = function.get_mut("name") {
+            if set_json_string_name(name, &new_local) {
+                changed += 1;
+            }
+        }
+    }
+    annotate_shortened_tool_description(tool, &original_local, &new_local);
+    changed
+}
+
+fn clamp_tool_list(
+    tools: &mut [Value],
+    namespace: &str,
+    used: &mut HashSet<String>,
+    forward: &mut HashMap<String, String>,
+    restore: &mut HashMap<String, String>,
+) -> usize {
+    let mut changed = 0;
+    for tool in tools.iter_mut() {
+        let Some(object) = tool.as_object_mut() else {
+            continue;
+        };
+        let typ = object
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("function")
+            .to_owned();
+        if typ == "namespace" {
+            let child_ns = object
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            if let Some(children) = object.get_mut("tools").and_then(Value::as_array_mut) {
+                changed += clamp_tool_list(children, &child_ns, used, forward, restore);
+            }
+            continue;
+        }
+        if typ != "function" && typ != "custom" && !typ.is_empty() {
+            continue;
+        }
+        changed += clamp_declared_tool_name(object, namespace, used, forward, restore);
+    }
+    changed
+}
+
+fn clamp_openai_compat_tool_names(body: &mut Map<String, Value>) -> usize {
+    let mut used = HashSet::new();
+    let mut forward = HashMap::new();
+    let mut restore = HashMap::new();
+    let mut changed = 0;
+    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+        changed += clamp_tool_list(tools, "", &mut used, &mut forward, &mut restore);
+    }
+    if let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) {
+        for item in items.iter_mut() {
+            let Some(item) = item.as_object_mut() else {
+                continue;
+            };
+            let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
+            if kind == "additional_tools" {
+                if let Some(tools) = item.get_mut("tools").and_then(Value::as_array_mut) {
+                    changed += clamp_tool_list(tools, "", &mut used, &mut forward, &mut restore);
+                }
+                continue;
+            }
+            if kind != "function_call" && kind != "custom_tool_call" {
+                continue;
+            }
+            let namespace = item
+                .get("namespace")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            changed +=
+                clamp_declared_tool_name(item, &namespace, &mut used, &mut forward, &mut restore);
+        }
+    }
+    set_tool_name_restore(restore);
+    changed
 }
 
 fn normalize_request_tools(body: &mut Map<String, Value>) -> usize {
@@ -1801,82 +2161,501 @@ pub fn rewrite_provider_json(body: &mut Value) -> usize {
     extracted.len()
 }
 
+/// Carries `<think>` / `<thinking>` scan state across SSE events so Spark
+/// (and similar Chat Completions models) stream reasoning instead of
+/// buffering until `</think>`.
+#[derive(Debug, Default)]
+pub struct SseThinkState {
+    /// ChatGPT / Grok already emit native reasoning events. Do not rewrite
+    /// their SSE (a stray `<` or `encrypted_content` substring would stall
+    /// or strip the stream).
+    pub disabled: bool,
+    scan: ThinkScan,
+    reasoning_open: bool,
+    item_id: String,
+    output_index: u64,
+    next_item: u64,
+}
+
+impl SseThinkState {
+    pub fn disabled() -> Self {
+        Self {
+            disabled: true,
+            ..Self::default()
+        }
+    }
+
+    fn needs_scan(&self) -> bool {
+        !self.disabled && (self.scan.is_active() || self.reasoning_open)
+    }
+}
+
+#[derive(Debug, Default)]
+struct ThinkScan {
+    hold: String,
+    inside: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ThinkPiece {
+    Visible(String),
+    Think(String),
+}
+
+enum OpenThink {
+    Found { rel: usize, open_len: usize },
+    HoldPrefix(usize),
+    None,
+}
+
+enum CloseThink {
+    Found { rel: usize, close_len: usize },
+    HoldPrefix(usize),
+    None,
+}
+
+fn is_open_think_prefix(rest_lower: &str) -> bool {
+    // Require `<think` so a lone `<` / `<t` / HTML `<th` is not held across
+    // ChatGPT/Gemini token boundaries (that looked like "the model stopped").
+    rest_lower.len() >= 6
+        && ("<think>".starts_with(rest_lower) || "<thinking>".starts_with(rest_lower))
+}
+
+fn is_close_think_prefix(rest_lower: &str) -> bool {
+    rest_lower.len() >= 7
+        && ("</think>".starts_with(rest_lower) || "</thinking>".starts_with(rest_lower))
+}
+
+fn find_open_think(s: &str) -> OpenThink {
+    let lower = s.to_ascii_lowercase();
+    let mut search_from = 0;
+    while search_from < lower.len() {
+        let Some(off) = lower[search_from..].find('<') else {
+            return OpenThink::None;
+        };
+        let rel = search_from + off;
+        let rest = &lower[rel..];
+        if rest.starts_with("<thinking>") {
+            return OpenThink::Found {
+                rel,
+                open_len: "<thinking>".len(),
+            };
+        }
+        if rest.starts_with("<think>") {
+            return OpenThink::Found {
+                rel,
+                open_len: "<think>".len(),
+            };
+        }
+        if is_open_think_prefix(rest) && rel + rest.len() == lower.len() {
+            return OpenThink::HoldPrefix(rel);
+        }
+        search_from = rel + 1;
+    }
+    OpenThink::None
+}
+
+fn find_close_think(s: &str) -> CloseThink {
+    let lower = s.to_ascii_lowercase();
+    let mut search_from = 0;
+    while search_from < lower.len() {
+        let Some(off) = lower[search_from..].find('<') else {
+            return CloseThink::None;
+        };
+        let rel = search_from + off;
+        let rest = &lower[rel..];
+        if rest.starts_with("</thinking>") {
+            return CloseThink::Found {
+                rel,
+                close_len: "</thinking>".len(),
+            };
+        }
+        if rest.starts_with("</think>") {
+            return CloseThink::Found {
+                rel,
+                close_len: "</think>".len(),
+            };
+        }
+        if is_close_think_prefix(rest) && rel + rest.len() == lower.len() {
+            return CloseThink::HoldPrefix(rel);
+        }
+        search_from = rel + 1;
+    }
+    CloseThink::None
+}
+
+impl ThinkScan {
+    fn is_active(&self) -> bool {
+        self.inside || !self.hold.is_empty()
+    }
+
+    fn push(&mut self, incoming: &str) -> Vec<ThinkPiece> {
+        if incoming.is_empty() && self.hold.is_empty() {
+            return Vec::new();
+        }
+        let mut src = std::mem::take(&mut self.hold);
+        src.push_str(incoming);
+        let mut pieces = Vec::new();
+        let mut i = 0;
+        while i < src.len() {
+            if !src.is_char_boundary(i) {
+                i += 1;
+                continue;
+            }
+            if !self.inside {
+                match find_open_think(&src[i..]) {
+                    OpenThink::Found { rel, open_len } => {
+                        let abs = i + rel;
+                        if abs > i {
+                            pieces.push(ThinkPiece::Visible(src[i..abs].to_owned()));
+                        }
+                        self.inside = true;
+                        i = abs + open_len;
+                    }
+                    OpenThink::HoldPrefix(rel) => {
+                        let abs = i + rel;
+                        if abs > i {
+                            pieces.push(ThinkPiece::Visible(src[i..abs].to_owned()));
+                        }
+                        self.hold = src[abs..].to_owned();
+                        return pieces;
+                    }
+                    OpenThink::None => {
+                        pieces.push(ThinkPiece::Visible(src[i..].to_owned()));
+                        return pieces;
+                    }
+                }
+            } else {
+                match find_close_think(&src[i..]) {
+                    CloseThink::Found { rel, close_len } => {
+                        let abs = i + rel;
+                        if abs > i {
+                            pieces.push(ThinkPiece::Think(src[i..abs].to_owned()));
+                        }
+                        self.inside = false;
+                        i = abs + close_len;
+                    }
+                    CloseThink::HoldPrefix(rel) => {
+                        let abs = i + rel;
+                        if abs > i {
+                            pieces.push(ThinkPiece::Think(src[i..abs].to_owned()));
+                        }
+                        self.hold = src[abs..].to_owned();
+                        return pieces;
+                    }
+                    CloseThink::None => {
+                        pieces.push(ThinkPiece::Think(src[i..].to_owned()));
+                        return pieces;
+                    }
+                }
+            }
+        }
+        pieces
+    }
+
+    fn flush(&mut self) -> Vec<ThinkPiece> {
+        let hold = std::mem::take(&mut self.hold);
+        if hold.is_empty() {
+            return Vec::new();
+        }
+        if self.inside {
+            vec![ThinkPiece::Think(hold)]
+        } else {
+            vec![ThinkPiece::Visible(hold)]
+        }
+    }
+}
+
+fn sse_data_line(value: &Value) -> String {
+    format!("data: {value}\n\n")
+}
+
+fn ensure_reasoning_open(state: &mut SseThinkState, out: &mut String) {
+    if state.reasoning_open {
+        return;
+    }
+    state.next_item = state.next_item.saturating_add(1);
+    state.item_id = format!("rs_cr_think_{}", state.next_item);
+    state.output_index = 0;
+    state.reasoning_open = true;
+    out.push_str(&sse_data_line(&json!({
+        "type": "response.output_item.added",
+        "output_index": state.output_index,
+        "item": {
+            "id": state.item_id,
+            "type": "reasoning",
+            "status": "in_progress",
+            "summary": []
+        }
+    })));
+    out.push_str(&sse_data_line(&json!({
+        "type": "response.reasoning_summary_part.added",
+        "item_id": state.item_id,
+        "output_index": state.output_index,
+        "summary_index": 0,
+        "part": { "type": "summary_text", "text": "" }
+    })));
+}
+
+fn emit_think_delta(state: &mut SseThinkState, out: &mut String, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    ensure_reasoning_open(state, out);
+    out.push_str(&sse_data_line(&json!({
+        "type": "response.reasoning_summary_text.delta",
+        "item_id": state.item_id,
+        "output_index": state.output_index,
+        "summary_index": 0,
+        "delta": text
+    })));
+}
+
+fn close_reasoning(state: &mut SseThinkState, out: &mut String) {
+    if !state.reasoning_open {
+        return;
+    }
+    out.push_str(&sse_data_line(&json!({
+        "type": "response.reasoning_summary_text.done",
+        "item_id": state.item_id,
+        "output_index": state.output_index,
+        "summary_index": 0,
+        "text": ""
+    })));
+    out.push_str(&sse_data_line(&json!({
+        "type": "response.reasoning_summary_part.done",
+        "item_id": state.item_id,
+        "output_index": state.output_index,
+        "summary_index": 0,
+        "part": { "type": "summary_text", "text": "" }
+    })));
+    out.push_str(&sse_data_line(&json!({
+        "type": "response.output_item.done",
+        "output_index": state.output_index,
+        "item": {
+            "id": state.item_id,
+            "type": "reasoning",
+            "status": "completed",
+            "summary": []
+        }
+    })));
+    state.reasoning_open = false;
+}
+
+fn emit_think_pieces(
+    state: &mut SseThinkState,
+    pieces: Vec<ThinkPiece>,
+    original_text_event: Option<&Value>,
+    out: &mut String,
+) {
+    for piece in pieces {
+        match piece {
+            ThinkPiece::Think(text) if text.is_empty() => {}
+            ThinkPiece::Think(text) => emit_think_delta(state, out, &text),
+            ThinkPiece::Visible(text) if text.is_empty() => {}
+            ThinkPiece::Visible(text) => {
+                close_reasoning(state, out);
+                if let Some(orig) = original_text_event {
+                    let mut ev = orig.clone();
+                    ev["delta"] = Value::String(text);
+                    out.push_str(&sse_data_line(&ev));
+                }
+            }
+        }
+    }
+}
+
+fn flush_think_state(state: &mut SseThinkState, out: &mut String) {
+    let pieces = state.scan.flush();
+    emit_think_pieces(state, pieces, None, out);
+    close_reasoning(state, out);
+}
+
+#[allow(dead_code)]
+pub fn flush_sse_think(state: &mut SseThinkState) -> String {
+    let mut out = String::new();
+    flush_think_state(state, &mut out);
+    out
+}
+
+fn event_kind(json: &Value) -> &str {
+    json.get("type").and_then(Value::as_str).unwrap_or("")
+}
+
+fn is_output_text_delta(kind: &str) -> bool {
+    kind == "response.output_text.delta"
+}
+
+fn is_think_boundary(kind: &str) -> bool {
+    matches!(
+        kind,
+        "response.output_item.added"
+            | "response.function_call_arguments.delta"
+            | "response.function_call_arguments.done"
+            | "response.output_text.done"
+            | "response.content_part.done"
+            | "response.output_item.done"
+            | "response.completed"
+            | "response.failed"
+            | "response.incomplete"
+    )
+}
+
+fn event_may_need_think_rewrite(state: &SseThinkState, event: &str) -> bool {
+    if state.disabled {
+        return false;
+    }
+    if state.needs_scan() {
+        return true;
+    }
+    let lower = event.to_ascii_lowercase();
+    if !lower.contains("<think") {
+        return false;
+    }
+    event.contains("output_text.delta") || event.contains("output_text.done")
+}
+
 #[allow(dead_code)]
 pub fn rewrite_sse_text(chunk: &str) -> String {
+    let mut state = SseThinkState::default();
+    rewrite_sse_text_with(&mut state, chunk)
+}
+
+#[allow(dead_code)]
+pub fn rewrite_sse_text_with(state: &mut SseThinkState, chunk: &str) -> String {
     let mut rewritten = String::with_capacity(chunk.len());
     let mut rest = chunk;
     while let Some(end) = rest.find("\n\n") {
         let (event, tail) = rest.split_at(end + 2);
-        rewritten.push_str(&rewrite_sse_event(event));
+        rewritten.push_str(&rewrite_sse_event(state, event));
         rest = tail;
     }
-    rewritten.push_str(&rewrite_sse_event(rest));
+    rewritten.push_str(&rewrite_sse_event(state, rest));
     rewritten
 }
 
 #[allow(dead_code)]
-fn rewrite_sse_event(event: &str) -> String {
+fn rewrite_sse_event(state: &mut SseThinkState, event: &str) -> String {
+    if event.trim().is_empty() {
+        return event.to_owned();
+    }
     let has_leak = find_leaked_tool_start(event).is_some();
-    let has_think = event.to_ascii_lowercase().contains("<think>")
-        || event.to_ascii_lowercase().contains("<thinking>");
-    if !has_leak && !has_think {
+    let restore = tool_name_restore_active();
+    let think = event_may_need_think_rewrite(state, event);
+    if !has_leak && !restore && !think {
         return event.to_owned();
     }
     let mut out = String::new();
     let mut extracted_tools = Vec::new();
+    let mut converted_text_delta = false;
     for line in event.split_inclusive('\n') {
         if let Some(data) = line.strip_prefix("data:") {
             let trimmed = data.trim();
             if let Ok(mut json) = serde_json::from_str::<Value>(trimmed) {
-                rewrite_provider_json(&mut json);
-                rewrite_tool_names_in_json(&mut json);
-                strip_think_tags_from_value(&mut json);
-                if let Some(delta) = json.pointer_mut("/delta") {
-                    rewrite_text_value(delta, &mut extracted_tools);
+                if restore {
+                    rewrite_tool_names_in_json(&mut json);
                 }
-                if let Some(text) = json.pointer_mut("/item/content/0/text") {
-                    rewrite_text_value(text, &mut extracted_tools);
+                if has_leak {
+                    rewrite_provider_json(&mut json);
                 }
-                out.push_str("data: ");
-                out.push_str(&json.to_string());
-                if line.ends_with('\n') {
-                    out.push('\n');
+                let kind = event_kind(&json).to_owned();
+                if think && is_output_text_delta(&kind) {
+                    if let Some(delta) = json.get("delta").and_then(Value::as_str) {
+                        let pieces = state.scan.push(delta);
+                        let mut visible_tools = Vec::new();
+                        let mut mapped = Vec::new();
+                        for piece in pieces {
+                            match piece {
+                                ThinkPiece::Visible(text) => {
+                                    let mut value = Value::String(text);
+                                    if has_leak {
+                                        rewrite_text_value(&mut value, &mut visible_tools);
+                                    }
+                                    if let Some(cleaned) = value.as_str() {
+                                        if !cleaned.is_empty() {
+                                            mapped.push(ThinkPiece::Visible(cleaned.to_owned()));
+                                        }
+                                    }
+                                }
+                                think_piece => mapped.push(think_piece),
+                            }
+                        }
+                        extracted_tools.extend(visible_tools);
+                        emit_think_pieces(state, mapped, Some(&json), &mut out);
+                        converted_text_delta = true;
+                        continue;
+                    }
+                }
+                if think && is_think_boundary(&kind) {
+                    if kind == "response.output_text.done" {
+                        if let Some(text) = json.get("text").and_then(Value::as_str) {
+                            if !state.needs_scan()
+                                && (text.to_ascii_lowercase().contains("<think>")
+                                    || text.to_ascii_lowercase().contains("<thinking>"))
+                            {
+                                let pieces = state.scan.push(text);
+                                emit_think_pieces(state, pieces, None, &mut out);
+                            }
+                        }
+                    }
+                    flush_think_state(state, &mut out);
+                }
+                if has_leak {
+                    if let Some(delta) = json.pointer_mut("/delta") {
+                        rewrite_text_value(delta, &mut extracted_tools);
+                    }
+                    if let Some(text) = json.pointer_mut("/item/content/0/text") {
+                        rewrite_text_value(text, &mut extracted_tools);
+                    }
+                }
+                if restore || has_leak {
+                    out.push_str("data: ");
+                    out.push_str(&json.to_string());
+                    if line.ends_with('\n') {
+                        out.push('\n');
+                    }
+                } else {
+                    out.push_str(line);
                 }
                 continue;
             }
-            let (mut cleaned, tools) = extract_leaked_tool_calls(data);
-            cleaned = strip_think_tags(&cleaned);
-            extracted_tools.extend(tools);
-            out.push_str("data:");
-            out.push_str(&cleaned);
-            if line.ends_with('\n') && !cleaned.ends_with('\n') {
-                out.push('\n');
+            if has_leak {
+                let (cleaned, tools) = extract_leaked_tool_calls(data);
+                extracted_tools.extend(tools);
+                out.push_str("data:");
+                out.push_str(&cleaned);
+                if line.ends_with('\n') && !cleaned.ends_with('\n') {
+                    out.push('\n');
+                }
+            } else {
+                out.push_str(line);
             }
+        } else if converted_text_delta {
+            continue;
         } else {
             out.push_str(line);
         }
     }
+    if converted_text_delta && !out.ends_with("\n\n") && !out.is_empty() {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        if !out.ends_with("\n\n") {
+            out.push('\n');
+        }
+    }
     for (index, tool) in extracted_tools.into_iter().enumerate() {
         let output_index = index as u64;
-        out.push_str("data: ");
-        out.push_str(
-            &json!({
-                "type": "response.output_item.added",
-                "output_index": output_index,
-                "item": tool.clone(),
-            })
-            .to_string(),
-        );
-        out.push_str("\n\ndata: ");
-        out.push_str(
-            &json!({
-                "type": "response.output_item.done",
-                "output_index": output_index,
-                "item": tool,
-            })
-            .to_string(),
-        );
-        out.push_str("\n\n");
+        out.push_str(&sse_data_line(&json!({
+            "type": "response.output_item.added",
+            "output_index": output_index,
+            "item": tool.clone(),
+        })));
+        out.push_str(&sse_data_line(&json!({
+            "type": "response.output_item.done",
+            "output_index": output_index,
+            "item": tool,
+        })));
     }
     out
 }
@@ -2317,18 +3096,33 @@ pub fn is_pool_failover_error(status: u16, body: &str) -> bool {
         return false;
     }
     let lower = body.to_ascii_lowercase();
-    lower.contains("model_cooldown")
-        || lower.contains("cooling down")
-        || lower.contains("usage_limit")
-        || lower.contains("usage limit")
-        || lower.contains("quota")
+    is_quota_exhausted_error(status, body)
         || lower.contains("rate_limit")
         || lower.contains("rate limit")
         || lower.contains("too many requests")
+        || is_exhausted_account_status(status, body)
+}
+
+/// Quota / subscription exhaustion. The gateway must not 5s/25s/125s retry
+/// these: Host should switch pools, and retrying the same account burns the
+/// Codex retry budget until "exceeded retry limit".
+pub fn is_quota_exhausted_error(status: u16, body: &str) -> bool {
+    if status == 402 {
+        return true;
+    }
+    if !matches!(status, 429 | 503) {
+        return false;
+    }
+    let lower = body.to_ascii_lowercase();
+    lower.contains("quota")
+        || lower.contains("usage_limit")
+        || lower.contains("usage limit")
+        || lower.contains("resource has been exhausted")
         || lower.contains("resource_exhausted")
+        || lower.contains("cooling down")
+        || lower.contains("model_cooldown")
         || lower.contains("payment_required")
         || lower.contains("payment required")
-        || is_exhausted_account_status(status, body)
 }
 
 #[cfg(test)]
@@ -2366,6 +3160,11 @@ mod tests {
         assert!(is_openai_family_model("openai/codex-mini-latest"));
         assert!(!is_openai_family_model("grok-4.6"));
         assert!(!is_openai_family_model("claude-fable-5"));
+        assert!(is_claude_family_model(
+            "cr_r16_antigravity/claude-opus-4.6-thinking"
+        ));
+        assert!(is_claude_family_model("claude-fable-5"));
+        assert!(!is_claude_family_model("grok-4.6"));
         assert!(!is_openai_family_model("gemini-3.1-pro-high"));
     }
 
@@ -3038,6 +3837,44 @@ mod tests {
             402,
             r#"{"error":{"message":"Payment Required","type":"invalid_request_error"}}"#
         ));
+        assert!(is_pool_failover_error(
+            429,
+            r#"{"error":{"code":"429","message":"Resource has been exhausted (e.g. check quota.)"}}"#
+        ));
+        assert!(is_quota_exhausted_error(
+            429,
+            r#"{"error":{"code":"429","message":"Resource has been exhausted (e.g. check quota.)"}}"#
+        ));
+        assert!(is_quota_exhausted_error(
+            429,
+            r#"{"error":{"code":"model_cooldown","message":"All credentials for model cr_r13_antigravity/gemini-3.7-flash are cooling down"}}"#
+        ));
+        assert!(!is_quota_exhausted_error(429, r#"{"error":"rate limit"}"#));
+    }
+
+    #[test]
+    fn orphaned_function_response_is_pruned_to_text() {
+        // Cross-thread agent history: a forked sub-agent carried a function
+        // response whose originating call is not in this request. Gemini
+        // rejects that with "invalid Gemini function call history".
+        let mut items = vec![
+            json!({"type":"function_call","name":"exec_command","call_id":"call-a"}),
+            json!({"type":"function_call_output","call_id":"call-a","output":"ok"}),
+            json!({"type":"function_call_output","call_id":"call-orphan","output":"stale cross-thread"}),
+        ];
+        let pruned = prune_unmatched_tool_outputs(&mut items);
+        assert_eq!(pruned, 1);
+        assert!(items
+            .iter()
+            .any(|item| item.get("call_id").and_then(Value::as_str) == Some("call-a")));
+        assert!(!items
+            .iter()
+            .any(|item| item.get("call_id").and_then(Value::as_str) == Some("call-orphan")));
+        // The orphaned output survives as a plain text message so context is
+        // not silently lost.
+        assert!(items
+            .iter()
+            .any(|item| item.get("type").and_then(Value::as_str) == Some("message")));
     }
 
     #[test]
@@ -3116,6 +3953,103 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("You are Codex"));
+    }
+
+    #[test]
+    fn muse_clamps_80_char_mcp_tool_name_and_restores_it_on_the_way_back() {
+        let long =
+            "mcp__openai_api_key_local_confirmation__confirm_openai_api_key_local_destination";
+        assert_eq!(long.chars().count(), 80);
+        let short = shorten_openai_compat_tool_name(long);
+        assert_eq!(short.chars().count(), 64);
+        assert_ne!(short, long);
+
+        let mut body = json!({
+            "model": "meta/muse-spark-1.2-contributor",
+            "tools": [{
+                "type": "function",
+                "name": long,
+                "description": "Confirm the local API key destination.",
+                "parameters": {"type":"object","properties":{}}
+            }],
+            "input": [{
+                "type": "function_call",
+                "name": long,
+                "call_id": "call_1",
+                "arguments": "{}"
+            }]
+        });
+        let stats = sanitize_responses_request("/v1/responses", &mut body);
+        assert!(stats.rewritten_tool_calls >= 1);
+        let sent = body["tools"][0]["name"].as_str().unwrap();
+        assert_eq!(sent.chars().count(), 64);
+        assert_eq!(body["input"][0]["name"], sent);
+        assert!(body["tools"][0]["description"]
+            .as_str()
+            .unwrap()
+            .contains(long));
+
+        let sse = rewrite_sse_text(&format!(
+            "data: {{\"type\":\"response.output_item.added\",\"item\":{{\"type\":\"function_call\",\"name\":\"{sent}\"}}}}\n\n"
+        ));
+        assert!(sse.contains(long));
+        assert!(!sse.contains(&format!("\"name\":\"{sent}\"")));
+        clear_tool_name_restore();
+    }
+
+    #[test]
+    fn muse_clamps_namespaced_mcp_child_before_cliproxy_expands_it() {
+        let namespace = "mcp__openai_api_key_local_confirmation";
+        let local = "confirm_openai_api_key_local_destination";
+        let expanded = format!("{namespace}__{local}");
+        assert_eq!(expanded.chars().count(), 80);
+
+        let mut body = json!({
+            "model": "meta/muse-spark-1.2-contributor",
+            "tools": [{
+                "type": "namespace",
+                "name": namespace,
+                "tools": [{
+                    "type": "function",
+                    "name": local,
+                    "description": "Confirm the local API key destination.",
+                    "parameters": {"type":"object","properties":{}}
+                }]
+            }],
+            "input": [{
+                "type": "function_call",
+                "name": local,
+                "namespace": namespace,
+                "call_id": "call_1",
+                "arguments": "{}"
+            }]
+        });
+        sanitize_responses_request("/v1/responses", &mut body);
+        let sent_local = body["tools"][0]["tools"][0]["name"].as_str().unwrap();
+        let sent_history = body["input"][0]["name"].as_str().unwrap();
+        let qualified = format!("{namespace}__{sent_local}");
+        assert_eq!(sent_local, sent_history);
+        assert!(qualified.chars().count() <= 64, "qualified={qualified}");
+        assert_ne!(sent_local, local);
+
+        let sse = rewrite_sse_text(&format!(
+            "data: {{\"type\":\"response.output_item.added\",\"item\":{{\"type\":\"function_call\",\"name\":\"{sent_local}\",\"namespace\":\"{namespace}\"}}}}\n\n"
+        ));
+        assert!(sse.contains(local));
+        clear_tool_name_restore();
+    }
+
+    #[test]
+    fn openai_family_keeps_long_tool_names() {
+        let long =
+            "mcp__openai_api_key_local_confirmation__confirm_openai_api_key_local_destination";
+        let mut body = json!({
+            "model": "gpt-5.6-terra",
+            "tools": [{"type":"function","name": long}]
+        });
+        sanitize_responses_request("/v1/responses", &mut body);
+        assert_eq!(body["tools"][0]["name"], long);
+        clear_tool_name_restore();
     }
 
     #[test]
@@ -3272,6 +4206,90 @@ mod tests {
             tag = "<think>"
         );
         assert_eq!(strip_think_tags(&table), table);
+    }
+
+    #[test]
+    fn spark_think_tags_become_reasoning_summary_deltas() {
+        let sse = rewrite_sse_text(
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m1\",\"delta\":\"<think>plan the edit</think>I'll run ls\"}\n\n",
+        );
+        assert!(sse.contains("response.reasoning_summary_text.delta"));
+        assert!(sse.contains("plan the edit"));
+        assert!(sse.contains("I'll run ls"));
+        assert!(!sse.contains("<think>"));
+        assert!(sse.contains("response.output_text.delta"));
+        let think_pos = sse.find("plan the edit").unwrap();
+        let vis_pos = sse.find("I'll run ls").unwrap();
+        assert!(think_pos < vis_pos);
+    }
+
+    #[test]
+    fn spark_think_tags_stream_across_sse_chunks() {
+        let mut state = SseThinkState::default();
+        let first = rewrite_sse_text_with(
+            &mut state,
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"<think\"}\n\n",
+        );
+        assert!(!first.contains("reasoning_summary_text.delta"));
+
+        let second = rewrite_sse_text_with(
+            &mut state,
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\">read the file first\"}\n\n",
+        );
+        assert!(second.contains("response.reasoning_summary_text.delta"));
+        assert!(second.contains("read the file first"));
+        assert!(!second.contains("\"type\":\"response.output_text.delta\""));
+
+        let third = rewrite_sse_text_with(
+            &mut state,
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"</think>now exec\"}\n\n",
+        );
+        assert!(third.contains("now exec"));
+        assert!(third.contains("response.output_text.delta"));
+        assert!(third.contains("response.output_item.done"));
+    }
+
+    #[test]
+    fn unclosed_think_is_flushed_on_completed() {
+        let mut state = SseThinkState::default();
+        let mid = rewrite_sse_text_with(
+            &mut state,
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"<think>still thinking\"}\n\n",
+        );
+        assert!(mid.contains("still thinking"));
+        assert!(mid.contains("reasoning_summary_text.delta"));
+        let done = rewrite_sse_text_with(
+            &mut state,
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\"}}\n\n",
+        );
+        assert!(done.contains("response.completed"));
+        assert!(done.contains("response.output_item.done"));
+        assert!(done.contains("\"type\":\"reasoning\""));
+    }
+
+    #[test]
+    fn less_than_in_output_text_is_not_held_as_think_tag() {
+        let sse = rewrite_sse_text(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"if a < b {\"}\n\n",
+        );
+        assert!(sse.contains("if a < b {"));
+        assert!(!sse.contains("reasoning_summary"));
+    }
+
+    #[test]
+    fn reasoning_encrypted_content_is_not_stripped() {
+        let raw = "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"abc<think>def\"}}\n\n";
+        let sse = rewrite_sse_text(raw);
+        assert!(sse.contains("abc<think>def"));
+        assert!(!sse.contains("reasoning_summary_text.delta"));
+    }
+
+    #[test]
+    fn openai_family_think_rewrite_is_disabled() {
+        let mut state = SseThinkState::disabled();
+        let raw = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"<think>secret</think>hello\"}\n\n";
+        let sse = rewrite_sse_text_with(&mut state, raw);
+        assert_eq!(sse, raw);
     }
 
     #[test]

@@ -7,14 +7,19 @@
 
 use super::responses_compat::{
     append_incomplete_turn_continuation, extract_leaked_tool_calls, is_chat_completions_path,
-    is_compact_path, is_exhausted_account_status, is_openai_family_model, is_responses_path,
-    is_unsupported_image_error, is_xai_family_model, prepare_official_compact_request,
-    prepare_xai_official_compact_request, rewrite_poisoned_upstream_status, rewrite_provider_json,
-    rewrite_sse_text, sanitize_responses_request, sanitize_responses_request_aggressive,
+    is_claude_family_model, is_compact_path, is_exhausted_account_status, is_openai_family_model,
+    is_quota_exhausted_error, is_responses_path, is_unsupported_image_error, is_xai_family_model,
+    prepare_official_compact_request, prepare_xai_official_compact_request,
+    flush_sse_think, rewrite_poisoned_upstream_status, rewrite_provider_json,
+    rewrite_sse_text_with, sanitize_responses_request, sanitize_responses_request_aggressive,
     sanitize_responses_request_without_images, should_continue_incomplete_agent_turn,
+    SseThinkState, ToolNameRestoreGuard,
     should_retry_after_upstream_error, shield_desktop_auth_failure, synthetic_compact_response,
 };
-use super::{detect_context_defaults, detect_max_output_defaults, ModelContextBudget};
+use super::{
+    detect_context_defaults, detect_max_output_defaults, map_glm53_reasoning_effort,
+    ModelContextBudget,
+};
 use anyhow::{bail, Context};
 use flate2::read::{DeflateDecoder, GzDecoder};
 use serde_json::Value;
@@ -330,19 +335,162 @@ fn inject_max_output_tokens(path: &str, body: &mut Value) -> bool {
             auto
         }
     };
-    if current == limit {
+    let mut changed = false;
+    if current != limit {
+        gateway_log(
+            "request.max_output",
+            &format!(
+                "CR-STR-0011 model={model} field={field} from={current} to={limit} remaining={} reserve={} used={}",
+                remaining_compact_budget(&model, body),
+                compact_output_reserve(&model),
+                estimate_request_input_tokens(body)
+            ),
+        );
+        body[field] = Value::from(limit);
+        changed = true;
+    }
+    changed |= ensure_claude_output_exceeds_thinking_budget(field, body);
+    changed
+}
+
+/// CLIProxy 7.2.135 maps Codex `reasoning.effort` to a numeric thinking
+/// budget (`max` → 128000). Anthropic/Vertex require
+/// `max_tokens > thinking.budget_tokens`. Equal values 400.
+fn cliproxy_claude_thinking_budget(effort: &str) -> Option<i64> {
+    Some(match effort.trim().to_ascii_lowercase().as_str() {
+        "minimal" => 512,
+        "low" => 1_024,
+        "medium" => 8_192,
+        "high" => 24_576,
+        "xhigh" => 32_768,
+        "max" | "ultra" => 128_000,
+        _ => return None,
+    })
+}
+
+fn reasoning_effort_from_body(body: &Value) -> Option<&str> {
+    body.get("reasoning")
+        .and_then(|value| value.get("effort"))
+        .and_then(Value::as_str)
+        .or_else(|| body.get("reasoning_effort").and_then(Value::as_str))
+        .or_else(|| {
+            body.get("output_config")
+                .and_then(|value| value.get("effort"))
+                .and_then(Value::as_str)
+        })
+}
+
+fn set_reasoning_effort(body: &mut Value, effort: &str) {
+    match body.get_mut("reasoning") {
+        Some(Value::Object(map)) => {
+            map.insert("effort".to_owned(), Value::String(effort.to_owned()));
+        }
+        _ => {
+            body["reasoning"] = serde_json::json!({ "effort": effort });
+        }
+    }
+    if body.get("reasoning_effort").is_some() {
+        body["reasoning_effort"] = Value::String(effort.to_owned());
+    }
+    if let Some(config) = body.get_mut("output_config").and_then(Value::as_object_mut) {
+        if config.contains_key("effort") {
+            config.insert("effort".to_owned(), Value::String(effort.to_owned()));
+        }
+    }
+}
+
+/// Codex Desktop hides reasoning unless the request asks for a summary.
+/// Keep ChatGPT / Grok request shapes unchanged; everyone else gets `auto`.
+fn ensure_visible_reasoning_summary(body: &mut Value) -> bool {
+    let Some(model) = body.get("model").and_then(Value::as_str) else {
+        return false;
+    };
+    if is_openai_family_model(model) || is_xai_family_model(model) {
+        return false;
+    }
+    let current = body
+        .get("reasoning")
+        .and_then(|value| value.get("summary"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if current.eq_ignore_ascii_case("auto")
+        || current.eq_ignore_ascii_case("concise")
+        || current.eq_ignore_ascii_case("detailed")
+    {
         return false;
     }
     gateway_log(
-        "request.max_output",
+        "request.reasoning",
         &format!(
-            "CR-STR-0011 model={model} field={field} from={current} to={limit} remaining={} reserve={} used={}",
-            remaining_compact_budget(&model, body),
-            compact_output_reserve(&model),
-            estimate_request_input_tokens(body)
+            "CR-STR-0014 model={model} field=reasoning.summary from={} to=auto",
+            if current.is_empty() { "(empty)" } else { current }
         ),
     );
-    body[field] = Value::from(limit);
+    match body.get_mut("reasoning") {
+        Some(Value::Object(map)) => {
+            map.insert("summary".to_owned(), Value::String("auto".to_owned()));
+        }
+        _ => {
+            body["reasoning"] = serde_json::json!({ "summary": "auto" });
+        }
+    }
+    true
+}
+
+/// GLM-5.3 only accepts low/high/max. Invalid Codex levels (medium, none, …)
+/// become a legal neighbor. `max` is a real upstream mode and is not rewritten.
+fn normalize_glm53_reasoning(body: &mut Value) -> bool {
+    let Some(model) = body.get("model").and_then(Value::as_str).map(str::to_owned) else {
+        return false;
+    };
+    let current = reasoning_effort_from_body(body).unwrap_or("");
+    let Some(mapped) = map_glm53_reasoning_effort(&model, current) else {
+        return false;
+    };
+    if current == mapped {
+        return false;
+    }
+    gateway_log(
+        "request.reasoning",
+        &format!(
+            "CR-STR-0013 model={model} field=reasoning.effort from={} to={mapped}",
+            if current.is_empty() { "(empty)" } else { current }
+        ),
+    );
+    set_reasoning_effort(body, mapped);
+    true
+}
+
+/// Leave room for the visible answer; thinking tokens count toward max_tokens.
+const CLAUDE_THINKING_OUTPUT_RESERVE: i64 = 4_096;
+
+fn ensure_claude_output_exceeds_thinking_budget(field: &str, body: &mut Value) -> bool {
+    let Some(model) = body.get("model").and_then(Value::as_str) else {
+        return false;
+    };
+    if !is_claude_family_model(model) {
+        return false;
+    }
+    let Some(effort) = reasoning_effort_from_body(body) else {
+        return false;
+    };
+    let Some(budget) = cliproxy_claude_thinking_budget(effort) else {
+        return false;
+    };
+    let current = body.get(field).and_then(Value::as_i64).unwrap_or(0);
+    if current > budget {
+        return false;
+    }
+    let required = budget
+        .saturating_add(CLAUDE_THINKING_OUTPUT_RESERVE)
+        .max(budget + 1);
+    gateway_log(
+        "request.max_output.thinking",
+        &format!(
+            "CR-STR-0012 model={model} field={field} effort={effort} budget={budget} from={current} to={required}"
+        ),
+    );
+    body[field] = Value::from(required);
     true
 }
 
@@ -527,6 +675,7 @@ fn handle_client(
     upstream: &str,
     rate_limit_max_retries: u32,
 ) -> anyhow::Result<()> {
+    let _tool_name_restore = ToolNameRestoreGuard;
     prepare_client_socket(client)?;
     let (header_bytes, leftover) = read_headers(client)?;
     let header_text = String::from_utf8_lossy(&header_bytes);
@@ -595,15 +744,21 @@ fn handle_client(
     let mut request_body = body;
     let mut continue_body: Option<Value> = None;
     let mut hold_text_completed = false;
+    let mut disable_think_rewrite = false;
     if method == "POST" && (is_responses_path(&path) || is_chat_completions_path(&path)) {
         if let Ok(mut json_body) = serde_json::from_slice::<Value>(&request_body) {
             let openai_family = json_body
                 .get("model")
                 .and_then(Value::as_str)
                 .is_some_and(is_openai_family_model);
+            disable_think_rewrite = json_body.get("model").and_then(Value::as_str).is_some_and(
+                |model| is_openai_family_model(model) || is_xai_family_model(model),
+            );
             if !openai_family {
                 let stats = sanitize_responses_request(&path, &mut json_body);
                 inject_max_output_tokens(&path, &mut json_body);
+                normalize_glm53_reasoning(&mut json_body);
+                ensure_visible_reasoning_summary(&mut json_body);
                 if is_compact_path(&path) && is_xai_family_model(&stats.model) {
                     prepare_xai_official_compact_request(&mut json_body);
                     request_body = serde_json::to_vec(&json_body)?;
@@ -673,7 +828,7 @@ fn handle_client(
                     return Ok(());
                 }
                 if sse_prelude_sent {
-                    finish_sse(client, "", false)?;
+                    finish_sse(client, "", false, &mut SseThinkState::default())?;
                 } else {
                     send_gateway_unavailable(client, &error)?;
                 }
@@ -695,7 +850,7 @@ fn handle_client(
                 write_all_socket(client, held.as_bytes())?;
                 return Ok(());
             }
-            finish_sse(client, "", false)?;
+            finish_sse(client, "", false, &mut SseThinkState::default())?;
             return Ok(());
         }
         if status < 400 || !is_responses_path(&path) {
@@ -715,13 +870,14 @@ fn handle_client(
                         stream_resume.take(),
                         continue_point.clone(),
                         hold_text_completed,
+                        disable_think_rewrite,
                     )? {
                         SseForward::Done => return Ok(()),
                         SseForward::ReconcileFailed => {
                             // The retry diverged from the delivered text; the
                             // client still holds a consistent partial answer,
                             // so close with a clean terminal event.
-                            finish_sse(client, "", false)?;
+                            finish_sse(client, "", false, &mut SseThinkState::default())?;
                             return Ok(());
                         }
                         SseForward::RetryableBeforeFirstEvent => {
@@ -730,7 +886,7 @@ fn handle_client(
                                     write_all_socket(client, held.as_bytes())?;
                                     return Ok(());
                                 }
-                                finish_sse(client, "", false)?;
+                                finish_sse(client, "", false, &mut SseThinkState::default())?;
                                 return Ok(());
                             };
                             gateway_log(
@@ -749,7 +905,7 @@ fn handle_client(
                                     write_all_socket(client, held.as_bytes())?;
                                     return Ok(());
                                 }
-                                finish_sse(client, "", false)?;
+                                finish_sse(client, "", false, &mut SseThinkState::default())?;
                                 return Ok(());
                             };
                             gateway_log(
@@ -1042,10 +1198,12 @@ fn open_upstream_with_rate_limit_retry(
             buffer_error_body(&mut stream, &response_headers_map, &mut leftover);
         }
         let rate_limited = if status == 429 {
-            true
+            buffer_error_body(&mut stream, &response_headers_map, &mut leftover);
+            !is_quota_exhausted_error(status, &String::from_utf8_lossy(&leftover))
         } else if status == 503 {
             buffer_error_body(&mut stream, &response_headers_map, &mut leftover);
-            is_exhausted_account_status(status, &String::from_utf8_lossy(&leftover))
+            let body = String::from_utf8_lossy(&leftover);
+            is_exhausted_account_status(status, &body) && !is_quota_exhausted_error(status, &body)
         } else {
             false
         };
@@ -1488,6 +1646,7 @@ struct SseSink<'a> {
     item_id: Option<String>,
     reconcile: Option<ReconcileState>,
     continue_point: Option<ContinuePoint>,
+    think: SseThinkState,
 }
 
 /// Event types a mid-stream text retry can reproduce or suppress safely.
@@ -1620,14 +1779,57 @@ fn rewrite_delta_event(
     Some(out)
 }
 
+fn apply_sse_rewrites(
+    event: &str,
+    id_rewrites: &[(String, String)],
+    think: &mut SseThinkState,
+) -> String {
+    let mut text = rewrite_sse_text_with(think, event);
+    for (from, to) in id_rewrites {
+        text = text.replace(from.as_str(), to.as_str());
+    }
+    text
+}
+
+fn sse_visible_output_text(block: &str) -> String {
+    let mut acc = String::new();
+    let mut rest = block;
+    loop {
+        let (event, tail) = match rest.find("\n\n") {
+            Some(end) => rest.split_at(end + 2),
+            None => ("", rest),
+        };
+        let piece = if event.is_empty() { tail } else { event };
+        if sse_event_type(piece).as_deref() == Some("response.output_text.delta") {
+            if let Some(delta) = sse_event_data(piece)
+                .as_ref()
+                .and_then(|json| json.get("delta"))
+                .and_then(Value::as_str)
+            {
+                acc.push_str(delta);
+            }
+        }
+        if event.is_empty() {
+            break;
+        }
+        rest = tail;
+    }
+    acc
+}
+
+fn sse_block_has_reasoning(block: &str) -> bool {
+    block.contains("reasoning_summary_text") || block.contains("\"type\":\"reasoning\"")
+}
+
 fn forward_event_with_rewrites(
     client: &mut TcpStream,
     event: &str,
     id_rewrites: &[(String, String)],
+    think: &mut SseThinkState,
 ) -> anyhow::Result<()> {
-    let mut text = rewrite_sse_text(event);
-    for (from, to) in id_rewrites {
-        text = text.replace(from.as_str(), to.as_str());
+    let text = apply_sse_rewrites(event, id_rewrites, think);
+    if text.trim().is_empty() {
+        return Ok(());
     }
     write_all_socket(client, text.as_bytes())?;
     Ok(())
@@ -1636,7 +1838,7 @@ fn forward_event_with_rewrites(
 impl<'a> SseSink<'a> {
     #[cfg(test)]
     fn new(client: &'a mut TcpStream, resume: Option<StreamResume>) -> SseSink<'a> {
-        Self::with_policy(client, resume, None, false)
+        Self::with_policy(client, resume, None, false, false)
     }
 
     fn with_policy(
@@ -1644,6 +1846,7 @@ impl<'a> SseSink<'a> {
         resume: Option<StreamResume>,
         continue_point: Option<ContinuePoint>,
         hold_text_completed: bool,
+        disable_think_rewrite: bool,
     ) -> SseSink<'a> {
         let delivered = resume
             .as_ref()
@@ -1674,6 +1877,11 @@ impl<'a> SseSink<'a> {
                 retry_item_id: None,
             }),
             continue_point,
+            think: if disable_think_rewrite {
+                SseThinkState::disabled()
+            } else {
+                SseThinkState::default()
+            },
         }
     }
 
@@ -1737,7 +1945,8 @@ impl<'a> SseSink<'a> {
             && kind.as_deref() == Some("response.completed")
             && !self.had_tool_call;
         if hold_completed && self.reconcile.is_none() {
-            let mut held = rewrite_sse_text(event);
+            let mut held = rewrite_sse_text_with(&mut self.think, event);
+            held.push_str(&flush_sse_think(&mut self.think));
             for (from, to) in self.continue_rewrites() {
                 held = held.replace(&from, &to);
             }
@@ -1759,6 +1968,7 @@ impl<'a> SseSink<'a> {
             item_id,
             reconcile,
             continue_point: _,
+            think,
         } = self;
         if let Some(recon) = reconcile {
             let Some(kind) = kind else {
@@ -1806,7 +2016,7 @@ impl<'a> SseSink<'a> {
                         if let (Some(from), Some(to)) = (&recon.retry_item_id, item_id.as_ref()) {
                             rewrites.push((from.clone(), to.clone()));
                         }
-                        forward_event_with_rewrites(client, event, &rewrites)?;
+                        forward_event_with_rewrites(client, event, &rewrites, think)?;
                         *sent_events = true;
                         return Ok(SseFlow::Continue);
                     }
@@ -1834,7 +2044,10 @@ impl<'a> SseSink<'a> {
                         rewrites.push((from.clone(), to.clone()));
                     }
                     if let Some(rewritten) = rewrite_delta_event(event, &suffix, &rewrites) {
-                        write_all_socket(client, rewrite_sse_text(&rewritten).as_bytes())?;
+                        write_all_socket(
+                            client,
+                            rewrite_sse_text_with(think, &rewritten).as_bytes(),
+                        )?;
                         *sent_events = true;
                     }
                     Ok(SseFlow::Continue)
@@ -1856,7 +2069,8 @@ impl<'a> SseSink<'a> {
                         rewrites.push((from.clone(), to.clone()));
                     }
                     if hold_completed {
-                        let mut held = rewrite_sse_text(event);
+                        let mut held = rewrite_sse_text_with(think, event);
+                        held.push_str(&flush_sse_think(think));
                         for (from, to) in &rewrites {
                             held = held.replace(from.as_str(), to.as_str());
                         }
@@ -1864,7 +2078,7 @@ impl<'a> SseSink<'a> {
                         return Ok(SseFlow::Continue);
                     }
                     *terminal = true;
-                    forward_event_with_rewrites(client, event, &rewrites)?;
+                    forward_event_with_rewrites(client, event, &rewrites, think)?;
                     *sent_events = true;
                     Ok(SseFlow::Continue)
                 }
@@ -1879,7 +2093,7 @@ impl<'a> SseSink<'a> {
                         if let (Some(from), Some(to)) = (&recon.retry_item_id, item_id.as_ref()) {
                             rewrites.push((from.clone(), to.clone()));
                         }
-                        forward_event_with_rewrites(client, event, &rewrites)?;
+                        forward_event_with_rewrites(client, event, &rewrites, think)?;
                         *sent_events = true;
                     }
                     Ok(SseFlow::Continue)
@@ -1893,7 +2107,7 @@ impl<'a> SseSink<'a> {
                         if let (Some(from), Some(to)) = (&recon.retry_item_id, item_id.as_ref()) {
                             rewrites.push((from.clone(), to.clone()));
                         }
-                        forward_event_with_rewrites(client, event, &rewrites)?;
+                        forward_event_with_rewrites(client, event, &rewrites, think)?;
                         *sent_events = true;
                         Ok(SseFlow::Continue)
                     } else {
@@ -1921,26 +2135,31 @@ impl<'a> SseSink<'a> {
                             *text_only = false;
                         }
                     }
-                    "response.output_text.delta" => {
+                    "response.output_text.delta" if item_id.is_none() => {
                         if let Some(json) = sse_event_data(event) {
-                            if let Some(delta) = json.get("delta").and_then(Value::as_str) {
-                                delivered_text.push_str(delta);
-                                turn_text.push_str(delta);
-                            }
-                            if item_id.is_none() {
-                                *item_id = json
-                                    .get("item_id")
-                                    .and_then(Value::as_str)
-                                    .map(str::to_owned);
-                            }
+                            *item_id = json
+                                .get("item_id")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned);
                         }
                     }
                     _ => {}
                 }
             }
             *terminal |= sse_event_is_terminal(event);
-            forward_event_with_rewrites(client, event, &self_continue_rewrites)?;
-            *sent_events = true;
+            let rewritten = apply_sse_rewrites(event, &self_continue_rewrites, think);
+            if sse_block_has_reasoning(&rewritten) {
+                *text_only = false;
+            }
+            if kind.as_deref() == Some("response.output_text.delta") {
+                let visible = sse_visible_output_text(&rewritten);
+                delivered_text.push_str(&visible);
+                turn_text.push_str(&visible);
+            }
+            if !rewritten.trim().is_empty() {
+                write_all_socket(client, rewritten.as_bytes())?;
+                *sent_events = true;
+            }
             Ok(SseFlow::Continue)
         }
     }
@@ -1949,7 +2168,10 @@ impl<'a> SseSink<'a> {
     fn eof_outcome(&mut self, carry: &str) -> anyhow::Result<SseForward> {
         if let Some(held) = self.held_completed.take() {
             if !carry.is_empty() {
-                write_all_socket(self.client, rewrite_sse_text(carry).as_bytes())?;
+                write_all_socket(
+                    self.client,
+                    rewrite_sse_text_with(&mut self.think, carry).as_bytes(),
+                )?;
             }
             return Ok(SseForward::IncompleteAgentTurn(IncompleteTurn {
                 delivered_text: self.delivered_text.clone(),
@@ -1965,7 +2187,10 @@ impl<'a> SseSink<'a> {
         }
         if self.continue_point.is_some() && self.sent_events {
             if !carry.is_empty() {
-                write_all_socket(self.client, rewrite_sse_text(carry).as_bytes())?;
+                write_all_socket(
+                    self.client,
+                    rewrite_sse_text_with(&mut self.think, carry).as_bytes(),
+                )?;
             }
             let payload = serde_json::json!({
                 "type": "response.completed",
@@ -1995,7 +2220,7 @@ impl<'a> SseSink<'a> {
     }
 
     fn finish(&mut self, carry: &str) -> anyhow::Result<()> {
-        finish_sse(self.client, carry, self.terminal)
+        finish_sse(self.client, carry, self.terminal, &mut self.think)
     }
 }
 
@@ -2011,9 +2236,16 @@ fn push_sse_events(sink: &mut SseSink, carry: &mut String) -> anyhow::Result<Sse
     Ok(SseFlow::Continue)
 }
 
-fn finish_sse(client: &mut TcpStream, carry: &str, terminal: bool) -> anyhow::Result<()> {
-    if !carry.is_empty() {
-        write_all_socket(client, rewrite_sse_text(carry).as_bytes())?;
+fn finish_sse(
+    client: &mut TcpStream,
+    carry: &str,
+    terminal: bool,
+    think: &mut SseThinkState,
+) -> anyhow::Result<()> {
+    let mut body = rewrite_sse_text_with(think, carry);
+    body.push_str(&flush_sse_think(think));
+    if !body.trim().is_empty() {
+        write_all_socket(client, body.as_bytes())?;
     }
     if !terminal {
         write_all_socket(client, b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"upstream_stream_interrupted\",\"message\":\"Upstream stream ended before completion.\"}}}\n\n")?;
@@ -2164,6 +2396,7 @@ fn forward_plain_sse(
     sink.eof_outcome(&carry)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn forward_agent_sse(
     client: &mut TcpStream,
     upstream: &mut TcpStream,
@@ -2172,6 +2405,7 @@ fn forward_agent_sse(
     resume: Option<StreamResume>,
     continue_point: Option<ContinuePoint>,
     hold_text_completed: bool,
+    disable_think_rewrite: bool,
 ) -> anyhow::Result<SseForward> {
     // The SSE prelude is written by the caller, once per client connection,
     // so a transparent retry never duplicates response headers. A mid-stream
@@ -2187,7 +2421,13 @@ fn forward_agent_sse(
     let chunked = headers
         .get("transfer-encoding")
         .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"));
-    let mut sink = SseSink::with_policy(client, resume, continue_point, hold_text_completed);
+    let mut sink = SseSink::with_policy(
+        client,
+        resume,
+        continue_point,
+        hold_text_completed,
+        disable_think_rewrite,
+    );
     if chunked {
         decode_chunked_to_sse(&mut sink, upstream, leftover)
     } else {
@@ -2301,6 +2541,7 @@ fn forward_rewritten_json_body(
 ) -> anyhow::Result<()> {
     if let Ok(mut json) = serde_json::from_slice::<Value>(&body) {
         rewrite_provider_json(&mut json);
+        crate::logic::responses_compat::rewrite_tool_names_in_json(&mut json);
         crate::logic::responses_compat::strip_think_tags_from_value(&mut json);
         body = serde_json::to_vec(&json)?;
     }
@@ -2588,6 +2829,165 @@ mod tests {
         assert!(inject_max_output_tokens("/v1/responses", &mut user_limit));
         assert_eq!(user_limit["max_output_tokens"], serde_json::json!(8_192));
         set_max_output_tokens_map(HashMap::new());
+        set_context_budget_map(HashMap::new());
+    }
+
+    #[test]
+    fn claude_max_effort_raises_output_above_thinking_budget() {
+        let _guard = OUTPUT_BUDGET_TEST.lock().unwrap();
+        set_max_output_tokens_map(HashMap::new());
+        set_context_budget_map(HashMap::from([(
+            "claude-opus-4.6-thinking".to_owned(),
+            ModelContextBudget {
+                window: 121_600,
+                compact_limit: 115_520,
+            },
+        )]));
+        let mut opus_max = serde_json::json!({
+            "model": "cr_r16_antigravity/claude-opus-4.6-thinking",
+            "reasoning": {"effort": "max"},
+            "max_output_tokens": 25_000,
+            "input": []
+        });
+        assert!(inject_max_output_tokens("/v1/responses", &mut opus_max));
+        let max_limit = opus_max["max_output_tokens"].as_i64().unwrap();
+        assert!(max_limit > 128_000, "max effort maps to a 128k thinking budget");
+        assert_eq!(max_limit, 128_000 + 4_096);
+
+        let mut already_above = opus_max.clone();
+        inject_max_output_tokens("/v1/responses", &mut already_above);
+        assert_eq!(already_above["max_output_tokens"], opus_max["max_output_tokens"]);
+
+        let mut opus_high = serde_json::json!({
+            "model": "claude-opus-4.6-thinking",
+            "reasoning": {"effort": "high"},
+            "max_output_tokens": 25_000,
+            "input": []
+        });
+        assert!(inject_max_output_tokens("/v1/responses", &mut opus_high));
+        let high_limit = opus_high["max_output_tokens"].as_i64().unwrap();
+        assert!(high_limit > 24_576);
+        assert!(high_limit <= 128_000);
+
+        let mut grok = serde_json::json!({
+            "model": "grok-4.6",
+            "reasoning": {"effort": "max"},
+            "max_output_tokens": 25_000,
+            "input": []
+        });
+        assert!(inject_max_output_tokens("/v1/responses", &mut grok));
+        assert_eq!(grok["max_output_tokens"], serde_json::json!(128_000));
+
+        set_max_output_tokens_map(HashMap::new());
+        set_context_budget_map(HashMap::new());
+    }
+
+    #[test]
+    fn glm53_flash_keeps_max_and_maps_illegal_levels() {
+        let mut flash_max = serde_json::json!({
+            "model": "z-ai/glm-5.3-flash",
+            "reasoning": {"effort": "max"}
+        });
+        assert!(!normalize_glm53_reasoning(&mut flash_max));
+        assert_eq!(flash_max["reasoning"]["effort"], "max");
+
+        let mut flash_empty = serde_json::json!({ "model": "z-ai/glm-5.3-flash" });
+        assert!(!normalize_glm53_reasoning(&mut flash_empty));
+        assert!(flash_empty.get("reasoning").is_none());
+
+        let mut flash_high = serde_json::json!({
+            "model": "z-ai/glm-5.3-flash",
+            "reasoning": {"effort": "high"}
+        });
+        assert!(!normalize_glm53_reasoning(&mut flash_high));
+        assert_eq!(flash_high["reasoning"]["effort"], "high");
+
+        let mut flash_low = serde_json::json!({
+            "model": "z-ai/glm-5.3-flash",
+            "reasoning_effort": "low"
+        });
+        assert!(!normalize_glm53_reasoning(&mut flash_low));
+        assert_eq!(flash_low["reasoning_effort"], "low");
+
+        let mut full_max = serde_json::json!({
+            "model": "glm-5.3",
+            "reasoning": {"effort": "max"}
+        });
+        assert!(!normalize_glm53_reasoning(&mut full_max));
+        assert_eq!(full_max["reasoning"]["effort"], "max");
+
+        let mut full_medium = serde_json::json!({
+            "model": "glm-5.3",
+            "reasoning": {"effort": "medium"}
+        });
+        assert!(normalize_glm53_reasoning(&mut full_medium));
+        assert_eq!(full_medium["reasoning"]["effort"], "high");
+
+        let mut other = serde_json::json!({
+            "model": "deepseek-v4-flash",
+            "reasoning": {"effort": "max"}
+        });
+        assert!(!normalize_glm53_reasoning(&mut other));
+        assert_eq!(other["reasoning"]["effort"], "max");
+    }
+
+    #[test]
+    fn third_party_reasoning_summary_none_becomes_auto() {
+        let mut glm = serde_json::json!({
+            "model": "z-ai/glm-5.3-flash",
+            "reasoning": {"effort": "max", "summary": "none"}
+        });
+        assert!(ensure_visible_reasoning_summary(&mut glm));
+        assert_eq!(glm["reasoning"]["summary"], "auto");
+        assert_eq!(glm["reasoning"]["effort"], "max");
+
+        let mut gemini = serde_json::json!({
+            "model": "gemini-3.7-flash",
+            "reasoning": {"effort": "high"}
+        });
+        assert!(ensure_visible_reasoning_summary(&mut gemini));
+        assert_eq!(gemini["reasoning"]["summary"], "auto");
+
+        let mut already = serde_json::json!({
+            "model": "gemini-3.7-flash",
+            "reasoning": {"summary": "concise"}
+        });
+        assert!(!ensure_visible_reasoning_summary(&mut already));
+        assert_eq!(already["reasoning"]["summary"], "concise");
+
+        let mut chatgpt = serde_json::json!({
+            "model": "gpt-5.6-terra",
+            "reasoning": {"summary": "none"}
+        });
+        assert!(!ensure_visible_reasoning_summary(&mut chatgpt));
+        assert_eq!(chatgpt["reasoning"]["summary"], "none");
+
+        let mut grok = serde_json::json!({
+            "model": "grok-4.6",
+            "reasoning": {"summary": "none"}
+        });
+        assert!(!ensure_visible_reasoning_summary(&mut grok));
+        assert_eq!(grok["reasoning"]["summary"], "none");
+    }
+
+    #[test]
+    fn glm53_flash_output_is_hard_capped_at_128k() {
+        let _guard = OUTPUT_BUDGET_TEST.lock().unwrap();
+        set_max_output_tokens_map(HashMap::new());
+        set_context_budget_map(HashMap::from([(
+            "z-ai/glm-5.3-flash".to_owned(),
+            ModelContextBudget {
+                window: 192_000,
+                compact_limit: 182_400,
+            },
+        )]));
+        let mut body = serde_json::json!({
+            "model": "z-ai/glm-5.3-flash",
+            "max_output_tokens": 0,
+            "input": []
+        });
+        assert!(inject_max_output_tokens("/v1/responses", &mut body));
+        assert_eq!(body["max_output_tokens"], serde_json::json!(128_000));
         set_context_budget_map(HashMap::new());
     }
 
@@ -3194,6 +3594,47 @@ mod tests {
         // 1 initial attempt + 2 retries, then the 429 is passed through so the
         // caller can surface a normal rate-limit error to the user.
         assert_eq!(attempts.load(Ordering::Relaxed), 3);
+        assert_eq!(response.status, 429);
+    }
+
+    #[test]
+    fn google_quota_429_is_not_retried_on_the_same_upstream() {
+        let quota = br#"{"error":{"code":"429","message":"Resource has been exhausted (e.g. check quota.)"}}"#;
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+        thread::spawn(move || {
+            while let Ok((mut socket, _)) = upstream.accept() {
+                let (headers, leftover) = read_headers(&mut socket).unwrap();
+                let length = parse_headers(&String::from_utf8_lossy(&headers))
+                    .get("content-length")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let mut body = leftover;
+                read_exact_more(&mut socket, &mut body, length).unwrap();
+                attempts_clone.fetch_add(1, Ordering::Relaxed);
+                let header = format!(
+                    "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    quota.len()
+                );
+                socket.write_all(header.as_bytes()).unwrap();
+                socket.write_all(quota).unwrap();
+            }
+        });
+
+        let mut retry_budget = RequestRetryBudget::new(3);
+        let response = open_upstream_with_rate_limit_retry(
+            &format!("http://127.0.0.1:{}", upstream_addr.port()),
+            "POST",
+            "/v1/responses",
+            &HashMap::new(),
+            b"{}",
+            &mut retry_budget,
+            None,
+        )
+        .unwrap();
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
         assert_eq!(response.status, 429);
     }
 

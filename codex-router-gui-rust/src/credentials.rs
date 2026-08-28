@@ -1,13 +1,73 @@
 //! Minimal Windows Credential Manager access for headless Router Host.
 
 use anyhow::{bail, Context, Result};
+use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
+use std::sync::OnceLock;
 use windows_sys::Win32::Foundation::ERROR_NOT_FOUND;
 use windows_sys::Win32::Security::Credentials::{
     CredDeleteW, CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE,
     CRED_TYPE_GENERIC,
 };
 use zeroize::Zeroizing;
+
+/// UserData-scoped prefix so CodexRouter keys do not collide with CraftStation
+/// or another Router copy that uses a different state root. Empty = legacy
+/// `CodexRouter/{name}` targets (tests and pre-scope processes).
+static CREDENTIAL_SCOPE: OnceLock<String> = OnceLock::new();
+
+/// Pin Windows credential names to this installation's UserData root.
+/// Safe to call more than once; the first non-empty scope wins.
+pub fn set_scope_from_root(router_root: &Path) {
+    let scope = credential_scope(router_root);
+    if scope.is_empty() {
+        return;
+    }
+    let _ = CREDENTIAL_SCOPE.set(scope);
+}
+
+fn credential_scope(router_root: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let root = credential_state_root(router_root);
+    let canonical = std::fs::canonicalize(&root).unwrap_or(root);
+    let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
+    digest
+        .iter()
+        .take(4)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn credential_state_root(router_root: &Path) -> PathBuf {
+    if let Some(path) = std::env::var_os("CODEX_ROUTER_USER_DATA_ROOT") {
+        let path = PathBuf::from(path);
+        if path.is_absolute() {
+            return path;
+        }
+    }
+    if std::env::var_os("CODEX_ROUTER_PORTABLE_STATE").is_some_and(|value| value == "1") {
+        return router_root.to_path_buf();
+    }
+    if router_root.join("release-manifest.json").is_file() {
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            return PathBuf::from(local_app_data)
+                .join("Codex-Router")
+                .join("UserData");
+        }
+    }
+    router_root.to_path_buf()
+}
+
+pub fn wincred_target(name: &str) -> String {
+    match CREDENTIAL_SCOPE.get() {
+        Some(scope) if !scope.is_empty() => format!("CodexRouter/{scope}/{name}"),
+        _ => format!("CodexRouter/{name}"),
+    }
+}
+
+pub fn legacy_wincred_target(name: &str) -> String {
+    format!("CodexRouter/{name}")
+}
 
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
@@ -29,7 +89,22 @@ pub fn read_text(name: &str) -> Result<Option<Zeroizing<String>>> {
     {
         return Ok(Some(Zeroizing::new(value)));
     }
-    let target = wide(&format!("CodexRouter/{name}"));
+    if let Some(value) = read_target(&wincred_target(name))? {
+        return Ok(Some(value));
+    }
+    let scoped = CREDENTIAL_SCOPE
+        .get()
+        .is_some_and(|scope| !scope.is_empty());
+    if scoped {
+        if let Some(value) = read_target(&legacy_wincred_target(name))? {
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
+}
+
+fn read_target(target_name: &str) -> Result<Option<Zeroizing<String>>> {
+    let target = wide(target_name);
     let mut credential: *mut CREDENTIALW = null_mut();
     let found = unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) };
     if found == 0 {
@@ -71,7 +146,7 @@ pub fn write_text(name: &str, secret: &str) -> Result<()> {
     if name.trim().is_empty() || name.contains('\0') {
         bail!("Windows credential name is invalid");
     }
-    let mut target = wide(&format!("CodexRouter/{name}"));
+    let mut target = wide(&wincred_target(name));
     let mut username = wide(&std::env::var("USERNAME").unwrap_or_default());
     let mut secret: Vec<u16> = secret.encode_utf16().collect();
     let blob_size = u32::try_from(secret.len().saturating_mul(std::mem::size_of::<u16>()))
@@ -98,7 +173,18 @@ pub fn write_text(name: &str, secret: &str) -> Result<()> {
 }
 
 pub fn delete_text(name: &str) -> Result<()> {
-    let target = wide(&format!("CodexRouter/{name}"));
+    delete_target(&wincred_target(name))?;
+    if CREDENTIAL_SCOPE
+        .get()
+        .is_some_and(|scope| !scope.is_empty())
+    {
+        delete_target(&legacy_wincred_target(name))?;
+    }
+    Ok(())
+}
+
+fn delete_target(target_name: &str) -> Result<()> {
+    let target = wide(target_name);
     let deleted = unsafe { CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0) } != 0;
     if !deleted {
         let error = std::io::Error::last_os_error();
@@ -129,5 +215,14 @@ mod tests {
             Some("CODEX_ROUTER_CLI_MANAGEMENT_SECRET")
         );
         assert_eq!(environment_override("AccountKey-1"), None);
+    }
+
+    #[test]
+    fn unscope_targets_keep_the_legacy_codex_router_prefix() {
+        assert_eq!(wincred_target("LocalApiKey"), "CodexRouter/LocalApiKey");
+        assert_eq!(
+            legacy_wincred_target("LocalApiKey"),
+            "CodexRouter/LocalApiKey"
+        );
     }
 }

@@ -1639,12 +1639,20 @@ async fn data_plane(State(state): State<HostState>, request: Request) -> Respons
                 }
             };
             let failover_text = String::from_utf8_lossy(&body_bytes);
-            if !plan.public_model.is_empty()
-                && codex_router_lib::responses_compat::is_pool_failover_error(
+            // 503 `auth_unavailable: no auth available` means the CLIProxy
+            // account pool behind this prefix has no usable credential. With
+            // per-account prefixes (3.0.13+) a single dead OAuth account now
+            // surfaces as this error, so it must fail over to the next pool
+            // instead of ending the conversation -- but only when a fallback
+            // pool actually exists (otherwise it is a real "no quota at all").
+            let missing_auth =
+                codex_router_lib::responses_compat::is_missing_provider_auth(&failover_text);
+            let should_failover = !plan.public_model.is_empty()
+                && (codex_router_lib::responses_compat::is_pool_failover_error(
                     upstream_status,
                     &failover_text,
-                )
-            {
+                ) || missing_auth);
+            if should_failover {
                 failed_pools.insert(plan.pool_id.clone());
                 let table = state
                     .control
@@ -1663,10 +1671,24 @@ async fn data_plane(State(state): State<HostState>, request: Request) -> Respons
                         "from_pool": plan.pool_id,
                         "public_model": plan.public_model,
                         "upstream_status": upstream_status,
+                        "reason": if missing_auth { "auth_unavailable" } else { "pool_exhausted" },
                         "request_id": request_id,
                         "timestamp": structured_log::timestamp(),
                     }));
                     continue;
+                }
+                // Every pool for this model is unavailable right now. Surface
+                // a WARN so the UI can tell the user the whole pool drained.
+                if missing_auth {
+                    let _ = state.control.logger.write(serde_json::json!({
+                        "level": "WARN",
+                        "event": "request.pool_unavailable",
+                        "public_model": plan.public_model,
+                        "upstream_status": upstream_status,
+                        "reason": "auth_unavailable",
+                        "request_id": request_id,
+                        "timestamp": structured_log::timestamp(),
+                    }));
                 }
             }
             if upstream_status == 402 {
@@ -1988,6 +2010,7 @@ where
 #[tokio::main]
 async fn main() -> Result<()> {
     let root = router_root();
+    codex_router_lib::credentials::set_scope_from_root(&root);
     let state_root = router_state_root();
     let data_root = state_root.join("data");
     let public_port = argument_value("--host-port=")

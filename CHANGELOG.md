@@ -2,6 +2,195 @@
 
 本文件记录面向用户的重要变化。完整技术细节以对应版本的源码和 GitHub Release 为准。
 
+## 3.1.3 - 2026-08-28
+
+### 原因
+
+每次打开 Codex-Router，已经用尽的订阅和日志里的账号切换会被当成「刚刚发生」，所有额度弹窗再弹一遍。
+
+### 修复
+
+- 启动后的第一份用量快照只作基线，不弹窗。
+- 启动回放的 pool failover 日志不再弹出切换/额度对话框。
+- 只有运行中额度从可用变成用尽时，才弹一次。
+
+## 3.1.2 - 2026-08-28
+
+### 原因
+
+3.1.1 把 Spark 的 `<think>` 转换套到**所有** Responses SSE 上。ChatGPT 5.6 Sol 等原生模型的 `output_item.added` 被整段重写，流里的 `<` 还会被当成标签前缀攒住，看起来像「也不输出了」。
+
+### 修复
+
+- ChatGPT / Grok 的 SSE 原样转发，不再做 think 标签转换。
+- 只有完整的 `<think` 才进入转换；比较运算符 `<`、加密 reasoning 字段不再被剥掉或卡住。
+
+## 3.1.1 - 2026-08-28
+
+### 原因
+
+Spark（`meta/muse-spark`）等模型把思考写在 `<think>` 标签里。网关按块剥标签，未闭合的思考增量被丢掉，Codex 同一条思考条空转，最后才整段砸出结果。
+
+### 修复
+
+- 流式 `<think>` / `<thinking>` 转成 `response.reasoning_summary_text.delta`，跨 SSE 块也能接上。
+- 思考结束后再出可见正文或工具调用。不能强迫模型在思考中途交错执行命令。
+
+## 3.1.0 - 2026-08-28
+
+### 原因
+
+关闭 Codex-Router 窗口后，旧便携版 Host 仍占端口。Stop 把「同名但路径不同」的 `codex-router-host.exe` 当成别人的安装，3.0.18 便留在 28083。新版本再 hop 端口，两套 Host 抢同一份 UserData。Muse 的 MCP 工具名超 64 字符 400 也一并收进本版。
+
+### 修复
+
+- 关闭/停止时清掉本机所有 `codex-router-host.exe` / `cli-proxy-api.exe` 在 18080 及 28080 段端口上的监听，不限安装路径。
+- 启动时接管同名旧 Host，不再 hop 出第二套。
+- Muse / Meta：按 CLIProxy 的 namespace 拼接把工具名压到 64 字符，回包还原。
+
+## 3.0.22 - 2026-08-28
+
+### 原因
+
+3.0.21 只缩短了顶层 `tools[].name`。Codex 实际把 MCP 工具放在 `type=namespace` 里，CLIProxy 转 Chat Completions 时再拼成 `namespace__child`。`mcp__openai_api_key_local_confirmation` + `confirm_openai_api_key_local_destination` 拼出来仍是 80 字符，Meta 继续 400。当时 3.0.18 Host 也还在跑。
+
+### 修复
+
+- 递归处理 namespace / additional_tools，按 CLIProxy 的拼接规则把即将发出的名字压到 64 字符以内。
+- 带 `namespace` 的历史 function_call 同步缩短；回包再还原成 Codex 的子工具名。
+
+## 3.0.21 - 2026-08-28
+
+### 原因
+
+`meta/muse-spark-1.2-contributor`（CommandCode / Meta 网关）报 400：`` `name` must be at most 64 characters, got 80 ``。Codex 把 MCP 工具名 `mcp__openai_api_key_local_confirmation__confirm_openai_api_key_local_destination`（80 字符）原样送给 Chat Completions，上游函数名上限是 64。
+
+### 修复
+
+- 第三方模型请求里，超过 64 字符的 tool / function_call 名称改成「前缀 + SHA-256 短哈希」，并在描述里留下原名。
+- 上游回包的 function_call 名称再还原成 Codex 的 MCP 全名，桌面端才能对上工具。
+
+## 3.0.20 - 2026-08-28
+
+### 原因
+
+Codex 线程 `01a04464-5d43-7ba0-84bf-56ef552e7bed` 用 `z-ai/glm-5.3-flash` 时，每一轮都显示「正在运行」约 1–2 分钟才发出第一条工具调用。现场：CLIProxy `POST /v1/responses` 耗时 `1m49s` / `44s` / `53s` / `1m4s`，但可见输出只有约 131–297 token、reasoning 0–115 token；同机 DeepSeek 只要 3–10 秒。没有 Router 重试。
+
+GLM-5.3-Flash **强制思考且不能关闭**。官方默认 `reasoning_effort=max`，Codex Desktop 全局 max 也会原样送上去。max 在 Agent 循环里会先想 40–90 秒才出 tool call；Router 目录还没暴露官方的 `low`，输出上限也按剩余压缩预算抬到 16 万+（超过官方 128K）。
+
+### 修复
+
+- GLM-5.3-Flash 目录档位为 `low` / `high` / `max`（`max` 仍在，只是更慢）；非法档位按官方 Coding Plan 映射，避免 400。
+- 第三方模型（Gemini / GLM / DeepSeek 等）目录 `default_reasoning_summary` 改为 `auto`，网关把请求里的 `summary=none` 改成 `auto`。否则 Codex 会丢掉思考增量，只显示最终结果。ChatGPT / Grok 请求形状保持原样。
+- GLM-5.3 输出硬上限 128K，不再按剩余压缩预算抬到十几万。
+
+## 3.0.19 - 2026-08-27
+
+### 原因
+
+从 3.0.17 切到 3.0.18 后点「保存并应用」报 `配置文件已写入，但本机路由应用失败`。旧 Host 仍占 `28083`，新版本因安装路径不同被当成「另一份 Router」，改去 `28080` 再起一套。两套 Host 抢同一份 `%LOCALAPPDATA%\Codex-Router\UserData`（sqlite、锁、Windows 凭据），CLI `/healthz` 30 秒超时（CR-CLI-0003），热推 CR-CFG-0005，停服务又 `lifecycle_busy`。CraftStation 与 Router 若共用未命名空间的 `CodexRouter/*` 凭据，也会互相覆盖。
+
+### 修复
+
+- 升级接管：UserData 里 `router-host.pid` 仍指向旧便携版 Host 时，视为本实例前驱，停掉后在原端口拉起新 Host，不再换端口双开。
+- Windows 凭据改为 `CodexRouter/{UserData指纹}/{name}`；读取时回退旧的 `CodexRouter/{name}`。CraftStation 不再碰到 Router 的 LocalApiKey / AdminPassword。
+
+## 3.0.18 - 2026-08-27
+
+### 原因
+
+Codex（ChatGPT）5 小时额度用完后，对话报 `503 no schedulable credential in pool`（CR-RTE-0002），不会切到已配置的第三方 API。现场 `01a02cf3-7ca0-7f92-9843-848ed2638cb9`：对话前一天已从 ChatGPT 429 切到中继，11:30 CLI 管理口 `PUT /v0/management/config.yaml` 返回 404 后 Host 把**所有**号池（含 API 兜底）标成 `available=false`，随后全部 503。
+
+3.0.15 把「5 小时窗口满」当成短时限流、不踢出号池；ChatGPT 又是 Desktop 持有凭证，隔离和 `recover-state` 都被跳过。只有一个 ChatGPT 账号时无法轮换，请求继续打官方，热推失败后再加上号池全停，第三方 API 永远进不去。
+
+### 修复
+
+- CLI 配置热推失败（404 / 未确认模型）时，仍按凭证编译结果发布路由表，不再把全部号池停泊。YAML 已写盘，前缀缺失由单次请求失败后换池处理。
+- ChatGPT 5 小时窗口满（周额度仍有余量）视为暂时耗尽：踢出号池、同名 API 兜底立刻接手；5 小时窗口恢复后重新加入号池。
+- ChatGPT 的 `recover-state` 只在本地把账号设回 `schedulable=1`，绝不经 CLIProxyAPI 用 `$TOKEN$` 探测。
+
+## 3.0.17 - 2026-08-27
+
+### 原因
+
+在官方（chatgpt.com / grok / google 等）点击「重置」后回到 Router，用量监控页短暂显示红色整页错误「用量查询暂时失败，已保留上次成功数据，请稍后重试」，各平台都会出现。重置瞬间各平台额度接口短暂抖动、或本地用量查询瞬时失败，`load_usage_snapshot` 返回错误后，红色失败 banner 覆盖了屏幕上仍在展示的上次成功数据，造成误报警。
+
+### 修复
+
+- 用量刷新失败但屏幕已有上次成功数据时，不再用红色「查询失败」整页 banner 覆盖数据，改为柔和的**黄色提示条**「用量刷新失败（已保留上次成功数据）」，数据继续展示，后台自动重试。
+- 仅当**没有任何上次数据**（首次查询即失败）时才显示红色失败 banner，并给出具体原因。
+- 新增 `Palette.warning` 配色与可测试的 `usage_error_for_ui` 辅助函数（有快照 → `RETRY-KEEP:` 前缀，UI 按黄色渲染）。
+
+## 3.0.16 - 2026-08-27
+
+### 原因
+
+OpenAI（ChatGPT）账号额度总是显示「平台未提供可读取的 5 小时 / 周 / 月额度窗口」。排查确认 `chatgpt.com/backend-api/wham/usage` 本身可用（真实账号返回 200，含 5 小时 primary 窗口与周 secondary 窗口），但 Router 对 Desktop 拥有的 OpenAI 账号在额度查询里直接返回缓存、从不调用 wham（历史 `desktop_openai_auth_owner` 设计），缓存又长期不更新，导致 UI 永远没有窗口。
+
+### 修复
+
+- OpenAI OAuth 账号的额度查询改为**实时只读 wham 探测**：用 Desktop 当前 access_token 直连 `wham/usage`（绝不经过 CLIProxyAPI 的 `$TOKEN$` 刷新路径，避免 token 家族被吊销），成功则写缓存并返回 `five_hour` / `seven_day` / `monthly` 窗口；失败则回退缓存并标注 `error_code`（如 `auth_unavailable`），不触发 re-auth 冷却。
+- 调度层面仍保持 observational：账号健康与换池仍由 Desktop / 既有隔离恢复链路负责，本次只恢复"窗口可读"。
+- 参考 token-monitor 的「查询层 + 适应层」思路：每个 provider 独立查询、解析、缓存降级（grok / antigravity / kimi 均已如此），OpenAI 是唯一漏掉的，本次补齐。
+
+## 3.0.15 - 2026-08-27
+
+### 原因
+
+ChatGPT 官方从纯周额度改成「5 小时滚动窗口 + 周额度」。Router 的额度判定是「任一窗口 used ≥ 99.999% 即耗尽」，于是 5 小时窗口被用完时（周额度明明还有余量）就把账号误判成额度耗尽，踢出号池并长期优先走 API；5 小时窗口重置后也没有及时回归号池。
+
+### 修复
+
+- 额度判定区分短窗口与长窗口：存在 weekly / seven-day 窗口时，**只有周窗口耗尽才算真耗尽**；5 小时窗口满只是短时限流，账号留在号池，请求由账号池自动轮换（不优先 API）。没有长窗口的平台保持原判定。
+- 新增「账号已回归号池」弹窗：订阅账号自检发现额度恢复、重新加入号池时，弹出提示「账号 X 额度已恢复，已重新加入号池」（同一恢复周期只弹一次）。
+- 账号离开号池（周额度真耗尽 → API 兜底）的提示弹窗继续生效，且只在真正耗尽时触发。
+
+## 3.0.14 - 2026-08-27
+
+### 原因
+
+3.0.13 把每个 OAuth 账号拆成独立 CLIProxy 前缀后，旧对话（continuation 绑定在旧账号池）在账号失效时收到 `503 auth_unavailable: no auth available (providers=xai, model=cr_r10a56_xai/grok-4.6)`。Host 的池切换判定只认识额度 / 限流 / 池耗尽，不认识 `auth_unavailable`，于是不换号直接把 503 透传给 Codex Desktop——新对话能选到可用账号，旧对话却一直卡在失效账号上报错。
+
+另外，跨线程多 Agent 协同（fork 子代理带上父对话的工具历史）在切到 Antigravity / Gemini 池时，会把没有对应 functionCall 的 functionResponse 一起带上，Gemini 校验失败返回 400 `invalid Gemini function call history`。
+
+### 修复
+
+- Host 池切换判定新增 `auth_unavailable`（no auth available）：只要还有可用的后备账号池就自动换号，旧对话不再 503；所有账号都不可用时才保留错误，并记录明确的 `request.pool_unavailable` 事件。
+- 换号（自动切换账号池）现在会弹窗提醒，弹窗同时覆盖"所有账号不可用"的提示（Windows 通知对话框，同一池只提醒一次）。
+- Gemini / Antigravity 请求在发送前裁剪无对应 functionCall 的孤立 functionResponse（跨线程历史），保留其文本内容，避免 400 结束对话。
+
+## 3.0.13 - 2026-08-26
+
+### 原因
+
+Gemini / Antigravity 额度用尽返回 `429 Resource has been exhausted (e.g. check quota.)`。三个 OAuth 账号被编进同一个 CLIProxy 前缀 `cr_r13_antigravity`，Google 一冷却就 `All credentials ... are cooling down`。Host 没有下一池可切。网关还把这条 429 当普通限流 5s/25s/125s 重试，Desktop 看到 `exceeded retry limit`。
+
+### 修复
+
+- 每个 OAuth 账号独立前缀（`cr_r13a52_antigravity` …），按账号优先级 P1/P2/P3 分池。额度用尽立刻换下一个账号。
+- 网关不再对额度/quota/cooldown 429 做同号重试。
+
+## 3.0.12 - 2026-08-26
+
+### 原因
+
+Codex Desktop 给 Antigravity Claude Opus 4.6 Thinking 显示约 122k 上下文。那是 Router 把 4.6 当成未知模型，套了保守默认 128k，再乘 95% 压缩点（128000×0.95=121600）。官方和 Vertex / Antigravity 的输入窗口是 **1M**；128k 是输出上限，不是上下文。Claude 5 已经按 1M 适配，4.6 / 4.7 / 4.8 漏了。
+
+### 修复
+
+- Claude Opus/Sonnet 4.6–4.8（含 `-thinking`）和 Claude 5 / Fable 5：默认上下文 1,000,000，95% 压缩点 950,000。
+- 其余 Claude（如 4.5）：200,000。
+
+## 3.0.11 - 2026-08-26
+
+### 原因
+
+Antigravity Claude Opus 4.6 Thinking 在最高思考档（`reasoning.effort = max`）立刻 400：``max_tokens` must be greater than `thinking.budget_tokens``。CLIProxy 7.2.135 把 `max` 映射成 128000 thinking budget，网关却按剩余压缩预算写入 `max_output_tokens`（现场 113874）。high / xhigh 的 budget 更小所以能过，只有 max 会撞上。Anthropic 要求严格大于，相等也不行。
+
+### 修复
+
+- Claude 族在注入输出上限后：若 `max_output_tokens` 不大于该档 thinking budget，抬到 budget + 4096（max → 132096），给正文留出额度。
+
 ## 3.0.10 - 2026-08-26
 
 ### 原因

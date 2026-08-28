@@ -387,6 +387,25 @@ impl ReasoningSpec {
     }
 }
 
+fn claude_has_million_token_context(name: &str) -> bool {
+    name.contains("claude-opus-5")
+        || name.contains("claude-sonnet-5")
+        || name.contains("claude-fable-5")
+        || name.contains("claude-mythos")
+        || name.contains("claude-opus-4-8")
+        || name.contains("claude-opus-4.8")
+        || name.contains("claude-sonnet-4-8")
+        || name.contains("claude-sonnet-4.8")
+        || name.contains("claude-opus-4-7")
+        || name.contains("claude-opus-4.7")
+        || name.contains("claude-sonnet-4-7")
+        || name.contains("claude-sonnet-4.7")
+        || name.contains("claude-opus-4-6")
+        || name.contains("claude-opus-4.6")
+        || name.contains("claude-sonnet-4-6")
+        || name.contains("claude-sonnet-4.6")
+}
+
 fn claude_reasoning_includes_xhigh(name: &str) -> bool {
     name.contains("claude-opus-5")
         || name.contains("claude-sonnet-5")
@@ -547,6 +566,28 @@ pub fn detect_reasoning(model_name: &str) -> ReasoningSpec {
             "Official DeepSeek Thinking Mode documentation",
         );
     }
+    if is_glm53_flash_model(&name) {
+        return ReasoningSpec::new(
+            &["low", "high", "max"],
+            "high",
+            false,
+            "Zhipu GLM-5.3-Flash",
+            "Zhipu GLM-5.3-Flash",
+            "GLM-5.3-Flash 官方 reasoning_effort：low / high / max。max 仍可用，只是强制思考更久；非法档位按官方 Coding Plan 映射",
+            "Official GLM-5.3-Flash reasoning_effort: low / high / max. max stays available and just thinks longer; illegal values are mapped per the Coding Plan",
+        );
+    }
+    if is_glm53_family_model(&name) {
+        return ReasoningSpec::new(
+            &["low", "high", "max"],
+            "high",
+            false,
+            "Zhipu GLM-5.3",
+            "Zhipu GLM-5.3",
+            "GLM-5.3 官方 reasoning_effort：low / high / max（默认 max）；Router 默认 high，非法档位按官方 Coding Plan 映射",
+            "Official GLM-5.3 reasoning_effort: low / high / max (upstream default max); Router defaults to high and maps illegal values per the Coding Plan",
+        );
+    }
     if name.contains("glm-5") || name.contains("glm-latest") {
         return ReasoningSpec::new(
             &["high", "max"],
@@ -596,6 +637,37 @@ pub fn is_valid_reasoning_level(value: &str) -> bool {
         value,
         "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
     )
+}
+
+fn is_glm53_family_model(name: &str) -> bool {
+    let name = name.trim().to_ascii_lowercase();
+    name.contains("glm-5.3") || name.contains("glm-5-3")
+}
+
+fn is_glm53_flash_model(name: &str) -> bool {
+    is_glm53_family_model(name) && name.to_ascii_lowercase().contains("flash")
+}
+
+/// Map Codex / Desktop reasoning effort onto GLM-5.3's official `low|high|max`.
+///
+/// GLM-5.3 / GLM-5.3-Flash reject anything else with HTTP 400. `max` is a
+/// real upstream mode and is left alone; empty/missing effort is also left
+/// alone so Codex's selected level (including max) is not rewritten.
+pub fn map_glm53_reasoning_effort(model: &str, effort: &str) -> Option<&'static str> {
+    let name = model.trim().to_ascii_lowercase();
+    if !is_glm53_family_model(&name) {
+        return None;
+    }
+    let effort = effort.trim().to_ascii_lowercase();
+    if effort.is_empty() {
+        return None;
+    }
+    Some(match effort.as_str() {
+        "none" | "minimal" | "low" => "low",
+        "medium" | "high" => "high",
+        "xhigh" | "max" | "ultra" => "max",
+        _ => "high",
+    })
 }
 
 fn manual_reasoning_spec(
@@ -1447,6 +1519,10 @@ pub fn recommended_model_display_name(model_id: &str) -> String {
         ("grok-4.5", "Grok-4.5"),
         ("cursor-composer-2.5", "Composer-2.5"),
         ("composer-2.5", "Composer-2.5"),
+        ("glm-5.3-flash", "GLM-5.3-Flash"),
+        ("glm-5-3-flash", "GLM-5.3-Flash"),
+        ("glm-5.3", "GLM-5.3"),
+        ("glm-5-3", "GLM-5.3"),
         ("glm-5.2", "GLM-5.2"),
         ("glm-5-2", "GLM-5.2"),
         ("ark-code-latest", "Ark-Code-Latest"),
@@ -1589,14 +1665,18 @@ pub fn detect_context_defaults(model_name: &str) -> ContextDefaults {
             source_en: "official Kimi K3 documentation",
         };
     }
-    if name.contains("claude-opus-5")
-        || name.contains("claude-sonnet-5")
-        || name.contains("claude-fable-5")
-    {
+    if claude_has_million_token_context(&name) {
         return ContextDefaults {
             window: 1_000_000,
-            source_zh: "Anthropic 官方模型目录",
-            source_en: "official Anthropic model catalog",
+            source_zh: "Anthropic / Vertex 官方 1M 上下文",
+            source_en: "official Anthropic / Vertex 1M context window",
+        };
+    }
+    if name.contains("claude") {
+        return ContextDefaults {
+            window: 200_000,
+            source_zh: "Anthropic 官方默认上下文",
+            source_en: "official Anthropic default context window",
         };
     }
     if name.contains("gemini-3") {
@@ -1706,6 +1786,14 @@ pub fn detect_max_output_defaults(model_name: &str) -> MaxOutputDefaults {
             hard_cap: true,
             source_zh: "xAI 兼容输出上限，避免超大 max_output_tokens 被拒绝",
             source_en: "compatibility output cap so Grok does not reject oversized max_output_tokens",
+        };
+    }
+    if is_glm53_family_model(&name) || name.contains("glm-5") || name.contains("glm-latest") {
+        return MaxOutputDefaults {
+            tokens: 128_000,
+            hard_cap: true,
+            source_zh: "GLM-5.3 官方输出上限 128K",
+            source_en: "official GLM-5.3 128K output cap",
         };
     }
     MaxOutputDefaults {
@@ -2253,7 +2341,14 @@ impl Drop for SecretWide {
 }
 
 fn router_credential_target(name: &str) -> Vec<u16> {
-    format!("CodexRouter/{name}")
+    crate::credentials::wincred_target(name)
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+fn router_legacy_credential_target(name: &str) -> Vec<u16> {
+    crate::credentials::legacy_wincred_target(name)
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect()
@@ -2269,8 +2364,6 @@ fn router_credential_environment(name: &str) -> Option<&'static str> {
 }
 
 fn read_router_credential(name: &str) -> anyhow::Result<Option<SecretWide>> {
-    const ERROR_NOT_FOUND: i32 = 1168;
-
     if let Some(value) = router_credential_environment(name)
         .and_then(|variable| std::env::var(variable).ok())
         .filter(|value| !value.trim().is_empty())
@@ -2278,7 +2371,14 @@ fn read_router_credential(name: &str) -> anyhow::Result<Option<SecretWide>> {
         return Ok(Some(SecretWide(value.encode_utf16().collect())));
     }
 
-    let target = router_credential_target(name);
+    if let Some(secret) = read_router_credential_target(&router_credential_target(name))? {
+        return Ok(Some(secret));
+    }
+    read_router_credential_target(&router_legacy_credential_target(name))
+}
+
+fn read_router_credential_target(target: &[u16]) -> anyhow::Result<Option<SecretWide>> {
+    const ERROR_NOT_FOUND: i32 = 1168;
     let mut credential: *mut CREDENTIALW = std::ptr::null_mut();
     if unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) } == 0 {
         let error = std::io::Error::last_os_error();
@@ -2462,7 +2562,8 @@ pub fn resolve_proxy_runtime(cfg: &RouterConfig) -> anyhow::Result<crate::proxy:
     Ok(crate::proxy::ProxyRuntime { settings, targets })
 }
 
-pub fn store_credentials(cfg: &mut RouterConfig, _router_root: &Path) -> anyhow::Result<usize> {
+pub fn store_credentials(cfg: &mut RouterConfig, router_root: &Path) -> anyhow::Result<usize> {
+    crate::credentials::set_scope_from_root(router_root);
     let mut writes = Vec::<(String, SecretWide)>::new();
     let mut updated_model_keys = 0usize;
     for (index, model) in cfg.models.iter_mut().enumerate() {
@@ -2538,9 +2639,10 @@ pub fn is_volcengine_plan_url(base_url: &str) -> bool {
 
 pub fn isolate_profile_credentials(
     cfg: &mut RouterConfig,
-    _router_root: &Path,
+    router_root: &Path,
     profile_id: &str,
 ) -> anyhow::Result<Vec<String>> {
+    crate::credentials::set_scope_from_root(router_root);
     let safe_id = slugify(profile_id);
     let mut writes = Vec::<(String, SecretWide)>::new();
     let mut replacements = Vec::new();
@@ -4335,6 +4437,8 @@ base_url = "https://api.430123.xyz/v1"
             ("x-ai/grok-4.5", "Grok-4.5"),
             ("cursor-composer-2.5", "Composer-2.5"),
             ("z-ai/glm-5.2", "GLM-5.2"),
+            ("z-ai/glm-5.3-flash", "GLM-5.3-Flash"),
+            ("glm-5.3", "GLM-5.3"),
         ] {
             assert_eq!(recommended_model_display_name(model_id), expected);
         }
@@ -4455,7 +4559,21 @@ base_url = "https://api.430123.xyz/v1"
         assert!(detect_max_output_defaults("deepseek-v4-pro").hard_cap);
         assert_eq!(detect_max_output_defaults("kimi-k3").tokens, 131_072);
         assert_eq!(detect_max_output_defaults("claude-sonnet-5").tokens, 128_000);
+        assert_eq!(detect_max_output_defaults("z-ai/glm-5.3-flash").tokens, 128_000);
+        assert!(detect_max_output_defaults("z-ai/glm-5.3-flash").hard_cap);
         assert!(!detect_max_output_defaults("gpt-5.6-sol").hard_cap);
+        assert_eq!(
+            map_glm53_reasoning_effort("z-ai/glm-5.3-flash", "max"),
+            Some("max")
+        );
+        assert_eq!(map_glm53_reasoning_effort("glm-5.3", "max"), Some("max"));
+        assert_eq!(
+            map_glm53_reasoning_effort("z-ai/glm-5.3-flash", "medium"),
+            Some("high")
+        );
+        assert_eq!(map_glm53_reasoning_effort("glm-5.3", "none"), Some("low"));
+        assert_eq!(map_glm53_reasoning_effort("z-ai/glm-5.3-flash", ""), None);
+        assert_eq!(map_glm53_reasoning_effort("deepseek-v4-flash", "max"), None);
         let reasoning = detect_reasoning("ark-code-latest");
         assert_eq!(reasoning.default_level, "high");
         assert!(!reasoning.supports_fast);
@@ -5516,6 +5634,13 @@ base_url = "https://api.430123.xyz/v1"
                 false,
             ),
             ("mimo-v2.5-pro", vec!["high"], "high", false),
+            (
+                "z-ai/glm-5.3-flash",
+                vec!["low", "high", "max"],
+                "high",
+                false,
+            ),
+            ("glm-5.3", vec!["low", "high", "max"], "high", false),
             ("GLM-5.2", vec!["high", "max"], "high", false),
             ("glm-latest", vec!["high", "max"], "high", false),
             ("grok-4.5", vec!["low", "medium", "high"], "high", false),
@@ -5549,6 +5674,8 @@ base_url = "https://api.430123.xyz/v1"
             "gpt-5.6-luna",
             "glm-latest",
             "GLM-5.2",
+            "z-ai/glm-5.3-flash",
+            "glm-5.3",
             "deepseek-v4-pro",
             "deepseek-v4-flash",
             "kimi-for-coding",
@@ -5667,6 +5794,25 @@ base_url = "https://api.430123.xyz/v1"
         kimi.model = "claude-opus-5".into();
         assert_eq!(resolve_context_window(&kimi), 1_000_000);
         assert_eq!(resolve_auto_compact_token_limit(&kimi), 950_000);
+
+        for model in [
+            "claude-opus-4.6-thinking",
+            "claude-opus-4-6-thinking",
+            "claude-sonnet-4.6",
+            "claude-opus-4-7",
+        ] {
+            kimi.model = model.into();
+            kimi.context_window = 0;
+            kimi.auto_compact_percent = 95;
+            assert_eq!(resolve_context_window(&kimi), 1_000_000, "{model}");
+            assert_eq!(resolve_auto_compact_token_limit(&kimi), 950_000, "{model}");
+        }
+
+        kimi.model = "claude-opus-4-5".into();
+        kimi.context_window = 0;
+        kimi.auto_compact_percent = 95;
+        assert_eq!(resolve_context_window(&kimi), 200_000);
+        assert_eq!(resolve_auto_compact_token_limit(&kimi), 190_000);
 
         kimi.context_window = 200_000;
         kimi.auto_compact_percent = 75;

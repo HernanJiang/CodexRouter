@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-3.0.10-0969da" alt="版本 3.0.10">
+  <img src="https://img.shields.io/badge/version-3.1.3-0969da" alt="版本 3.1.3">
   <img src="https://img.shields.io/badge/platform-Windows%20%2F%20macOS%20%2F%20Linux-0078d4" alt="Windows / macOS / Linux">
   <img src="https://img.shields.io/badge/architecture-x64-555555" alt="x64">
   <img src="https://img.shields.io/badge/default%20build-portable-2ea44f" alt="默认构建便携版">
@@ -83,6 +83,15 @@ CodexRouter 可以将 OAuth 和 API 渠道合并为 Codex 可见的模型目录�
 - 3.0.8：Grok 写完整份 Verdict 后不再复读「任务已完成」；长篇报告里的「下一步」不再触发自动续跑。推理档位：Grok 4.6 增加 `xhigh`，Claude 4.6 Thinking 为 low/medium/high/max，GLM-5.2 为 high/max。
 - 3.0.9：Grok 402 Payment Required 立刻换下一个账号/池。Grok 登录改由 Host 在 `127.0.0.1:56121/callback` 做 PKCE 换 token，授权页能真正拿到 xAI 登录。
 - 3.0.10：Grok 400 `invalid-argument` 是 Codex Desktop 的 `mcp__codex_app__automation_update` schema（根上 `oneOf`/`$ref`）再加上 `max_output_tokens` 超过 128k。进 CLIProxy 前先把该工具 schema 换成空 object，Grok 输出硬上限 128k。
+- 3.0.11：Claude Opus 最高思考档不再 400 `max_tokens` must be greater than `thinking.budget_tokens`。网关把输出抬到高于 CLIProxy 的 128k max budget。
+- 3.0.12：Claude Opus/Sonnet 4.6+ 目录上下文改为 1M（95% 压缩点 950k），不再用未知模型的 128k，Desktop 也就不会只显示约 122k。
+- 3.0.13：Gemini/Antigravity 额度 429 立刻换下一个 OAuth 账号，不再把整池冷却后再重试到 Codex 报 exceeded retry limit。
+- 3.0.18：ChatGPT 5 小时额度用尽后立刻切到已配置的同名第三方 API。CLI 热推失败不再把全部号池停掉（避免 `503 no schedulable credential in pool`）。
+- 3.1.0：关闭应用会清掉旧便携版留下的 Host 端口；Muse 超长 MCP 工具名不再 400。
+- 3.0.22：Muse / Meta 按 CLIProxy 的 MCP 命名空间拼接缩短工具名，避免 400。
+- 3.0.21：Muse / Meta 等第三方模型缩短超过 64 字符的 MCP 工具名，避免 400。
+- 3.0.20：GLM-5.3-Flash 保留 `max`；Gemini / GLM 等第三方模型会把思考过程显示出来，不再只丢最终结果。
+- 3.0.19：Windows 凭据按 UserData 命名空间隔离，避免和 CraftStation 抢 `CodexRouter/*` 钥匙。
 
 ### 按模型适配的控制项
 

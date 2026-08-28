@@ -525,6 +525,28 @@ mod tests {
     }
 
     #[test]
+    fn unschedulable_oauth_pool_falls_through_to_relay() {
+        let (mut oauth, relay) = openai_pools();
+        oauth.available = false;
+        let table = RouteTable::new(vec![oauth.clone(), relay.clone()]).unwrap();
+        let mut bindings = ContinuationBindings::new();
+        let key = table
+            .continuation_key(None, Some("resp-sol"), None, None)
+            .unwrap();
+        bindings.bind(key.clone(), oauth.pool_id.clone(), Duration::from_secs(60));
+        let selected = select_pool(
+            &table,
+            "gpt-5.6-sol",
+            Some(&key),
+            &bindings,
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(selected.pool_id, relay.pool_id);
+        assert!(has_fallback_pool(&table, "gpt-5.6-sol", &HashSet::new()));
+    }
+
+    #[test]
     fn excluded_oauth_pool_falls_through_to_relay() {
         let (oauth, relay) = openai_pools();
         let table = RouteTable::new(vec![oauth.clone(), relay.clone()]).unwrap();

@@ -70,10 +70,16 @@ fn adopt_isolated_host_if_foreign_with_candidates(
     };
     let expected_host = host_executable(router_root);
     let expected_cli = cli_executable(router_root);
+    let host_pid = host_pid_file(router_root);
     let configured_group_conflicts =
-        listener_process_id(ports.host, &expected_host, ServiceKind::RouterHost)
-            .is_err_and(|error| is_port_conflict_error(&error))
-            || listener_process_id(ports.cli, &expected_cli, ServiceKind::CliProxyApi)
+        claim_managed_listener(
+            ports.host,
+            &expected_host,
+            ServiceKind::RouterHost,
+            &host_pid,
+        )
+        .is_err_and(|error| is_port_conflict_error(&error))
+            || claim_managed_cli(ports.cli, &expected_cli, &expected_host, &host_pid)
                 .is_err_and(|error| is_port_conflict_error(&error))
             || !gateway_port_usable(ports.host.saturating_add(2));
     if !configured_group_conflicts {
@@ -453,12 +459,58 @@ fn assert_interruption_allowed(process_id: u32, port: u16, operation: &str) -> a
 }
 
 fn terminate_verified_process(process_id: u32, expected_path: &Path) -> anyhow::Result<()> {
+    terminate_managed_process(process_id, expected_path, None)
+}
+
+fn terminate_managed_process(
+    process_id: u32,
+    expected_path: &Path,
+    pid_file: Option<&Path>,
+) -> anyhow::Result<()> {
     let actual = match process_path(process_id) {
         Ok(path) => path,
         Err(_) if !process_exists(process_id) => return Ok(()),
         Err(error) => return Err(error),
     };
-    if !paths_equal(&actual, expected_path) {
+    let allowed = paths_equal(&actual, expected_path)
+        || pid_file.is_some_and(|path| process_is_managed(process_id, expected_path, path));
+    if !allowed {
+        bail!("refusing to terminate an unverified process");
+    }
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE,
+            0,
+            process_id,
+        )
+    };
+    if handle.is_null() {
+        return Err(std::io::Error::last_os_error())
+            .context("could not open verified service process");
+    }
+    let terminated = unsafe { TerminateProcess(handle, 1) } != 0;
+    let waited = unsafe { WaitForSingleObject(handle, 10_000) } == WAIT_OBJECT_0;
+    unsafe { CloseHandle(handle) };
+    if !terminated && process_exists(process_id) {
+        return Err(std::io::Error::last_os_error())
+            .context("could not terminate verified service process");
+    }
+    if !waited && process_exists(process_id) {
+        bail!("verified service process did not exit within 10 seconds");
+    }
+    Ok(())
+}
+
+fn terminate_same_image_process(process_id: u32, expected_path: &Path) -> anyhow::Result<()> {
+    let actual = match process_path(process_id) {
+        Ok(path) => path,
+        Err(_) if !process_exists(process_id) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if paths_equal(&actual, expected_path) {
+        return terminate_managed_process(process_id, expected_path, None);
+    }
+    if !same_service_image(&actual, expected_path) {
         bail!("refusing to terminate an unverified process");
     }
     let handle = unsafe {
@@ -511,6 +563,144 @@ fn host_executable(router_root: &Path) -> PathBuf {
 
 fn cli_executable(router_root: &Path) -> PathBuf {
     router_root.join(r"app\cli-proxy-api.exe")
+}
+
+fn host_pid_file(router_root: &Path) -> PathBuf {
+    user_data::data_root(router_root).join(r"pids\router-host.pid")
+}
+
+fn same_service_image(actual: &Path, expected: &Path) -> bool {
+    actual
+        .file_name()
+        .zip(expected.file_name())
+        .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
+}
+
+fn process_is_managed(process_id: u32, expected_path: &Path, _pid_file: &Path) -> bool {
+    let Ok(actual) = process_path(process_id) else {
+        return false;
+    };
+    paths_equal(&actual, expected_path) || same_service_image(&actual, expected_path)
+}
+
+fn router_host_port_candidates(configured_host: u16) -> Vec<u16> {
+    let mut ports = vec![18_080, configured_host];
+    ports.extend(ADOPT_HOST_PORT_CANDIDATES.iter().copied());
+    ports.retain(|port| *port >= 1_024);
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
+/// Older portables share UserData but listen on hopped ports. Closing the GUI
+/// must free those listeners; starting a new portable must not leave them.
+fn sweep_stale_router_listeners(
+    expected_host: &Path,
+    expected_cli: &Path,
+    configured_host: u16,
+    keep_host_pid: Option<u32>,
+) -> anyhow::Result<()> {
+    let keep_cli_port = default_cli_port(configured_host);
+    for host_port in router_host_port_candidates(configured_host) {
+        if let Some(pid) = loopback_listener_pid(host_port)? {
+            if keep_host_pid != Some(pid)
+                && process_path(pid)
+                    .ok()
+                    .is_some_and(|path| same_service_image(&path, expected_host))
+            {
+                terminate_same_image_process(pid, expected_host)?;
+            }
+        }
+        let cli_port = default_cli_port(host_port);
+        if keep_host_pid.is_some() && cli_port == keep_cli_port {
+            continue;
+        }
+        if let Some(pid) = loopback_listener_pid(cli_port)? {
+            if process_path(pid)
+                .ok()
+                .is_some_and(|path| same_service_image(&path, expected_cli))
+            {
+                terminate_same_image_process(pid, expected_cli)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn loopback_listener_pid(port: u16) -> anyhow::Result<Option<u32>> {
+    let listeners = tcp_rows()?
+        .into_iter()
+        .filter(|row| row.dwState == MIB_TCP_STATE_LISTEN as u32 && row_port(row) == port)
+        .collect::<Vec<_>>();
+    if listeners.is_empty() {
+        return Ok(None);
+    }
+    let loopback = u32::from_ne_bytes(Ipv4Addr::LOCALHOST.octets());
+    if listeners.iter().any(|row| row.dwLocalAddr != loopback) {
+        return Ok(None);
+    }
+    let process_ids = listeners
+        .iter()
+        .map(|row| row.dwOwningPid)
+        .collect::<HashSet<_>>();
+    if process_ids.len() != 1 {
+        return Ok(None);
+    }
+    Ok(process_ids.into_iter().next())
+}
+
+/// Treat a previous portable's host/CLI as this UserData's process when the
+/// image name matches. Version upgrades share UserData but have different
+/// install paths; hopping ports would start a second stack against the same
+/// sqlite/locks.
+fn claim_managed_listener(
+    port: u16,
+    expected_path: &Path,
+    kind: ServiceKind,
+    _pid_file: &Path,
+) -> anyhow::Result<Option<u32>> {
+    match listener_process_id(port, expected_path, kind) {
+        Ok(value) => Ok(value),
+        Err(error) if error.to_string().contains("ROUTER_INSTALL_ROOT_CONFLICT") => {
+            let Some(occupant) = loopback_listener_pid(port)? else {
+                return Err(error);
+            };
+            if process_path(occupant)
+                .ok()
+                .is_some_and(|path| same_service_image(&path, expected_path))
+            {
+                Ok(Some(occupant))
+            } else {
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn claim_managed_cli(
+    port: u16,
+    expected_cli: &Path,
+    _expected_host: &Path,
+    _host_pid_file: &Path,
+) -> anyhow::Result<Option<u32>> {
+    match listener_process_id(port, expected_cli, ServiceKind::CliProxyApi) {
+        Ok(value) => Ok(value),
+        Err(error) if error.to_string().contains("ROUTER_INSTALL_ROOT_CONFLICT") => {
+            let Some(occupant) = loopback_listener_pid(port)? else {
+                return Err(error);
+            };
+            let Ok(actual) = process_path(occupant) else {
+                return Err(error);
+            };
+            if same_service_image(&actual, expected_cli) {
+                Ok(Some(occupant))
+            } else {
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 fn host_health(base_uri: &url::Url, timeout: Duration) -> bool {
     let mut health = base_uri.clone();
@@ -667,19 +857,19 @@ fn inspect_existing_host(
     base_uri: &url::Url,
     repair: bool,
 ) -> anyhow::Result<Option<u32>> {
-    let data_root = user_data::data_root(router_root);
-    let pid_file = data_root.join(r"pids\router-host.pid");
+    let pid_file = host_pid_file(router_root);
     let expected = host_executable(router_root);
-    let saved_process = read_pid_file(&pid_file).and_then(|process_id| {
-        process_path(process_id)
-            .ok()
-            .filter(|path| paths_equal(path, &expected))
-            .map(|_| process_id)
-    });
-    if read_pid_file(&pid_file).is_some() && saved_process.is_none() {
+    let saved_raw = read_pid_file(&pid_file);
+    let saved_process = saved_raw.filter(|&process_id| process_is_managed(process_id, &expected, &pid_file));
+    if saved_raw.is_some() && saved_process.is_none() {
         let _ = std::fs::remove_file(&pid_file);
     }
-    let listener = listener_process_id(ports.host, &expected, ServiceKind::RouterHost)?;
+    let listener = claim_managed_listener(
+        ports.host,
+        &expected,
+        ServiceKind::RouterHost,
+        &pid_file,
+    )?;
 
     if let Some(process_id) = saved_process {
         match listener {
@@ -690,7 +880,7 @@ fn inspect_existing_host(
                 bail!("ROUTER_LIFECYCLE_DEFERRED: Router Host PID {process_id} is running but its listener is temporarily unavailable. No Router service was changed.");
             }
             None => {
-                terminate_verified_process(process_id, &expected)?;
+                terminate_managed_process(process_id, &expected, Some(&pid_file))?;
                 let _ = std::fs::remove_file(&pid_file);
                 return Ok(None);
             }
@@ -704,19 +894,34 @@ fn inspect_existing_host(
     if saved_process.is_none() {
         config::atomic_write(&pid_file, process_id.to_string().as_bytes())?;
     }
+    let same_install = process_path(process_id)
+        .ok()
+        .is_some_and(|path| paths_equal(&path, &expected));
+    if repair && !same_install {
+        // Predecessor from another portable that shares this UserData (upgrade).
+        // Replace it with this install's host instead of hopping ports.
+        terminate_managed_process(process_id, &expected, Some(&pid_file))?;
+        let _ = std::fs::remove_file(&pid_file);
+        return Ok(None);
+    }
     if !host_health_stable(base_uri) {
         if !repair {
             bail!("ROUTER_LIFECYCLE_DEFERRED: Router Host PID {process_id} did not pass the bounded health observation. It was not terminated.");
         }
-        terminate_verified_process(process_id, &expected)?;
+        terminate_managed_process(process_id, &expected, Some(&pid_file))?;
         let _ = std::fs::remove_file(&pid_file);
         return Ok(None);
     }
     // The host health contract already includes the CLI probe; verify the
     // private port ownership so a foreign CLIProxyAPI install cannot hide
     // behind a healthy host.
-    listener_process_id(ports.cli, &cli_executable(router_root), ServiceKind::CliProxyApi)?
-        .context("CLIProxyAPI is not listening on its expected private port")?;
+    claim_managed_cli(
+        ports.cli,
+        &cli_executable(router_root),
+        &expected,
+        &pid_file,
+    )?
+    .context("CLIProxyAPI is not listening on its expected private port")?;
     Ok(Some(process_id))
 }
 
@@ -766,6 +971,12 @@ pub fn ensure_services_with_config(
         bail!("Router initialization was cancelled");
     }
     let existing = inspect_existing_host(router_root, ports, &base_uri, repair)?;
+    sweep_stale_router_listeners(
+        &host_executable(router_root),
+        &cli_executable(router_root),
+        ports.host,
+        existing,
+    )?;
     if existing.is_none() {
         let process_id = start_router_host(
             router_root,
@@ -840,14 +1051,22 @@ pub fn stop_services_with_config(
     let ports = LifecyclePorts::from_config(config)?;
     let data_root = user_data::data_root(router_root);
     let host_path = host_executable(router_root);
-    let pid_file = data_root.join(r"pids\router-host.pid");
-    let saved_host = read_pid_file(&pid_file).filter(|process_id| {
-        process_path(*process_id)
-            .is_ok_and(|path| paths_equal(&path, &host_path))
-    });
+    let pid_file = host_pid_file(router_root);
+    let saved_host = read_pid_file(&pid_file)
+        .filter(|process_id| process_is_managed(*process_id, &host_path, &pid_file));
     // A listener owned by another Router installation or program is not ours
-    // to stop; treat the port as foreign-owned and leave it running.
-    let listening_host = owned_listener_or_none(ports.host, &host_path, ServiceKind::RouterHost)?;
+    // to stop; treat the port as foreign-owned and leave it running. A
+    // predecessor portable that still owns this UserData PID is ours.
+    let listening_host = match claim_managed_listener(
+        ports.host,
+        &host_path,
+        ServiceKind::RouterHost,
+        &pid_file,
+    ) {
+        Ok(value) => value,
+        Err(error) if is_port_conflict_error(&error) => None,
+        Err(error) => return Err(error),
+    };
     if saved_host.is_some()
         && listening_host.is_some()
         && saved_host != listening_host
@@ -855,25 +1074,32 @@ pub fn stop_services_with_config(
         bail!("Router Host PID file and listener refer to different processes");
     }
     let cli_path = cli_executable(router_root);
-    let listening_cli = owned_listener_or_none(ports.cli, &cli_path, ServiceKind::CliProxyApi)?;
+    let listening_cli = match claim_managed_cli(ports.cli, &cli_path, &host_path, &pid_file) {
+        Ok(value) => value,
+        Err(error) if is_port_conflict_error(&error) => None,
+        Err(error) => return Err(error),
+    };
     if let Some(process_id) = saved_host.or(listening_host) {
         if !force {
             assert_interruption_allowed(process_id, ports.host, "Stop Router")?;
         }
-        terminate_verified_process(process_id, &host_path)?;
+        terminate_managed_process(process_id, &host_path, Some(&pid_file))?;
     }
     // The CLI is bound to the host through a kill-on-close Job Object and
     // normally dies with it; sweep the private port anyway in case the job
     // assignment failed or an older build left an orphan behind.
     if let Some(captured_process_id) = listening_cli {
-        match owned_listener_or_none(ports.cli, &cli_path, ServiceKind::CliProxyApi)? {
-            Some(current_process_id) if current_process_id == captured_process_id => {
-                terminate_verified_process(current_process_id, &cli_path)?;
+        match claim_managed_cli(ports.cli, &cli_path, &host_path, &pid_file) {
+            Ok(Some(current_process_id)) if current_process_id == captured_process_id => {
+                terminate_same_image_process(current_process_id, &cli_path)?;
             }
-            Some(_) => bail!("CLIProxyAPI listener owner changed during shutdown"),
-            None => {}
+            Ok(Some(_)) => bail!("CLIProxyAPI listener owner changed during shutdown"),
+            Ok(None) => {}
+            Err(error) if is_port_conflict_error(&error) => {}
+            Err(error) => return Err(error),
         }
     }
+    sweep_stale_router_listeners(&host_path, &cli_path, ports.host, None)?;
     let deadline = Instant::now() + Duration::from_secs(3);
     let status = loop {
         let status = status_services_with_config(router_root, config)?;
@@ -1096,6 +1322,36 @@ mod tests {
             Some(format!("http://127.0.0.1:{replacement}"))
         );
         drop(cli);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn same_service_image_matches_filename_across_install_roots() {
+        assert!(same_service_image(
+            Path::new(r"D:\Work\CodexRouter\Release\3.0.17\app\codex-router-host.exe"),
+            Path::new(r"D:\Work\CodexRouter\Release\3.0.18\app\codex-router-host.exe"),
+        ));
+        assert!(!same_service_image(
+            Path::new(r"D:\Work\CodexRouter\Release\3.0.17\app\codex-router-host.exe"),
+            Path::new(r"D:\Work\CodexRouter\Release\3.0.18\app\cli-proxy-api.exe"),
+        ));
+        let ports = router_host_port_candidates(28_080);
+        assert!(ports.contains(&18_080));
+        assert!(ports.contains(&28_080));
+        assert!(ports.contains(&28_083));
+    }
+
+    #[test]
+    fn userdata_predecessor_requires_matching_pid_file() {
+        let root = temporary_root("predecessor-pid");
+        let pid_file = root.join("router-host.pid");
+        std::fs::write(&pid_file, "4242").unwrap();
+        assert_eq!(read_pid_file(&pid_file), Some(4242));
+        assert!(!process_is_managed(
+            1,
+            Path::new(r"D:\app\codex-router-host.exe"),
+            &pid_file
+        ));
         let _ = std::fs::remove_dir_all(root);
     }
 }

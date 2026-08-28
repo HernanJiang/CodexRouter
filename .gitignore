@@ -1,3 +1,14 @@
+# Development worktree (unstable; do not commit)
+/dev/
+
+# Legacy source nest (do not revive)
+/Source/
+/source/
+
+# Agent / browser dumps
+.playwright-mcp/
+ai_workspace/
+
 # Runtime data
 data/
 logs/
@@ -49,6 +60,8 @@ build/
 # Local portable release stages and generated root catalog
 /Codex-Router-Portable-*-windows-x64-*/
 /model-catalog.json
+/Release/
+/Test/
 
 # Go build artifacts
 source/backend/sub2api

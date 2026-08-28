@@ -1,5 +1,7 @@
 mod autostart;
 mod config;
+#[allow(dead_code)]
+mod credentials;
 mod lifecycle;
 mod lifecycle_cutover;
 mod logic;
@@ -801,11 +803,14 @@ fn fallback_transition_notification(
     config: &RouterConfig,
 ) -> Option<(i64, String, String)> {
     for subscription in &current.subscriptions {
+        let Some(previous) = previous else {
+            // Startup has no prior snapshot. Already-exhausted accounts must
+            // not pop as if they just ran out.
+            continue;
+        };
         if subscription.health != "quotaExhausted"
-            || previous.is_some_and(|snapshot| {
-                snapshot.subscriptions.iter().any(|account| {
-                    account.id == subscription.id && account.health == "quotaExhausted"
-                })
+            || previous.subscriptions.iter().any(|account| {
+                account.id == subscription.id && account.health == "quotaExhausted"
             })
         {
             continue;
@@ -905,6 +910,174 @@ fn show_fallback_notification(zh: bool, source: String, target: String) {
             .set_title(&title)
             .set_description(&description)
             .set_level(rfd::MessageLevel::Info)
+            .show();
+    });
+}
+
+/// Detect an OAuth subscription that recovered from quota exhaustion and has
+/// rejoined the preferred routing path. Returns (account_id, name). The
+/// account must have been non-healthy in the previous snapshot to avoid
+/// popping for accounts that were always healthy.
+fn rejoined_account_notification(
+    previous: Option<&UsageSnapshot>,
+    current: &UsageSnapshot,
+) -> Option<(i64, String)> {
+    let previous = previous?;
+    for subscription in &current.subscriptions {
+        if subscription.health != "healthy" {
+            continue;
+        }
+        let was_recovering = previous.subscriptions.iter().any(|account| {
+            account.id == subscription.id
+                && !matches!(account.health.as_str(), "healthy" | "")
+        });
+        if was_recovering {
+            let name = if subscription.name.trim().is_empty() {
+                subscription.platform.trim().to_owned()
+            } else {
+                subscription.name.trim().to_owned()
+            };
+            return Some((subscription.id, name));
+        }
+    }
+    None
+}
+
+fn show_rejoined_pool_notification(zh: bool, name: String) {
+    let title = if zh {
+        "Codex-Router 账号已回归号池"
+    } else {
+        "Codex-Router account rejoined the pool"
+    }
+    .to_owned();
+    let description = if zh {
+        format!("账号「{name}」额度已恢复，已重新加入号池，优先走订阅路由。")
+    } else {
+        format!(
+            "Account '{name}' quota recovered and rejoined the pool; it is preferred again for routing."
+        )
+    };
+    std::thread::spawn(move || {
+        let _ = rfd::MessageDialog::new()
+            .set_title(&title)
+            .set_description(&description)
+            .set_level(rfd::MessageLevel::Info)
+            .show();
+    });
+}
+
+/// Parse a Router Host pool-failover event into (from_pool, reason).
+/// Record looks like: "[Router events] ... event=request.pool_failover |
+/// from_pool=cr/r10a56/xai | reason=auth_unavailable".
+fn pool_failover_parts(record: &str) -> Option<(String, String)> {
+    if !record.contains("event=request.pool_failover") {
+        return None;
+    }
+    let from_pool = record.split_whitespace().find_map(|field| {
+        field
+            .strip_prefix("from_pool=")
+            .map(|value| value.trim_end_matches('|').to_owned())
+    })?;
+    let reason = record
+        .split_whitespace()
+        .find_map(|field| {
+            field
+                .strip_prefix("reason=")
+                .map(|value| value.trim_end_matches('|').to_owned())
+        })
+        .unwrap_or_else(|| "pool_exhausted".to_owned());
+    Some((from_pool, reason))
+}
+
+/// True when a Router Host event reports that every pool for a model is
+/// currently unavailable (no auth available at all).
+fn pool_unavailable_model(record: &str) -> Option<String> {
+    if !record.contains("event=request.pool_unavailable") {
+        return None;
+    }
+    record.split_whitespace().find_map(|field| {
+        field
+            .strip_prefix("model=")
+            .map(|value| value.trim_end_matches('|').to_owned())
+    })
+}
+
+/// Extract an OAuth account id from a pool id like `cr/r10a56/xai` where the
+/// route segment is `r{route}a{account}`.
+fn account_id_from_pool_id(pool_id: &str) -> Option<i64> {
+    let route = pool_id.split('/').nth(1)?;
+    let account = route.strip_prefix('r')?;
+    let account = account.split('a').next_back()?;
+    if account.is_empty() || account.chars().any(|character| !character.is_ascii_digit()) {
+        return None;
+    }
+    account.parse().ok()
+}
+
+fn pool_account_label(oauth_accounts: &[OAuthAccountSummary], pool_id: &str) -> String {
+    account_id_from_pool_id(pool_id)
+        .and_then(|id| {
+            oauth_accounts
+                .iter()
+                .find(|account| account.id == id)
+                .map(|account| account.name.clone())
+        })
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| pool_id.to_owned())
+}
+
+fn show_pool_switch_notification(zh: bool, from_label: String, reason: String) {
+    let title = if zh {
+        "Codex-Router 已自动切换账号"
+    } else {
+        "Codex-Router switched account"
+    }
+    .to_owned();
+    let reason_text = match reason.as_str() {
+        "auth_unavailable" if zh => "认证不可用",
+        "auth_unavailable" => "auth unavailable",
+        _ if zh => "额度或限流耗尽",
+        _ => "quota exhausted",
+    };
+    let description = if zh {
+        format!(
+            "账号「{from_label}」不可用（{reason_text}），已自动切换到下一个可用账号。"
+        )
+    } else {
+        format!(
+            "Account '{from_label}' is unavailable ({reason_text}); routing switched to the next available account."
+        )
+    };
+    std::thread::spawn(move || {
+        let _ = rfd::MessageDialog::new()
+            .set_title(&title)
+            .set_description(&description)
+            .set_level(rfd::MessageLevel::Info)
+            .show();
+    });
+}
+
+fn show_pool_unavailable_notification(zh: bool, model: String) {
+    let title = if zh {
+        "Codex-Router 账号池不可用"
+    } else {
+        "Codex-Router pool unavailable"
+    }
+    .to_owned();
+    let description = if zh {
+        format!(
+            "模型 {model} 的所有可用账号当前都不可用（没有可用认证）。请检查账号额度，或重新导入 / 启用账号后再试。"
+        )
+    } else {
+        format!(
+            "All accounts serving {model} are currently unavailable (no auth available). Please check quota or re-import / enable an account."
+        )
+    };
+    std::thread::spawn(move || {
+        let _ = rfd::MessageDialog::new()
+            .set_title(&title)
+            .set_description(&description)
+            .set_level(rfd::MessageLevel::Warning)
             .show();
     });
 }
@@ -1489,6 +1662,16 @@ struct CodexRouterApp {
     usage_refresh_due: Option<std::time::Instant>,
     self_check_quota_refresh_pending: bool,
     notified_quota_accounts: BTreeSet<i64>,
+    /// False until the first usage snapshot is applied. Startup must not pop
+    /// quota dialogs for accounts that were already exhausted.
+    usage_notifications_ready: bool,
+    /// De-duplicates the "switched account" popup so one dead pool does not
+    /// spawn a notification on every retried request.
+    notified_pool_failovers: BTreeSet<String>,
+    /// De-duplicates the "quota recovered / rejoined pool" popup so one
+    /// account only pops once per recovery cycle (recovered -> exhausted ->
+    /// recovered).
+    rejoined_pool_notified: BTreeSet<i64>,
     monitor_subscription_order: Vec<i64>,
     monitor_api_order: Vec<i64>,
     share_codex_state: bool,
@@ -2456,6 +2639,18 @@ fn oauth_accounts_error_is_retryable(error: &str) -> bool {
         || lower.contains("503")
 }
 
+/// Returns the usage-error text shown on the quota monitor banner. When a
+/// successful snapshot is already on screen, a failed refresh degrades to a
+/// soft "retry-keep" notice (rendered yellow) instead of a red banner, so a
+/// transient failure right after a provider reset does not replace live data.
+fn usage_error_for_ui(has_previous_snapshot: bool, detail: String) -> String {
+    if has_previous_snapshot {
+        format!("RETRY-KEEP:{detail}")
+    } else {
+        detail
+    }
+}
+
 fn usage_error_for_display(zh: bool, text: &str) -> String {
     let trimmed = text.trim();
     let summary = if trimmed.starts_with("class=")
@@ -2836,6 +3031,7 @@ fn append_bounded_log(logs: &mut String, message: &str) {
     *logs = retained;
 }
 
+#[allow(dead_code)]
 fn read_windows_credential(target: &str) -> Result<String, String> {
     use windows_sys::Win32::Security::Credentials::{
         CredFree, CredReadW, CREDENTIALW, CRED_TYPE_GENERIC,
@@ -2939,7 +3135,11 @@ fn router_deep_health(base_uri: &str, timeout: std::time::Duration) -> Result<()
         .set_write_timeout(Some(remaining))
         .map_err(|error| format!("Router write timeout setup failed: {error}"))?;
 
-    let api_key = read_windows_credential("CodexRouter/LocalApiKey")?;
+    let api_key = crate::credentials::read_text("LocalApiKey")
+        .map_err(|error| error.to_string())?
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "The local Router credential is missing".to_owned())?;
+    let api_key = api_key.as_str();
     if api_key.contains(['\r', '\n']) {
         return Err("The local Router credential contains invalid characters".to_owned());
     }
@@ -3152,6 +3352,7 @@ impl CodexRouterApp {
         let (runtime_log_tx, runtime_log_rx) = runtime_logs::bounded_channel();
         let router_root = RouterConfig::find_router_root();
         let _ = user_data::prepare(&router_root);
+        crate::credentials::set_scope_from_root(&router_root);
         let ui_preferences_path = user_data::preferences_path(&router_root);
         let mut ui_preferences = UiPreferences::load(&ui_preferences_path).unwrap_or_default();
         // Bump forces the minimize-to-tray first-close prompt once more after
@@ -3507,6 +3708,9 @@ impl CodexRouterApp {
             usage_refresh_due: (configured && router_mode_enabled).then(std::time::Instant::now),
             self_check_quota_refresh_pending: false,
             notified_quota_accounts: BTreeSet::new(),
+            usage_notifications_ready: false,
+            notified_pool_failovers: BTreeSet::new(),
+            rejoined_pool_notified: BTreeSet::new(),
             monitor_subscription_order,
             monitor_api_order,
             share_codex_state,
@@ -4010,6 +4214,9 @@ impl CodexRouterApp {
             usage_refresh_due: None,
             self_check_quota_refresh_pending: false,
             notified_quota_accounts: BTreeSet::new(),
+            usage_notifications_ready: false,
+            notified_pool_failovers: BTreeSet::new(),
+            rejoined_pool_notified: BTreeSet::new(),
             monitor_subscription_order: vec![101, 202],
             monitor_api_order: vec![303],
             share_codex_state: true,
@@ -5627,27 +5834,46 @@ impl CodexRouterApp {
                             runtime_logs::summarize_error_for_display(&error.to_string())
                         ));
                     }
-                    if let Some((account_id, source, target)) = fallback_transition_notification(
-                        self.usage_snapshot.as_ref(),
-                        &snapshot,
-                        &self.config,
-                    ) {
-                        // The runtime log can report the same upstream 429
-                        // immediately after this snapshot. Share the dedupe
-                        // set so one quota transition yields one notification.
-                        // Keep the exact account selected by the helper: when
-                        // several subscriptions exhaust in one pass, the
-                        // first matching account is not necessarily the one
-                        // that has a real fallback pair.
-                        self.notified_quota_accounts.insert(account_id);
-                        show_fallback_notification(self.ui_language == "zh", source, target);
-                    }
                     let exhausted_ids = snapshot
                         .subscriptions
                         .iter()
                         .filter(|account| account.health == "quotaExhausted")
                         .map(|account| account.id)
                         .collect::<BTreeSet<_>>();
+                    if self.usage_notifications_ready {
+                        if let Some((account_id, source, target)) =
+                            fallback_transition_notification(
+                                self.usage_snapshot.as_ref(),
+                                &snapshot,
+                                &self.config,
+                            )
+                        {
+                            // The runtime log can report the same upstream 429
+                            // immediately after this snapshot. Share the dedupe
+                            // set so one quota transition yields one notification.
+                            // Keep the exact account selected by the helper: when
+                            // several subscriptions exhaust in one pass, the
+                            // first matching account is not necessarily the one
+                            // that has a real fallback pair.
+                            self.notified_quota_accounts.insert(account_id);
+                            // Reset the rejoin dedupe so the next recovery pops
+                            // the "quota recovered / rejoined pool" notification.
+                            self.rejoined_pool_notified.remove(&account_id);
+                            show_fallback_notification(self.ui_language == "zh", source, target);
+                        }
+                        if let Some((account_id, name)) =
+                            rejoined_account_notification(self.usage_snapshot.as_ref(), &snapshot)
+                        {
+                            if self.rejoined_pool_notified.insert(account_id) {
+                                show_rejoined_pool_notification(self.ui_language == "zh", name);
+                            }
+                        }
+                    } else {
+                        // First snapshot is the startup baseline: already-exhausted
+                        // accounts must not pop as if they just ran out.
+                        self.notified_quota_accounts.extend(exhausted_ids.iter().copied());
+                        self.usage_notifications_ready = true;
+                    }
                     self.notified_quota_accounts
                         .retain(|account_id| exhausted_ids.contains(account_id));
                     self.usage_snapshot = Some(snapshot);
@@ -5692,7 +5918,15 @@ impl CodexRouterApp {
                         self.refresh_oauth_accounts();
                     }
                     let detail = usage_error_for_display(zh, &error);
-                    self.usage_error = detail.clone();
+                    // When a successful snapshot is already on screen, a
+                    // failed refresh must not replace the live data with a
+                    // red "query failed" banner (e.g. right after a provider
+                    // reset while wham/other endpoints settle). Keep showing
+                    // the last good data and render a soft yellow notice.
+                    self.usage_error = usage_error_for_ui(
+                        self.usage_snapshot.is_some(),
+                        detail.clone(),
+                    );
                     self.log(format!(
                         "{}: {detail}",
                         if zh {
@@ -6415,7 +6649,9 @@ impl CodexRouterApp {
                 if let Some(account_id) = failover_account_id(&record) {
                     self.routing_sync_pending = true;
                     self.request_routing_sync();
-                    if self.notified_quota_accounts.insert(account_id) {
+                    if self.usage_notifications_ready
+                        && self.notified_quota_accounts.insert(account_id)
+                    {
                         if let Some((source, target)) = fallback_names_for_account(
                             &self.config,
                             &self.oauth_accounts,
@@ -6423,6 +6659,24 @@ impl CodexRouterApp {
                         ) {
                             show_fallback_notification(self.ui_language == "zh", source, target);
                         }
+                    }
+                }
+                if let Some((from_pool, reason)) = pool_failover_parts(&record) {
+                    if self.usage_notifications_ready
+                        && self
+                            .notified_pool_failovers
+                            .insert(format!("failover:{from_pool}"))
+                    {
+                        let label = pool_account_label(&self.oauth_accounts, &from_pool);
+                        show_pool_switch_notification(self.ui_language == "zh", label, reason);
+                    }
+                } else if let Some(model) = pool_unavailable_model(&record) {
+                    if self.usage_notifications_ready
+                        && self
+                            .notified_pool_failovers
+                            .insert(format!("unavailable:{model}"))
+                    {
+                        show_pool_unavailable_notification(self.ui_language == "zh", model);
                     }
                 }
                 if runtime_logs::runtime_record_is_actionable(&record) {
@@ -10045,6 +10299,89 @@ mod main_tests {
     }
 
     #[test]
+    fn usage_error_degrades_to_retry_keep_when_a_snapshot_is_on_screen() {
+        assert!(
+            super::usage_error_for_ui(true, "用量查询暂时失败".to_owned())
+                .starts_with("RETRY-KEEP:")
+        );
+        assert_eq!(
+            super::usage_error_for_ui(false, "用量查询暂时失败".to_owned()),
+            "用量查询暂时失败"
+        );
+    }
+
+    #[test]
+    fn pool_failover_event_parts_are_parsed_from_router_records() {
+        assert_eq!(
+            super::pool_failover_parts(
+                "[Router events] 2026-08-27T.. class=upstream | event=request.pool_failover | from_pool=cr/r10a56/xai | reason=auth_unavailable"
+            ),
+            Some(("cr/r10a56/xai".to_owned(), "auth_unavailable".to_owned()))
+        );
+        assert_eq!(
+            super::pool_failover_parts(
+                "[Router events] event=request.pool_failover | from_pool=cr/r13a52/antigravity | reason=pool_exhausted"
+            ),
+            Some((
+                "cr/r13a52/antigravity".to_owned(),
+                "pool_exhausted".to_owned()
+            ))
+        );
+        assert_eq!(
+            super::pool_failover_parts("[Router events] event=request_failure | status=503"),
+            None
+        );
+        assert_eq!(
+            super::pool_unavailable_model(
+                "[Router events] event=request.pool_unavailable | model=grok-4.6 | reason=auth_unavailable"
+            ),
+            Some("grok-4.6".to_owned())
+        );
+        assert_eq!(super::pool_unavailable_model("[Router events] event=request.pool_failover"), None);
+        assert_eq!(super::account_id_from_pool_id("cr/r10a56/xai"), Some(56));
+        assert_eq!(super::account_id_from_pool_id("cr/r13f/xai"), None);
+        assert_eq!(super::account_id_from_pool_id("cr/r10a56"), Some(56));
+        assert_eq!(super::account_id_from_pool_id("cr/other/xai"), None);
+    }
+
+    #[test]
+    fn rejoined_account_notification_fires_only_after_recovery() {
+        let previous = UsageSnapshot {
+            subscriptions: vec![UsageAccount {
+                id: 4,
+                name: "ChatGPT".into(),
+                platform: "chatgpt".into(),
+                health: "quotaExhausted".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let current = UsageSnapshot {
+            subscriptions: vec![UsageAccount {
+                id: 4,
+                name: "ChatGPT".into(),
+                platform: "chatgpt".into(),
+                health: "healthy".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            super::rejoined_account_notification(Some(&previous), &current),
+            Some((4, "ChatGPT".to_owned()))
+        );
+        // No pop for an account that was already healthy.
+        assert_eq!(super::rejoined_account_notification(Some(&current), &current), None);
+        // No pop while the account is still exhausted.
+        assert_eq!(
+            super::rejoined_account_notification(Some(&previous), &previous),
+            None
+        );
+        // No pop without a previous snapshot.
+        assert_eq!(super::rejoined_account_notification(None, &current), None);
+    }
+
+    #[test]
     fn quota_notification_is_transition_based_and_requires_a_real_fallback_pair() {
         let mut config = RouterConfig {
             oauth_account_ids: Some(vec![4]),
@@ -10091,7 +10428,7 @@ mod main_tests {
         );
         assert_eq!(
             fallback_transition_notification(None, &exhausted, &config),
-            Some((4, "SuperGrok".into(), "OpenRouter Grok".into()))
+            None
         );
         assert_eq!(
             fallback_transition_notification(Some(&exhausted), &exhausted, &config),

@@ -393,7 +393,8 @@ pub async fn sync_backend(state: &ControlState) -> Result<usize> {
     {
         let route_has_oauth = oauth_routes.contains(&route_id);
         let is_fallback_pool = route_has_oauth && account_type != "oauth";
-        let pool_route_id = pool_route_id_for_account(route_id, &account_type, route_has_oauth);
+        let pool_route_id =
+            pool_route_id_for_account(route_id, &account_type, route_has_oauth, account_id);
         let account_available = account_is_cli_eligible(schedulable, &status);
         if seen_pools.insert(pool_route_id.clone()) {
             pool_routes.push(PoolRoute {
@@ -405,7 +406,7 @@ pub async fn sync_backend(state: &ControlState) -> Result<usize> {
                 priority: if is_fallback_pool {
                     fallback_pool_priority(route_priority)
                 } else {
-                    route_priority as i32
+                    account_priority.max(1) as i32
                 },
                 enabled: true,
                 available: false,
@@ -680,25 +681,22 @@ pub async fn sync_backend(state: &ControlState) -> Result<usize> {
     } else {
         true
     };
-    let published_table = if registry_ready {
-        table
-    } else {
-        RouteTable::new(
-            table
-                .routes()
-                .iter()
-                .cloned()
-                .map(|mut route| {
-                    route.available = false;
-                    route
-                })
-                .collect(),
-        )?
-    };
+    // Credential-based availability is what Host scheduling needs. Parking
+    // every pool on a transient CR-CFG-0005 (management PUT 404 / watcher
+    // coalesce) turns a reload hiccup into CR-RTE-0002 for the user —
+    // including the API fallback that was already serving the conversation.
+    if !registry_ready {
+        let _ = state.logger.write(json!({
+            "level":"WARN",
+            "event":"backend.route_table_published_without_cli_ack",
+            "error_code":"CR-CFG-0005",
+            "available_pools": table.routes().iter().filter(|route| route.available).count(),
+        }));
+    }
     *state
         .routes
         .write()
-        .unwrap_or_else(|error| error.into_inner()) = published_table;
+        .unwrap_or_else(|error| error.into_inner()) = table;
     *state
         .cli_index_map
         .write()
@@ -1910,15 +1908,69 @@ async fn probe_account_for_state(
 
 async fn recover_account_after_probe(state: &ControlState, id: i64, model: &str) -> Response {
     if is_desktop_owned_openai(state, id) {
+        let recovery_state = state.store.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT status FROM accounts WHERE id=?1 AND deleted_at IS NULL",
+                    rusqlite::params![id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(Into::into)
+        });
+        match recovery_state {
+            Ok(Some(status)) if status == "disabled" => {
+                return failure(
+                    StatusCode::CONFLICT,
+                    "CR-OAU-0008",
+                    "disabled OAuth account must be re-authenticated before recovery",
+                );
+            }
+            Ok(None) => return failure(StatusCode::NOT_FOUND, "CR-STO-0007", "account not found"),
+            Err(_) => {
+                return failure(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "CR-STO-0003",
+                    "could not read account recovery state",
+                );
+            }
+            Ok(Some(_)) => {}
+        }
+        let updated = state.store.with_connection(|connection| {
+            connection.execute(
+                "UPDATE accounts
+                 SET status='active',schedulable=1,updated_at=CURRENT_TIMESTAMP
+                 WHERE id=?1 AND deleted_at IS NULL",
+                rusqlite::params![id],
+            )?;
+            Ok::<u64, anyhow::Error>(connection.changes())
+        });
+        if !matches!(updated, Ok(1)) {
+            return failure(StatusCode::NOT_FOUND, "CR-STO-0007", "account not found");
+        }
+        if let Err(error) = sync_backend(state).await {
+            let _ = state.logger.write(json!({
+                "level":"ERROR",
+                "event":"control.account_recovery_sync_failed",
+                "account_id":id,
+                "error_description":error.to_string(),
+            }));
+            return failure(
+                StatusCode::BAD_GATEWAY,
+                "CR-CFG-0005",
+                "account was recovered but CLI routing could not be rebuilt",
+            );
+        }
         let _ = state.logger.write(json!({
             "level":"INFO",
-            "event":"control.account_recovery_skipped",
+            "event":"control.account_recovery_local",
             "account_id":id,
             "reason":"desktop_openai_auth_owner",
         }));
         return success(json!({
             "id": id,
-            "skipped": true,
+            "schedulable": true,
+            "probed": false,
             "reason": "desktop_openai_auth_owner",
         }));
     }
@@ -4148,10 +4200,18 @@ fn account_is_cli_eligible(schedulable: i64, status: &str) -> bool {
     )
 }
 
-/// OAuth and API-key fallback must not share a CLIProxy prefix: a ChatGPT
-/// usage-limit 429 cools every credential in that prefix, including the relay.
-fn pool_route_id_for_account(route_id: i64, account_type: &str, route_has_oauth: bool) -> String {
-    if route_has_oauth && !account_type.eq_ignore_ascii_case("oauth") {
+/// OAuth accounts get their own CLIProxy prefix. Google/xAI quota 429 cools
+/// every credential in a prefix, so three Antigravity logins on one Gemini
+/// card must not share `cr_r13_antigravity`. API-key fallback stays `r{id}f`.
+fn pool_route_id_for_account(
+    route_id: i64,
+    account_type: &str,
+    route_has_oauth: bool,
+    account_id: i64,
+) -> String {
+    if account_type.eq_ignore_ascii_case("oauth") {
+        format!("r{route_id}a{account_id}")
+    } else if route_has_oauth {
         format!("r{route_id}f")
     } else {
         format!("r{route_id}")
@@ -4503,9 +4563,14 @@ mod tests {
 
     #[test]
     fn oauth_and_relay_get_separate_pool_ids() {
-        assert_eq!(pool_route_id_for_account(1, "oauth", true), "r1");
-        assert_eq!(pool_route_id_for_account(1, "apikey", true), "r1f");
-        assert_eq!(pool_route_id_for_account(3, "apikey", false), "r3");
+        assert_eq!(pool_route_id_for_account(1, "oauth", true, 52), "r1a52");
+        assert_eq!(pool_route_id_for_account(13, "oauth", true, 53), "r13a53");
+        assert_ne!(
+            pool_route_id_for_account(13, "oauth", true, 52),
+            pool_route_id_for_account(13, "oauth", true, 53)
+        );
+        assert_eq!(pool_route_id_for_account(1, "apikey", true, 9), "r1f");
+        assert_eq!(pool_route_id_for_account(3, "apikey", false, 9), "r3");
         assert_eq!(fallback_pool_priority(1), 100);
         assert!(!account_is_cli_eligible(1, "disabled"));
         assert!(!account_is_cli_eligible(0, "active"));
@@ -4915,7 +4980,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn desktop_openai_recovery_does_not_touch_cli() {
+    async fn desktop_openai_recovery_reenables_locally_without_cli_probe() {
         let root = std::env::temp_dir().join(format!(
             "router-openai-recovery-skip-{}",
             uuid::Uuid::now_v7()
@@ -4927,7 +4992,8 @@ mod tests {
             .await
             .unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["data"]["skipped"], true);
+        assert_eq!(body["data"]["probed"], false);
+        assert_eq!(body["data"]["schedulable"], true);
         assert_eq!(body["data"]["reason"], "desktop_openai_auth_owner");
         assert_eq!(
             requests
@@ -4949,7 +5015,7 @@ mod tests {
                     .map_err(Into::into)
             })
             .unwrap();
-        assert_eq!(status, ("error".to_owned(), 0));
+        assert_eq!(status, ("active".to_owned(), 1));
         server.abort();
         let _ = std::fs::remove_dir_all(root);
     }

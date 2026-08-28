@@ -9950,19 +9950,33 @@ impl CodexRouterApp {
             ui.add_space(6.0);
         }
         if !self.usage_error.is_empty() {
+            let retry_keep = self.usage_error.strip_prefix("RETRY-KEEP:");
+            let (notice_color, title, body) = if let Some(body) = retry_keep {
+                (
+                    palette.warning,
+                    t(
+                        zh,
+                        "用量刷新失败（已保留上次成功数据）",
+                        "Usage refresh failed (last good data kept)",
+                    )
+                    .to_owned(),
+                    friendly_error(body, zh),
+                )
+            } else {
+                (
+                    palette.danger,
+                    t(zh, "查询失败", "Query failed").to_owned(),
+                    friendly_error(&self.usage_error, zh),
+                )
+            };
             egui::Frame::new()
                 .fill(palette.paper)
-                .stroke(egui::Stroke::new(1.0, palette.danger))
+                .stroke(egui::Stroke::new(1.0, notice_color))
                 .corner_radius(egui::CornerRadius::same(7))
                 .inner_margin(egui::Margin::same(14))
                 .show(ui, |ui| {
                     ui.label(
-                        egui::RichText::new(format!(
-                            "{}：{}",
-                            t(zh, "查询失败", "Query failed"),
-                            friendly_error(&self.usage_error, zh)
-                        ))
-                        .color(palette.danger),
+                        egui::RichText::new(format!("{title}：{body}")).color(notice_color),
                     );
                 });
             ui.add_space(8.0);

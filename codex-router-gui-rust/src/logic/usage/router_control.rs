@@ -503,14 +503,38 @@ pub(crate) async fn query_account_usage(
         }
     }
     if material.account_type == "oauth" && material.platform == "openai" {
-        let _ = logger.write(json!({
-            "level":"INFO",
-            "event":"desktop.session.openai_usage_observational",
-            "error_code": crate::control_plane::desktop_session::DSK_USAGE_OBSERVATIONAL,
-            "account_id":id,
-            "reason":"desktop_openai_auth_owner",
-        }));
-        return Ok(AccountUsage::Found(cached(store, id, "openai")?));
+        // Read-only wham probe using Desktop's current access token (never
+        // the CLIProxyAPI refresh-capable path), mirroring the Grok probe.
+        // Scheduling stays observational -- Desktop owns this account's
+        // health -- but the quota windows are live so the dashboard shows the
+        // real 5-hour / weekly caps instead of a stale empty cache.
+        match fetch_provider(cli, desktop_auth_path, &material).await {
+            Ok(windows) => {
+                if let Err(error) = persist(store, id, "openai", &windows) {
+                    let _ = logger.write(json!({
+                        "level":"WARN", "event":"control.openai_quota_cache_failed",
+                        "account_id":id, "error_description":error.to_string()
+                    }));
+                }
+                return Ok(AccountUsage::Found(openai_payload(
+                    &windows, false, "upstream",
+                )));
+            }
+            Err(failure) => {
+                if failure.needs_reauth {
+                    note_reauth_failure(store, id)?;
+                }
+                let mut value = cached(store, id, "openai")
+                    .unwrap_or_else(|_| openai_payload(&[], true, "cache"));
+                value["error_code"] = Value::String(failure.error_code.to_owned());
+                value["needs_reauth"] = Value::Bool(failure.needs_reauth);
+                let _ = logger.write(json!({
+                    "level":"WARN", "event":"control.oauth_quota_refresh_failed",
+                    "account_id":id, "platform":"openai", "error_code":failure.error_code
+                }));
+                return Ok(AccountUsage::Found(value));
+            }
+        }
     }
     if material.account_type == "oauth" && material.platform == "grok" {
         match fetch_provider(cli, desktop_auth_path, &material).await {
@@ -1089,7 +1113,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn desktop_openai_quota_is_observational_and_never_hits_upstream() {
+    async fn desktop_openai_quota_without_login_serves_cache_and_flags_unavailable() {
+        // With no desktop auth path the read-only wham probe cannot run; the
+        // account must fall back to cache and flag the cause instead of
+        // arming a re-auth cooldown (the failure is not a dead refresh token).
         let (root, store) = test_store();
         insert_openai_oauth_account(&store, "active", 1);
         let logger = test_logger(&root);
@@ -1097,28 +1124,78 @@ mod tests {
             .await
             .unwrap();
         let AccountUsage::Found(value) = usage else {
-            panic!("desktop-owned ChatGPT quota must stay observational");
+            panic!("desktop-owned ChatGPT quota must still resolve to a payload");
         };
-        assert_ne!(value["error_code"], "unauthenticated");
+        assert_eq!(value["error_code"], "auth_unavailable");
+        assert_eq!(value["source"], "cache");
         assert_ne!(value["needs_reauth"], true);
         assert!(!reauth_cooldown_active(&store, 1).unwrap());
         let events = std::fs::read_to_string(logger.path()).unwrap();
-        assert!(events.contains("CR-DSK-0005"));
-        assert!(events.contains("desktop.session.openai_usage_observational"));
+        assert!(events.contains("control.oauth_quota_refresh_failed"));
         let _ = root;
     }
 
     #[tokio::test]
-    async fn desktop_openai_quota_missing_login_does_not_arm_reauth_cooldown() {
+    async fn desktop_openai_quota_reads_live_wham_windows() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await;
+            let body = concat!(
+                r#"{"plan_type":"plus","rate_limit":{"allowed":true,"limit_reached":false,"#,
+                r#""primary_window":{"used_percent":48,"limit_window_seconds":18000,"reset_after_seconds":5290,"reset_at":1787801733},"#,
+                r#""secondary_window":{"used_percent":23,"limit_window_seconds":604800,"reset_after_seconds":573921,"reset_at":1788370364}}}"#
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
         let (root, store) = test_store();
         insert_openai_oauth_account(&store, "active", 1);
+        let auth_path = root.join("desktop-auth.json");
+        std::fs::write(
+            &auth_path,
+            json!({"tokens":{"access_token":"test-access-token"}}).to_string(),
+        )
+        .unwrap();
         let logger = test_logger(&root);
-        let usage = query_account_usage(&store, &unreachable_cli(), &logger, None, 1)
+
+        // Route the probe at the loopback mock and drop any system proxy env
+        // so the request never leaves this process.
+        for name in [
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ] {
+            unsafe { std::env::remove_var(name) };
+        }
+        unsafe {
+            std::env::set_var(
+                "CODEX_ROUTER_WHAM_USAGE_URL",
+                format!("http://{address}/backend-api/wham/usage"),
+            );
+        }
+
+        let usage = query_account_usage(&store, &unreachable_cli(), &logger, Some(&auth_path), 1)
             .await
             .unwrap();
-        let AccountUsage::Found(_) = usage else {
-            panic!("the account must still resolve to a payload");
+        let AccountUsage::Found(value) = usage else {
+            panic!("live openai quota must resolve to a payload");
         };
+        assert_eq!(value["five_hour"]["used_percent"], 48.0);
+        assert_eq!(value["seven_day"]["used_percent"], 23.0);
+        assert_eq!(value["stale"], false);
+        assert_eq!(value["source"], "upstream");
         assert!(!reauth_cooldown_active(&store, 1).unwrap());
         let _ = root;
     }

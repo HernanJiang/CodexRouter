@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-3.0.10-0969da" alt="Version 3.0.10">
+  <img src="https://img.shields.io/badge/version-3.1.3-0969da" alt="Version 3.1.3">
   <img src="https://img.shields.io/badge/platform-Windows%20%2F%20macOS%20%2F%20Linux-0078d4" alt="Windows / macOS / Linux">
   <img src="https://img.shields.io/badge/architecture-x64-555555" alt="x64">
   <img src="https://img.shields.io/badge/default%20build-portable-2ea44f" alt="Portable build by default">
@@ -83,6 +83,10 @@ Switch models directly from the Codex model menu and continue in the same contex
 - 3.0.8: Grok no longer parrot-replies 「任务已完成」 after a finished Verdict; auto-continue ignores long reports that only mention 「下一步」. Reasoning menus: Grok 4.6 adds `xhigh`, Claude 4.6 Thinking gets low/medium/high/max, GLM-5.2 gets high/max.
 - 3.0.9: Grok 402 Payment Required fails over to the next account/pool. Grok login is Host-owned PKCE on `127.0.0.1:56121/callback`, so the UI can actually receive xAI tokens.
 - 3.0.10: Grok 400 `invalid-argument` was Codex Desktop's `mcp__codex_app__automation_update` schema (`oneOf`/`$ref`) plus `max_output_tokens` above 128k. Router now simplifies that tool schema before CLIProxy and caps Grok output at 128k.
+- 3.0.11: Claude Opus max thinking no longer 400s with `max_tokens` must be greater than `thinking.budget_tokens`. Router raises output above CLIProxy's 128k max-effort budget.
+- 3.0.12: Claude Opus/Sonnet 4.6+ catalog context is 1M (950k at 95% compact), not the 128k unknown-model fallback that Desktop showed as ~122k.
+- 3.0.18: ChatGPT 5-hour quota exhaustion fails over to the configured same-name API relay. A failed CLI config push no longer parks every pool (`503 no schedulable credential in pool`).
+- 3.0.13: Gemini/Antigravity quota 429 now fails over to the next OAuth account instead of cooling the whole shared prefix and retrying until Codex reports exceeded retry limit.
 
 ### Model-aware controls
 

@@ -449,7 +449,13 @@ pub fn build_model_catalog_with_root(cfg: &RouterConfig, router_root: &Path) -> 
         entry["availability_nux"] = Value::Null;
         entry["upgrade"] = Value::Null;
         entry["include_skills_usage_instructions"] = Value::Bool(false);
-        entry["default_reasoning_summary"] = Value::String("none".to_owned());
+        // ChatGPT 原生 reasoning 事件在 summary=auto 时会在 Desktop 里留一块空思考区。
+        // 第三方模型（Gemini / GLM / DeepSeek 等）必须开 summary，否则思考增量被客户端丢掉，只剩最终结果。
+        entry["default_reasoning_summary"] = Value::String(if is_openai_catalog_model(model) {
+            "none".to_owned()
+        } else {
+            "auto".to_owned()
+        });
         entry["support_verbosity"] = Value::Bool(true);
         entry["default_verbosity"] = Value::String("low".to_owned());
         if is_openai_catalog_model(model) {
@@ -776,6 +782,62 @@ mod tests {
             .as_array()
             .is_some_and(|tiers| tiers.iter().any(|tier| tier == "fast")));
         assert!(!catalog_requires_chatgpt_allowlist(&cfg));
+    }
+
+    #[test]
+    fn glm53_flash_catalog_exposes_low_high_and_streams_reasoning() {
+        let cfg = crate::config::RouterConfig {
+            models: vec![ModelConfig {
+                model: "z-ai/glm-5.3-flash".to_owned(),
+                source: "apikey".to_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let catalog = build_model_catalog(&cfg);
+        assert_eq!(catalog[0]["slug"], "z-ai/glm-5.3-flash");
+        assert_eq!(catalog[0]["default_reasoning_level"], "high");
+        assert_eq!(catalog[0]["default_reasoning_summary"], "auto");
+        let levels: Vec<&str> = catalog[0]["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|level| level["effort"].as_str())
+            .collect();
+        assert_eq!(levels, vec!["low", "high", "max"]);
+    }
+
+    #[test]
+    fn gemini_catalog_asks_desktop_to_show_reasoning_summaries() {
+        let cfg = crate::config::RouterConfig {
+            models: vec![
+                ModelConfig {
+                    model: "gemini-3.7-flash".to_owned(),
+                    source: "apikey".to_owned(),
+                    ..Default::default()
+                },
+                ModelConfig {
+                    model: "gpt-5.6-terra".to_owned(),
+                    source: "oauth".to_owned(),
+                    oauth_platform: "openai".to_owned(),
+                    oauth_account_id: 1,
+                    ..Default::default()
+                },
+            ],
+            oauth_account_ids: Some(vec![1]),
+            ..Default::default()
+        };
+        let catalog = build_model_catalog(&cfg);
+        let gemini = catalog
+            .iter()
+            .find(|entry| entry["slug"] == "gemini-3.7-flash")
+            .unwrap();
+        let chatgpt = catalog
+            .iter()
+            .find(|entry| entry["slug"] == "gpt-5.6-terra")
+            .unwrap();
+        assert_eq!(gemini["default_reasoning_summary"], "auto");
+        assert_eq!(chatgpt["default_reasoning_summary"], "none");
     }
 
     #[test]

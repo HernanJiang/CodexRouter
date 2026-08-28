@@ -1,7 +1,7 @@
 # CodexRouter Terms and Compliance
 
-Software version: v3.0.10
-Release date: 2026-08-26
+Software version: v3.1.3
+Release date: 2026-08-28
 Terms revision: v1.3 (2026-08-18)
 Copyright holder: Hernan_Jiang
 Official release location: https://github.com/HernanJiang/CodexRouter

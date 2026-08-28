@@ -87,18 +87,58 @@ fn credential_rejected(note: &str) -> bool {
         || note.contains("class=permission")
 }
 
+/// Windows whose `kind` represents the long (weekly / seven-day) subscription
+/// window. ChatGPT now exposes a 5-hour rolling window plus a weekly cap.
+fn has_weekly_quota_window(windows: &[UsageWindow]) -> bool {
+    windows
+        .iter()
+        .any(|window| matches!(window.kind.as_str(), "weekly" | "seven_day" | "sevenDay"))
+}
+
+fn window_at_capacity(window: &UsageWindow) -> bool {
+    window.used_percent.is_some_and(|value| value >= 99.999)
+}
+
+fn weekly_quota_is_exhausted(windows: &[UsageWindow]) -> bool {
+    windows
+        .iter()
+        .filter(|window| matches!(window.kind.as_str(), "weekly" | "seven_day" | "sevenDay"))
+        .any(window_at_capacity)
+}
+
+fn short_quota_is_exhausted(windows: &[UsageWindow]) -> bool {
+    windows
+        .iter()
+        .filter(|window| {
+            matches!(
+                window.kind.as_str(),
+                "fiveHour" | "five_hour" | "five-hour" | "fivehour"
+            )
+        })
+        .any(window_at_capacity)
+}
+
 fn live_quota_is_usable(windows: &[UsageWindow]) -> bool {
-    !windows.is_empty()
-        && !windows
-            .iter()
-            .any(|window| window.used_percent.is_some_and(|value| value >= 99.999))
+    if windows.is_empty() {
+        return false;
+    }
+    if has_weekly_quota_window(windows) {
+        // Weekly drain is a real subscription outage. A full 5-hour window is
+        // a short block: keep the account out of the pool so the matching API
+        // fallback can serve, and return it when the 5-hour window resets.
+        return !weekly_quota_is_exhausted(windows) && !short_quota_is_exhausted(windows);
+    }
+    !windows.iter().any(window_at_capacity)
 }
 
 fn live_quota_is_exhausted(windows: &[UsageWindow]) -> bool {
-    !windows.is_empty()
-        && windows
-            .iter()
-            .any(|window| window.used_percent.is_some_and(|value| value >= 99.999))
+    if windows.is_empty() {
+        return false;
+    }
+    if has_weekly_quota_window(windows) {
+        return weekly_quota_is_exhausted(windows) || short_quota_is_exhausted(windows);
+    }
+    windows.iter().any(window_at_capacity)
 }
 
 fn live_usage_payload_is_fresh(value: &Value) -> bool {
@@ -641,7 +681,6 @@ fn query_account(
         .as_ref()
         .map(api_quota_pool_provider)
         .unwrap_or_else(|| string(&task.account, "platform")));
-    let desktop_owned_openai = kind == "oauth" && platform == "openai";
     let mut query_note = String::new();
     let stats = match retry_account_read(|| {
         admin.get(
@@ -822,12 +861,14 @@ fn query_account(
     }
     let was_unschedulable = string(&task.account, "status") == "error"
         || get(&task.account, "schedulable").and_then(Value::as_bool) == Some(false);
+    // ChatGPT Desktop owns the refresh token, so recover-state must not probe
+    // CLIProxyAPI. Isolation itself is a local schedulable flip and is required
+    // so a full 5-hour/weekly window actually hands traffic to the API fallback.
+    // recover-state for OpenAI is also local-only (no $TOKEN$ probe).
     let recovered = reconcile_recovery
-        && !desktop_owned_openai
         && !explicitly_disabled_oauth
         && maybe_recover_misdisabled_account(admin, &task, &windows, fresh, &query_note, deadline);
     let isolated = reconcile_recovery
-        && !desktop_owned_openai
         && !explicitly_disabled_oauth
         && maybe_isolate_exhausted_oauth_account(admin, &task, &windows, fresh, &query_note, deadline);
 
@@ -2153,9 +2194,7 @@ fn resolve_state(
     {
         detail.clear();
     }
-    let exhausted = windows
-        .iter()
-        .any(|window| window.used_percent.is_some_and(|value| value >= 99.999));
+    let exhausted = live_quota_is_exhausted(windows);
     let health = if exhausted {
         "quotaExhausted"
     } else if status == "active" && schedulable != Some(false) {
@@ -2723,9 +2762,18 @@ fn reconcile_oauth_recovery_observations(
                 }
             }
             OAuthRecoveryDirective::Isolate => {
-                if record.account.health != "quotaExhausted"
-                    && isolate_oauth_account(admin, account_id, deadline).is_ok()
-                {
+                // Health can already be quotaExhausted from live windows while
+                // the account is still schedulable (ChatGPT 5-hour full). That
+                // must still flip schedulable=0 so select_pool can pick the
+                // API fallback instead of returning CR-RTE-0002 / 429.
+                let still_in_pool = record.account.status != "error"
+                    && record.account.status != "disabled"
+                    && !record
+                        .account
+                        .status_detail
+                        .to_ascii_lowercase()
+                        .contains("fallback");
+                if still_in_pool && isolate_oauth_account(admin, account_id, deadline).is_ok() {
                     record.account.health = "quotaExhausted".to_owned();
                     record.account.status_detail =
                         "OAuth quota is unavailable; matching API fallback remains active."
@@ -4160,6 +4208,59 @@ mod tests {
     }
 
     #[test]
+    fn five_hour_full_chatgpt_is_made_unschedulable_for_api_fallback() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]).into_owned();
+            let body = r#"{"data":{"schedulable":false}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            request
+        });
+        let admin = AdminClient {
+            client: Client::builder().no_proxy().build().unwrap(),
+            base_url: format!("http://{address}"),
+            bearer: Arc::new(Zeroizing::new("test-token".to_owned())),
+        };
+        let task = AccountTask {
+            account: json!({
+                "id": 61,
+                "type": "oauth",
+                "platform": "openai",
+                "status": "active",
+                "schedulable": true
+            }),
+            channel: None,
+            query_provider_usage: false,
+            auto_isolate_on_exhaustion: true,
+        };
+        let windows = vec![
+            coding_window("fiveHour", 100.0, None, ""),
+            coding_window("weekly", 39.0, None, ""),
+        ];
+
+        assert!(maybe_isolate_exhausted_oauth_account(
+            &admin,
+            &task,
+            &windows,
+            true,
+            "",
+            Instant::now() + Duration::from_secs(2),
+        ));
+        let request = server.join().unwrap();
+        assert!(request.starts_with("POST /api/v1/admin/accounts/61/schedulable "));
+        assert!(request.contains(r#""schedulable":false"#));
+    }
+
+    #[test]
     fn only_oauth_accounts_with_a_selected_matching_api_fallback_are_auto_isolated() {
         let mut cfg = RouterConfig {
             oauth_fallback: crate::config::OAuthFallback {
@@ -4395,6 +4496,72 @@ mod tests {
         let paths = server.join().unwrap();
 
         assert!(paths.iter().all(|path| !path.ends_with("/models")));
+    }
+
+    #[test]
+    fn five_hour_window_full_drains_account_until_the_short_window_resets() {
+        // ChatGPT runs a 5-hour rolling window + a weekly cap. A full 5h
+        // window must leave the pool so the matching API fallback can serve;
+        // a reset 5h window with weekly headroom returns the account.
+        let five_hour_full = UsageWindow {
+            kind: "fiveHour".to_owned(),
+            used_percent: Some(100.0),
+            ..UsageWindow::default()
+        };
+        let weekly_headroom = UsageWindow {
+            kind: "weekly".to_owned(),
+            used_percent: Some(40.0),
+            ..UsageWindow::default()
+        };
+        assert!(live_quota_is_exhausted(&[
+            five_hour_full.clone(),
+            weekly_headroom.clone()
+        ]));
+        assert!(!live_quota_is_usable(&[
+            five_hour_full.clone(),
+            weekly_headroom.clone()
+        ]));
+        assert_eq!(
+            resolve_state(
+                "active",
+                Some(true),
+                "",
+                &[five_hour_full, weekly_headroom.clone()],
+                true
+            )
+            .0,
+            "quotaExhausted"
+        );
+        let five_hour_reset = UsageWindow {
+            kind: "fiveHour".to_owned(),
+            used_percent: Some(10.0),
+            ..UsageWindow::default()
+        };
+        assert!(!live_quota_is_exhausted(&[
+            five_hour_reset.clone(),
+            weekly_headroom.clone()
+        ]));
+        assert!(live_quota_is_usable(&[five_hour_reset, weekly_headroom]));
+        // A full weekly cap is a real drain even when the 5h window is low.
+        let weekly_full = UsageWindow {
+            kind: "weekly".to_owned(),
+            used_percent: Some(100.0),
+            ..UsageWindow::default()
+        };
+        let five_hour_low = UsageWindow {
+            kind: "fiveHour".to_owned(),
+            used_percent: Some(20.0),
+            ..UsageWindow::default()
+        };
+        assert!(live_quota_is_exhausted(&[five_hour_low.clone(), weekly_full.clone()]));
+        assert!(!live_quota_is_usable(&[five_hour_low.clone(), weekly_full]));
+        // Without a weekly window the legacy any-window behaviour is kept.
+        let only_five_hour_full = UsageWindow {
+            kind: "fiveHour".to_owned(),
+            used_percent: Some(100.0),
+            ..UsageWindow::default()
+        };
+        assert!(live_quota_is_exhausted(&[only_five_hour_full]));
     }
 
     #[test]

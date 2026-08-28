@@ -16,6 +16,7 @@ pub struct Palette {
     pub glass: egui::Color32,
     pub success: egui::Color32,
     pub danger: egui::Color32,
+    pub warning: egui::Color32,
 }
 
 pub fn palette(name: &str) -> Palette {
@@ -36,6 +37,7 @@ pub fn palette(name: &str) -> Palette {
             glass: egui::Color32::from_rgb(248, 252, 255),
             success: egui::Color32::from_rgb(29, 130, 89),
             danger: egui::Color32::from_rgb(190, 54, 51),
+            warning: egui::Color32::from_rgb(212, 148, 28),
         }
     } else {
         // Coffee theme with the same opaque dialog treatment.
@@ -54,6 +56,7 @@ pub fn palette(name: &str) -> Palette {
             glass: egui::Color32::from_rgb(252, 246, 236),
             success: egui::Color32::from_rgb(58, 119, 83),
             danger: egui::Color32::from_rgb(166, 66, 52),
+            warning: egui::Color32::from_rgb(201, 155, 61),
         }
     }
 }

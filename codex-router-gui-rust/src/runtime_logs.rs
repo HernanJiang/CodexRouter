@@ -350,7 +350,7 @@ pub(crate) fn spawn(
                                 if let Some(record) =
                                     format_diagnostic_line(source.label, source.kind, &line)
                                 {
-                                    if record.contains("openai.upstream_failover_switching") {
+                                    if is_startup_quota_popup_record(&record) {
                                         continue;
                                     }
                                     if recent.len() == INITIAL_LINES_PER_SOURCE {
@@ -472,6 +472,14 @@ fn router_event_timestamp(line: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 /// only if they happen again); lines without a parsable timestamp stay
 /// visible so a malformed feed never hides a real problem, and the other log
 /// sources keep their existing behavior.
+/// Quota / pool-switch popups must not replay from the startup tail. Live
+/// events after the first usage snapshot still notify.
+fn is_startup_quota_popup_record(record: &str) -> bool {
+    record.contains("openai.upstream_failover_switching")
+        || record.contains("event=request.pool_failover")
+        || record.contains("event=request.pool_unavailable")
+}
+
 fn initial_history_line_is_current(
     kind: LogKind,
     line: &str,
@@ -502,6 +510,12 @@ fn is_router_events_diagnostic(line: &str) -> bool {
     .iter()
     .any(|needle| upper.contains(*needle));
     if !level_ok {
+        // Pool switch / pool-drained events are INFO-level but user-actionable:
+        // the UI turns them into a "switched account" notification.
+        let event = router_event_name(line);
+        if event == "request.pool_failover" || event == "request.pool_unavailable" {
+            return true;
+        }
         return false;
     }
     // Configuration sync emits WARN-level `configuration` rows on every Apply.
@@ -576,8 +590,22 @@ fn format_plain_diagnostic(label: &str, line: &str) -> String {
     output.push_str(&summarize_error_for_display(&format!("{label} {line}")));
     let mut safe = redact_for_display(&output);
     if safe.contains("event=[REDACTED]") {
-        if let Some(event) = event {
+        if let Some(event) = event.as_deref() {
             safe = safe.replacen("event=[REDACTED]", &format!("event={event}"), 1);
+        }
+    }
+    let event_name = event.as_deref().unwrap_or_default();
+    if event_name == "request.pool_failover" || event_name == "request.pool_unavailable" {
+        for (key, json_key) in [
+            ("from_pool", "from_pool"),
+            ("reason", "reason"),
+            ("model", "public_model"),
+        ] {
+            if let Some(value) = router_event_json_field(line, json_key) {
+                if !safe.contains(&format!("{key}=")) {
+                    append_field(&mut safe, key, &value);
+                }
+            }
         }
     }
     limit_utf8_bytes(&safe, MAX_RECORD_BYTES)
@@ -1023,6 +1051,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pool_switch_events_are_diagnostic_and_carry_pool_fields() {
+        // INFO-level pool-switch events must reach the UI so it can pop the
+        // "switched account" notification.
+        assert!(is_router_events_diagnostic(
+            r#"{"level":"INFO","event":"request.pool_failover","from_pool":"cr/r10a56/xai","reason":"auth_unavailable"}"#
+        ));
+        assert!(is_router_events_diagnostic(
+            r#"{"level":"INFO","event":"request.pool_unavailable","public_model":"grok-4.6"}"#
+        ));
+        // Ordinary INFO traffic stays out of the UI.
+        assert!(!is_router_events_diagnostic(
+            r#"{"level":"INFO","event":"request.ok"}"#
+        ));
+        let formatted = format_plain_diagnostic(
+            "Router events",
+            r#"{"level":"INFO","event":"request.pool_failover","from_pool":"cr/r10a56/xai","reason":"auth_unavailable","public_model":"grok-4.6"}"#,
+        );
+        assert!(formatted.contains("event=request.pool_failover"));
+        assert!(formatted.contains("from_pool=cr/r10a56/xai"));
+        assert!(formatted.contains("reason=auth_unavailable"));
+    }
+
+    #[test]
     fn redaction_removes_credentials_and_user_paths() {
         let raw = concat!(
             "Authorization: Bearer secret-bearer-value ",
@@ -1221,6 +1272,22 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert!(records[0].contains("dropped_records=1"));
         assert!(!records[0].contains("private-secret"));
+    }
+
+    #[test]
+    fn startup_history_does_not_replay_quota_popup_events() {
+        assert!(is_startup_quota_popup_record(
+            "[Router events] event=request.pool_failover | from_pool=cr/r10a56/xai"
+        ));
+        assert!(is_startup_quota_popup_record(
+            "[Router events] event=request.pool_unavailable | model=grok-4.6"
+        ));
+        assert!(is_startup_quota_popup_record(
+            "openai.upstream_failover_switching | upstream_status=429 | account_id=4"
+        ));
+        assert!(!is_startup_quota_popup_record(
+            r#"{"level":"ERROR","error_code":"CR-SYS-0001"}"#
+        ));
     }
 
     #[test]
