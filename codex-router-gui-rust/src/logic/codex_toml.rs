@@ -118,12 +118,13 @@ pub fn generate_codex_router_config(
     {
         doc.remove("forced_login_method");
     }
-    // features.apps = false
+    // Keep Codex app/MCP tools available so models can create and message
+    // threads through the Codex app tool surface.
     let mut features = doc
         .remove("features")
         .and_then(|item| item.into_table().ok())
         .unwrap_or_default();
-    features.insert("apps", toml_edit::value(false));
+    features.insert("apps", toml_edit::value(true));
 
     // models.new_thread defaults
     let mut new_thread = toml_edit::Table::new();
@@ -1718,7 +1719,7 @@ mod tests {
         assert!(text.contains("model = \"gpt-5.6-sol\""));
         assert!(text
             .contains("model_catalog_json = \"C:/users/test/.codex-router/model-catalog.json\""));
-        assert!(text.contains("[features]") && text.contains("apps = false"));
+        assert!(text.contains("[features]") && text.contains("apps = true"));
         assert!(text.contains("[model_providers.codex_router]"));
         assert!(text.contains("base_url = \"http://127.0.0.1:18082/v1\""));
         assert!(text.contains("experimental_bearer_token = \"sk-local-abc123\""));

@@ -927,10 +927,15 @@ fn rejoined_account_notification(
         if subscription.health != "healthy" {
             continue;
         }
-        let was_recovering = previous.subscriptions.iter().any(|account| {
-            account.id == subscription.id
-                && !matches!(account.health.as_str(), "healthy" | "")
-        });
+        let previous_account = previous
+            .subscriptions
+            .iter()
+            .find(|account| account.id == subscription.id)?;
+        // A local schedulable flip also makes the account look healthy. It is
+        // not a provider quota recovery, especially for ChatGPT Desktop
+        // where recover-state intentionally performs no upstream probe.
+        let was_recovering = previous_account.health == "quotaExhausted"
+            && quota_windows_recovered(previous_account, subscription);
         if was_recovering {
             let name = if subscription.name.trim().is_empty() {
                 subscription.platform.trim().to_owned()
@@ -941,6 +946,38 @@ fn rejoined_account_notification(
         }
     }
     None
+}
+
+fn quota_windows_recovered(previous: &UsageAccount, current: &UsageAccount) -> bool {
+    let provider = previous.platform.trim().to_ascii_lowercase();
+    if !matches!(provider.as_str(), "openai" | "chatgpt") {
+        // Providers without quota windows have no stronger signal available;
+        // keep the historical health transition behavior for those accounts.
+        return true;
+    }
+    // Desktop OpenAI can report a local healthy state while the quota query
+    // is stale or unavailable. Missing windows therefore cannot confirm a
+    // provider-side recovery.
+    if previous.windows.is_empty() || current.windows.is_empty() {
+        return false;
+    }
+
+    previous.windows.iter().any(|old_window| {
+        let was_full = old_window
+            .used_percent
+            .is_some_and(|value| value >= 99.999);
+        if !was_full {
+            return false;
+        }
+        current.windows.iter().any(|new_window| {
+            new_window.kind == old_window.kind
+                && (new_window
+                    .used_percent
+                    .is_some_and(|value| value < 99.999)
+                    || (!old_window.reset_at.trim().is_empty()
+                        && old_window.reset_at != new_window.reset_at))
+        })
+    })
 }
 
 fn show_rejoined_pool_notification(zh: bool, name: String) {
@@ -5874,8 +5911,14 @@ impl CodexRouterApp {
                         self.notified_quota_accounts.extend(exhausted_ids.iter().copied());
                         self.usage_notifications_ready = true;
                     }
-                    self.notified_quota_accounts
-                        .retain(|account_id| exhausted_ids.contains(account_id));
+                    self.notified_quota_accounts.retain(|account_id| {
+                        exhausted_ids.contains(account_id)
+                            || !quota_recovery_confirmed(
+                                self.usage_snapshot.as_ref(),
+                                &snapshot,
+                                *account_id,
+                            )
+                    });
                     self.usage_snapshot = Some(snapshot);
                     self.usage_snapshot_profile_key = profile_key;
                     if self.self_check_quota_refresh_pending {
@@ -8981,6 +9024,31 @@ fn codex_setup_running() -> bool {
     false
 }
 
+fn quota_recovery_confirmed(
+    previous: Option<&UsageSnapshot>,
+    current: &UsageSnapshot,
+    account_id: i64,
+) -> bool {
+    let Some(current_account) = current
+        .subscriptions
+        .iter()
+        .find(|account| account.id == account_id)
+    else {
+        return false;
+    };
+    let Some(previous_account) = previous.and_then(|snapshot| {
+        snapshot
+            .subscriptions
+            .iter()
+            .find(|account| account.id == account_id)
+    }) else {
+        return false;
+    };
+    previous_account.health == "quotaExhausted"
+        && current_account.health != "quotaExhausted"
+        && quota_windows_recovered(previous_account, current_account)
+}
+
 #[cfg(windows)]
 fn process_name_running(names: &[&str]) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
@@ -9739,7 +9807,7 @@ mod main_tests {
         window_size_is_usable,
         usage_error_for_display, user_data, AdminTaskActivity, ApplyUiRollback, IsolationKind,
         IsolationProfile, ModelConfig, OAuthAccountSummary, OAuthModelSummary, Page,
-        RequestResultDisposition, RouterConfig, UsageAccount, UsageSnapshot, APP_TITLE,
+        RequestResultDisposition, RouterConfig, UsageAccount, UsageSnapshot, UsageWindow, APP_TITLE,
         APP_VERSION, COMPACT_WINDOW_LOGICAL_SIZE, DEFAULT_WINDOW_LOGICAL_SIZE, MAX_LOG_BYTES,
         MIN_WINDOW_LOGICAL_SIZE, RETAIN_LOG_BYTES, WINDOWS_1080P_200_WORK_AREA_LOGICAL_SIZE,
         WINDOWS_NON_CLIENT_LOGICAL_ALLOWANCE,
@@ -10352,6 +10420,12 @@ mod main_tests {
                 name: "ChatGPT".into(),
                 platform: "chatgpt".into(),
                 health: "quotaExhausted".into(),
+                windows: vec![UsageWindow {
+                    kind: "fiveHour".into(),
+                    used_percent: Some(100.0),
+                    reset_at: "2026-08-29T01:00:00Z".into(),
+                    ..Default::default()
+                }],
                 ..Default::default()
             }],
             ..Default::default()
@@ -10362,6 +10436,12 @@ mod main_tests {
                 name: "ChatGPT".into(),
                 platform: "chatgpt".into(),
                 health: "healthy".into(),
+                windows: vec![UsageWindow {
+                    kind: "fiveHour".into(),
+                    used_percent: Some(20.0),
+                    reset_at: "2026-08-29T02:00:00Z".into(),
+                    ..Default::default()
+                }],
                 ..Default::default()
             }],
             ..Default::default()
@@ -10379,6 +10459,50 @@ mod main_tests {
         );
         // No pop without a previous snapshot.
         assert_eq!(super::rejoined_account_notification(None, &current), None);
+    }
+
+    #[test]
+    fn rejoined_notification_rejects_status_only_flapping_without_a_quota_reset() {
+        let windows = vec![
+            UsageWindow {
+                kind: "fiveHour".into(),
+                used_percent: Some(74.0),
+                ..Default::default()
+            },
+            UsageWindow {
+                kind: "weekly".into(),
+                used_percent: Some(75.0),
+                ..Default::default()
+            },
+        ];
+        let previous = UsageSnapshot {
+            subscriptions: vec![UsageAccount {
+                id: 61,
+                name: "ChatGPT OAuth".into(),
+                platform: "openai".into(),
+                health: "quotaExhausted".into(),
+                windows: windows.clone(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let current = UsageSnapshot {
+            subscriptions: vec![UsageAccount {
+                id: 61,
+                name: "ChatGPT OAuth".into(),
+                platform: "openai".into(),
+                health: "healthy".into(),
+                windows,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            super::rejoined_account_notification(Some(&previous), &current),
+            None,
+            "a local schedulable flip is not proof that provider quota recovered"
+        );
     }
 
     #[test]

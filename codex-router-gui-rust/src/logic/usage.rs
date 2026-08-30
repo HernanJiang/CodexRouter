@@ -218,7 +218,18 @@ fn maybe_recover_misdisabled_account(
 ) -> bool {
     let status = string(&task.account, "status");
     let schedulable = get(&task.account, "schedulable").and_then(Value::as_bool);
+    let platform = string(&task.account, "platform");
     if status == "disabled" {
+        return false;
+    }
+    // ChatGPT Desktop owns the OAuth refresh token.  Its recover-state
+    // endpoint is deliberately local-only, so a successful call here would
+    // only flip schedulable=true; it would not prove that the upstream quota
+    // has recovered.  The recovery worker handles Desktop OpenAI accounts
+    // after an observed quota reset instead.
+    if string(&task.account, "type") == "oauth"
+        && matches!(platform.as_str(), "openai" | "chatgpt")
+    {
         return false;
     }
     let currently_disabled = status == "error" || schedulable == Some(false);
@@ -2620,10 +2631,24 @@ fn oauth_recovery_directive(
     evidence: OAuthQuotaEvidence,
     currently_isolated: bool,
     observed_at: &str,
+    quota_reset_confirmed: bool,
     now: DateTime<Utc>,
 ) -> OAuthRecoveryDirective {
     match evidence {
-        OAuthQuotaEvidence::Usable if currently_isolated => OAuthRecoveryDirective::Recover,
+        OAuthQuotaEvidence::Usable if currently_isolated => {
+            let stable_long_enough = DateTime::parse_from_rfc3339(observed_at)
+                .ok()
+                .map(|started| {
+                    now.signed_duration_since(started.with_timezone(&Utc))
+                        >= chrono::Duration::minutes(10)
+                })
+                .unwrap_or(false);
+            if stable_long_enough && quota_reset_confirmed {
+                OAuthRecoveryDirective::Recover
+            } else {
+                OAuthRecoveryDirective::Isolate
+            }
+        }
         OAuthQuotaEvidence::Usable => OAuthRecoveryDirective::None,
         OAuthQuotaEvidence::Exhausted => OAuthRecoveryDirective::Isolate,
         OAuthQuotaEvidence::Unknown if observed_at.is_empty() => OAuthRecoveryDirective::None,
@@ -2745,14 +2770,44 @@ fn reconcile_oauth_recovery_observations(
             .and_then(|index| observations.entries.get(index))
             .map(|entry| entry.observed_at.as_str())
             .unwrap_or("");
+        let quota_reset_confirmed = observation_index
+            .and_then(|index| observations.entries.get(index))
+            .is_some_and(|entry| {
+                if entry.reset_at.trim().is_empty() {
+                    return false;
+                }
+                let current_reset_at = record
+                    .account
+                    .windows
+                    .iter()
+                    .map(|window| window.reset_at.trim())
+                    .filter(|value| !value.is_empty())
+                    .max()
+                    .unwrap_or_default();
+                let reset_elapsed = DateTime::parse_from_rfc3339(&entry.reset_at)
+                    .ok()
+                    .map(|reset| now >= reset.with_timezone(&Utc))
+                    .unwrap_or(false);
+                reset_elapsed || (!current_reset_at.is_empty() && current_reset_at != entry.reset_at)
+            });
         let currently_isolated = record.account.status == "error"
             || record.account.health == "quotaExhausted"
             || record.account.health == "cooldown"
             || record.account.status_detail.contains("fallback")
+            // Keep an account isolated while a previous real 429/exhaustion
+            // observation is pending. The Desktop OpenAI recover-state path
+            // can otherwise make the account look healthy by only flipping a
+            // local schedulable flag.
+            || observation_index.is_some()
             || (record.quota_evidence == OAuthQuotaEvidence::Unknown
                 && observation_index.is_some());
-        let directive =
-            oauth_recovery_directive(record.quota_evidence, currently_isolated, observed_at, now);
+        let directive = oauth_recovery_directive(
+            record.quota_evidence,
+            currently_isolated,
+            observed_at,
+            quota_reset_confirmed,
+            now,
+        );
 
         match directive {
             OAuthRecoveryDirective::None => {
@@ -2793,21 +2848,23 @@ fn reconcile_oauth_recovery_observations(
                 };
                 let next_probe_at =
                     (now + probe_delay).to_rfc3339_opts(SecondsFormat::Millis, true);
+                let reset_at = record
+                    .account
+                    .windows
+                    .iter()
+                    .filter(|window| window.used_percent.is_some_and(|value| value >= 99.999))
+                    .map(|window| window.reset_at.clone())
+                    .filter(|value| !value.is_empty())
+                    .max()
+                    .or_else(|| previous.map(|entry| entry.reset_at.clone()))
+                    .unwrap_or_default();
                 let entry = OAuthRecoveryObservation {
                     account_id,
                     exhausted: record.quota_evidence == OAuthQuotaEvidence::Exhausted,
                     observed_at,
                     last_probe_at,
                     next_probe_at,
-                    reset_at: record
-                        .account
-                        .windows
-                        .iter()
-                        .filter(|window| window.used_percent.is_some_and(|value| value >= 99.999))
-                        .map(|window| window.reset_at.clone())
-                        .filter(|value| !value.is_empty())
-                        .max()
-                        .unwrap_or_default(),
+                    reset_at,
                     recent_error: if record.quota_evidence == OAuthQuotaEvidence::Unknown {
                         "quota_unavailable".to_owned()
                     } else {
@@ -3272,7 +3329,7 @@ mod tests {
     use std::net::TcpListener;
 
     #[test]
-    fn usable_oauth_quota_recovers_immediately() {
+    fn usable_oauth_quota_requires_a_stable_confirmation_window() {
         let now = DateTime::parse_from_rfc3339("2026-08-12T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -3281,6 +3338,18 @@ mod tests {
                 OAuthQuotaEvidence::Usable,
                 true,
                 "2026-08-11T23:59:00Z",
+                false,
+                now,
+            ),
+            OAuthRecoveryDirective::Isolate,
+            "one usable sample must not immediately undo a real upstream 429"
+        );
+        assert_eq!(
+            oauth_recovery_directive(
+                OAuthQuotaEvidence::Usable,
+                true,
+                "2026-08-11T23:50:00Z",
+                true,
                 now,
             ),
             OAuthRecoveryDirective::Recover
@@ -3587,6 +3656,7 @@ mod tests {
                 OAuthQuotaEvidence::Unknown,
                 true,
                 "2026-08-11T19:00:01Z",
+                false,
                 now,
             ),
             OAuthRecoveryDirective::Isolate
@@ -3603,6 +3673,7 @@ mod tests {
                 OAuthQuotaEvidence::Unknown,
                 true,
                 "2026-08-11T19:00:00Z",
+                false,
                 now,
             ),
             OAuthRecoveryDirective::Recover
@@ -3612,6 +3683,7 @@ mod tests {
                 OAuthQuotaEvidence::Exhausted,
                 true,
                 "2026-08-11T18:00:00Z",
+                false,
                 now,
             ),
             OAuthRecoveryDirective::Isolate,
@@ -3833,7 +3905,7 @@ mod tests {
     }
 
     #[test]
-    fn usable_quota_does_not_reenable_account_when_recovery_probe_fails() {
+    fn desktop_openai_usable_quota_does_not_reenable_account_locally() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
@@ -3898,8 +3970,7 @@ mod tests {
             Instant::now() + Duration::from_secs(2),
         ));
         let paths = server.join().unwrap();
-        assert!(paths.iter().any(|path| path.contains("recover-state")));
-        assert!(paths.iter().all(|path| !path.contains("/schedulable")));
+        assert!(paths.is_empty(), "Desktop-owned OpenAI recovery is state-gated");
     }
 
     #[test]

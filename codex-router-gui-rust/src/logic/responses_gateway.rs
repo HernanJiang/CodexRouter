@@ -9,7 +9,8 @@ use super::responses_compat::{
     append_incomplete_turn_continuation, extract_leaked_tool_calls, is_chat_completions_path,
     is_claude_family_model, is_compact_path, is_exhausted_account_status, is_openai_family_model,
     is_quota_exhausted_error, is_responses_path, is_unsupported_image_error, is_xai_family_model,
-    prepare_official_compact_request, prepare_xai_official_compact_request,
+    normalize_official_compact_replay, prepare_official_compact_request,
+    prepare_xai_official_compact_request,
     flush_sse_think, rewrite_poisoned_upstream_status, rewrite_provider_json,
     rewrite_sse_text_with, sanitize_responses_request, sanitize_responses_request_aggressive,
     sanitize_responses_request_without_images, should_continue_incomplete_agent_turn,
@@ -789,6 +790,12 @@ fn handle_client(
             } else if inject_max_output_tokens(&path, &mut json_body) {
                 // OpenAI-family models pass through unsanitized; only
                 // re-serialize when a configured limit was injected.
+                request_body = serde_json::to_vec(&json_body)?;
+            }
+            if openai_family
+                && !is_compact_path(&path)
+                && normalize_official_compact_replay(&mut json_body)
+            {
                 request_body = serde_json::to_vec(&json_body)?;
             }
         }
@@ -2202,7 +2209,7 @@ impl<'a> SseSink<'a> {
             *terminal |= sse_event_is_terminal(event);
             let rewritten = apply_sse_rewrites(event, &self_continue_rewrites, think);
             // A third-party Chat Completions stream is converted by the
-            // compatibility layer into Responses events. The raw chunk has
+            // compatibility layer into Responses events.  The raw chunk has
             // no `type`, so terminal/tool/text bookkeeping must inspect the
             // rewritten event as well or EOF will be misclassified as a
             // dropped stream after a valid `[DONE]`.
@@ -2277,9 +2284,14 @@ impl<'a> SseSink<'a> {
         if !self.sent_events {
             return Ok(SseForward::RetryableBeforeFirstEvent);
         }
-        // Tool calls and reasoning items already reached the client, but the
-        // upstream still dropped before a terminal event. Retry with the
-        // delivered prefix so a sudden disconnect does not end the turn.
+        // A plain text prefix can be reconciled on a reconnect.  Reasoning,
+        // tool calls, and other structured items cannot: replaying them after
+        // the client has already seen the first item creates a second
+        // reasoning/tool timeline and is what makes the UI appear to roll
+        // back and replay output. End this stream cleanly instead.
+        if !self.text_only || self.had_tool_call {
+            return Ok(SseForward::ReconcileFailed);
+        }
         Ok(SseForward::RetryableWithPrefix(self.resume_point()))
     }
 
@@ -4306,9 +4318,10 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_partial_stream_is_retryable_after_disconnect() {
-        // A sudden drop after a tool-call item must still retry; otherwise
-        // Codex shows "stream disconnected before completion" with no reconnect.
+    fn tool_call_partial_stream_fails_without_replaying_the_structured_timeline() {
+        // A sudden drop after a tool-call item must not replay that item. The
+        // client already saw its first structured event, so a clean failure is
+        // safer than a second function-call timeline.
         let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
         let upstream_addr = upstream.local_addr().unwrap();
         thread::spawn(move || {
@@ -4324,7 +4337,7 @@ mod tests {
             let (mut client, _) = client_listener.accept().unwrap();
             let mut sink = SseSink::new(&mut client, None);
             let outcome = forward_plain_sse(&mut sink, &mut upstream_stream, Vec::new()).unwrap();
-            assert!(matches!(outcome, SseForward::RetryableWithPrefix(_)));
+            assert_eq!(outcome, SseForward::ReconcileFailed);
         });
         let mut client = TcpStream::connect(client_addr).unwrap();
         let mut output = String::new();
@@ -4510,6 +4523,66 @@ mod tests {
         (output, attempts.load(Ordering::Relaxed), captured)
     }
 
+    #[test]
+    fn chat_completion_sse_is_converted_at_the_gateway_boundary() {
+        let body = serde_json::json!({
+            "model": "gemini-3.7-flash",
+            "stream": true,
+            "tools": [{
+                "type": "function",
+                "name": "exec_command",
+                "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}
+            }],
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "读取状态"}]}]
+        })
+        .to_string();
+        let (output, attempts, _requests) = run_agent_body_against_mock(
+            &body,
+            |_attempt, _request, socket| {
+                let reasoning = serde_json::json!({
+                    "id": "chatcmpl-gateway",
+                    "choices": [{"delta": {"reasoning_content": "先检查工具"}}]
+                });
+                let first_tool = serde_json::json!({
+                    "id": "chatcmpl-gateway",
+                    "choices": [{"delta": {"tool_calls": [{
+                        "index": 0,
+                        "id": "call_gateway",
+                        "function": {"name": "exec_command", "arguments": "{\"cmd\":\"Get-"}
+                    }]}}]
+                });
+                let second_tool = serde_json::json!({
+                    "id": "chatcmpl-gateway",
+                    "choices": [{"delta": {"tool_calls": [{
+                        "index": 0,
+                        "function": {"arguments": "Date\"}"}
+                    }]}}]
+                });
+                let finished = serde_json::json!({
+                    "id": "chatcmpl-gateway",
+                    "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
+                });
+                let stream = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {reasoning}\n\ndata: {first_tool}\n\ndata: {second_tool}\n\ndata: {finished}\n\ndata: [DONE]\n\n"
+                );
+                socket.write_all(stream.as_bytes()).unwrap();
+            },
+            1,
+        );
+        assert_eq!(attempts, 1);
+        assert!(output.contains("response.reasoning_summary_text.delta"));
+        assert!(output.contains("先检查工具"));
+        assert!(output.contains("response.output_item.added"));
+        assert!(output.contains("response.function_call_arguments.delta"));
+        assert!(output.contains("Get-"));
+        assert!(output.contains("Date"));
+        assert!(output.contains("response.function_call_arguments.done"));
+        assert!(output.contains("response.output_item.done"));
+        assert_eq!(output.matches("response.completed").count(), 1);
+        assert!(!output.contains("response.failed"));
+        assert!(!output.contains("[DONE]"));
+    }
+
     fn grok_mid_agent_request() -> String {
         serde_json::json!({
             "model": "grok-4.6",
@@ -4570,66 +4643,6 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(output.matches("response.completed").count(), 1);
         assert!(!output.contains("response.failed"));
-    }
-
-    #[test]
-    fn chat_completion_sse_is_converted_at_the_gateway_boundary() {
-        let body = serde_json::json!({
-            "model": "gemini-3.7-flash",
-            "stream": true,
-            "tools": [{
-                "type": "function",
-                "name": "exec_command",
-                "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}
-            }],
-            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "读取状态"}]}]
-        })
-        .to_string();
-        let (output, attempts, _requests) = run_agent_body_against_mock(
-            &body,
-            |_attempt, _request, socket| {
-                let reasoning = serde_json::json!({
-                    "id": "chatcmpl-gateway",
-                    "choices": [{"delta": {"reasoning_content": "先检查工具"}}]
-                });
-                let first_tool = serde_json::json!({
-                    "id": "chatcmpl-gateway",
-                    "choices": [{"delta": {"tool_calls": [{
-                        "index": 0,
-                        "id": "call_gateway",
-                        "function": {"name": "exec_command", "arguments": "{\"cmd\":\"Get-"}
-                    }]}}]
-                });
-                let second_tool = serde_json::json!({
-                    "id": "chatcmpl-gateway",
-                    "choices": [{"delta": {"tool_calls": [{
-                        "index": 0,
-                        "function": {"arguments": "Date\"}"}
-                    }]}}]
-                });
-                let finished = serde_json::json!({
-                    "id": "chatcmpl-gateway",
-                    "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
-                });
-                let stream = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {reasoning}\n\ndata: {first_tool}\n\ndata: {second_tool}\n\ndata: {finished}\n\ndata: [DONE]\n\n"
-                );
-                socket.write_all(stream.as_bytes()).unwrap();
-            },
-            1,
-        );
-        assert_eq!(attempts, 1);
-        assert!(output.contains("response.reasoning_summary_text.delta"));
-        assert!(output.contains("先检查工具"));
-        assert!(output.contains("response.output_item.added"));
-        assert!(output.contains("response.function_call_arguments.delta"));
-        assert!(output.contains("Get-"));
-        assert!(output.contains("Date"));
-        assert!(output.contains("response.function_call_arguments.done"));
-        assert!(output.contains("response.output_item.done"));
-        assert_eq!(output.matches("response.completed").count(), 1);
-        assert!(!output.contains("response.failed"));
-        assert!(!output.contains("[DONE]"));
     }
 
     #[test]

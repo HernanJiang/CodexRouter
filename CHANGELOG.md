@@ -2,15 +2,65 @@
 
 本文件记录面向用户的重要变化。完整技术细节以对应版本的源码和 GitHub Release 为准。
 
-## 3.1.4 - 2026-08-29
+## 3.1.11 - 2026-08-30
 
 ### 修复
 
-- 修复 Gemini、Muse 等 Chat Completions 兼容流把 `reasoning_content`、`reasoning`、`thinking` 和 `<think>` 内容误当普通正文输出的问题；现在会实时转换为 Codex Responses reasoning summary delta。
-- 修复分块 `tool_calls` 被缓冲到最终事件的问题；工具调用首个分块到达时立即转换为 `response.output_item.added` 和 `response.function_call_arguments.delta`，结束时补齐 `done` 与唯一的 `response.completed`。
-- 修复兼容流在网关边界转换后被误判为没有终止事件的问题，避免有效的 Chat Completions `[DONE]` 流被当成断流重试。
+- 修复 Muse Spark `Recursive JSON schemas are not currently supported`：Gmail 等 MCP 工具的 `$ref` 自引用（如 `GmailMessagePartRequest.parts`）会原样送给 Meta。现在第三方工具 schema 会展开 `$ref`、去掉 `$defs`，遇到循环则改成普通 object。
+- Grok 切换后的 `invalid-argument` 同源：同一套递归 schema 被 Grok OAuth 打成笼统 400。Grok 也走同一套断环。
+- Muse 会更新模型身份提示，不再沿用上一轮的「你是 Grok」。
 
-说明：Router 只能转发模型实际产生的 reasoning 和工具调用；如果 Gemini/Muse 本身没有生成可执行动作，Router 不会凭空制造 ReAct 步骤。
+## 3.1.10 - 2026-08-30
+
+### 修复
+
+- 修复切换到 Grok 后出现 `{"code":"invalid-argument"}`：Codex 的 `thread_id` 被写进 `prompt_cache_key`、`client_metadata` 和 `X-Request-Id`，CLIProxy 再把它当成 `X-Grok-Conv-Id`。Grok 没有这个会话就会 400。
+- 切到 Grok 时丢弃这些 Codex 信封字段，并给上游换新的请求 ID；工具 schema 去掉 OpenAI 专有的 `strict`，把空的 `additionalProperties: {}` 改成合法值。
+- 切换模型后系统身份提示会改成当前模型，不再继续自称上一轮的 Kimi/Gemini。
+
+## 3.1.9 - 2026-08-29
+
+### 修复
+
+- 修复 Muse/OpenAI 兼容网关报 `Duplicate function_call_output for call_id 'call_compat_1'`：同一 `call_id` 只保留一次工具调用和一次回包，不同工具误用同一 ID 时会改写配对。
+- 修复 Gemini 400 `Unknown name "userAgent"|"requestType"|"requestId"`：从 Responses 请求和历史条目中去掉 Google protobuf 不认识的信封字段，并丢弃误入 `input` 的请求元数据块。
+- 修复 Gemini/Muse 在 Codex 里只显示一行“思考中”、结束后才砸出结果的问题：把 `reasoning_text`、thought 内容块和 Chat Completions 思考字段实时转成 `reasoning_summary` 事件，工具调用仍在思考之后立刻发出。
+
+## 3.1.8 - 2026-08-29
+
+### 修复
+
+- 修复 Gemini 通过 Codex App 创建和发送子任务时的 `projectId` 转换，保持创建成功和发送成功回执原样返回。
+- Gemini 会根据当前工作目录和最新 `list_projects` 结果修正无效的项目 ID；`clientThreadId` 继续保留为排队中的临时任务标识。
+- 强化第三方模型对 Codex App 工具回包状态与线程、项目、主机 ID 的遵循。
+
+## 3.1.7 - 2026-08-29
+
+### 修复
+
+- 修复 Gemini 3.7 Flash 无法使用 `create_thread`、`send_message_to_thread` 等 Codex App 线程工具的问题。
+- Router 生成的 Codex 配置不再关闭 `features.apps`，线程与跨任务工具可以进入模型请求。
+- Gemini 请求会把 Codex 的 namespace 工具转换为 Google 可调用的扁平 function；跨线程历史中的 function call 也同步转换，回包再还原原始 namespace 和工具名。
+- Gemini 工具 schema 会保留可执行字段，同时去除 Google 线路不兼容的 `$ref`、`$defs`、`oneOf`、`anyOf` 等联合结构，避免模型看到工具却不产生调用。
+- Kimi 继续保留原有 Chat Completions 工具兼容路径，Muse 的 namespace/长工具名处理不变。
+
+## 3.1.6 - 2026-08-29
+
+### 修复
+
+- 修复 ChatGPT 官方 Responses 流中已经输出过的思考文本，在 `output_text.done` 或 `output_item.done` 聚合事件中再次被转换并重复显示。
+- 修复已发送思考或工具调用后发生断流时，网关按普通正文前缀重试，导致思考和工具执行时间线闪现、回收后再次重放。
+- 修复 ChatGPT 官方 compact 完成后的普通请求仍携带已被压缩替代的旧历史、旧 continuation handle，导致模型重新处理前文。
+- 保留 ChatGPT/Grok 原生 reasoning 事件的原样转发，并保持 Kimi 现有 Chat Completions 兼容路径不变。
+
+## 3.1.5 - 2026-08-29
+
+### 修复
+
+- 修复 ChatGPT Desktop OAuth 的本地 `recover-state` 把真实上游 429 误判为额度恢复，导致账号在号池与隔离状态之间反复跳转。
+- 只有确认额度窗口发生 reset 并经过稳定观察后，才恢复 OpenAI OAuth 路由。
+- 「额度已恢复，已重新加入号池」通知不再由单纯的 `healthy`/`schedulable` 状态翻转触发，避免重复弹窗。
+- 保留尚未确认恢复的账号通知去重状态，避免下一次重试再次弹出同一条额度切换通知。
 
 ## 3.1.3 - 2026-08-28
 

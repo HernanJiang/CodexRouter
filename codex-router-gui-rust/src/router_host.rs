@@ -647,7 +647,6 @@ fn extract_headers(request_headers: &axum::http::HeaderMap) -> reqwest::header::
         "anthropic-version",
         "anthropic-beta",
         "x-codex-client",
-        "session_id",
     ] {
         if let (Ok(header_name), Some(value)) = (
             HeaderName::from_bytes(name.as_bytes()),
@@ -823,6 +822,9 @@ struct PlanResult {
     /// `{prefix}/{public_model}` as sent to the CLI; needed to rewrite
     /// path-carried models (Gemini v1beta) back into the URL.
     internal_model: String,
+    /// Grok OAuth treats inbound `X-Request-Id` / `prompt_cache_key` as
+    /// `X-Grok-Conv-Id`. A Codex thread id from another model is invalid.
+    fresh_upstream_request_id: bool,
 }
 
 fn plan_request(
@@ -854,6 +856,7 @@ fn plan_request(
             pool_prefix: String::new(),
             upstream_model: String::new(),
             internal_model: String::new(),
+            fresh_upstream_request_id: false,
         });
     };
     let mut table = state
@@ -914,16 +917,19 @@ fn plan_request(
             );
         }
     };
-    if codex_router_lib::routing::should_drop_previous_response(
+    let switched_provider = codex_router_lib::routing::should_drop_previous_response(
         &table,
         &bindings,
         continuation_key.as_deref(),
         &selected,
-    ) {
+    );
+    if switched_provider {
         if let Some(object) = parsed.as_object_mut() {
             object.remove("previous_response_id");
             object.remove("conversation_id");
             object.remove("conversation");
+            object.remove("prompt_cache_key");
+            object.remove("client_metadata");
         }
     }
     if let Some(key) = continuation_key {
@@ -962,6 +968,9 @@ fn plan_request(
         pool_prefix: selected.prefix.clone(),
         upstream_model: selected.upstream_model.clone(),
         internal_model,
+        fresh_upstream_request_id: switched_provider
+            || codex_router_lib::responses_compat::is_xai_family_model(&selected.upstream_model)
+            || codex_router_lib::responses_compat::is_xai_family_model(&selected.public_model),
     })
 }
 
@@ -1251,7 +1260,6 @@ async fn proxy_websocket(
         "anthropic-version",
         "anthropic-beta",
         "x-codex-client",
-        "session_id",
     ] {
         if let Some(value) = parts.headers.get(name) {
             if let Ok(text) = value.to_str() {
@@ -1473,6 +1481,7 @@ async fn data_plane(State(state): State<HostState>, request: Request) -> Respons
                 pool_prefix: String::new(),
                 upstream_model: String::new(),
                 internal_model: String::new(),
+                fresh_upstream_request_id: false,
             }
         };
         // Gemini v1beta carries the model in the URL path; rewrite it to the
@@ -1522,6 +1531,11 @@ async fn data_plane(State(state): State<HostState>, request: Request) -> Respons
             }
         }
         let url = format!("{}{}", state.cli_base, mapped);
+        let upstream_request_id = if plan.fresh_upstream_request_id {
+            structured_log::request_id()
+        } else {
+            request_id.clone()
+        };
         let upstream_response = state
             .cli_data
             .request(method.clone(), &url)
@@ -1530,7 +1544,7 @@ async fn data_plane(State(state): State<HostState>, request: Request) -> Respons
                 "authorization",
                 format!("Bearer {}", state.local_key.as_str()),
             )
-            .header("x-request-id", &request_id)
+            .header("x-request-id", &upstream_request_id)
             .body(plan.body.clone())
             .send()
             .await;

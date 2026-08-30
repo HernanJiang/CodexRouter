@@ -23,9 +23,26 @@ const RECENT_KEEP_CHARS: usize = 32_000;
 const COMPACT_MIN_KEEP_ITEMS: usize = 8;
 /// OpenAI-compatible Chat Completions / Meta Muse reject function `name` > 64.
 const OPENAI_COMPAT_TOOL_NAME_MAX: usize = 64;
+const CODEX_APP_CREATE_THREAD_GUIDANCE: &str = "调用前必须从最新 list_projects 结果原样复制 projectId，禁止猜测或改写 UUID。请严格遵循工具回包中的成功状态和 ID；clientThreadId 仅表示排队中的临时任务，不要当作真实 threadId 使用。";
 
 thread_local! {
     static TOOL_NAME_RESTORE: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    static GEMINI_NAMESPACE_RESTORE: RefCell<HashMap<String, GeminiNamespaceTool>> =
+        RefCell::new(HashMap::new());
+    static CODEX_APP_PROJECT_CONTEXT: RefCell<CodexAppProjectContext> =
+        RefCell::new(CodexAppProjectContext::default());
+}
+
+#[derive(Clone, Debug)]
+struct GeminiNamespaceTool {
+    namespace: String,
+    local_name: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CodexAppProjectContext {
+    current_project_id: Option<String>,
+    known_project_ids: HashSet<String>,
 }
 
 /// Clears shortened-tool-name aliases when a gateway request thread exits.
@@ -39,18 +56,51 @@ impl Drop for ToolNameRestoreGuard {
 
 fn clear_tool_name_restore() {
     TOOL_NAME_RESTORE.with(|slot| slot.borrow_mut().clear());
+    GEMINI_NAMESPACE_RESTORE.with(|slot| slot.borrow_mut().clear());
+    CODEX_APP_PROJECT_CONTEXT.with(|slot| *slot.borrow_mut() = CodexAppProjectContext::default());
 }
 
 fn set_tool_name_restore(map: HashMap<String, String>) {
     TOOL_NAME_RESTORE.with(|slot| *slot.borrow_mut() = map);
 }
 
+fn set_gemini_namespace_restore(map: HashMap<String, GeminiNamespaceTool>) {
+    GEMINI_NAMESPACE_RESTORE.with(|slot| *slot.borrow_mut() = map);
+}
+
 fn tool_name_restore_active() -> bool {
     TOOL_NAME_RESTORE.with(|slot| !slot.borrow().is_empty())
+        || GEMINI_NAMESPACE_RESTORE.with(|slot| !slot.borrow().is_empty())
 }
 
 fn restore_short_tool_name(name: &str) -> Option<String> {
     TOOL_NAME_RESTORE.with(|slot| slot.borrow().get(name).cloned())
+}
+
+fn restore_gemini_namespace_tool(name: &str) -> Option<GeminiNamespaceTool> {
+    if let Some(restored) = GEMINI_NAMESPACE_RESTORE.with(|slot| slot.borrow().get(name).cloned()) {
+        return Some(restored);
+    }
+    restore_short_tool_name(name)
+        .and_then(|short| GEMINI_NAMESPACE_RESTORE.with(|slot| slot.borrow().get(&short).cloned()))
+}
+
+fn restore_tool_name_parts(name: &str) -> (String, Option<String>) {
+    if let Some(restored) = restore_gemini_namespace_tool(name) {
+        return (restored.local_name, Some(restored.namespace));
+    }
+    if let Some(restored) = restore_short_tool_name(name) {
+        if let Some(namespace_restored) =
+            GEMINI_NAMESPACE_RESTORE.with(|slot| slot.borrow().get(&restored).cloned())
+        {
+            return (
+                namespace_restored.local_name,
+                Some(namespace_restored.namespace),
+            );
+        }
+        return (restored, None);
+    }
+    (name.to_owned(), None)
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -96,6 +146,8 @@ pub fn third_party_identity(model: &str) -> Option<(&'static str, &'static str)>
         Some(("DeepSeek", "deepseek"))
     } else if id.contains("claude") || id.contains("fable") {
         Some(("Claude", "claude"))
+    } else if id.contains("muse") {
+        Some(("Muse", "muse"))
     } else {
         None
     }
@@ -104,7 +156,7 @@ pub fn third_party_identity(model: &str) -> Option<(&'static str, &'static str)>
 pub fn third_party_identity_clause(model: &str) -> Option<String> {
     let (name, short) = third_party_identity(model)?;
     Some(format!(
-        "# 模型身份\n你是{name}，通过 Codex-Router 接入。不要自称 GPT、ChatGPT 或 Codex 官方模型。写测试报告必须写入 D:\\\\Work\\\\CodexRouter\\\\Test\\\\Agent_Test_{}_{short}.md，禁止使用 chatgpt 或 unknown 作为文件名。调用工具时使用系统声明的工具名 exec_command，参数字段为 cmd。若工具列表没有 exec_command，仍然调用 exec_command，参数用 cmd。\n任务完成前每一轮必须发出结构化 function_call；只写计划或「接下来」而不调用工具会被 Codex 当成收工。\n",
+        "# 模型身份\n你是{name}，通过 Codex-Router 接入。不要自称 GPT、ChatGPT 或 Codex 官方模型。写测试报告必须写入 D:\\\\Work\\\\CodexRouter\\\\Test\\\\Agent_Test_{}_{short}.md，禁止使用 chatgpt 或 unknown 作为文件名。调用工具时使用系统声明的工具名 exec_command，参数字段为 cmd。若工具列表没有 exec_command，仍然调用 exec_command，参数用 cmd。\n任务完成前每一轮必须发出结构化 function_call；只写计划或「接下来」而不调用工具会被 Codex 当成收工。\n工具结果真实性规则：工具返回 failed、isError、error、Unknown、not found 或其他明确错误时，调用就是失败。不得声称成功，不得编造或改写 projectId、threadId、hostId，不得输出 ::created-thread。只有成功回包包含真实 threadId 时，才可输出 ::created-thread{{threadId=\"...\"}}；只有 clientThreadId 时，只能输出 ::created-thread{{clientThreadId=\"...\"}}，不能把它当作 threadId，也不能用它打开或跨线程发送。调用 create_thread 前，必须从最新 list_projects JSON 原文复制 projectId，禁止猜测 UUID。工具失败后必须重试或明确报告失败，不能直接给成功答复。\n",
         env!("CARGO_PKG_VERSION")
     ))
 }
@@ -193,6 +245,18 @@ pub fn prepare_official_compact_request(body: &mut Value) {
     ] {
         object.remove(key);
     }
+}
+
+/// Normalize the next official Responses request after compaction.  The
+/// compacted item replaces every input item before it, so replaying that old
+/// prefix alongside the item causes duplicated context and repeated model
+/// reasoning.  This is intentionally public because the OpenAI-family path
+/// otherwise bypasses the third-party sanitizer in the gateway.
+pub fn normalize_official_compact_replay(body: &mut Value) -> bool {
+    let Some(object) = body.as_object_mut() else {
+        return false;
+    };
+    normalize_post_compact_replay(object)
 }
 
 fn is_official_xai_compaction_item(item: &Map<String, Value>) -> bool {
@@ -539,6 +603,31 @@ fn grok_function_parameters_mut(tool: &mut Map<String, Value>) -> Option<&mut Va
         .and_then(|function| function.get_mut("parameters"))
 }
 
+fn grok_normalize_schema_value(value: &mut Value) -> usize {
+    let mut changed = 0;
+    match value {
+        Value::Object(object) => {
+            if object.get("additionalProperties") == Some(&json!({})) {
+                object.insert("additionalProperties".to_owned(), Value::Bool(true));
+                changed += 1;
+            }
+            let keys: Vec<String> = object.keys().cloned().collect();
+            for key in keys {
+                if let Some(child) = object.get_mut(&key) {
+                    changed += grok_normalize_schema_value(child);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                changed += grok_normalize_schema_value(item);
+            }
+        }
+        _ => {}
+    }
+    changed
+}
+
 fn sanitize_grok_tool_list(tools: &mut [Value], namespace: &str) -> usize {
     let mut changed = 0;
     for tool in tools.iter_mut() {
@@ -564,12 +653,16 @@ fn sanitize_grok_tool_list(tools: &mut [Value], namespace: &str) -> usize {
         if typ != "function" && typ != "custom" {
             continue;
         }
+        if object.remove("strict").is_some() {
+            changed += 1;
+        }
         let name = tool_declared_name(&Value::Object(object.clone()));
         let force_safe = is_grok_hang_schema_tool(&name, namespace);
         if let Some(params) = grok_function_parameters_mut(object) {
             if simplify_grok_function_parameters(params, force_safe) {
                 changed += 1;
             }
+            changed += grok_normalize_schema_value(params);
         } else if force_safe {
             object.insert("parameters".to_owned(), grok_safe_function_parameters());
             changed += 1;
@@ -580,6 +673,9 @@ fn sanitize_grok_tool_list(tools: &mut [Value], namespace: &str) -> usize {
 
 fn sanitize_grok_request(body: &mut Map<String, Value>) -> usize {
     let mut changed = 0;
+    if body.remove("include").is_some() {
+        changed += 1;
+    }
     if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
         changed += sanitize_grok_tool_list(tools, "");
     }
@@ -606,6 +702,532 @@ fn sanitize_grok_request(body: &mut Map<String, Value>) -> usize {
             changed += 1;
         }
     }
+    changed
+}
+
+fn gemini_schema_drop_key(key: &str) -> bool {
+    matches!(
+        key,
+        "$schema"
+            | "$defs"
+            | "definitions"
+            | "$ref"
+            | "oneOf"
+            | "anyOf"
+            | "allOf"
+            | "not"
+            | "if"
+            | "then"
+            | "else"
+            | "const"
+            | "patternProperties"
+            | "dependentSchemas"
+            | "unevaluatedProperties"
+    )
+}
+
+fn gemini_schema_reference_name(reference: &str) -> Option<&str> {
+    reference
+        .strip_prefix("#/$defs/")
+        .or_else(|| reference.strip_prefix("#/definitions/"))
+}
+
+fn merge_gemini_schema_alternatives(
+    object: &mut Map<String, Value>,
+    alternatives: Vec<Value>,
+    definitions: &Map<String, Value>,
+    resolving: &mut HashSet<String>,
+    depth: usize,
+) {
+    let mut merged_properties = Map::new();
+    let mut common_required: Option<HashSet<String>> = None;
+    let mut object_alternative = false;
+    let mut fallback = None;
+
+    for mut alternative in alternatives {
+        sanitize_gemini_schema_value(
+            &mut alternative,
+            definitions,
+            resolving,
+            depth.saturating_add(1),
+        );
+        let Value::Object(alternative) = alternative else {
+            continue;
+        };
+        let is_object = alternative.get("type").and_then(Value::as_str) == Some("object")
+            || alternative.contains_key("properties");
+        if !is_object {
+            if fallback.is_none() {
+                fallback = Some(Value::Object(alternative));
+            }
+            continue;
+        }
+        object_alternative = true;
+        if let Some(properties) = alternative.get("properties").and_then(Value::as_object) {
+            for (name, schema) in properties {
+                merged_properties
+                    .entry(name.clone())
+                    .or_insert_with(|| schema.clone());
+            }
+        }
+        let required = alternative
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        common_required = Some(match common_required {
+            Some(previous) => previous.intersection(&required).cloned().collect(),
+            None => required,
+        });
+    }
+
+    if object_alternative {
+        object
+            .entry("type".to_owned())
+            .or_insert_with(|| Value::String("object".to_owned()));
+        if let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) {
+            for (name, schema) in merged_properties {
+                properties.entry(name).or_insert(schema);
+            }
+        } else if !merged_properties.is_empty() {
+            object.insert("properties".to_owned(), Value::Object(merged_properties));
+        }
+        if !object.contains_key("required") {
+            if let Some(required) = common_required {
+                let mut required = required.into_iter().collect::<Vec<_>>();
+                required.sort();
+                if !required.is_empty() {
+                    object.insert(
+                        "required".to_owned(),
+                        Value::Array(required.into_iter().map(Value::String).collect()),
+                    );
+                }
+            }
+        }
+    } else if let Some(Value::Object(fallback)) = fallback {
+        for key in ["type", "properties", "required", "items", "enum"] {
+            if !object.contains_key(key) {
+                if let Some(value) = fallback.get(key) {
+                    object.insert(key.to_owned(), value.clone());
+                }
+            }
+        }
+    }
+}
+
+fn sanitize_gemini_schema_value(
+    value: &mut Value,
+    definitions: &Map<String, Value>,
+    resolving: &mut HashSet<String>,
+    depth: usize,
+) {
+    if depth > 24 {
+        return;
+    }
+    let original = std::mem::replace(value, Value::Null);
+    let Value::Object(mut object) = original else {
+        *value = original;
+        return;
+    };
+
+    if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+        if let Some(name) = gemini_schema_reference_name(reference) {
+            if !resolving.insert(name.to_owned()) {
+                *value = json!({ "type": "object", "additionalProperties": true });
+                return;
+            }
+            if let Some(definition) = definitions.get(name) {
+                let mut replacement = definition.clone();
+                for (key, sibling) in &object {
+                    if key != "$ref" && !gemini_schema_drop_key(key) {
+                        if let Some(replacement_object) = replacement.as_object_mut() {
+                            replacement_object
+                                .entry(key.clone())
+                                .or_insert_with(|| sibling.clone());
+                        }
+                    }
+                }
+                sanitize_gemini_schema_value(
+                    &mut replacement,
+                    definitions,
+                    resolving,
+                    depth.saturating_add(1),
+                );
+                resolving.remove(name);
+                *value = replacement;
+                return;
+            }
+            resolving.remove(name);
+        }
+    }
+
+    for key in ["oneOf", "anyOf", "allOf"] {
+        if let Some(alternatives) = object
+            .remove(key)
+            .and_then(|value| value.as_array().cloned())
+        {
+            merge_gemini_schema_alternatives(
+                &mut object,
+                alternatives,
+                definitions,
+                resolving,
+                depth,
+            );
+        }
+    }
+
+    let keys = object.keys().cloned().collect::<Vec<_>>();
+    for key in keys {
+        if gemini_schema_drop_key(&key) {
+            continue;
+        }
+        if let Some(child) = object.get_mut(&key) {
+            sanitize_gemini_schema_value(child, definitions, resolving, depth.saturating_add(1));
+        }
+    }
+    for key in object.keys().cloned().collect::<Vec<_>>() {
+        if gemini_schema_drop_key(&key) {
+            object.remove(&key);
+        }
+    }
+    if let Some(Value::Array(types)) = object.get_mut("type") {
+        let selected = types
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|kind| *kind != "null")
+            .map(str::to_owned);
+        if let Some(selected) = selected {
+            *types = vec![Value::String(selected)];
+        } else {
+            object.remove("type");
+        }
+    }
+    *value = Value::Object(object);
+}
+
+fn simplify_gemini_function_parameters(parameters: &mut Value) -> bool {
+    let definitions = parameters
+        .as_object()
+        .map(|object| {
+            ["$defs", "definitions"]
+                .into_iter()
+                .filter_map(|key| object.get(key).and_then(Value::as_object))
+                .flat_map(|values| {
+                    values
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                })
+                .collect::<Map<_, _>>()
+        })
+        .unwrap_or_default();
+    let before = parameters.clone();
+    sanitize_gemini_schema_value(parameters, &definitions, &mut HashSet::new(), 0);
+    *parameters != before
+}
+
+fn gemini_tool_parameters_mut(tool: &mut Map<String, Value>) -> Option<&mut Value> {
+    if tool.contains_key("parameters") {
+        return tool.get_mut("parameters");
+    }
+    tool.get_mut("function")
+        .and_then(Value::as_object_mut)
+        .and_then(|function| function.get_mut("parameters"))
+}
+
+fn sanitize_third_party_tool_schemas(tools: &mut [Value]) -> usize {
+    let mut changed = 0;
+    for tool in tools {
+        let Some(object) = tool.as_object_mut() else {
+            continue;
+        };
+        let typ = object
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("function")
+            .to_owned();
+        if typ == "namespace" {
+            if let Some(children) = object.get_mut("tools").and_then(Value::as_array_mut) {
+                changed += sanitize_third_party_tool_schemas(children);
+            }
+            continue;
+        }
+        if typ != "function" && typ != "custom" && !typ.is_empty() {
+            continue;
+        }
+        if object.remove("strict").is_some() {
+            changed += 1;
+        }
+        if let Some(parameters) = gemini_tool_parameters_mut(object) {
+            if simplify_gemini_function_parameters(parameters) {
+                changed += 1;
+            }
+        }
+    }
+    changed
+}
+
+fn register_gemini_namespace_tool(
+    sent_name: &str,
+    namespace: &str,
+    local_name: &str,
+    restore: &mut HashMap<String, GeminiNamespaceTool>,
+) {
+    if namespace.is_empty() {
+        return;
+    }
+    restore.insert(
+        sent_name.to_owned(),
+        GeminiNamespaceTool {
+            namespace: namespace.to_owned(),
+            local_name: local_name.to_owned(),
+        },
+    );
+}
+
+fn append_codex_app_create_thread_guidance(
+    object: &mut Map<String, Value>,
+    namespace: &str,
+    local_name: &str,
+) -> bool {
+    if !namespace.eq_ignore_ascii_case("mcp__codex_app")
+        || !local_name.eq_ignore_ascii_case("create_thread")
+    {
+        return false;
+    }
+    let mut changed = false;
+    if let Some(description) = object.get("description").and_then(Value::as_str) {
+        if !description.contains("projectId") {
+            object.insert(
+                "description".to_owned(),
+                Value::String(format!("{description}\n{CODEX_APP_CREATE_THREAD_GUIDANCE}")),
+            );
+            changed = true;
+        }
+    }
+    if let Some(function) = object.get_mut("function").and_then(Value::as_object_mut) {
+        if let Some(description) = function.get("description").and_then(Value::as_str) {
+            if !description.contains("projectId") {
+                function.insert(
+                    "description".to_owned(),
+                    Value::String(format!("{description}\n{CODEX_APP_CREATE_THREAD_GUIDANCE}")),
+                );
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+fn flattened_gemini_tool_name(full_name: &str, used: &HashSet<String>) -> String {
+    if full_name.chars().count() <= OPENAI_COMPAT_TOOL_NAME_MAX && !used.contains(full_name) {
+        full_name.to_owned()
+    } else if full_name.chars().count() > OPENAI_COMPAT_TOOL_NAME_MAX {
+        shorten_openai_compat_tool_name_unique(full_name, used)
+    } else {
+        shorten_to_char_len(full_name, OPENAI_COMPAT_TOOL_NAME_MAX, used)
+    }
+}
+
+fn flatten_gemini_tool_values(
+    values: Vec<Value>,
+    namespace: &str,
+    used: &mut HashSet<String>,
+    forward: &mut HashMap<String, String>,
+    restore: &mut HashMap<String, GeminiNamespaceTool>,
+    output: &mut Vec<Value>,
+) -> usize {
+    let mut changed = 0;
+    for value in values {
+        let Some(mut object) = value.as_object().cloned() else {
+            output.push(value);
+            continue;
+        };
+        let typ = object
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("function")
+            .to_owned();
+        if typ == "namespace" {
+            let child_name = object
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let child_namespace = qualify_namespace_tool_name(namespace, &child_name);
+            let children = object
+                .remove("tools")
+                .and_then(|tools| tools.as_array().cloned())
+                .unwrap_or_default();
+            changed += flatten_gemini_tool_values(
+                children,
+                &child_namespace,
+                used,
+                forward,
+                restore,
+                output,
+            );
+            continue;
+        }
+        let is_function = typ == "function" || typ == "custom";
+        if !is_function {
+            output.push(Value::Object(object));
+            continue;
+        }
+        let local_name = tool_declared_name(&Value::Object(object.clone()));
+        if local_name.is_empty() {
+            output.push(Value::Object(object));
+            continue;
+        }
+        let full_name = qualify_namespace_tool_name(namespace, &local_name);
+        let sent_name = flattened_gemini_tool_name(&full_name, used);
+        used.insert(sent_name.clone());
+        forward.insert(full_name.clone(), sent_name.clone());
+
+        let mut original_namespace = namespace.to_owned();
+        let mut original_local = local_name.clone();
+        if original_namespace.is_empty() {
+            if let Some(local) = full_name.strip_prefix("mcp__codex_app__") {
+                original_namespace = "mcp__codex_app".to_owned();
+                original_local = local.to_owned();
+            }
+        } else if let Some(local) = local_name.strip_prefix(&(original_namespace.clone() + "__")) {
+            original_local = local.to_owned();
+        }
+        if append_codex_app_create_thread_guidance(
+            &mut object,
+            &original_namespace,
+            &original_local,
+        ) {
+            changed += 1;
+        }
+        register_gemini_namespace_tool(&sent_name, &original_namespace, &original_local, restore);
+
+        object.insert("type".to_owned(), Value::String("function".to_owned()));
+        object.insert("name".to_owned(), Value::String(sent_name.clone()));
+        if let Some(function) = object.get_mut("function").and_then(Value::as_object_mut) {
+            function.insert("name".to_owned(), Value::String(sent_name));
+        }
+        object.remove("namespace");
+        object.remove("tools");
+        if let Some(parameters) = gemini_tool_parameters_mut(&mut object) {
+            if simplify_gemini_function_parameters(parameters) {
+                changed += 1;
+            }
+        }
+        output.push(Value::Object(object));
+        changed += usize::from(!namespace.is_empty());
+    }
+    changed
+}
+
+fn flatten_gemini_history_item(
+    item: &mut Map<String, Value>,
+    forward: &HashMap<String, String>,
+) -> usize {
+    let mut changed = 0;
+    let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
+    if matches!(kind, "function_call" | "custom_tool_call") {
+        let local_name = item
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let namespace = item
+            .get("namespace")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let qualified = qualify_namespace_tool_name(&namespace, &local_name);
+        if let Some(sent_name) = forward.get(&qualified) {
+            if item.get("name").and_then(Value::as_str) != Some(sent_name) {
+                item.insert("name".to_owned(), Value::String(sent_name.clone()));
+                changed += 1;
+            }
+            if item.remove("namespace").is_some() {
+                changed += 1;
+            }
+        }
+    }
+    if let Some(tool_calls) = item.get_mut("tool_calls").and_then(Value::as_array_mut) {
+        for call in tool_calls {
+            let Some(function) = call.get_mut("function").and_then(Value::as_object_mut) else {
+                continue;
+            };
+            let name = function
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            if let Some(sent_name) = forward.get(&name) {
+                if function.get("name").and_then(Value::as_str) != Some(sent_name) {
+                    function.insert("name".to_owned(), Value::String(sent_name.clone()));
+                    changed += 1;
+                }
+            }
+        }
+    }
+    if let Some(function) = item.get_mut("function_call").and_then(Value::as_object_mut) {
+        let name = function
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        if let Some(sent_name) = forward.get(&name) {
+            if function.get("name").and_then(Value::as_str) != Some(sent_name) {
+                function.insert("name".to_owned(), Value::String(sent_name.clone()));
+                changed += 1;
+            }
+        }
+    }
+    changed
+}
+
+fn flatten_gemini_history_tool_names(
+    body: &mut Map<String, Value>,
+    forward: &HashMap<String, String>,
+) -> usize {
+    let mut changed = 0;
+    for key in ["input", "messages"] {
+        if let Some(items) = body.get_mut(key).and_then(Value::as_array_mut) {
+            for item in items.iter_mut().filter_map(Value::as_object_mut) {
+                changed += flatten_gemini_history_item(item, forward);
+            }
+        }
+    }
+    changed
+}
+
+fn flatten_gemini_namespace_tools(body: &mut Map<String, Value>) -> usize {
+    let Some(tools) = body.remove("tools") else {
+        set_gemini_namespace_restore(HashMap::new());
+        return 0;
+    };
+    let Value::Array(values) = tools else {
+        body.insert("tools".to_owned(), tools);
+        set_gemini_namespace_restore(HashMap::new());
+        return 0;
+    };
+    let mut used = HashSet::new();
+    let mut forward = HashMap::new();
+    let mut restore = HashMap::new();
+    let mut output = Vec::new();
+    let mut changed = flatten_gemini_tool_values(
+        values,
+        "",
+        &mut used,
+        &mut forward,
+        &mut restore,
+        &mut output,
+    );
+    body.insert("tools".to_owned(), Value::Array(output));
+    changed += flatten_gemini_history_tool_names(body, &forward);
+    set_gemini_namespace_restore(restore);
     changed
 }
 
@@ -867,70 +1489,380 @@ fn ensure_chat_tool_messages(body: &mut Map<String, Value>) -> usize {
     inserted
 }
 
-fn ensure_tool_call_outputs(items: &mut Vec<Value>) -> usize {
-    let mut inserted = 0;
-    let mut index = 0;
-    let mut pending = Vec::new();
-    while index < items.len() {
-        if is_function_call_item(&items[index]) {
-            let call_id = item_call_id(&items[index]);
-            if !call_id.is_empty() {
-                pending.push(call_id);
-            }
-            index += 1;
-            continue;
-        }
-        if is_function_output_item(&items[index]) {
-            let call_id = item_call_id(&items[index]);
-            pending.retain(|seen| seen != &call_id);
-            index += 1;
-            continue;
-        }
-        if !pending.is_empty() {
-            for call_id in pending.drain(..) {
-                items.insert(index, synthetic_tool_output(&call_id));
-                inserted += 1;
-                index += 1;
-            }
-        }
-        index += 1;
-    }
-    for call_id in pending {
-        items.push(synthetic_tool_output(&call_id));
-        inserted += 1;
-    }
-    inserted
+fn function_call_signature(item: &Value) -> (String, String) {
+    let name = item
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let arguments = match item.get("arguments") {
+        Some(Value::String(text)) => text.clone(),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    };
+    (name, arguments)
 }
 
-/// Gemini / Antigravity reject a `functionResponse` whose call id has no
-/// matching `functionCall` earlier in the same request. Cross-thread agent
-/// history (a forked sub-agent carrying the parent's function responses
-/// without the originating calls) produces exactly this orphaned output, and
-/// the upstream answers 400 `invalid Gemini function call history`. Dropping
-/// the unmatched output -- keeping its payload as a plain text message so the
-/// context survives -- lets the conversation continue on the new pool.
-fn prune_unmatched_tool_outputs(items: &mut Vec<Value>) -> usize {
-    let mut pruned = 0;
-    let mut seen_calls: std::collections::HashSet<String> = Default::default();
+fn set_item_call_id(item: &mut Value, call_id: &str) {
+    if let Some(object) = item.as_object_mut() {
+        object.insert("call_id".to_owned(), Value::String(call_id.to_owned()));
+        if object
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.starts_with("call_compat_"))
+        {
+            object.insert("id".to_owned(), Value::String(call_id.to_owned()));
+        }
+    }
+}
+
+fn next_unique_call_compat_id(used: &HashSet<String>) -> String {
+    let mut index = 1_u64;
+    loop {
+        let candidate = format!("call_compat_{index}");
+        if !used.contains(&candidate) {
+            return candidate;
+        }
+        index = index.saturating_add(1);
+        if index == 0 {
+            return format!("call_compat_{}", used.len().saturating_add(1));
+        }
+    }
+}
+
+fn existing_call_with_signature(items: &[Value], signature: &(String, String)) -> bool {
+    items
+        .iter()
+        .any(|item| is_function_call_item(item) && function_call_signature(item) == *signature)
+}
+
+/// Muse / OpenAI-compat gateways reject a request when the same `call_id`
+/// has two `function_call_output` items. Leaked-tool extraction reused
+/// `call_compat_1` on every assistant message, and `ensure_tool_call_outputs`
+/// then synthesized a second output for the duplicated id.
+fn normalize_tool_call_history(items: &mut Vec<Value>, prune_orphans: bool) -> usize {
     let mut output = Vec::with_capacity(items.len());
-    for item in items.drain(..) {
-        let call_id = item_call_id(&item);
+    let mut seen_calls = HashSet::new();
+    let mut seen_outputs = HashSet::new();
+    let mut pending = Vec::new();
+    let mut last_reassigned: HashMap<String, String> = HashMap::new();
+    let mut changed = 0;
+    for mut item in items.drain(..) {
         if is_function_call_item(&item) {
+            let signature = function_call_signature(&item);
+            let mut call_id = item_call_id(&item);
+            if !call_id.is_empty() && seen_calls.contains(&call_id) {
+                if existing_call_with_signature(&output, &signature) {
+                    changed += 1;
+                    continue;
+                }
+                let new_id = next_unique_call_compat_id(&seen_calls);
+                last_reassigned.insert(call_id.clone(), new_id.clone());
+                set_item_call_id(&mut item, &new_id);
+                call_id = new_id;
+                changed += 1;
+            } else if !call_id.is_empty() {
+                last_reassigned.remove(&call_id);
+            }
             if !call_id.is_empty() {
-                seen_calls.insert(call_id);
+                seen_calls.insert(call_id.clone());
+                if !pending.iter().any(|seen: &String| seen == &call_id) {
+                    pending.push(call_id);
+                }
             }
             output.push(item);
             continue;
         }
-        if is_function_output_item(&item) && !call_id.is_empty() && !seen_calls.contains(&call_id) {
-            output.push(message_from_text(summarize_item(&item)));
-            pruned += 1;
+        if is_function_output_item(&item) {
+            let mut call_id = item_call_id(&item);
+            if !call_id.is_empty() && seen_outputs.contains(&call_id) {
+                if let Some(new_id) = last_reassigned.get(&call_id).cloned() {
+                    if !seen_outputs.contains(&new_id) {
+                        set_item_call_id(&mut item, &new_id);
+                        call_id = new_id;
+                        changed += 1;
+                    } else {
+                        changed += 1;
+                        continue;
+                    }
+                } else {
+                    changed += 1;
+                    continue;
+                }
+            }
+            if prune_orphans && !call_id.is_empty() && !seen_calls.contains(&call_id) {
+                output.push(message_from_text(summarize_item(&item)));
+                changed += 1;
+                continue;
+            }
+            if !call_id.is_empty() {
+                seen_outputs.insert(call_id.clone());
+                pending.retain(|seen| seen != &call_id);
+            }
+            output.push(item);
             continue;
+        }
+        for call_id in pending.drain(..) {
+            if seen_outputs.contains(&call_id) {
+                continue;
+            }
+            output.push(synthetic_tool_output(&call_id));
+            seen_outputs.insert(call_id);
+            changed += 1;
         }
         output.push(item);
     }
+    for call_id in pending {
+        if seen_outputs.contains(&call_id) {
+            continue;
+        }
+        output.push(synthetic_tool_output(&call_id));
+        changed += 1;
+    }
     *items = output;
-    pruned
+    changed
+}
+
+fn is_codex_app_namespace(namespace: &str) -> bool {
+    let namespace = namespace.trim().to_ascii_lowercase();
+    namespace == "codex_app" || namespace == "mcp__codex_app" || namespace.ends_with("codex_app")
+}
+
+fn is_codex_app_create_thread_name(name: &str, namespace: Option<&str>) -> bool {
+    let name = name.trim().to_ascii_lowercase();
+    name == "mcp__codex_app__create_thread"
+        || (name == "create_thread" && namespace.is_some_and(is_codex_app_namespace))
+        || name == "create_thread"
+}
+
+fn is_codex_app_list_projects_name(name: &str, namespace: Option<&str>) -> bool {
+    let name = name.trim().to_ascii_lowercase();
+    name == "mcp__codex_app__list_projects"
+        || (name == "list_projects" && namespace.is_some_and(is_codex_app_namespace))
+        || name == "list_projects"
+}
+
+fn function_output_fragments(item: &Value) -> Vec<String> {
+    let Some(value) = item.get("output").or_else(|| item.get("content")) else {
+        return Vec::new();
+    };
+    match value {
+        Value::String(text) => vec![text.to_owned()],
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| {
+                part.as_str()
+                    .map(str::to_owned)
+                    .or_else(|| part.get("text").and_then(Value::as_str).map(str::to_owned))
+            })
+            .collect(),
+        other => vec![other.to_string()],
+    }
+}
+
+fn normalize_project_path(path: &str) -> String {
+    path.trim()
+        .trim_matches('"')
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
+}
+
+fn current_cwd_from_instructions(instructions: &str) -> Option<String> {
+    let start = instructions.find("<cwd>")? + "<cwd>".len();
+    let end = instructions[start..].find("</cwd>")?;
+    let cwd = instructions[start..start + end].trim();
+    (!cwd.is_empty()).then(|| normalize_project_path(cwd))
+}
+
+fn collect_projects_from_value(
+    value: &Value,
+    current_cwd: Option<&str>,
+    context: &mut CodexAppProjectContext,
+) {
+    let Some(projects) = value.get("projects").and_then(Value::as_array) else {
+        return;
+    };
+    for project in projects {
+        let Some(project_id) = project
+            .get("projectId")
+            .or_else(|| project.get("project_id"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+        else {
+            continue;
+        };
+        context.known_project_ids.insert(project_id.to_owned());
+        if let (Some(current_cwd), Some(path)) =
+            (current_cwd, project.get("path").and_then(Value::as_str))
+        {
+            if normalize_project_path(path) == current_cwd {
+                context.current_project_id = Some(project_id.to_owned());
+            }
+        }
+    }
+}
+
+fn capture_codex_app_project_context(body: &Map<String, Value>) {
+    let instructions = body
+        .get("instructions")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let current_cwd = current_cwd_from_instructions(instructions);
+    let mut list_projects_call_ids = HashSet::new();
+    let mut outputs = Vec::new();
+    for key in ["input", "messages"] {
+        let Some(items) = body.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+        for item in items {
+            if is_function_call_item(item) {
+                let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+                let namespace = item.get("namespace").and_then(Value::as_str);
+                if is_codex_app_list_projects_name(name, namespace) {
+                    let call_id = item_call_id(item);
+                    if !call_id.is_empty() {
+                        list_projects_call_ids.insert(call_id);
+                    }
+                }
+            }
+            if item_role(item) == "assistant" {
+                let Some(tool_calls) = item.get("tool_calls").and_then(Value::as_array) else {
+                    continue;
+                };
+                for call in tool_calls {
+                    let call_id = call.get("id").and_then(Value::as_str).unwrap_or_default();
+                    let Some(function) = call.get("function").and_then(Value::as_object) else {
+                        continue;
+                    };
+                    let name = function
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if !call_id.is_empty() && is_codex_app_list_projects_name(name, None) {
+                        list_projects_call_ids.insert(call_id.to_owned());
+                    }
+                }
+            }
+        }
+        for item in items {
+            if is_function_output_item(item) {
+                let call_id = item_call_id(item);
+                if list_projects_call_ids.contains(&call_id) {
+                    outputs.extend(function_output_fragments(item));
+                }
+            }
+            if item_role(item) == "tool" {
+                let call_id = item
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if list_projects_call_ids.contains(call_id) {
+                    outputs.extend(function_output_fragments(item));
+                }
+            }
+        }
+    }
+
+    let mut context = CodexAppProjectContext::default();
+    for fragment in outputs {
+        if let Some(value) = parse_json_fragment(&fragment) {
+            collect_projects_from_value(&value, current_cwd.as_deref(), &mut context);
+            if let Value::String(nested) = value {
+                if let Some(nested) = parse_json_fragment(&nested) {
+                    collect_projects_from_value(&nested, current_cwd.as_deref(), &mut context);
+                }
+            }
+        }
+    }
+    CODEX_APP_PROJECT_CONTEXT.with(|slot| *slot.borrow_mut() = context);
+}
+
+fn parse_json_fragment(text: &str) -> Option<Value> {
+    let trimmed = text.trim();
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        return Some(value);
+    }
+    for (offset, character) in trimmed.char_indices() {
+        if !matches!(character, '{' | '[') {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(&trimmed[offset..]) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn repair_codex_app_create_thread_arguments(arguments: &mut Value) -> bool {
+    let Some(target) = arguments.get_mut("target").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    if target
+        .get("type")
+        .and_then(Value::as_str)
+        .is_none_or(|kind| !kind.eq_ignore_ascii_case("project"))
+    {
+        return false;
+    }
+    let Some(project_id) = target.get_mut("projectId") else {
+        return false;
+    };
+    let Some(project_id_text) = project_id.as_str().map(str::to_owned) else {
+        return false;
+    };
+    CODEX_APP_PROJECT_CONTEXT.with(|slot| {
+        let context = slot.borrow();
+        let Some(current_project_id) = context.current_project_id.as_deref() else {
+            return false;
+        };
+        if context.known_project_ids.contains(&project_id_text) {
+            return false;
+        }
+        *project_id = Value::String(current_project_id.to_owned());
+        true
+    })
+}
+
+fn looks_like_codex_app_create_thread_arguments(arguments: &Value) -> bool {
+    arguments.get("prompt").is_some() && arguments.get("target").is_some()
+}
+
+fn rewrite_codex_app_create_thread_arguments(value: &mut Value) -> usize {
+    match value {
+        Value::Object(object) => {
+            let name = object
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let namespace = object.get("namespace").and_then(Value::as_str);
+            let is_create_call = is_codex_app_create_thread_name(name, namespace);
+            let mut changed = 0;
+            let arguments = object
+                .get("arguments")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if let Some(arguments) = arguments.as_deref() {
+                if let Some(mut parsed) = parse_json_fragment(arguments) {
+                    if (is_create_call || looks_like_codex_app_create_thread_arguments(&parsed))
+                        && repair_codex_app_create_thread_arguments(&mut parsed)
+                    {
+                        object.insert("arguments".to_owned(), Value::String(parsed.to_string()));
+                        changed += 1;
+                    }
+                }
+            }
+            for child in object.values_mut() {
+                changed += rewrite_codex_app_create_thread_arguments(child);
+            }
+            changed
+        }
+        Value::Array(values) => values
+            .iter_mut()
+            .map(rewrite_codex_app_create_thread_arguments)
+            .sum(),
+        _ => 0,
+    }
 }
 
 fn compact_split_at(items: &[Value], keep_last: usize) -> usize {
@@ -1300,8 +2232,45 @@ fn strip_gemini_server_continuation(object: &mut Map<String, Value>) -> bool {
     changed
 }
 
-fn sanitize_gemini_item(item: &mut Map<String, Value>) -> usize {
+/// Codex / Gemini-CLI request envelopes leak fields Google's
+/// GenerateContentRequest protobuf does not have. CLIProxy then copies
+/// them onto `request` (or into `contents[]`) and Gemini answers 400
+/// `Unknown name "userAgent"|"requestType"|"requestId"`.
+const GEMINI_REQUEST_METADATA_KEYS: &[&str] = &[
+    "userAgent",
+    "requestType",
+    "requestId",
+    "sessionId",
+    "safetySettings",
+    "systemInstruction",
+    "toolConfig",
+];
+
+fn strip_gemini_request_metadata_keys(object: &mut Map<String, Value>) -> usize {
     let mut stripped = 0;
+    for key in GEMINI_REQUEST_METADATA_KEYS {
+        if object.remove(*key).is_some() {
+            stripped += 1;
+        }
+    }
+    stripped
+}
+
+fn is_request_metadata_blob(item: &Value) -> bool {
+    let Some(object) = item.as_object() else {
+        return false;
+    };
+    let has_meta = GEMINI_REQUEST_METADATA_KEYS
+        .iter()
+        .any(|key| object.contains_key(*key));
+    if !has_meta {
+        return false;
+    }
+    item_type(item).is_empty() && item_role(item).is_empty()
+}
+
+fn sanitize_gemini_item(item: &mut Map<String, Value>) -> usize {
+    let mut stripped = strip_gemini_request_metadata_keys(item);
     let keys: Vec<String> = item.keys().cloned().collect();
     for key in keys {
         if !matches!(
@@ -1338,11 +2307,29 @@ pub fn sanitize_responses_request(path: &str, body: &mut Value) -> SanitizeStats
         return stats;
     };
 
+    if gemini {
+        capture_codex_app_project_context(object);
+    }
+
+    // A returned compaction item represents the transcript before it.  Some
+    // Codex clients replay that item together with the old input and the old
+    // server-side continuation handle.  Keep the compaction item and the
+    // input after it, but do not send the replaced prefix a second time.
+    if stats.openai_family && !is_compact_path(path) && normalize_post_compact_replay(object) {
+        stats.converted_items += 1;
+    }
+
     if !stats.openai_family && strip_include_encrypted(object) {
         stats.stripped_encrypted += 1;
     }
     if gemini && strip_gemini_server_continuation(object) {
         stats.converted_items += 1;
+    }
+    if gemini {
+        stats.converted_items += strip_gemini_request_metadata_keys(object);
+    }
+    if !stats.openai_family {
+        stats.converted_items += strip_third_party_request_envelope(object);
     }
     if !stats.openai_family && strip_unusable_third_party_continuation(object) {
         stats.converted_items += 1;
@@ -1350,6 +2337,9 @@ pub fn sanitize_responses_request(path: &str, body: &mut Value) -> SanitizeStats
     if !stats.openai_family {
         stats.rewritten_tool_calls += inject_third_party_identity(object);
         stats.rewritten_tool_calls += normalize_request_tools(object);
+        if gemini {
+            stats.rewritten_tool_calls += flatten_gemini_namespace_tools(object);
+        }
         if is_chat_completions_agent_model(&stats.model) {
             stats.rewritten_tool_calls += convert_native_shell_tools(object);
             stats.rewritten_tool_calls += simplify_chat_agent_tools(object);
@@ -1358,6 +2348,22 @@ pub fn sanitize_responses_request(path: &str, body: &mut Value) -> SanitizeStats
         }
         if grok {
             stats.rewritten_tool_calls += sanitize_grok_request(object);
+        }
+        if let Some(tools) = object.get_mut("tools").and_then(Value::as_array_mut) {
+            stats.rewritten_tool_calls += sanitize_third_party_tool_schemas(tools);
+        }
+        if let Some(items) = object.get_mut("input").and_then(Value::as_array_mut) {
+            for item in items.iter_mut() {
+                let Some(item) = item.as_object_mut() else {
+                    continue;
+                };
+                if item.get("type").and_then(Value::as_str) != Some("additional_tools") {
+                    continue;
+                }
+                if let Some(tools) = item.get_mut("tools").and_then(Value::as_array_mut) {
+                    stats.rewritten_tool_calls += sanitize_third_party_tool_schemas(tools);
+                }
+            }
         }
         stats.rewritten_tool_calls += clamp_openai_compat_tool_names(object);
     }
@@ -1373,6 +2379,10 @@ pub fn sanitize_responses_request(path: &str, body: &mut Value) -> SanitizeStats
             stats.stripped_encrypted += sanitize_function_output(&mut map, stats.openai_family);
             stats.stripped_encrypted += sanitize_reasoning(&mut map, stats.openai_family);
             if gemini {
+                if is_request_metadata_blob(&Value::Object(map.clone())) {
+                    stats.converted_items += 1;
+                    continue;
+                }
                 stats.stripped_encrypted += sanitize_gemini_item(&mut map);
             }
             if !stats.openai_family {
@@ -1418,10 +2428,7 @@ pub fn sanitize_responses_request(path: &str, body: &mut Value) -> SanitizeStats
             stats.locally_compacted = compact_input(&mut replacement, LOCAL_COMPACT_KEEP_LAST);
         }
         if !stats.openai_family {
-            stats.rewritten_tool_calls += ensure_tool_call_outputs(&mut replacement);
-        }
-        if gemini {
-            stats.rewritten_tool_calls += prune_unmatched_tool_outputs(&mut replacement);
+            stats.rewritten_tool_calls += normalize_tool_call_history(&mut replacement, gemini);
         }
         object.insert("input".to_owned(), Value::Array(replacement));
     }
@@ -1435,6 +2442,34 @@ pub fn sanitize_responses_request(path: &str, body: &mut Value) -> SanitizeStats
     }
 
     stats
+}
+
+fn normalize_post_compact_replay(object: &mut Map<String, Value>) -> bool {
+    let compaction_index = object
+        .get("input")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .rposition(|item| matches!(item_type(item).as_str(), "compaction" | "compact"))
+        });
+    let Some(compaction_index) = compaction_index else {
+        return false;
+    };
+
+    let mut changed = false;
+    if compaction_index > 0 {
+        if let Some(items) = object.get_mut("input").and_then(Value::as_array_mut) {
+            items.drain(..compaction_index);
+            changed = true;
+        }
+    }
+    for key in ["previous_response_id", "conversation_id", "conversation"] {
+        if object.remove(key).is_some() {
+            changed = true;
+        }
+    }
+    changed
 }
 
 pub fn sanitize_responses_request_aggressive(path: &str, body: &mut Value) -> SanitizeStats {
@@ -1916,12 +2951,66 @@ fn exec_command_function_tool() -> Value {
     })
 }
 
+/// Codex / OpenAI-compat envelope fields that Grok OAuth (`cli-chat-proxy`)
+/// maps onto `X-Grok-Conv-Id` or rejects as `invalid-argument`. After a
+/// model switch the value is still the Codex thread id, not a Grok
+/// conversation.
+const THIRD_PARTY_ENVELOPE_KEYS: &[&str] = &[
+    "client_metadata",
+    "prompt_cache_key",
+    "metadata",
+    "userAgent",
+    "requestType",
+    "requestId",
+    "sessionId",
+    "service_tier",
+    "truncation",
+    "safety_identifier",
+    "prompt_cache_retention",
+];
+
+fn strip_third_party_request_envelope(object: &mut Map<String, Value>) -> usize {
+    let mut stripped = 0;
+    for key in THIRD_PARTY_ENVELOPE_KEYS {
+        if object.remove(*key).is_some() {
+            stripped += 1;
+        }
+    }
+    stripped
+}
+
+fn strip_identity_preamble(text: &str) -> &str {
+    let trimmed = text.trim_start();
+    let skipped = text.len() - trimmed.len();
+    if !trimmed.starts_with("# 模型身份") {
+        return text;
+    }
+    let mut pos = skipped;
+    let mut first = true;
+    for line in trimmed.split_inclusive('\n') {
+        if !first {
+            let heading = line.trim_start();
+            if (heading.starts_with("# ") && !heading.starts_with("# 模型身份"))
+                || heading.starts_with("You are ")
+            {
+                return &text[pos..];
+            }
+        }
+        first = false;
+        pos += line.len();
+    }
+    ""
+}
+
 fn inject_third_party_identity(body: &mut Map<String, Value>) -> usize {
     let model = body
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
+    let Some((name, _)) = third_party_identity(&model) else {
+        return 0;
+    };
     let Some(clause) = third_party_identity_clause(&model) else {
         return 0;
     };
@@ -1930,12 +3019,18 @@ fn inject_third_party_identity(body: &mut Map<String, Value>) -> usize {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    if current.contains("# 模型身份") {
+    let expected = format!("你是{name}");
+    if current.contains("# 模型身份") && current.contains(&expected) {
         return 0;
     }
+    let rest = strip_identity_preamble(&current);
     body.insert(
         "instructions".to_owned(),
-        Value::String(format!("{clause}\n{current}")),
+        Value::String(if rest.is_empty() {
+            clause
+        } else {
+            format!("{clause}\n{rest}")
+        }),
     );
     1
 }
@@ -2004,9 +3099,24 @@ pub fn rewrite_tool_names_in_json(value: &mut Value) -> usize {
     let mut changed = 0;
     match value {
         Value::Object(map) => {
-            if let Some(name) = map.get_mut("name") {
-                if remap_tool_name_value(name) {
+            if let Some(name) = map.get("name").and_then(Value::as_str).map(str::to_owned) {
+                if let Some(restored) = restore_gemini_namespace_tool(&name) {
+                    map.insert(
+                        "name".to_owned(),
+                        Value::String(restored.local_name.clone()),
+                    );
+                    if matches!(
+                        map.get("type").and_then(Value::as_str),
+                        Some("function_call" | "custom_tool_call")
+                    ) || (map.contains_key("call_id") && map.contains_key("arguments"))
+                    {
+                        map.insert("namespace".to_owned(), Value::String(restored.namespace));
+                    }
                     changed += 1;
+                } else if let Some(name) = map.get_mut("name") {
+                    if remap_tool_name_value(name) {
+                        changed += 1;
+                    }
                 }
             }
             for child in map.values_mut() {
@@ -2172,6 +3282,8 @@ pub struct SseThinkState {
     pub disabled: bool,
     scan: ThinkScan,
     reasoning_open: bool,
+    streamed_output_items: HashSet<String>,
+    streamed_output_seen: bool,
     item_id: String,
     output_index: u64,
     next_item: u64,
@@ -2183,6 +3295,8 @@ pub struct SseThinkState {
     chat_visible_text: String,
     chat_next_output_index: u64,
     chat_tool_calls: BTreeMap<u64, ChatToolCallState>,
+    chat_leaked_tool_buffer: String,
+    chat_next_leaked_tool_index: u64,
     chat_completed: bool,
 }
 
@@ -2190,6 +3304,7 @@ pub struct SseThinkState {
 struct ChatToolCallState {
     id: String,
     name: String,
+    namespace: Option<String>,
     arguments: String,
     output_index: u64,
     item_started: bool,
@@ -2479,7 +3594,7 @@ fn emit_think_pieces(
             ThinkPiece::Visible(text) => {
                 close_reasoning(state, out);
                 if state.chat_mode {
-                    emit_chat_visible_delta(state, out, &text);
+                    emit_chat_visible_text_with_leaked_tools(state, out, &text);
                 } else if let Some(orig) = original_text_event {
                     let mut ev = orig.clone();
                     ev["delta"] = Value::String(text);
@@ -2526,6 +3641,97 @@ fn is_think_boundary(kind: &str) -> bool {
     )
 }
 
+fn event_is_raw_reasoning(event: &str) -> bool {
+    event.contains("reasoning_text.delta")
+        || event.contains("reasoning_text.done")
+        || event.contains("\"type\":\"reasoning\"")
+        || event.contains("\"type\": \"reasoning\"")
+        || event.contains("response.reasoning.delta")
+}
+
+fn reasoning_item_has_summary(item: &Value) -> bool {
+    item.get("summary")
+        .and_then(Value::as_array)
+        .is_some_and(|parts| {
+            parts.iter().any(|part| {
+                part.get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.is_empty())
+            })
+        })
+}
+
+fn reasoning_item_content_text(item: &Value) -> String {
+    item.get("content")
+        .and_then(Value::as_array)
+        .map(|parts| {
+            parts
+                .iter()
+                .filter(|part| chat_part_is_thought(part))
+                .filter_map(chat_text_value)
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default()
+}
+
+/// Codex Desktop/TUI render the expandable thinking timeline from
+/// `reasoning_summary_*` events. Gemini/Muse often emit the raw
+/// `reasoning_text` content channel (or Chat Completions thought parts),
+/// which only shows a single "thinking" row until the turn finishes.
+fn rewrite_raw_reasoning_event(
+    state: &mut SseThinkState,
+    json: &Value,
+    kind: &str,
+    out: &mut String,
+) -> bool {
+    match kind {
+        "response.reasoning_text.delta" | "response.reasoning.delta" => {
+            let text = json
+                .get("delta")
+                .and_then(Value::as_str)
+                .or_else(|| json.get("text").and_then(Value::as_str))
+                .unwrap_or_default();
+            emit_think_delta(state, out, text);
+            true
+        }
+        "response.reasoning_text.done" => true,
+        "response.output_item.added" | "response.output_item.done" => {
+            let Some(item) = json.get("item") else {
+                return false;
+            };
+            if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+                return false;
+            }
+            if reasoning_item_has_summary(item) {
+                return false;
+            }
+            let text = reasoning_item_content_text(item);
+            if text.is_empty() {
+                return false;
+            }
+            emit_think_delta(state, out, &text);
+            if kind == "response.output_item.done" {
+                close_reasoning(state, out);
+            }
+            true
+        }
+        "response.content_part.added" | "response.content_part.done" => {
+            let part = json.get("part").unwrap_or(&Value::Null);
+            if !chat_part_is_thought(part) {
+                return false;
+            }
+            if kind == "response.content_part.added" {
+                if let Some(text) = chat_text_value(part) {
+                    emit_think_delta(state, out, &text);
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 fn event_may_need_think_rewrite(state: &SseThinkState, event: &str) -> bool {
     if state.disabled {
         return false;
@@ -2533,11 +3739,17 @@ fn event_may_need_think_rewrite(state: &SseThinkState, event: &str) -> bool {
     if state.needs_scan() {
         return true;
     }
+    if event_is_raw_reasoning(event) {
+        return true;
+    }
     let lower = event.to_ascii_lowercase();
     if !lower.contains("<think") {
         return false;
     }
-    event.contains("output_text.delta") || event.contains("output_text.done")
+    event.contains("output_text.delta")
+        || event.contains("output_text.done")
+        || event.contains("output_item.done")
+        || event.contains("content_part.done")
 }
 
 fn chat_completion_chunk(json: &Value) -> bool {
@@ -2620,7 +3832,7 @@ fn emit_chat_tool_delta(
     close_reasoning(state, out);
     close_chat_message(state, out);
     let next_output_index = state.chat_next_output_index;
-    let (id, tool_name, output_index, item_started, argument_delta) = {
+    let (id, tool_name, namespace, output_index, item_started, argument_delta) = {
         let tool = state
             .chat_tool_calls
             .entry(index)
@@ -2633,7 +3845,11 @@ fn emit_chat_tool_delta(
             tool.id = call_id.to_owned();
         }
         if let Some(name) = name.filter(|name| !name.is_empty()) {
-            tool.name = remap_tool_name(name);
+            let (restored_name, namespace) = restore_tool_name_parts(name);
+            tool.name = restored_name;
+            if namespace.is_some() {
+                tool.namespace = namespace;
+            }
         }
         let argument_delta = arguments.unwrap_or_default().to_owned();
         tool.arguments.push_str(&argument_delta);
@@ -2642,6 +3858,7 @@ fn emit_chat_tool_delta(
         (
             tool.id.clone(),
             tool.name.clone(),
+            tool.namespace.clone(),
             tool.output_index,
             started,
             argument_delta,
@@ -2649,17 +3866,21 @@ fn emit_chat_tool_delta(
     };
     if !item_started {
         state.chat_next_output_index = state.chat_next_output_index.saturating_add(1);
+        let mut item = json!({
+            "id": id,
+            "type": "function_call",
+            "status": "in_progress",
+            "call_id": id,
+            "name": tool_name,
+            "arguments": ""
+        });
+        if let Some(namespace) = namespace {
+            item["namespace"] = Value::String(namespace);
+        }
         out.push_str(&sse_data_line(&json!({
             "type": "response.output_item.added",
             "output_index": output_index,
-            "item": {
-                "id": id,
-                "type": "function_call",
-                "status": "in_progress",
-                "call_id": id,
-                "name": tool_name,
-                "arguments": ""
-            }
+            "item": item
         })));
     }
     if !argument_delta.is_empty() {
@@ -2704,30 +3925,201 @@ fn close_chat_message(state: &mut SseThinkState, out: &mut String) {
     state.chat_message_open = false;
 }
 
-fn close_chat_tools(state: &mut SseThinkState, out: &mut String) {
-    for tool in state.chat_tool_calls.values_mut() {
+fn next_chat_tool_index(state: &mut SseThinkState) -> u64 {
+    let mut index = state.chat_next_leaked_tool_index;
+    while state.chat_tool_calls.contains_key(&index) {
+        index = index.saturating_add(1);
+    }
+    state.chat_next_leaked_tool_index = index.saturating_add(1);
+    index
+}
+
+fn close_chat_tool(state: &mut SseThinkState, out: &mut String, index: u64) {
+    let details = state.chat_tool_calls.get_mut(&index).and_then(|tool| {
         if !tool.item_started {
-            continue;
+            return None;
         }
-        out.push_str(&sse_data_line(&json!({
-            "type": "response.function_call_arguments.done",
-            "item_id": tool.id,
-            "output_index": tool.output_index,
-            "arguments": tool.arguments
-        })));
-        out.push_str(&sse_data_line(&json!({
-            "type": "response.output_item.done",
-            "output_index": tool.output_index,
-            "item": {
-                "id": tool.id,
-                "type": "function_call",
-                "status": "completed",
-                "call_id": tool.id,
-                "name": tool.name,
-                "arguments": tool.arguments
-            }
-        })));
         tool.item_started = false;
+        Some((
+            tool.id.clone(),
+            tool.name.clone(),
+            tool.namespace.clone(),
+            tool.arguments.clone(),
+            tool.output_index,
+        ))
+    });
+    let Some((id, name, namespace, arguments, output_index)) = details else {
+        return;
+    };
+    out.push_str(&sse_data_line(&json!({
+        "type": "response.function_call_arguments.done",
+        "item_id": id,
+        "output_index": output_index,
+        "arguments": arguments
+    })));
+    let mut item = json!({
+        "id": id,
+        "type": "function_call",
+        "status": "completed",
+        "call_id": id,
+        "name": name,
+        "arguments": arguments
+    });
+    if let Some(namespace) = namespace {
+        item["namespace"] = Value::String(namespace);
+    }
+    out.push_str(&sse_data_line(&json!({
+        "type": "response.output_item.done",
+        "output_index": output_index,
+        "item": item
+    })));
+}
+
+fn emit_chat_leaked_tool_value(state: &mut SseThinkState, out: &mut String, tool: &Value) {
+    let index = next_chat_tool_index(state);
+    emit_chat_tool_delta(
+        state,
+        out,
+        index,
+        tool.get("call_id").and_then(Value::as_str),
+        tool.get("name").and_then(Value::as_str),
+        tool.get("arguments").and_then(Value::as_str),
+    );
+    // A leaked tool call is complete as soon as its balanced JSON arrives.
+    // Emit the terminal item immediately so Codex can execute it before the
+    // provider sends its final [DONE] chunk.
+    close_chat_tool(state, out, index);
+}
+
+fn emit_chat_visible_text_with_leaked_tools(
+    state: &mut SseThinkState,
+    out: &mut String,
+    text: &str,
+) {
+    if text.is_empty() {
+        return;
+    }
+    if state.chat_leaked_tool_buffer.is_empty() {
+        if let Some(start) = find_leaked_tool_start(text) {
+            if start > 0 {
+                emit_chat_visible_delta(state, out, &text[..start]);
+            }
+            state.chat_leaked_tool_buffer.push_str(&text[start..]);
+        } else {
+            emit_chat_visible_delta(state, out, text);
+            return;
+        }
+    } else {
+        state.chat_leaked_tool_buffer.push_str(text);
+    }
+
+    loop {
+        let Some(start) = find_leaked_tool_start(&state.chat_leaked_tool_buffer) else {
+            let pending = std::mem::take(&mut state.chat_leaked_tool_buffer);
+            if !pending.is_empty() {
+                emit_chat_visible_delta(state, out, &pending);
+            }
+            return;
+        };
+        if start > 0 {
+            let prefix = state.chat_leaked_tool_buffer[..start].to_owned();
+            state.chat_leaked_tool_buffer = state.chat_leaked_tool_buffer[start..].to_owned();
+            emit_chat_visible_delta(state, out, &prefix);
+        }
+        let Some(prefix_end) = skip_leaked_prefix(&state.chat_leaked_tool_buffer) else {
+            return;
+        };
+        let after_prefix = state.chat_leaked_tool_buffer[prefix_end..].to_owned();
+        let Some((raw, consumed)) = take_balanced_json(&after_prefix) else {
+            // Keep the marker and partial JSON out of the visible answer until
+            // the next provider delta completes the tool call.
+            return;
+        };
+        let tool = normalize_leaked_tool_call(&raw, state.chat_next_leaked_tool_index as usize + 1);
+        emit_chat_leaked_tool_value(state, out, &tool);
+        let mut tail = after_prefix[consumed..].to_owned();
+        if tail.starts_with(')') {
+            tail.remove(0);
+        }
+        state.chat_leaked_tool_buffer = tail;
+        if state.chat_leaked_tool_buffer.is_empty() {
+            return;
+        }
+    }
+}
+
+fn flush_chat_leaked_tool_buffer(state: &mut SseThinkState, out: &mut String) {
+    let pending = std::mem::take(&mut state.chat_leaked_tool_buffer);
+    if !pending.is_empty() {
+        emit_chat_visible_delta(state, out, &pending);
+    }
+}
+
+/// Remove provider-only think tags from aggregate output fields.  A provider
+/// may repeat the complete text in `done`/`item.done` after the same text was
+/// already delivered through deltas; those terminal fields must never be fed
+/// back through the streaming think scanner.
+fn strip_done_output_text(json: &mut Value) -> bool {
+    let mut changed = false;
+    if let Some(text) = json.get("text").and_then(Value::as_str).map(str::to_owned) {
+        let stripped = strip_think_tags(&text);
+        if stripped != text {
+            json["text"] = Value::String(stripped);
+            changed = true;
+        }
+    }
+    if let Some(part) = json.get_mut("part").and_then(Value::as_object_mut) {
+        if let Some(text) = part.get("text").and_then(Value::as_str) {
+            let stripped = strip_think_tags(text);
+            if stripped != text {
+                part.insert("text".to_owned(), Value::String(stripped));
+                changed = true;
+            }
+        }
+    }
+    if let Some(item) = json.get_mut("item").and_then(Value::as_object_mut) {
+        if let Some(content) = item.get_mut("content") {
+            if let Some(parts) = content.as_array_mut() {
+                for part in parts {
+                    if let Some(text) = part.get("text").and_then(Value::as_str).map(str::to_owned)
+                    {
+                        let stripped = strip_think_tags(&text);
+                        if stripped != text {
+                            if let Some(part_map) = part.as_object_mut() {
+                                part_map.insert("text".to_owned(), Value::String(stripped));
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            } else if let Some(text) = content.as_str() {
+                let stripped = strip_think_tags(text);
+                if stripped != text {
+                    *content = Value::String(stripped);
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
+}
+
+fn streamed_output_item_id(json: &Value) -> Option<&str> {
+    json.get("item_id")
+        .and_then(Value::as_str)
+        .or_else(|| json.pointer("/item/id").and_then(Value::as_str))
+}
+
+fn output_item_was_streamed(state: &SseThinkState, json: &Value) -> bool {
+    streamed_output_item_id(json)
+        .map(|item_id| state.streamed_output_items.contains(item_id))
+        .unwrap_or(state.streamed_output_seen)
+}
+
+fn close_chat_tools(state: &mut SseThinkState, out: &mut String) {
+    let indexes = state.chat_tool_calls.keys().copied().collect::<Vec<_>>();
+    for index in indexes {
+        close_chat_tool(state, out, index);
     }
 }
 
@@ -2736,6 +4128,7 @@ fn finish_chat_response(state: &mut SseThinkState, out: &mut String) {
         return;
     }
     flush_think_state(state, out);
+    flush_chat_leaked_tool_buffer(state, out);
     close_chat_message(state, out);
     close_chat_tools(state, out);
     out.push_str(&sse_data_line(&json!({
@@ -2747,6 +4140,75 @@ fn finish_chat_response(state: &mut SseThinkState, out: &mut String) {
         }
     })));
     state.chat_completed = true;
+}
+
+fn chat_text_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(parts) => {
+            let mut found = false;
+            let mut text = String::new();
+            for part in parts {
+                if let Some(part_text) = chat_text_value(part) {
+                    found = true;
+                    text.push_str(&part_text);
+                }
+            }
+            found.then_some(text)
+        }
+        Value::Object(object) => {
+            for key in ["text", "content", "value", "thinking", "thought"] {
+                if let Some(value) = object.get(key) {
+                    if value.is_boolean() {
+                        continue;
+                    }
+                    if let Some(text) = chat_text_value(value) {
+                        return Some(text);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn chat_part_is_thought(part: &Value) -> bool {
+    if part.get("thought").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    matches!(
+        part.get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str(),
+        "thought" | "thinking" | "reasoning" | "reasoning_text"
+    )
+}
+
+fn split_chat_message_content(value: &Value) -> (String, String) {
+    match value {
+        Value::Array(parts) => {
+            let mut reasoning = String::new();
+            let mut visible = String::new();
+            for part in parts {
+                let Some(text) = chat_text_value(part) else {
+                    continue;
+                };
+                if chat_part_is_thought(part) {
+                    reasoning.push_str(&text);
+                } else {
+                    visible.push_str(&text);
+                }
+            }
+            (reasoning, visible)
+        }
+        Value::Object(_) if chat_part_is_thought(value) => {
+            (chat_text_value(value).unwrap_or_default(), String::new())
+        }
+        other => (String::new(), chat_text_value(other).unwrap_or_default()),
+    }
 }
 
 fn rewrite_chat_completion_event(
@@ -2770,18 +4232,79 @@ fn rewrite_chat_completion_event(
         return true;
     };
     let delta = choice.get("delta").unwrap_or(&Value::Null);
-    for field in ["reasoning_content", "reasoning", "thinking"] {
-        if let Some(text) = delta.get(field).and_then(Value::as_str) {
-            emit_think_delta(state, out, text);
+    let message = choice.get("message").unwrap_or(&Value::Null);
+    let mut emitted_reasoning = false;
+    for field in ["reasoning_content", "reasoning", "thinking", "thoughts"] {
+        if let Some(text) = delta.get(field).and_then(chat_text_value) {
+            if !text.is_empty() {
+                emit_think_delta(state, out, &text);
+                emitted_reasoning = true;
+            }
         }
     }
-    if let Some(content) = delta.get("content").and_then(Value::as_str) {
-        let pieces = state.scan.push(content);
-        emit_think_pieces(state, pieces, None, out);
+    if !emitted_reasoning {
+        for field in ["reasoning_content", "reasoning", "thinking", "thoughts"] {
+            if let Some(text) = message.get(field).and_then(chat_text_value) {
+                if !text.is_empty() {
+                    emit_think_delta(state, out, &text);
+                }
+            }
+        }
     }
-    if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
-        for call in tool_calls {
-            let index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
+    let mut emitted_content = false;
+    if let Some(content) = delta.get("content") {
+        let (reasoning, visible) = split_chat_message_content(content);
+        if !reasoning.is_empty() {
+            emit_think_delta(state, out, &reasoning);
+        }
+        if !visible.is_empty() {
+            let pieces = state.scan.push(&visible);
+            emit_think_pieces(state, pieces, None, out);
+            emitted_content = true;
+        } else if !reasoning.is_empty() {
+            emitted_content = true;
+        }
+    }
+    if !emitted_content {
+        if let Some(content) = message.get("content") {
+            let (reasoning, visible) = split_chat_message_content(content);
+            if !reasoning.is_empty() {
+                emit_think_delta(state, out, &reasoning);
+            }
+            if !visible.is_empty() {
+                let pieces = state.scan.push(&visible);
+                emit_think_pieces(state, pieces, None, out);
+            }
+        }
+    }
+    if !emitted_content {
+        if let Some(parts) = delta.get("parts").or_else(|| message.get("parts")) {
+            let (reasoning, visible) = split_chat_message_content(parts);
+            if !reasoning.is_empty() {
+                emit_think_delta(state, out, &reasoning);
+            }
+            if !visible.is_empty() {
+                let pieces = state.scan.push(&visible);
+                emit_think_pieces(state, pieces, None, out);
+            }
+        }
+    }
+    let tool_calls = delta
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .filter(|calls| !calls.is_empty())
+        .or_else(|| {
+            message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .filter(|calls| !calls.is_empty())
+        });
+    if let Some(tool_calls) = tool_calls {
+        for (position, call) in tool_calls.iter().enumerate() {
+            let index = call
+                .get("index")
+                .and_then(Value::as_u64)
+                .unwrap_or(position as u64);
             let function = call.get("function").unwrap_or(&Value::Null);
             emit_chat_tool_delta(
                 state,
@@ -2843,6 +4366,7 @@ fn rewrite_sse_event(state: &mut SseThinkState, event: &str) -> String {
                 if !state.disabled
                     && (chat_completion_chunk(&json) || json.as_str() == Some("[DONE]"))
                 {
+                    rewrite_codex_app_create_thread_arguments(&mut json);
                     rewrite_chat_completion_event(state, &json, &mut out);
                     continue;
                 }
@@ -2857,8 +4381,20 @@ fn rewrite_sse_event(state: &mut SseThinkState, event: &str) -> String {
                     rewrite_provider_json(&mut json);
                 }
                 let kind = event_kind(&json).to_owned();
+                let mut json_changed = restore || has_leak;
+                if rewrite_codex_app_create_thread_arguments(&mut json) > 0 {
+                    json_changed = true;
+                }
+                if think && rewrite_raw_reasoning_event(state, &json, &kind, &mut out) {
+                    converted_text_delta = true;
+                    continue;
+                }
                 if think && is_output_text_delta(&kind) {
                     if let Some(delta) = json.get("delta").and_then(Value::as_str) {
+                        state.streamed_output_seen = true;
+                        if let Some(item_id) = json.get("item_id").and_then(Value::as_str) {
+                            state.streamed_output_items.insert(item_id.to_owned());
+                        }
                         let pieces = state.scan.push(delta);
                         let mut visible_tools = Vec::new();
                         let mut mapped = Vec::new();
@@ -2887,7 +4423,9 @@ fn rewrite_sse_event(state: &mut SseThinkState, event: &str) -> String {
                 if think && is_think_boundary(&kind) {
                     if kind == "response.output_text.done" {
                         if let Some(text) = json.get("text").and_then(Value::as_str) {
-                            if !state.needs_scan()
+                            if output_item_was_streamed(state, &json) {
+                                json_changed |= strip_done_output_text(&mut json);
+                            } else if !state.needs_scan()
                                 && (text.to_ascii_lowercase().contains("<think>")
                                     || text.to_ascii_lowercase().contains("<thinking>"))
                             {
@@ -2895,6 +4433,9 @@ fn rewrite_sse_event(state: &mut SseThinkState, event: &str) -> String {
                                 emit_think_pieces(state, pieces, None, &mut out);
                             }
                         }
+                    }
+                    if kind == "response.output_item.done" {
+                        json_changed |= strip_done_output_text(&mut json);
                     }
                     flush_think_state(state, &mut out);
                 }
@@ -2906,7 +4447,7 @@ fn rewrite_sse_event(state: &mut SseThinkState, event: &str) -> String {
                         rewrite_text_value(text, &mut extracted_tools);
                     }
                 }
-                if restore || has_leak {
+                if json_changed {
                     out.push_str("data: ");
                     out.push_str(&json.to_string());
                     if line.ends_with('\n') {
@@ -3570,7 +5111,7 @@ mod tests {
         assert!(!stats.openai_family);
         assert!(stats.stripped_encrypted >= 2);
         assert!(stats.converted_items >= 1);
-        assert_eq!(body["include"], json!(["file_search_call.results"]));
+        assert!(body.get("include").is_none());
         assert!(body["input"][0].get("encrypted_content").is_none());
         assert_eq!(body["input"][0]["type"], "message");
         assert_eq!(body["input"][1]["output"], "the tool printed hello");
@@ -4155,13 +5696,16 @@ mod tests {
         // Cross-thread agent history: a forked sub-agent carried a function
         // response whose originating call is not in this request. Gemini
         // rejects that with "invalid Gemini function call history".
-        let mut items = vec![
-            json!({"type":"function_call","name":"exec_command","call_id":"call-a"}),
-            json!({"type":"function_call_output","call_id":"call-a","output":"ok"}),
-            json!({"type":"function_call_output","call_id":"call-orphan","output":"stale cross-thread"}),
-        ];
-        let pruned = prune_unmatched_tool_outputs(&mut items);
-        assert_eq!(pruned, 1);
+        let mut body = json!({
+            "model": "gemini-3.7-flash",
+            "input": [
+                {"type":"function_call","name":"exec_command","call_id":"call-a","arguments":"{\"cmd\":\"pwd\"}"},
+                {"type":"function_call_output","call_id":"call-a","output":"ok"},
+                {"type":"function_call_output","call_id":"call-orphan","output":"stale cross-thread"}
+            ]
+        });
+        sanitize_responses_request("/v1/responses", &mut body);
+        let items = body["input"].as_array().unwrap();
         assert!(items
             .iter()
             .any(|item| item.get("call_id").and_then(Value::as_str) == Some("call-a")));
@@ -4566,6 +6110,78 @@ mod tests {
     }
 
     #[test]
+    fn streamed_think_is_not_reintroduced_by_output_text_done() {
+        let mut state = SseThinkState::default();
+        let aggregate = concat!("<", "think>先检查工具</think>正文");
+        let delta_event = json!({
+            "type": "response.output_text.delta",
+            "item_id": "m1",
+            "delta": aggregate
+        });
+        let delta = rewrite_sse_text_with(&mut state, &format!("data: {delta_event}\n\n"));
+        let done_event = json!({
+            "type": "response.output_text.done",
+            "item_id": "m1",
+            "text": aggregate
+        });
+        let done = rewrite_sse_text_with(&mut state, &format!("data: {done_event}\n\n"));
+        let item_done_event = json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "m1",
+                "type": "message",
+                "content": [{"type": "output_text", "text": aggregate}]
+            }
+        });
+        let item_done = rewrite_sse_text_with(&mut state, &format!("data: {item_done_event}\n\n"));
+
+        assert_eq!(delta.matches("先检查工具").count(), 1);
+        assert_eq!(
+            delta
+                .matches("response.reasoning_summary_text.delta")
+                .count(),
+            1
+        );
+        assert_eq!(delta.matches("正文").count(), 1);
+        assert_eq!(done.matches("先检查工具").count(), 0);
+        assert!(done.contains("\"text\":\"正文\""));
+        assert_eq!(item_done.matches("先检查工具").count(), 0);
+        assert!(item_done.contains("\"text\":\"正文\""));
+    }
+
+    #[test]
+    fn official_compaction_replay_drops_replaced_prefix_and_server_handle() {
+        let mut body = json!({
+            "model": "gpt-5.6-sol",
+            "previous_response_id": "resp_before_compact",
+            "conversation_id": "conv_before_compact",
+            "conversation": {"id": "conv_before_compact"},
+            "input": [
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"old user task"}]},
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"old assistant reasoning"}]},
+                {"type":"compaction","encrypted_content":"official-compact-summary"},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"continue from compact summary"}]}
+            ]
+        });
+
+        assert!(normalize_official_compact_replay(&mut body));
+        assert!(body.get("previous_response_id").is_none());
+        assert!(body.get("conversation_id").is_none());
+        assert!(body.get("conversation").is_none());
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], "compaction");
+        assert_eq!(
+            input[1]["content"][0]["text"],
+            "continue from compact summary"
+        );
+        let encoded = body.to_string();
+        assert!(!encoded.contains("old user task"));
+        assert!(!encoded.contains("old assistant reasoning"));
+    }
+
+    #[test]
     fn less_than_in_output_text_is_not_held_as_think_tag() {
         let sse = rewrite_sse_text(
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"if a < b {\"}\n\n",
@@ -4633,6 +6249,88 @@ mod tests {
         assert!(output.contains("先读取文件"));
         assert!(output.contains("response.output_text.delta"));
         assert!(output.contains("正文"));
+    }
+
+    #[test]
+    fn chat_completion_embedded_tool_call_is_emitted_after_reasoning() {
+        let value = json!({
+            "id": "chatcmpl-embedded-tool",
+            "choices": [{
+                "delta": {
+                    "reasoning_content": "先检查文件",
+                    "content": "functions__exec({\"cmd\":\"Get-ChildItem\"})"
+                }
+            }]
+        });
+        let output = rewrite_sse_text(&format!("data: {value}\n\n"));
+        let reasoning_pos = output
+            .find("response.reasoning_summary_text.delta")
+            .expect("reasoning must be streamed");
+        let tool_pos = output
+            .find("\"type\":\"function_call\"")
+            .expect("embedded tool call must become a structured function_call");
+        assert!(reasoning_pos < tool_pos);
+        assert!(output.contains("Get-ChildItem"));
+        assert!(!output.contains("functions__exec"));
+    }
+
+    #[test]
+    fn chat_completion_embedded_tool_call_is_buffered_only_until_json_closes() {
+        let mut state = SseThinkState::default();
+        let first = json!({
+            "id": "chatcmpl-embedded-tool-stream",
+            "choices": [{
+                "delta": {
+                    "reasoning_content": "先检查文件",
+                    "content": "functions__exec({\"cmd\":\"Get-"
+                }
+            }]
+        });
+        let first_output = rewrite_sse_text_with(&mut state, &format!("data: {first}\n\n"));
+        assert!(first_output.contains("response.reasoning_summary_text.delta"));
+        assert!(!first_output.contains("\"type\":\"function_call\""));
+        assert!(!first_output.contains("functions__exec"));
+
+        let second = json!({
+            "id": "chatcmpl-embedded-tool-stream",
+            "choices": [{
+                "delta": {
+                    "content": "ChildItem\"})"
+                }
+            }]
+        });
+        let second_output = rewrite_sse_text_with(&mut state, &format!("data: {second}\n\n"));
+        assert!(second_output.contains("\"type\":\"function_call\""));
+        assert!(second_output.contains("Get-ChildItem"));
+        assert!(!second_output.contains("functions__exec"));
+    }
+
+    #[test]
+    fn chat_completion_message_content_and_tools_are_converted() {
+        let value = json!({
+            "id": "chatcmpl-message-shape",
+            "choices": [{
+                "message": {
+                    "reasoning_content": "读取状态",
+                    "content": [{"type": "text", "text": "完成"}],
+                    "tool_calls": [{
+                        "id": "call_message",
+                        "type": "function",
+                        "function": {
+                            "name": "exec_command",
+                            "arguments": "{\"cmd\":\"Get-Date\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let output = rewrite_sse_text(&format!("data: {value}\n\n"));
+        assert!(output.contains("response.reasoning_summary_text.delta"));
+        assert!(output.contains("读取状态"));
+        assert!(output.contains("完成"));
+        assert!(output.contains("\"type\":\"function_call\""));
+        assert!(output.contains("Get-Date"));
     }
 
     #[test]
@@ -4751,6 +6449,258 @@ mod tests {
     }
 
     #[test]
+    fn gemini_flattens_codex_app_thread_tools_and_restores_namespace() {
+        let mut body = json!({
+            "model": "gemini-3.7-flash",
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "mcp__codex_app",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "create_thread",
+                            "description": "Create a Codex task.",
+                            "parameters": {
+                                "type": "object",
+                                "oneOf": [
+                                    {
+                                        "type": "object",
+                                        "properties": {
+                                            "prompt": {"type": "string"},
+                                            "target": {
+                                                "oneOf": [
+                                                    {
+                                                        "type": "object",
+                                                        "properties": {
+                                                            "type": {"type": "string"},
+                                                            "projectId": {"type": "string"}
+                                                        },
+                                                        "required": ["type", "projectId"]
+                                                    },
+                                                    {
+                                                        "type": "object",
+                                                        "properties": {
+                                                            "type": {"type": "string"},
+                                                            "directoryName": {"type": "string"}
+                                                        },
+                                                        "required": ["type"]
+                                                    }
+                                                ]
+                                            }
+                                        },
+                                        "required": ["prompt", "target"]
+                                    },
+                                    {"type": "null"}
+                                ],
+                                "$defs": {
+                                    "target": {
+                                        "type": "object",
+                                        "properties": {"type": {"type": "string"}}
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "type": "function",
+                            "name": "send_message_to_thread",
+                            "description": "Send a message to another Codex task.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "threadId": {"type": "string"},
+                                    "prompt": {"type": "string"}
+                                },
+                                "required": ["threadId", "prompt"]
+                            }
+                        }
+                    ]
+                }
+            ],
+            "input": [
+                {
+                    "type": "function_call",
+                    "name": "create_thread",
+                    "namespace": "mcp__codex_app",
+                    "call_id": "call-history",
+                    "arguments": "{\"prompt\":\"previous dry run\"}"
+                }
+            ]
+        });
+
+        let stats = sanitize_responses_request("/v1/responses", &mut body);
+        assert!(stats.rewritten_tool_calls >= 2);
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert!(tools.iter().all(|tool| tool["type"] == "function"));
+        assert!(tools.iter().all(|tool| {
+            tool["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("mcp__codex_app__"))
+        }));
+        let create = tools
+            .iter()
+            .find(|tool| tool["name"] == "mcp__codex_app__create_thread")
+            .unwrap();
+        assert!(create["parameters"].get("oneOf").is_none());
+        assert!(create["parameters"].get("$defs").is_none());
+        assert_eq!(create["parameters"]["type"], "object");
+        assert!(create["parameters"]["properties"]["prompt"].is_object());
+        assert!(create["description"]
+            .as_str()
+            .unwrap()
+            .contains("projectId"));
+        assert_eq!(body["input"][0]["name"], "mcp__codex_app__create_thread");
+        assert!(body["input"][0].get("namespace").is_none());
+
+        let response = rewrite_sse_text(&format!(
+            "data: {}\n\n",
+            json!({
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "function_call",
+                    "name": "mcp__codex_app__create_thread",
+                    "namespace": null,
+                    "call_id": "call-thread"
+                }
+            })
+        ));
+        assert!(response.contains("\"name\":\"create_thread\""));
+        assert!(response.contains("\"namespace\":\"mcp__codex_app\""));
+
+        let chat_chunk = json!({
+            "id": "chat-gemini",
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": {
+                            "name": "mcp__codex_app__send_message_to_thread",
+                            "arguments": "{\"threadId\":\"dry\",\"prompt\":\"continue\"}"
+                        }
+                    }]
+                }
+            }]
+        });
+        let chat_response = rewrite_sse_text(&format!("data: {chat_chunk}\n\n"));
+        assert!(chat_response.contains("\"name\":\"send_message_to_thread\""));
+        assert!(chat_response.contains("\"namespace\":\"mcp__codex_app\""));
+        clear_tool_name_restore();
+    }
+
+    #[test]
+    fn gemini_repairs_unknown_codex_app_project_id_before_tool_executes() {
+        let mut body = json!({
+            "model": "gemini-3.7-flash",
+            "instructions": "<environment_context><cwd>D:\\Work\\CodexRouter</cwd></environment_context>",
+            "tools": [{
+                "type": "namespace",
+                "name": "mcp__codex_app",
+                "tools": [{
+                    "type": "function",
+                    "name": "create_thread",
+                    "description": "Create a Codex task.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "prompt": {"type": "string"},
+                            "target": {"type": "object"}
+                        }
+                    }
+                }]
+            }],
+            "input": [
+                {
+                    "type": "function_call",
+                    "name": "list_projects",
+                    "namespace": "mcp__codex_app",
+                    "call_id": "call-projects",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-projects",
+                    "output": "{\"schemaVersion\":2,\"projects\":[{\"projectId\":\"real-project\",\"path\":\"D:\\\\Work\\\\CodexRouter\"}]}"
+                }
+            ]
+        });
+
+        sanitize_responses_request("/v1/responses", &mut body);
+        let response = rewrite_sse_text(&format!(
+            "data: {}\n\n",
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "name": "mcp__codex_app__create_thread",
+                    "arguments": "{\"prompt\":\"初始化\",\"target\":{\"type\":\"project\",\"projectId\":\"invented-project\",\"environment\":{\"type\":\"local\"}}}"
+                }
+            })
+        ));
+
+        assert!(response.contains("real-project"));
+        assert!(!response.contains("invented-project"));
+        clear_tool_name_restore();
+    }
+
+    #[test]
+    fn gemini_preserves_codex_app_success_reply_without_result_rewrite() {
+        let mut body = json!({
+            "model": "gemini-3.7-flash",
+            "tools": [{
+                "type": "namespace",
+                "name": "mcp__codex_app",
+                "tools": [{
+                    "type": "function",
+                    "name": "create_thread",
+                    "description": "Create a Codex task.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "prompt": {"type": "string"}
+                        }
+                    }
+                }]
+            }],
+            "input": [
+                {
+                    "type": "function_call",
+                    "name": "create_thread",
+                    "namespace": "mcp__codex_app",
+                    "call_id": "call-create",
+                    "arguments": "{\"prompt\":\"初始化测试任务\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-create",
+                    "output": [
+                        {"type": "input_text", "text": "Wall time: 0.02 seconds\nOutput:"},
+                        {"type": "input_text", "text": "{\"threadId\":\"real-thread\",\"hostId\":\"local\"}"}
+                    ]
+                }
+            ]
+        });
+
+        sanitize_responses_request("/v1/responses", &mut body);
+        assert!(body["input"][1]["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|part| part["text"] == "{\"threadId\":\"real-thread\",\"hostId\":\"local\"}"));
+        let response = rewrite_sse_text(&format!(
+            "data: {}\n\n",
+            json!({
+                "type": "response.output_text.delta",
+                "delta": "发送成功。\n\n::created-thread{threadId=\"real-thread\"}"
+            })
+        ));
+
+        assert!(response.contains("发送成功"));
+        assert!(response.contains("created-thread"));
+        clear_tool_name_restore();
+    }
+
+    #[test]
     fn modelinput_502_is_rewritten_to_client_error() {
         assert!(should_retry_after_upstream_error(
             400,
@@ -4791,5 +6741,326 @@ mod tests {
             "auth_unavailable: no auth available (providers=antigravity, model=cr_r13_antigravity/gemini-3.7-flash)"
         ));
         assert!(is_exhausted_account_status(503, "no available accounts"));
+    }
+
+    #[test]
+    fn muse_duplicate_call_compat_output_is_collapsed() {
+        let mut body = json!({
+            "model": "meta/muse-spark-1.2-contributor",
+            "userAgent": "codex_cli_rs",
+            "requestType": "responses",
+            "requestId": "req-muse-dup",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type":"output_text","text":"functions__exec({\"cmd\":\"Get-ChildItem\"})"}]
+                },
+                {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": "call_compat_1",
+                    "arguments": "{\"cmd\":\"Get-ChildItem\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_compat_1",
+                    "output": "ok"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_compat_1",
+                    "output": "[tool result missing from history; continue the user task]"
+                }
+            ]
+        });
+        sanitize_responses_request("/v1/responses", &mut body);
+        assert!(body.get("userAgent").is_none());
+        assert!(body.get("requestType").is_none());
+        assert!(body.get("requestId").is_none());
+        let outputs: Vec<_> = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == "function_call_output")
+            .collect();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0]["call_id"], "call_compat_1");
+        assert_eq!(outputs[0]["output"], "ok");
+        let calls: Vec<_> = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == "function_call")
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["call_id"], "call_compat_1");
+    }
+
+    #[test]
+    fn reused_call_compat_id_for_a_different_tool_is_reassigned() {
+        let mut body = json!({
+            "model": "meta/muse-spark-1.2-contributor",
+            "input": [
+                {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": "call_compat_1",
+                    "arguments": "{\"cmd\":\"Get-Location\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_compat_1",
+                    "output": "C:\\\\temp"
+                },
+                {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": "call_compat_1",
+                    "arguments": "{\"cmd\":\"Get-Date\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_compat_1",
+                    "output": "2026-08-29"
+                }
+            ]
+        });
+        sanitize_responses_request("/v1/responses", &mut body);
+        let items = body["input"].as_array().unwrap();
+        assert_eq!(items[0]["call_id"], "call_compat_1");
+        assert_eq!(items[1]["call_id"], "call_compat_1");
+        assert_ne!(items[2]["call_id"], "call_compat_1");
+        assert_eq!(items[2]["call_id"], items[3]["call_id"]);
+        assert_eq!(items[3]["output"], "2026-08-29");
+        let output_ids: Vec<_> = items
+            .iter()
+            .filter(|item| item["type"] == "function_call_output")
+            .map(|item| item["call_id"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(output_ids.len(), 2);
+        assert_ne!(output_ids[0], output_ids[1]);
+    }
+
+    #[test]
+    fn gemini_strips_request_envelope_metadata_fields() {
+        let mut body = json!({
+            "model": "gemini-3.7-flash",
+            "userAgent": "codex_cli_rs",
+            "requestType": "responses",
+            "requestId": "req-gemini-meta",
+            "sessionId": "sess-1",
+            "input": [
+                {
+                    "userAgent": "codex_cli_rs",
+                    "requestType": "responses",
+                    "requestId": "req-gemini-meta",
+                    "safetySettings": [],
+                    "systemInstruction": {"parts":[{"text":"nope"}]},
+                    "toolConfig": {}
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "userAgent": "codex_cli_rs",
+                    "requestType": "responses",
+                    "requestId": "req-gemini-meta",
+                    "content": [{"type":"input_text","text":"继续"}]
+                }
+            ]
+        });
+        sanitize_responses_request("/v1/responses", &mut body);
+        let encoded = body.to_string();
+        assert!(!encoded.contains("userAgent"));
+        assert!(!encoded.contains("requestType"));
+        assert!(!encoded.contains("requestId"));
+        assert!(!encoded.contains("sessionId"));
+        assert!(!encoded.contains("safetySettings"));
+        assert!(!encoded.contains("systemInstruction"));
+        assert!(!encoded.contains("toolConfig"));
+        let items = body["input"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["role"], "user");
+        assert_eq!(items[0]["content"][0]["text"], "继续");
+    }
+
+    #[test]
+    fn gemini_reasoning_text_deltas_become_summary_deltas() {
+        let output = rewrite_sse_text(
+            "data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"先检查工作目录\"}\n\n",
+        );
+        assert!(output.contains("response.reasoning_summary_text.delta"));
+        assert!(output.contains("先检查工作目录"));
+        assert!(!output.contains("reasoning_text.delta"));
+    }
+
+    #[test]
+    fn gemini_thought_content_parts_stream_as_reasoning_summary() {
+        let value = json!({
+            "id": "chatcmpl-thought-parts",
+            "choices": [{
+                "delta": {
+                    "content": [
+                        {"type": "thought", "text": "先列出文件"},
+                        {"type": "text", "text": "开始执行"}
+                    ]
+                }
+            }]
+        });
+        let output = rewrite_sse_text(&format!("data: {value}\n\n"));
+        let reasoning_pos = output
+            .find("response.reasoning_summary_text.delta")
+            .expect("thought parts must stream as reasoning");
+        let visible_pos = output
+            .find("response.output_text.delta")
+            .expect("visible text must still stream");
+        assert!(reasoning_pos < visible_pos);
+        assert!(output.contains("先列出文件"));
+        assert!(output.contains("开始执行"));
+    }
+
+    #[test]
+    fn gemini_reasoning_content_channel_item_is_promoted_to_summary() {
+        let value = json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "rs_gemini",
+                "type": "reasoning",
+                "summary": [],
+                "content": [{"type":"reasoning_text","text":"分析当前目录"}]
+            }
+        });
+        let output = rewrite_sse_text(&format!("data: {value}\n\n"));
+        assert!(output.contains("response.reasoning_summary_text.delta"));
+        assert!(output.contains("分析当前目录"));
+    }
+
+    #[test]
+    fn muse_breaks_recursive_gmail_part_schema() {
+        let mut body = json!({
+            "model": "meta/muse-spark-1.2-contributor",
+            "instructions": "# 模型身份\n你是Grok，通过 Codex-Router 接入。\nYou are Codex, an agent based on GPT-5.",
+            "tools": [{
+                "type": "namespace",
+                "name": "mcp__codex_apps__gmail",
+                "tools": [{
+                    "type": "function",
+                    "name": "_create_draft",
+                    "strict": false,
+                    "parameters": {
+                        "type": "object",
+                        "$defs": {
+                            "GmailMessagePartRequest": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["mime_type"],
+                                "properties": {
+                                    "mime_type": {"type": "string"},
+                                    "parts": {
+                                        "anyOf": [
+                                            {
+                                                "type": "array",
+                                                "items": {"$ref": "#/$defs/GmailMessagePartRequest"}
+                                            },
+                                            {"type": "null"}
+                                        ]
+                                    }
+                                }
+                            }
+                        },
+                        "properties": {
+                            "payload": {"$ref": "#/$defs/GmailMessagePartRequest"}
+                        }
+                    }
+                }]
+            }]
+        });
+        sanitize_responses_request("/v1/responses", &mut body);
+        let encoded = body.to_string();
+        assert!(
+            !encoded.contains("$ref"),
+            "recursive $ref must be inlined or broken: {encoded}"
+        );
+        assert!(
+            !encoded.contains("$defs"),
+            "resolved schemas must drop $defs: {encoded}"
+        );
+        let instructions = body["instructions"].as_str().unwrap();
+        assert!(instructions.contains("你是Muse"));
+        assert!(!instructions.contains("你是Grok"));
+        assert!(body["tools"][0]["tools"][0].get("strict").is_none());
+    }
+
+    #[test]
+    fn grok_also_breaks_recursive_tool_schema() {
+        let mut body = json!({
+            "model": "grok-4.6",
+            "tools": [{
+                "type": "function",
+                "name": "mcp__codex_apps__gmail___create_draft",
+                "parameters": {
+                    "type": "object",
+                    "$defs": {
+                        "Part": {
+                            "type": "object",
+                            "properties": {
+                                "parts": {
+                                    "type": "array",
+                                    "items": {"$ref": "#/$defs/Part"}
+                                }
+                            }
+                        }
+                    },
+                    "properties": {
+                        "payload": {"$ref": "#/$defs/Part"}
+                    }
+                }
+            }]
+        });
+        sanitize_responses_request("/v1/responses", &mut body);
+        let encoded = body.to_string();
+        assert!(!encoded.contains("$ref"), "{encoded}");
+        assert!(!encoded.contains("$defs"), "{encoded}");
+    }
+
+    #[test]
+    fn switching_to_grok_drops_codex_session_envelope_and_stale_identity() {
+        let mut body = json!({
+            "model": "grok-4.6",
+            "client_metadata": {
+                "session_id": "01a048bd-1fbd-71d2-bf93-1984c8038de1",
+                "thread_id": "01a048bd-1fbd-71d2-bf93-1984c8038de1"
+            },
+            "prompt_cache_key": "01a048bd-1fbd-71d2-bf93-1984c8038de1",
+            "include": ["reasoning.encrypted_content"],
+            "store": false,
+            "instructions": "# 模型身份\n你是Kimi，通过 Codex-Router 接入。\nYou are Codex, an agent based on GPT-5.",
+            "tools": [{
+                "type": "function",
+                "name": "exec_command",
+                "strict": false,
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": {},
+                    "properties": {"cmd": {"type": "string"}}
+                }
+            }],
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "继续"}]
+            }]
+        });
+        sanitize_responses_request("/v1/responses", &mut body);
+        assert!(body.get("client_metadata").is_none());
+        assert!(body.get("prompt_cache_key").is_none());
+        assert!(body.get("include").is_none());
+        let instructions = body["instructions"].as_str().unwrap();
+        assert!(instructions.contains("你是Grok"));
+        assert!(!instructions.contains("你是Kimi"));
+        assert!(instructions.contains("You are Codex"));
+        assert!(body["tools"][0].get("strict").is_none());
+        assert_eq!(body["tools"][0]["parameters"]["additionalProperties"], true);
     }
 }

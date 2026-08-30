@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-3.1.4-0969da" alt="Version 3.1.4">
+  <img src="https://img.shields.io/badge/version-3.1.11-0969da" alt="Version 3.1.11">
   <img src="https://img.shields.io/badge/platform-Windows%20%2F%20macOS%20%2F%20Linux-0078d4" alt="Windows / macOS / Linux">
   <img src="https://img.shields.io/badge/architecture-x64-555555" alt="x64">
   <img src="https://img.shields.io/badge/default%20build-portable-2ea44f" alt="Portable build by default">
@@ -127,9 +127,9 @@ The current runtime retains the memory and background-work optimizations. Idle t
 
 ## Download And First Run
 
-Download the Windows x64 package from [GitHub Releases](https://github.com/HernanJiang/CodexRouter/releases/tag/v3.1.4):
+Download the Windows x64 package from [GitHub Releases](https://github.com/HernanJiang/CodexRouter/releases/tag/v2.1.14):
 
-`Codex-Router-Portable-3.1.4-windows-x64.zip`
+`Codex-Router-Portable-2.1.14-windows-x64.zip`
 
 Portable is the default release and local delivery target. The per-user installer remains an optional build and is generated only when explicitly requested.
 
