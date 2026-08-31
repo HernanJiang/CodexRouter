@@ -2,6 +2,13 @@
 
 本文件记录面向用户的重要变化。完整技术细节以对应版本的源码和 GitHub Release 为准。
 
+## 3.1.19 - 2026-08-31
+
+### 修复
+
+- 修复 ChatGPT 线程切换/恢复后，历史中的 `function_call_output` 丢失或带空 `call_id`，经兼容转换后触发 `A function call output without a call_id requires a name.` 的问题。
+- 能可靠匹配时恢复原始 `call_id`；无法可靠匹配的跨线程孤立输出降级为普通文本，避免伪造调用关系并阻止上游请求失败。
+
 ## 3.1.17 - 2026-08-31
 
 ### 修复

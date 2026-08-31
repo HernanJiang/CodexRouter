@@ -1389,6 +1389,91 @@ fn item_call_id(item: &Value) -> String {
         .to_owned()
 }
 
+fn explicit_call_id(item: &Value) -> Option<String> {
+    item.get("call_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|call_id| !call_id.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn repair_openai_input_function_outputs(items: &mut [Value]) -> usize {
+    let mut pending = Vec::new();
+    let mut changed = 0;
+    for item in items.iter_mut() {
+        if is_function_call_item(item) {
+            let call_id = item_call_id(item);
+            if !call_id.is_empty() {
+                pending.push(call_id);
+            }
+            continue;
+        }
+        if !is_function_output_item(item) {
+            pending.clear();
+            continue;
+        }
+
+        if let Some(call_id) = explicit_call_id(item) {
+            pending.retain(|pending_id| pending_id != &call_id);
+            continue;
+        }
+
+        if pending.len() == 1 {
+            let call_id = pending[0].clone();
+            set_item_call_id(item, &call_id);
+            pending.clear();
+            changed += 1;
+        } else {
+            let replacement = message_from_text(summarize_item(item));
+            *item = replacement;
+            changed += 1;
+        }
+    }
+    changed
+}
+
+fn repair_openai_chat_tool_messages(messages: &mut [Value]) -> usize {
+    let mut changed = 0;
+    for message in messages.iter_mut() {
+        let is_tool = message
+            .get("role")
+            .and_then(Value::as_str)
+            .is_some_and(|role| role.eq_ignore_ascii_case("tool"));
+        let has_tool_call_id = message
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .is_some_and(|call_id| !call_id.trim().is_empty());
+        if !is_tool || has_tool_call_id {
+            continue;
+        }
+        let Some(object) = message.as_object_mut() else {
+            continue;
+        };
+        object.insert("role".to_owned(), Value::String("user".to_owned()));
+        object.remove("tool_call_id");
+        changed += 1;
+    }
+    changed
+}
+
+/// Repair only the invalid tool-output shapes produced when a ChatGPT thread
+/// is resumed after switching from another thread.  The normal OpenAI path is
+/// intentionally pass-through, so this narrow repair must run there without
+/// applying the broader third-party history rewrites.
+pub fn repair_openai_function_call_outputs(body: &mut Value) -> usize {
+    let Some(object) = body.as_object_mut() else {
+        return 0;
+    };
+    let mut changed = 0;
+    if let Some(items) = object.get_mut("input").and_then(Value::as_array_mut) {
+        changed += repair_openai_input_function_outputs(items);
+    }
+    if let Some(messages) = object.get_mut("messages").and_then(Value::as_array_mut) {
+        changed += repair_openai_chat_tool_messages(messages);
+    }
+    changed
+}
+
 fn shell_cmd_from(map: &Map<String, Value>) -> String {
     if let Some(cmd) = map.get("cmd").and_then(Value::as_str) {
         return cmd.to_owned();
@@ -2388,6 +2473,9 @@ pub fn sanitize_responses_request(path: &str, body: &mut Value) -> SanitizeStats
     stats.openai_family = is_openai_family_model(&stats.model);
     let grok = stats.model.to_ascii_lowercase().contains("grok");
     let gemini = is_gemini_family_model(&stats.model);
+    if stats.openai_family {
+        stats.rewritten_tool_calls += repair_openai_function_call_outputs(body);
+    }
     let Some(object) = body.as_object_mut() else {
         return stats;
     };
@@ -5422,6 +5510,138 @@ mod tests {
             body["input"][1]["encrypted_content"],
             "gAAAAABvalidopenaiencryptedfunctionoutput000000"
         );
+    }
+
+    #[test]
+    fn chatgpt_thread_switch_restores_empty_function_output_call_id() {
+        let mut body = json!({
+            "model": "gpt-5.6-terra",
+            "input": [
+                {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": "call_thread_switch",
+                    "arguments": "{\"cmd\":\"pwd\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "",
+                    "output": "ok"
+                }
+            ]
+        });
+
+        sanitize_responses_request("/v1/responses", &mut body);
+
+        assert_eq!(body["input"][1]["call_id"], "call_thread_switch");
+    }
+
+    #[test]
+    fn chatgpt_thread_switch_converts_orphan_function_output_without_call_id() {
+        let mut body = json!({
+            "model": "gpt-5.6-terra",
+            "input": [{
+                "type": "function_call_output",
+                "output": "orphan tool result after switching threads"
+            }]
+        });
+
+        sanitize_responses_request("/v1/responses", &mut body);
+
+        let item = &body["input"][0];
+        assert_eq!(item["type"], "message");
+        assert_eq!(item["role"], "user");
+        assert!(item
+            .to_string()
+            .contains("orphan tool result after switching threads"));
+        assert!(item.get("call_id").is_none());
+    }
+
+    #[test]
+    fn chatgpt_thread_switch_repairs_missing_function_output_call_id() {
+        let mut body = json!({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": "call_missing_field",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call_output",
+                    "output": "ok"
+                }
+            ]
+        });
+
+        sanitize_responses_request("/v1/responses", &mut body);
+
+        assert_eq!(body["input"][1]["call_id"], "call_missing_field");
+    }
+
+    #[test]
+    fn chatgpt_thread_switch_does_not_guess_between_parallel_calls() {
+        let mut body = json!({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": "call_parallel_a",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": "call_parallel_b",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call_output",
+                    "output": "ambiguous result after switching threads"
+                }
+            ]
+        });
+
+        sanitize_responses_request("/v1/responses", &mut body);
+
+        let item = &body["input"][2];
+        assert_eq!(item["type"], "message");
+        assert!(item
+            .to_string()
+            .contains("ambiguous result after switching threads"));
+        assert!(item.get("call_id").is_none());
+    }
+
+    #[test]
+    fn chatgpt_thread_switch_converts_empty_chat_tool_call_id() {
+        let mut body = json!({
+            "model": "gpt-5.6-terra",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_thread_switch",
+                        "type": "function",
+                        "function": {"name": "exec_command", "arguments": "{}"}
+                    }]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "",
+                    "content": "tool result after switching threads"
+                }
+            ]
+        });
+
+        sanitize_responses_request("/v1/chat/completions", &mut body);
+
+        let message = &body["messages"][1];
+        assert_eq!(message["role"], "user");
+        assert!(message.get("tool_call_id").is_none());
+        assert_eq!(message["content"], "tool result after switching threads");
     }
 
     #[test]

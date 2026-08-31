@@ -16,6 +16,7 @@ use super::responses_compat::{
     sanitize_responses_request_without_images, should_continue_incomplete_agent_turn,
     SseThinkState, ToolNameRestoreGuard,
     should_retry_after_upstream_error, shield_desktop_auth_failure, synthetic_compact_response,
+    repair_openai_function_call_outputs,
 };
 use super::{
     detect_context_defaults, detect_max_output_defaults, map_glm53_reasoning_effort,
@@ -787,10 +788,16 @@ fn handle_client(
                 // response with extra non-compaction items.
                 prepare_official_compact_request(&mut json_body);
                 request_body = serde_json::to_vec(&json_body)?;
-            } else if inject_max_output_tokens(&path, &mut json_body) {
-                // OpenAI-family models pass through unsanitized; only
-                // re-serialize when a configured limit was injected.
-                request_body = serde_json::to_vec(&json_body)?;
+            } else {
+                let repaired_tool_outputs =
+                    repair_openai_function_call_outputs(&mut json_body) > 0;
+                let injected_max_output_tokens = inject_max_output_tokens(&path, &mut json_body);
+                // OpenAI-family models otherwise pass through unsanitized;
+                // serialize only when the narrow repair or a configured limit
+                // changed the request.
+                if repaired_tool_outputs || injected_max_output_tokens {
+                    request_body = serde_json::to_vec(&json_body)?;
+                }
             }
             if openai_family
                 && !is_compact_path(&path)
@@ -3239,7 +3246,7 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_request_is_forwarded_without_rewriting() {
+    fn chatgpt_request_repairs_thread_switch_tool_output_before_forwarding() {
         let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
         let upstream_addr = upstream.local_addr().unwrap();
         let received = std::sync::Arc::new(Mutex::new(None::<Vec<u8>>));
@@ -3270,7 +3277,7 @@ mod tests {
         });
 
         let mut client = TcpStream::connect(gateway_addr).unwrap();
-        let body = br#"{"model":"gpt-5.6-sol","include":["reasoning.encrypted_content"],"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}"#;
+        let body = br#"{"model":"gpt-5.6-sol","include":["reasoning.encrypted_content"],"input":[{"type":"function_call","name":"exec_command","call_id":"call_thread_switch","arguments":"{\"cmd\":\"pwd\"}"},{"type":"function_call_output","call_id":"","output":"ok"},{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},{"type":"function_call_output","output":"orphan tool result after switching threads"}]}"#;
         let request = format!(
             "POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
@@ -3289,9 +3296,19 @@ mod tests {
         let original_json: serde_json::Value = serde_json::from_slice(body).unwrap();
         assert_eq!(forwarded_json["model"], original_json["model"]);
         assert_eq!(forwarded_json["include"], original_json["include"]);
-        assert_eq!(forwarded_json["input"], original_json["input"]);
+        assert_eq!(forwarded_json["input"][0], original_json["input"][0]);
+        assert_eq!(forwarded_json["input"][1]["type"], "function_call_output");
+        assert_eq!(forwarded_json["input"][1]["call_id"], "call_thread_switch");
+        assert_eq!(forwarded_json["input"][1]["output"], "ok");
+        assert_eq!(forwarded_json["input"][2], original_json["input"][2]);
+        assert_eq!(forwarded_json["input"][3]["type"], "message");
+        assert_eq!(forwarded_json["input"][3]["role"], "user");
+        assert!(forwarded_json["input"][3].get("call_id").is_none());
+        assert!(forwarded_json["input"][3]
+            .to_string()
+            .contains("orphan tool result after switching threads"));
         let injected = forwarded_json["max_output_tokens"].as_i64().unwrap();
-        let expected = remaining_compact_budget("gpt-5.6-sol", &original_json);
+        let expected = remaining_compact_budget("gpt-5.6-sol", &forwarded_json);
         assert_eq!(injected, expected);
         assert!(injected > 0);
         let text = String::from_utf8_lossy(&response);
