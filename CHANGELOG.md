@@ -2,6 +2,13 @@
 
 本文件记录面向用户的重要变化。完整技术细节以对应版本的源码和 GitHub Release 为准。
 
+## 3.1.16 - 2026-08-31
+
+### 工程修复
+
+- 兼容 GitHub Windows runner 的 Rust 1.98 Clippy 新门禁：缩小 JSON 解析错误返回类型，并使用固定宽度像素切片遍历。
+- Grok schema 清理、工具预算与真实流量修复保持不变；本版本用于恢复 Windows Release 工作流的完整资产校验和 OAuth smoke。
+
 ## 3.1.15 - 2026-08-31
 
 ### 修复

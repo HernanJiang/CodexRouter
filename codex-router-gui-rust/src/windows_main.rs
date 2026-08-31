@@ -10866,7 +10866,7 @@ mod main_tests {
 
         let mut min_x = width;
         let mut max_x = 0;
-        for (index, pixel) in rgba.chunks_exact(4).enumerate() {
+        for (index, pixel) in rgba.as_chunks::<4>().0.iter().enumerate() {
             if pixel[3] >= 16 {
                 let x = index as u32 % width;
                 min_x = min_x.min(x);

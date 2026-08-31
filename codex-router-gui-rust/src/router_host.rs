@@ -2166,25 +2166,25 @@ fn authorize_data_request(
 async fn read_json_body(
     request: Request,
     request_id: &str,
-) -> std::result::Result<Value, Response> {
+) -> std::result::Result<Value, Box<Response>> {
     let bytes = match axum::body::to_bytes(request.into_body(), MAX_BODY_BYTES).await {
         Ok(bytes) => bytes,
         Err(_) => {
-            return Err(error_response(
+            return Err(Box::new(error_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "CR-REQ-0004",
                 "request body is too large",
                 request_id,
-            ));
+            )));
         }
     };
     serde_json::from_slice(&bytes).map_err(|_| {
-        error_response(
+        Box::new(error_response(
             StatusCode::BAD_REQUEST,
             "CR-REQ-0006",
             "request body is not valid JSON",
             request_id,
-        )
+        ))
     })
 }
 
@@ -2264,7 +2264,7 @@ async fn data_embeddings(State(state): State<HostState>, request: Request) -> Re
         Ok(value) => value,
         Err(response) => {
             let _ = terminal.complete("rejected", Some(400), Some("CR-REQ-0006"), 1);
-            return response;
+            return *response;
         }
     };
     let Some(model) = parsed
@@ -2425,7 +2425,7 @@ async fn image_async_submit(state: HostState, request: Request, kind: ImageJobKi
         Ok(value) => value,
         Err(response) => {
             let _ = terminal.complete("rejected", Some(400), Some("CR-REQ-0006"), 1);
-            return response;
+            return *response;
         }
     };
     let Some(model) = parsed
@@ -2753,7 +2753,7 @@ async fn image_batch_submit(State(state): State<HostState>, request: Request) ->
         Ok(value) => value,
         Err(response) => {
             let _ = terminal.complete("rejected", Some(400), Some("CR-REQ-0006"), 1);
-            return response;
+            return *response;
         }
     };
     let Some(model) = parsed
