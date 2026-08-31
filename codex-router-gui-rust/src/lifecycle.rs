@@ -1169,7 +1169,23 @@ mod tests {
 
     fn port_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn wait_for_test_listener(port: u16) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if loopback_listener_pid(port).ok().flatten() == Some(std::process::id()) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "test listener on port {port} never reached the Windows TCP owner table"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 
     fn temporary_root(name: &str) -> PathBuf {
@@ -1279,6 +1295,8 @@ mod tests {
         let configured_port = configured.local_addr().unwrap().port();
         let busy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let busy_port = busy.local_addr().unwrap().port();
+        wait_for_test_listener(configured_port);
+        wait_for_test_listener(busy_port);
         let free_triple = find_free_port_triple();
         let mut config = RouterConfig::default();
         config.deploy.sub2api_host = format!("http://127.0.0.1:{configured_port}");
@@ -1308,6 +1326,7 @@ mod tests {
         let root = temporary_root("adopt-cli-conflict");
         let configured = find_free_port_triple();
         let cli = TcpListener::bind((Ipv4Addr::LOCALHOST, configured + 1)).unwrap();
+        wait_for_test_listener(configured + 1);
         let replacement = find_free_port_triple();
         let mut config = RouterConfig::default();
         config.deploy.sub2api_host = format!("http://127.0.0.1:{configured}");

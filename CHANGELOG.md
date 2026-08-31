@@ -2,6 +2,14 @@
 
 本文件记录面向用户的重要变化。完整技术细节以对应版本的源码和 GitHub Release 为准。
 
+## 3.1.17 - 2026-08-31
+
+### 修复
+
+- 修复全新 Windows 用户态首次执行 OAuth 准备时，CLI 入口没有绑定隔离 UserData 凭据 scope，导致 Router Host 已就绪但管理会话仍返回 `admin_session`。
+- 稳定 Windows TCP owner 表相关测试：等待新 listener 可观测，并允许后续测试从 poisoned 测试锁恢复。
+- GitHub Windows Release 门禁现在会在任一 Rust 原生命令失败后立即中止，不再由后续 Clippy 成功覆盖测试失败退出码。
+
 ## 3.1.16 - 2026-08-31
 
 ### 工程修复

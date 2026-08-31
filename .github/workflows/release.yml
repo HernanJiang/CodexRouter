@@ -44,8 +44,11 @@ jobs:
         shell: pwsh
         run: |
           cargo fmt --manifest-path codex-router-gui-rust/Cargo.toml -- --check
+          if ($LASTEXITCODE -ne 0) { throw 'cargo fmt failed.' }
           cargo test --locked --manifest-path codex-router-gui-rust/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { throw 'cargo test failed.' }
           cargo clippy --locked --manifest-path codex-router-gui-rust/Cargo.toml --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw 'cargo clippy failed.' }
 
       - name: Wait for locally verified release asset
         id: package

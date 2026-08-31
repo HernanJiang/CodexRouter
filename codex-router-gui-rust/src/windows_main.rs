@@ -9338,6 +9338,7 @@ fn try_cli_mode() -> Option<anyhow::Result<()>> {
             let router_root = argument_value("--router-root=")
                 .map(PathBuf::from)
                 .unwrap_or_else(RouterConfig::find_router_root);
+            crate::credentials::set_scope_from_root(&router_root);
             let provider = argument_value("--provider=").unwrap_or_else(|| "openai".to_owned());
             let mut config = RouterConfig::default();
             if let Some(host) = argument_value("--sub2api-host=") {
