@@ -2,6 +2,13 @@
 
 本文件记录面向用户的重要变化。完整技术细节以对应版本的源码和 GitHub Release 为准。
 
+## 3.2.0 - 2026-08-31
+
+### 修复
+
+- 修复 DeepSeek 在兼容 Chat Completions/Responses 流中泄漏 `<｜DSML｜invoke>`、`<｜DSML｜parameter>`、伪工具调用和转义协议标记，导致对话出现协议幻觉的问题。
+- DSML 清理仅对 DeepSeek 路由启用，并跨 SSE 增量保持状态；正常回答和其他模型中的合法 XML/HTML 文本不受影响。
+
 ## 3.1.19 - 2026-08-31
 
 ### 修复

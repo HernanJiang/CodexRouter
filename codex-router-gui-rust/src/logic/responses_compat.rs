@@ -134,6 +134,17 @@ pub fn is_chat_completions_agent_model(model: &str) -> bool {
     slug.contains("kimi") || slug.contains("k3")
 }
 
+pub fn is_deepseek_family_model(model: &str) -> bool {
+    let slug = model
+        .trim()
+        .trim_start_matches('~')
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase();
+    slug.contains("deepseek")
+}
+
 pub fn third_party_identity(model: &str) -> Option<(&'static str, &'static str)> {
     let id = model.trim().trim_start_matches('~').to_ascii_lowercase();
     if id.contains("grok") {
@@ -3453,7 +3464,12 @@ pub struct SseThinkState {
     /// their SSE (a stray `<` or `encrypted_content` substring would stall
     /// or strip the stream).
     pub disabled: bool,
+    /// DeepSeek-compatible endpoints may emit DSML tool-control tokens as
+    /// ordinary Chat Completions text.  This is enabled only for DeepSeek;
+    /// other providers must keep arbitrary XML/HTML in user-visible output.
+    deepseek_dsml: bool,
     scan: ThinkScan,
+    dsml: DeepSeekDsmlScan,
     reasoning_open: bool,
     streamed_output_items: HashSet<String>,
     streamed_output_seen: bool,
@@ -3491,8 +3507,248 @@ impl SseThinkState {
         }
     }
 
+    pub fn deepseek() -> Self {
+        Self {
+            deepseek_dsml: true,
+            ..Self::default()
+        }
+    }
+
     fn needs_scan(&self) -> bool {
         !self.disabled && (self.scan.is_active() || self.reasoning_open)
+    }
+}
+
+#[derive(Debug, Default)]
+struct DeepSeekDsmlScan {
+    hold: String,
+    inside_invoke: bool,
+    suppress_pseudo_call: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeepSeekDsmlTag {
+    InvokeOpen,
+    InvokeClose,
+    Other,
+}
+
+const DEEPSEEK_DSML_PREFIX: &str = "<｜DSML｜";
+
+fn deepseek_dsml_tag_at(text: &str, index: usize) -> Option<(DeepSeekDsmlTag, usize)> {
+    let rest = &text[index..];
+    for prefix in [
+        DEEPSEEK_DSML_PREFIX,
+        "</｜DSML｜",
+        "\\<｜DSML｜",
+        "\\</｜DSML｜",
+        "&lt;｜DSML｜",
+        "&lt;/｜DSML｜",
+        "\\&lt;｜DSML｜",
+        "\\&lt;/｜DSML｜",
+    ] {
+        let Some(body) = rest.strip_prefix(prefix) else {
+            continue;
+        };
+        let is_close = prefix.contains("</") || prefix.contains("&lt;/");
+        let name = body.strip_prefix('/').unwrap_or(body);
+        let (name_end, end_len) = if let Some(end) = name.find('>') {
+            (end, end + 1)
+        } else if let Some(end) = name.find("&gt;") {
+            (end, end + "&gt;".len())
+        } else {
+            continue;
+        };
+        let raw_name = &name[..name_end];
+        let tag = if raw_name.eq_ignore_ascii_case("invoke") {
+            if is_close {
+                DeepSeekDsmlTag::InvokeClose
+            } else {
+                DeepSeekDsmlTag::InvokeOpen
+            }
+        } else {
+            DeepSeekDsmlTag::Other
+        };
+        return Some((tag, prefix.len() + end_len));
+    }
+    let slash_len = rest.bytes().take_while(|byte| *byte == b'\\').count();
+    if slash_len > 0 {
+        return deepseek_dsml_tag_at(text, index + slash_len)
+            .map(|(tag, len)| (tag, slash_len + len));
+    }
+    None
+}
+
+fn deepseek_dsml_prefix_suffix_len(text: &str) -> usize {
+    let tags = [
+        "<｜DSML｜invoke>",
+        "</｜DSML｜invoke>",
+        "<｜DSML｜parameter>",
+        "</｜DSML｜parameter>",
+        "\\<｜DSML｜invoke>",
+        "\\</｜DSML｜invoke>",
+        "&lt;｜DSML｜invoke&gt;",
+        "&lt;/｜DSML｜invoke&gt;",
+        "&lt;｜DSML｜parameter&gt;",
+        "&lt;/｜DSML｜parameter&gt;",
+        "\\&lt;｜DSML｜invoke&gt;",
+        "\\&lt;/｜DSML｜invoke&gt;",
+    ];
+    (1..=text.len())
+        .filter(|len| {
+            if !text.is_char_boundary(text.len() - len) {
+                return false;
+            }
+            let suffix = &text[text.len() - len..];
+            tags.iter()
+                .any(|tag| tag.starts_with(suffix) && tag.len() > suffix.len())
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn deepseek_pseudo_call_end(text: &str, start: usize) -> Option<usize> {
+    let mut index = start;
+    while let Some(ch) = text[index..].chars().next() {
+        if ch.is_whitespace() {
+            index += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    let name_start = index;
+    while let Some(ch) = text[index..].chars().next() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' || ch == ':' {
+            index += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if index == name_start || !text[index..].starts_with('(') {
+        return Some(start);
+    }
+    let mut depth = 0_i32;
+    let mut quote = None;
+    let mut escaped = false;
+    for (offset, ch) in text[index..].char_indices() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index + offset + ch.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+impl DeepSeekDsmlScan {
+    fn push(&mut self, incoming: &str) -> String {
+        let mut source = std::mem::take(&mut self.hold);
+        source.push_str(incoming);
+        let mut visible = String::new();
+        let mut index = 0;
+        while index < source.len() {
+            if let Some((tag, len)) = deepseek_dsml_tag_at(&source, index) {
+                if tag == DeepSeekDsmlTag::InvokeOpen {
+                    self.inside_invoke = true;
+                    self.suppress_pseudo_call = false;
+                } else if tag == DeepSeekDsmlTag::InvokeClose {
+                    self.inside_invoke = false;
+                    self.suppress_pseudo_call = true;
+                }
+                index += len;
+                continue;
+            }
+            if self.inside_invoke {
+                let remaining = &source[index..];
+                if deepseek_dsml_prefix_suffix_len(remaining) > 0 {
+                    self.hold = remaining.to_owned();
+                    return visible;
+                }
+                let Some(ch) = source[index..].chars().next() else {
+                    break;
+                };
+                index += ch.len_utf8();
+                continue;
+            }
+            if self.suppress_pseudo_call {
+                match deepseek_pseudo_call_end(&source, index) {
+                    Some(end) if end > index => {
+                        index = end;
+                        self.suppress_pseudo_call = false;
+                        continue;
+                    }
+                    Some(_) => self.suppress_pseudo_call = false,
+                    None => {
+                        self.hold = source[index..].to_owned();
+                        return visible;
+                    }
+                }
+            }
+            let Some(ch) = source[index..].chars().next() else {
+                break;
+            };
+            visible.push(ch);
+            index += ch.len_utf8();
+        }
+        if !self.inside_invoke && !self.suppress_pseudo_call {
+            let suffix_len = deepseek_dsml_prefix_suffix_len(&visible);
+            if suffix_len > 0 {
+                let split = visible.len() - suffix_len;
+                self.hold = visible.split_off(split);
+            }
+        }
+        visible
+    }
+
+    fn flush(&mut self) -> String {
+        // An incomplete DSML marker, invocation, or pseudo-call is provider
+        // protocol, never user-visible prose. Drop it at stream end.
+        self.hold.clear();
+        self.suppress_pseudo_call = false;
+        String::new()
+    }
+}
+
+fn scrub_deepseek_text(state: &mut SseThinkState, text: &str) -> String {
+    if state.deepseek_dsml {
+        state.dsml.push(text)
+    } else {
+        text.to_owned()
+    }
+}
+
+pub fn strip_deepseek_dsml_from_value(value: &mut Value) -> bool {
+    match value {
+        Value::String(text) => {
+            let mut state = SseThinkState::deepseek();
+            let mut cleaned = state.dsml.push(text);
+            cleaned.push_str(&state.dsml.flush());
+            if cleaned != *text {
+                *text = cleaned;
+                true
+            } else {
+                false
+            }
+        }
+        Value::Array(values) => values.iter_mut().any(strip_deepseek_dsml_from_value),
+        Value::Object(object) => object.values_mut().any(strip_deepseek_dsml_from_value),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
     }
 }
 
@@ -3779,6 +4035,9 @@ fn emit_think_pieces(
 }
 
 fn flush_think_state(state: &mut SseThinkState, out: &mut String) {
+    if state.deepseek_dsml {
+        let _ = state.dsml.flush();
+    }
     let pieces = state.scan.flush();
     emit_think_pieces(state, pieces, None, out);
     close_reasoning(state, out);
@@ -3914,6 +4173,12 @@ fn event_may_need_think_rewrite(state: &SseThinkState, event: &str) -> bool {
     }
     if event_is_raw_reasoning(event) {
         return true;
+    }
+    if state.deepseek_dsml {
+        return event.contains("output_text.delta")
+            || event.contains("output_text.done")
+            || event.contains("output_item.done")
+            || event.contains("content_part.done");
     }
     let lower = event.to_ascii_lowercase();
     if !lower.contains("<think") {
@@ -4396,6 +4661,13 @@ fn rewrite_chat_completion_event(
     if !chat_completion_chunk(json) {
         return false;
     }
+    if json
+        .get("model")
+        .and_then(Value::as_str)
+        .is_some_and(is_deepseek_family_model)
+    {
+        state.deepseek_dsml = true;
+    }
     ensure_chat_started(state, json, out);
     let choice = json
         .get("choices")
@@ -4408,7 +4680,11 @@ fn rewrite_chat_completion_event(
     let message = choice.get("message").unwrap_or(&Value::Null);
     let mut emitted_reasoning = false;
     for field in ["reasoning_content", "reasoning", "thinking", "thoughts"] {
-        if let Some(text) = delta.get(field).and_then(chat_text_value) {
+        if let Some(text) = delta
+            .get(field)
+            .and_then(chat_text_value)
+            .map(|text| scrub_deepseek_text(state, &text))
+        {
             if !text.is_empty() {
                 emit_think_delta(state, out, &text);
                 emitted_reasoning = true;
@@ -4417,7 +4693,11 @@ fn rewrite_chat_completion_event(
     }
     if !emitted_reasoning {
         for field in ["reasoning_content", "reasoning", "thinking", "thoughts"] {
-            if let Some(text) = message.get(field).and_then(chat_text_value) {
+            if let Some(text) = message
+                .get(field)
+                .and_then(chat_text_value)
+                .map(|text| scrub_deepseek_text(state, &text))
+            {
                 if !text.is_empty() {
                     emit_think_delta(state, out, &text);
                 }
@@ -4427,6 +4707,8 @@ fn rewrite_chat_completion_event(
     let mut emitted_content = false;
     if let Some(content) = delta.get("content") {
         let (reasoning, visible) = split_chat_message_content(content);
+        let reasoning = scrub_deepseek_text(state, &reasoning);
+        let visible = scrub_deepseek_text(state, &visible);
         if !reasoning.is_empty() {
             emit_think_delta(state, out, &reasoning);
         }
@@ -4441,6 +4723,8 @@ fn rewrite_chat_completion_event(
     if !emitted_content {
         if let Some(content) = message.get("content") {
             let (reasoning, visible) = split_chat_message_content(content);
+            let reasoning = scrub_deepseek_text(state, &reasoning);
+            let visible = scrub_deepseek_text(state, &visible);
             if !reasoning.is_empty() {
                 emit_think_delta(state, out, &reasoning);
             }
@@ -4453,6 +4737,8 @@ fn rewrite_chat_completion_event(
     if !emitted_content {
         if let Some(parts) = delta.get("parts").or_else(|| message.get("parts")) {
             let (reasoning, visible) = split_chat_message_content(parts);
+            let reasoning = scrub_deepseek_text(state, &reasoning);
+            let visible = scrub_deepseek_text(state, &visible);
             if !reasoning.is_empty() {
                 emit_think_delta(state, out, &reasoning);
             }
@@ -4568,7 +4854,8 @@ fn rewrite_sse_event(state: &mut SseThinkState, event: &str) -> String {
                         if let Some(item_id) = json.get("item_id").and_then(Value::as_str) {
                             state.streamed_output_items.insert(item_id.to_owned());
                         }
-                        let pieces = state.scan.push(delta);
+                        let delta = scrub_deepseek_text(state, delta);
+                        let pieces = state.scan.push(&delta);
                         let mut visible_tools = Vec::new();
                         let mut mapped = Vec::new();
                         for piece in pieces {
@@ -6664,6 +6951,104 @@ mod tests {
         assert!(second_output.contains("\"type\":\"function_call\""));
         assert!(second_output.contains("Get-ChildItem"));
         assert!(!second_output.contains("functions__exec"));
+    }
+
+    #[test]
+    fn deepseek_dsml_protocol_does_not_leak_into_visible_text() {
+        let value = json!({
+            "id": "chatcmpl-deepseek-dsml",
+            "model": "deepseek-v4-flash",
+            "choices": [{
+                "delta": {
+                    "content": "<｜DSML｜invoke>\nmanual_fetch('backlog id: hostConfigurations.financialDatacenter')\n</｜DSML｜invoke>正常答案"
+                }
+            }]
+        });
+        let output = rewrite_sse_text(&format!("data: {value}\n\n"));
+        assert!(!output.contains("DSML"), "protocol leaked: {output}");
+        assert!(
+            !output.contains("manual_fetch"),
+            "fake tool leaked: {output}"
+        );
+        assert!(output.contains("正常答案"), "visible answer lost: {output}");
+    }
+
+    #[test]
+    fn deepseek_dsml_protocol_is_suppressed_across_chat_completion_chunks() {
+        let mut state = SseThinkState::default();
+        let first = json!({
+            "id": "chatcmpl-deepseek-dsml-stream",
+            "model": "deepseek-v4-flash",
+            "choices": [{"delta": {"content": "<｜DSML｜inv"}}]
+        });
+        let second = json!({
+            "id": "chatcmpl-deepseek-dsml-stream",
+            "model": "deepseek-v4-flash",
+            "choices": [{"delta": {"content": "oke>manual_fetch('secret')</｜DSML｜invoke>可见"}}]
+        });
+        let first_output = rewrite_sse_text_with(&mut state, &format!("data: {first}\n\n"));
+        let second_output = rewrite_sse_text_with(&mut state, &format!("data: {second}\n\n"));
+        let output = format!("{first_output}{second_output}");
+        assert!(!output.contains("DSML"), "protocol leaked: {output}");
+        assert!(
+            !output.contains("manual_fetch"),
+            "fake tool leaked: {output}"
+        );
+        assert!(output.contains("可见"), "visible answer lost: {output}");
+    }
+
+    #[test]
+    fn deepseek_dsml_escaped_and_entity_encoded_markers_are_suppressed() {
+        let text = r#"\\</｜DSML｜parameter>\&lt;/｜DSML｜invoke&gt;manual_fetch('x')\&lt;/｜DSML｜invoke&gt;结束"#;
+        let value = json!({
+            "id": "chatcmpl-deepseek-dsml-encoded",
+            "model": "deepseek-v4-flash",
+            "choices": [{"delta": {"content": text}}]
+        });
+        let output = rewrite_sse_text(&format!("data: {value}\n\n"));
+        assert!(
+            !output.contains("DSML"),
+            "encoded protocol leaked: {output}"
+        );
+        assert!(
+            !output.contains("manual_fetch"),
+            "encoded fake tool leaked: {output}"
+        );
+        assert!(output.contains("结束"), "visible answer lost: {output}");
+    }
+
+    #[test]
+    fn deepseek_dsml_is_removed_from_responses_text_events_without_model_field() {
+        let mut state = SseThinkState::deepseek();
+        let first = rewrite_sse_text_with(
+            &mut state,
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m1\",\"delta\":\"<｜DSML｜invoke>\"}\n\n",
+        );
+        let second = rewrite_sse_text_with(
+            &mut state,
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m1\",\"delta\":\"manual_fetch('hidden')</｜DSML｜invoke>最终答案\"}\n\n",
+        );
+        let output = format!("{first}{second}");
+        assert!(!output.contains("DSML"), "protocol leaked: {output}");
+        assert!(
+            !output.contains("manual_fetch"),
+            "fake tool leaked: {output}"
+        );
+        assert!(output.contains("最终答案"), "visible answer lost: {output}");
+    }
+
+    #[test]
+    fn non_deepseek_models_keep_dsml_like_user_text() {
+        let value = json!({
+            "id": "chatcmpl-xml",
+            "model": "meta/muse-spark-1.2-contributor",
+            "choices": [{"delta": {"content": "文档中的 <｜DSML｜invoke> 示例"}}]
+        });
+        let output = rewrite_sse_text(&format!("data: {value}\n\n"));
+        assert!(
+            output.contains("<｜DSML｜invoke>"),
+            "user text was stripped: {output}"
+        );
     }
 
     #[test]

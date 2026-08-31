@@ -7,7 +7,8 @@
 
 use super::responses_compat::{
     append_incomplete_turn_continuation, extract_leaked_tool_calls, is_chat_completions_path,
-    is_claude_family_model, is_compact_path, is_exhausted_account_status, is_openai_family_model,
+    is_claude_family_model, is_compact_path, is_deepseek_family_model,
+    is_exhausted_account_status, is_openai_family_model,
     is_quota_exhausted_error, is_responses_path, is_unsupported_image_error, is_xai_family_model,
     normalize_official_compact_replay, prepare_official_compact_request,
     prepare_xai_official_compact_request,
@@ -747,6 +748,7 @@ fn handle_client(
     let mut continue_body: Option<Value> = None;
     let mut hold_text_completed = false;
     let mut disable_think_rewrite = false;
+    let mut deepseek_dsml = false;
     if method == "POST" && (is_responses_path(&path) || is_chat_completions_path(&path)) {
         if let Ok(mut json_body) = serde_json::from_slice::<Value>(&request_body) {
             let openai_family = json_body
@@ -756,6 +758,10 @@ fn handle_client(
             disable_think_rewrite = json_body.get("model").and_then(Value::as_str).is_some_and(
                 |model| is_openai_family_model(model) || is_xai_family_model(model),
             );
+            deepseek_dsml = json_body
+                .get("model")
+                .and_then(Value::as_str)
+                .is_some_and(is_deepseek_family_model);
             if !openai_family {
                 let stats = sanitize_responses_request(&path, &mut json_body);
                 inject_max_output_tokens(&path, &mut json_body);
@@ -885,6 +891,7 @@ fn handle_client(
                         continue_point.clone(),
                         hold_text_completed,
                         disable_think_rewrite,
+                        deepseek_dsml,
                     )? {
                         SseForward::Done => return Ok(()),
                         SseForward::ReconcileFailed => {
@@ -993,6 +1000,7 @@ fn handle_client(
                                 client,
                                 &response_headers_map,
                                 body,
+                                deepseek_dsml,
                             );
                         }
                         Err(error) => {
@@ -1905,7 +1913,7 @@ fn forward_event_with_rewrites(
 impl<'a> SseSink<'a> {
     #[cfg(test)]
     fn new(client: &'a mut TcpStream, resume: Option<StreamResume>) -> SseSink<'a> {
-        Self::with_policy(client, resume, None, false, false)
+        Self::with_policy(client, resume, None, false, false, false)
     }
 
     fn with_policy(
@@ -1914,6 +1922,7 @@ impl<'a> SseSink<'a> {
         continue_point: Option<ContinuePoint>,
         hold_text_completed: bool,
         disable_think_rewrite: bool,
+        deepseek_dsml: bool,
     ) -> SseSink<'a> {
         let delivered = resume
             .as_ref()
@@ -1946,6 +1955,8 @@ impl<'a> SseSink<'a> {
             continue_point,
             think: if disable_think_rewrite {
                 SseThinkState::disabled()
+            } else if deepseek_dsml {
+                SseThinkState::deepseek()
             } else {
                 SseThinkState::default()
             },
@@ -2489,6 +2500,7 @@ fn forward_agent_sse(
     continue_point: Option<ContinuePoint>,
     hold_text_completed: bool,
     disable_think_rewrite: bool,
+    deepseek_dsml: bool,
 ) -> anyhow::Result<SseForward> {
     // The SSE prelude is written by the caller, once per client connection,
     // so a transparent retry never duplicates response headers. A mid-stream
@@ -2510,6 +2522,7 @@ fn forward_agent_sse(
         continue_point,
         hold_text_completed,
         disable_think_rewrite,
+        deepseek_dsml,
     );
     if chunked {
         decode_chunked_to_sse(&mut sink, upstream, leftover)
@@ -2621,11 +2634,15 @@ fn forward_rewritten_json_body(
     client: &mut TcpStream,
     headers: &HashMap<String, String>,
     mut body: Vec<u8>,
+    deepseek_dsml: bool,
 ) -> anyhow::Result<()> {
     if let Ok(mut json) = serde_json::from_slice::<Value>(&body) {
         rewrite_provider_json(&mut json);
         crate::logic::responses_compat::rewrite_tool_names_in_json(&mut json);
         crate::logic::responses_compat::strip_think_tags_from_value(&mut json);
+        if deepseek_dsml {
+            crate::logic::responses_compat::strip_deepseek_dsml_from_value(&mut json);
+        }
         body = serde_json::to_vec(&json)?;
     }
     send_raw(client, &rebuild_response(200, headers, &body))?;
