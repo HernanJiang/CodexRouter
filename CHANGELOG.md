@@ -2,6 +2,36 @@
 
 本文件记录面向用户的重要变化。完整技术细节以对应版本的源码和 GitHub Release 为准。
 
+## 3.1.15 - 2026-08-31
+
+### 修复
+
+- 修复 Grok 同时启用大量 function 工具与内置 `web_search` 时仍返回 `invalid-argument`：真实 xAI 流量表明 `web_search` 共存时的安全边界低于纯 function 请求。
+- Router 在带 `web_search` 时使用已由原始历史请求验证的 337 总工具上限（336 function + `web_search`）；不带搜索时仍保留 349 个 function。
+
+## 3.1.14 - 2026-08-31
+
+### 修复
+
+- 修正 Grok OAuth Responses 的实际工具边界：上游错误文案宣称最多 350 个工具，但真实请求在恰好 350 个时仍返回 `invalid-argument`，同一请求降到 349 个后成功。
+- Router 现在使用经真实 xAI 流量验证的 349 安全上限；原始历史、`web_search` 和 349 个工具组合已返回 HTTP 200。
+
+## 3.1.13 - 2026-08-31
+
+### 修复
+
+- 修复 Grok Responses 在 Codex 同时启用大量 App/MCP namespace 工具时返回 `{"code":"invalid-argument"}`。
+- Grok 上游最多接受 350 个展开后的工具；Router 现在在 namespace 展开前按叶子工具数限额，保留直接工具并按原顺序裁剪超出的 namespace 子工具。
+- 新增真实上游边界回归：350 个工具成功，超过 350 个由 Grok 返回的 `Maximum tools limit reached` 被锁定为测试依据。
+
+## 3.1.12 - 2026-08-31
+
+### 修复
+
+- 修复 Grok 在启用 Codex App、Computer Use 等复杂工具后返回 `{"code":"invalid-argument"}`：Grok OAuth 不接受工具参数 schema 中的 `format`、`pattern` 和非布尔 `additionalProperties`。
+- Grok 专用清理现在会递归移除不兼容的 schema 校验关键字，并把 schema 形式的 `additionalProperties` 规范化为布尔值；工具、消息历史和 namespace 能力保持不变。
+- 新增 `/v1/responses` → Router → CLIProxy 完整链路回归，覆盖客户端任务 ID、Codex 会话信封、嵌套 namespace 工具和 Grok 同款 `invalid-argument` 错误。
+
 ## 3.1.11 - 2026-08-30
 
 ### 修复

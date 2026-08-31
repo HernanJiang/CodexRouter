@@ -545,6 +545,78 @@ fn grok_safe_function_parameters() -> Value {
     })
 }
 
+// Grok reports a nominal maximum of 350 tools, but live OAuth Responses
+// requests containing exactly 350 are still rejected with invalid-argument;
+// the same function-only payload succeeds with 349. When web_search is also
+// present, the verified safe boundary is 336 functions plus web_search. Codex
+// sends namespace containers, so raw `tools.len()` can be far below either
+// effective count.
+const GROK_MAX_EXPANDED_TOOLS: usize = 349;
+const GROK_MAX_EXPANDED_TOOLS_WITH_WEB_SEARCH: usize = 337;
+
+fn is_namespace_tool(tool: &Value) -> bool {
+    tool.get("type").and_then(Value::as_str) == Some("namespace")
+}
+
+fn retain_namespace_tool_budget(tools: &mut Vec<Value>, remaining: &mut usize) -> usize {
+    let mut removed = 0;
+    tools.retain_mut(|tool| {
+        if is_namespace_tool(tool) {
+            if let Some(children) = tool.get_mut("tools").and_then(Value::as_array_mut) {
+                removed += retain_namespace_tool_budget(children, remaining);
+            }
+            true
+        } else if *remaining > 0 {
+            *remaining -= 1;
+            true
+        } else {
+            removed += 1;
+            false
+        }
+    });
+    removed
+}
+
+fn cap_grok_expanded_tools(tools: &mut Vec<Value>) -> usize {
+    let max_tools = if tools
+        .iter()
+        .any(|tool| tool.get("type").and_then(Value::as_str) == Some("web_search"))
+    {
+        GROK_MAX_EXPANDED_TOOLS_WITH_WEB_SEARCH
+    } else {
+        GROK_MAX_EXPANDED_TOOLS
+    };
+    let direct_tools = tools.iter().filter(|tool| !is_namespace_tool(tool)).count();
+    let mut namespace_budget = max_tools.saturating_sub(direct_tools);
+    let mut removed = 0;
+
+    for tool in tools.iter_mut().filter(|tool| is_namespace_tool(tool)) {
+        if let Some(children) = tool.get_mut("tools").and_then(Value::as_array_mut) {
+            removed += retain_namespace_tool_budget(children, &mut namespace_budget);
+        }
+    }
+
+    // A pathological request may itself contain more than the safe direct
+    // tool limit.
+    // Namespace children have already yielded all of their budget, so retain
+    // the first declarations deterministically as the only possible fallback.
+    if direct_tools > max_tools {
+        let mut direct_budget = max_tools;
+        tools.retain(|tool| {
+            if is_namespace_tool(tool) {
+                false
+            } else if direct_budget > 0 {
+                direct_budget -= 1;
+                true
+            } else {
+                removed += 1;
+                false
+            }
+        });
+    }
+    removed
+}
+
 fn is_grok_hang_schema_tool(name: &str, namespace: &str) -> bool {
     let name = name.trim();
     let lower = name.to_ascii_lowercase();
@@ -607,7 +679,19 @@ fn grok_normalize_schema_value(value: &mut Value) -> usize {
     let mut changed = 0;
     match value {
         Value::Object(object) => {
-            if object.get("additionalProperties") == Some(&json!({})) {
+            // Grok's Responses adapter accepts the basic object-schema subset,
+            // but rejects several validation-only JSON Schema keywords that
+            // Codex app/plugin tools emit. It also requires
+            // `additionalProperties` to be a boolean rather than a schema.
+            for key in ["format", "pattern"] {
+                if object.remove(key).is_some() {
+                    changed += 1;
+                }
+            }
+            if object
+                .get("additionalProperties")
+                .is_some_and(|value| !value.is_boolean())
+            {
                 object.insert("additionalProperties".to_owned(), Value::Bool(true));
                 changed += 1;
             }
@@ -677,6 +761,7 @@ fn sanitize_grok_request(body: &mut Map<String, Value>) -> usize {
         changed += 1;
     }
     if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+        changed += cap_grok_expanded_tools(tools);
         changed += sanitize_grok_tool_list(tools, "");
     }
     let drop_text = body
@@ -5187,6 +5272,62 @@ mod tests {
     }
 
     #[test]
+    fn grok_caps_namespace_expansion_at_upstream_tool_limit() {
+        let namespace_children = (0..343)
+            .map(|index| {
+                json!({
+                    "type": "function",
+                    "name": format!("plugin_tool_{index}"),
+                    "parameters": {"type": "object", "properties": {}}
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut tools = (0..11)
+            .map(|index| {
+                json!({
+                    "type": "function",
+                    "name": format!("direct_tool_{index}"),
+                    "parameters": {"type": "object", "properties": {}}
+                })
+            })
+            .collect::<Vec<_>>();
+        tools.push(json!({
+            "type": "namespace",
+            "name": "mcp__codex_apps",
+            "tools": namespace_children
+        }));
+        tools.push(json!({"type": "web_search"}));
+        let mut body = json!({
+            "model": "grok-4.6",
+            "tools": tools,
+            "input": "continue"
+        });
+
+        let stats = sanitize_responses_request("/v1/responses", &mut body);
+        let tools = body["tools"].as_array().unwrap();
+        let direct = tools
+            .iter()
+            .filter(|tool| tool["type"] != "namespace")
+            .count();
+        let expanded_children = tools
+            .iter()
+            .filter(|tool| tool["type"] == "namespace")
+            .flat_map(|tool| tool["tools"].as_array().unwrap())
+            .count();
+
+        assert_eq!(direct, 12);
+        assert_eq!(expanded_children, 325);
+        assert_eq!(
+            direct + expanded_children,
+            GROK_MAX_EXPANDED_TOOLS_WITH_WEB_SEARCH
+        );
+        assert!(stats.rewritten_tool_calls >= 18);
+        assert!(tools.iter().any(|tool| tool["name"] == "direct_tool_10"));
+        assert!(tools.iter().any(|tool| tool["type"] == "web_search"));
+        assert_eq!(tools[11]["tools"][324]["name"], "plugin_tool_324");
+    }
+
+    #[test]
     fn grok_request_canonicalizes_cross_account_history() {
         let mut body = json!({
             "model": "grok-4.6",
@@ -7043,7 +7184,10 @@ mod tests {
                 "parameters": {
                     "type": "object",
                     "additionalProperties": {},
-                    "properties": {"cmd": {"type": "string"}}
+                    "properties": {
+                        "cmd": {"type": "string", "format": "uri"},
+                        "placement": {"type": "string", "pattern": "^(right|bottom)$"}
+                    }
                 }
             }],
             "input": [{
@@ -7062,5 +7206,11 @@ mod tests {
         assert!(instructions.contains("You are Codex"));
         assert!(body["tools"][0].get("strict").is_none());
         assert_eq!(body["tools"][0]["parameters"]["additionalProperties"], true);
+        assert!(body["tools"][0]["parameters"]["properties"]["cmd"]
+            .get("format")
+            .is_none());
+        assert!(body["tools"][0]["parameters"]["properties"]["placement"]
+            .get("pattern")
+            .is_none());
     }
 }

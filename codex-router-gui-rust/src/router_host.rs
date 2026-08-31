@@ -3551,6 +3551,158 @@ mod tests {
         }
     }
 
+    fn grok_test_route() -> PoolRoute {
+        PoolRoute {
+            pool_id: "pool-grok".to_owned(),
+            prefix: "cr_test_xai".to_owned(),
+            public_model: "grok-4.6".to_owned(),
+            upstream_model: "grok-4.6".to_owned(),
+            provider: "xai".to_owned(),
+            priority: 1,
+            enabled: true,
+            available: true,
+        }
+    }
+
+    fn contains_grok_rejected_schema_keyword(value: &Value) -> bool {
+        match value {
+            Value::Object(object) => {
+                object
+                    .keys()
+                    .any(|key| matches!(key.as_str(), "format" | "pattern"))
+                    || object
+                        .get("additionalProperties")
+                        .is_some_and(|value| !value.is_boolean())
+                    || object.values().any(contains_grok_rejected_schema_keyword)
+            }
+            Value::Array(items) => items.iter().any(contains_grok_rejected_schema_keyword),
+            _ => false,
+        }
+    }
+
+    async fn mock_grok_cli() -> (String, tokio::sync::oneshot::Receiver<Value>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (captured_tx, captured_rx) = tokio::sync::oneshot::channel::<Value>();
+        let captured_tx = Arc::new(Mutex::new(Some(captured_tx)));
+        let app = Router::new().route(
+            "/v1/responses",
+            post({
+                let captured_tx = captured_tx.clone();
+                move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                    let captured_tx = captured_tx.clone();
+                    async move {
+                        let parsed: Value = serde_json::from_slice(&body).unwrap();
+                        let request_id = headers
+                            .get("x-request-id")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_owned();
+                        let session_forwarded = headers.contains_key("x-codex-session")
+                            || headers.contains_key("session_id");
+                        if let Some(sender) = captured_tx
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .take()
+                        {
+                            let _ = sender.send(serde_json::json!({
+                                "body": parsed,
+                                "request_id": request_id,
+                                "session_forwarded": session_forwarded,
+                            }));
+                        }
+                        if contains_grok_rejected_schema_keyword(&parsed) {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "type": "error",
+                                    "code": "invalid-argument"
+                                })),
+                            )
+                                .into_response();
+                        }
+                        (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
+                    }
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), captured_rx)
+    }
+
+    #[tokio::test]
+    async fn grok_full_chain_removes_schema_keywords_that_trigger_invalid_argument() {
+        let (cli_base, captured_rx) = mock_grok_cli().await;
+        let mut state = test_host_state();
+        state.cli_base = Arc::new(cli_base);
+        *state
+            .control
+            .routes
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) =
+            RouteTable::new(vec![grok_test_route()]).unwrap();
+        let app = public_router(state);
+        let client_request_id = "01a02879-c79e-7041-9782-cc41ab37384f";
+        let request = AxumRequest::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer sk-test-local-key-1234567890")
+            .header("content-type", "application/json")
+            .header("x-request-id", client_request_id)
+            .header("x-codex-session", client_request_id)
+            .body(AxumBody::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "grok-4.6",
+                    "client_metadata": {"thread_id": client_request_id},
+                    "prompt_cache_key": client_request_id,
+                    "input": [{
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "继续"}]
+                    }],
+                    "tools": [{
+                        "type": "namespace",
+                        "name": "mcp__codex_app",
+                        "tools": [{
+                            "type": "function",
+                            "name": "open_in_codex",
+                            "strict": false,
+                            "parameters": {
+                                "type": "object",
+                                "additionalProperties": {},
+                                "properties": {
+                                    "path": {"type": "string", "format": "uri"},
+                                    "placement": {"type": "string", "pattern": "^(right|bottom)$"}
+                                }
+                            }
+                        }]
+                    }]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let response_body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let response_json: Value = serde_json::from_slice(&response_body).unwrap();
+        let captured = captured_rx.await.unwrap();
+
+        assert_ne!(captured["request_id"], client_request_id);
+        assert_eq!(captured["session_forwarded"], false);
+        assert!(captured["body"].get("client_metadata").is_none());
+        assert!(captured["body"].get("prompt_cache_key").is_none());
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "Grok rejected the sanitized full-chain payload: {response_json}"
+        );
+    }
+
     #[tokio::test]
     async fn sse_eof_without_terminal_emits_failed_event() {
         let state = test_host_state();

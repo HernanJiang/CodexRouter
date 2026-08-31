@@ -622,7 +622,7 @@ dependencies = [
 
 [[package]]
 name = "codex-router"
-version = "3.1.11"
+version = "3.1.15"
 dependencies = [
  "anyhow",
  "arboard",
