@@ -3614,7 +3614,37 @@ fn discovered_oauth_models(platform: &str, models: &Value) -> Vec<crate::OAuthMo
             display_name,
         });
     }
+    if platform == "antigravity" {
+        inject_antigravity_current_gemini_flash(&mut discovered);
+    }
     discovered
+}
+
+fn inject_antigravity_current_gemini_flash(discovered: &mut Vec<crate::OAuthModelSummary>) {
+    const ID: &str = "gemini-3.8-flash";
+    const NAME: &str = "Gemini 3.8 Flash";
+    if discovered.is_empty() {
+        return;
+    }
+    if !discovered
+        .iter()
+        .any(|model| model.id.to_ascii_lowercase().contains("gemini"))
+    {
+        return;
+    }
+    if discovered
+        .iter()
+        .any(|model| model.id.eq_ignore_ascii_case(ID))
+    {
+        return;
+    }
+    discovered.insert(
+        0,
+        crate::OAuthModelSummary {
+            id: ID.to_owned(),
+            display_name: NAME.to_owned(),
+        },
+    );
 }
 
 fn oauth_accounts_failure_needs_router_repair(summary: &str) -> bool {
@@ -4806,6 +4836,21 @@ base_url = "https://api.430123.xyz/v1"
     }
 
     #[test]
+    fn antigravity_injects_gemini_38_when_live_catalog_still_lists_37() {
+        let models = discovered_oauth_models(
+            "antigravity",
+            &json!([
+                {"id": "gemini-3.7-flash-high", "display_name": "Gemini 3.7 Flash High"},
+                {"id": "claude-sonnet-4-6"}
+            ]),
+        );
+        assert_eq!(models[0].id, "gemini-3.8-flash");
+        assert_eq!(models[0].display_name, "Gemini 3.8 Flash");
+        assert!(models.iter().any(|model| model.id == "gemini-3.7-flash"));
+        assert!(models.iter().any(|model| model.id == "claude-sonnet-4-6"));
+    }
+
+    #[test]
     fn antigravity_folds_gemini_38_flash_tiers_like_37() {
         assert_eq!(
             antigravity_gemini_flash_public_id("gemini-3.8-flash-high").as_deref(),
@@ -4841,9 +4886,10 @@ base_url = "https://api.430123.xyz/v1"
                 .iter()
                 .map(|model| model.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["gemini-3.1-pro-high", "claude-fable-5"]
+            vec!["gemini-3.8-flash", "gemini-3.1-pro-high", "claude-fable-5"]
         );
-        assert_eq!(models[1].display_name, "claude-fable-5");
+        assert_eq!(models[0].display_name, "Gemini 3.8 Flash");
+        assert_eq!(models[2].display_name, "claude-fable-5");
         assert!(!models.iter().any(|model| model.id == "gemini-3-flash"));
 
         let openai = discovered_oauth_models(
@@ -4878,11 +4924,13 @@ base_url = "https://api.430123.xyz/v1"
         assert_eq!(gemini_38.len(), 1);
         assert_eq!(gemini_38[0].display_name, "Gemini 3.8 Flash");
         assert!(antigravity_flash.iter().any(|model| model.id == "gemini-3.6-flash-high"));
-        assert!(
-            !discovered_oauth_models("antigravity", &json!([{"id": "gemini-3.6-flash-low"}]))
-                .iter()
-                .any(|model| model.id == "gemini-3.7-flash")
+        let only_36 = discovered_oauth_models(
+            "antigravity",
+            &json!([{"id": "gemini-3.6-flash-low"}]),
         );
+        assert!(!only_36.iter().any(|model| model.id == "gemini-3.7-flash"));
+        assert_eq!(only_36[0].id, "gemini-3.8-flash");
+        assert!(only_36.iter().any(|model| model.id == "gemini-3.6-flash-low"));
     }
 
     #[test]
