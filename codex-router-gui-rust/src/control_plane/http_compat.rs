@@ -260,14 +260,29 @@ fn merge_payload(base: &mut Value, patch: &Value) {
     }
 }
 
+#[derive(Clone, Copy)]
+enum CliPublish {
+    Skip,
+    Push,
+}
+
 /// Rebuild the route table and recompile the CLIProxyAPI configuration from
 /// SQLite state. Returns the number of compiled route targets. Best effort by
 /// design: callers log the structured error instead of failing the API call.
 pub async fn sync_backend(state: &ControlState) -> Result<usize> {
+    sync_backend_ex(state, CliPublish::Push).await
+}
+
+async fn sync_backend_ex(state: &ControlState, publish: CliPublish) -> Result<usize> {
     let Some(backend) = state.backend.clone() else {
         return Ok(0);
     };
-    let cli_ready = state.cli.health().await.is_ok();
+    let publish_cli = matches!(publish, CliPublish::Push);
+    // Account create/update during Apply must not health-check or PUT the CLI
+    // on every channel: waiting for `/v1/models` (and the watcher reload it
+    // triggers) is what pinned the UI on Applying. Host memory still rebuilds;
+    // the final composite-route reconcile publishes YAML once.
+    let cli_ready = publish_cli && state.cli.health().await.is_ok();
     // The CLI is the authority for file-based auth indexes. Its synthesizer
     // may normalize paths or retain an existing index, so reproducing the
     // hash locally is only a startup fallback and is not sufficient for
@@ -611,12 +626,6 @@ pub async fn sync_backend(state: &ControlState) -> Result<usize> {
         }
     }
     let table = RouteTable::new(pool_routes)?;
-    let mut expected_models = table
-        .routes()
-        .iter()
-        .filter(|route| route.available)
-        .map(|route| format!("{}/{}", route.prefix, route.public_model))
-        .collect::<Vec<_>>();
     let mut config = if targets.is_empty() {
         let mut config = config_compiler::CliProxyConfig {
             port: backend.cli_port,
@@ -644,54 +653,25 @@ pub async fn sync_backend(state: &ControlState) -> Result<usize> {
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
     let yaml = config_compiler::to_yaml(&config)?;
-    expected_models.sort();
-    expected_models.dedup();
-    // Push through the management API: the CLI validates the document, writes
-    // it in place and reloads clients through its own file watcher. Confirm
-    // the live model registry because rapid writes can be coalesced by the
-    // Windows watcher even after a successful PUT. A local
-    // rename would replace the watched file and permanently kill that watcher
-    // (fsnotify on Windows never re-attaches after an atomic replace).
-    if !cli_ready {
-        std::fs::write(&backend.config_path, &yaml)
-            .with_context(|| format!("write {}", backend.config_path.display()))?;
-        *state
-            .routes
-            .write()
-            .unwrap_or_else(|error| error.into_inner()) = table;
-        *state
-            .cli_index_map
-            .write()
-            .unwrap_or_else(|error| error.into_inner()) = cli_index_map;
-        quarantine_legacy_openai_auth_files(&backend.auth_dir, &state.logger);
-        return Ok(targets.len());
-    }
-    let registry_ready = if let Err(error) = state
-        .cli
-        .put_config_yaml_and_wait_for_models(&yaml, &backend.downstream_key, &expected_models)
-        .await
-    {
-        let _ = state.logger.write(json!({"level":"INFO","event":"backend.config_reload_deferred","error_code":"CR-CFG-0005","error_description":error.to_string()}));
-        // CLI is not up yet (startup ordering) or unreachable: fall back to an
-        // in-place write so the next CLI start loads the fresh snapshot while
-        // preserving the watched file identity if a live CLI races us.
-        std::fs::write(&backend.config_path, &yaml)
-            .with_context(|| format!("write {}", backend.config_path.display()))?;
-        false
-    } else {
-        true
-    };
-    // Credential-based availability is what Host scheduling needs. Parking
-    // every pool on a transient CR-CFG-0005 (management PUT 404 / watcher
-    // coalesce) turns a reload hiccup into CR-RTE-0002 for the user —
-    // including the API fallback that was already serving the conversation.
-    if !registry_ready {
-        let _ = state.logger.write(json!({
-            "level":"WARN",
-            "event":"backend.route_table_published_without_cli_ack",
-            "error_code":"CR-CFG-0005",
-            "available_pools": table.routes().iter().filter(|route| route.available).count(),
-        }));
+    if publish_cli {
+        // Push through the management API: the CLI validates the document,
+        // writes it in place and reloads clients through its own file watcher.
+        // A local rename would replace the watched file and permanently kill
+        // that watcher (fsnotify on Windows never re-attaches after an atomic
+        // replace). Account create/update skips this path so Apply does not
+        // PUT the same YAML once per channel.
+        if !cli_ready {
+            std::fs::write(&backend.config_path, &yaml)
+                .with_context(|| format!("write {}", backend.config_path.display()))?;
+        } else if let Err(error) = state.cli.put_config_yaml(&yaml).await {
+            let _ = state.logger.write(json!({
+                "level":"INFO",
+                "event":"backend.config_reload_deferred",
+                "error_description":error.to_string(),
+            }));
+            std::fs::write(&backend.config_path, &yaml)
+                .with_context(|| format!("write {}", backend.config_path.display()))?;
+        }
     }
     *state
         .routes
@@ -1701,7 +1681,7 @@ pub async fn create_account(
         body.to_string(),
     ));
     out["auth_index"] = auth_index.into();
-    let _ = sync_backend(&state).await;
+    let _ = sync_backend_ex(&state, CliPublish::Skip).await;
     success(out)
 }
 
@@ -1739,7 +1719,7 @@ pub async fn update_account(
             }
             let mut out = merged;
             out["id"] = id.into();
-            let _ = sync_backend(&state).await;
+            let _ = sync_backend_ex(&state, CliPublish::Skip).await;
             success(out)
         }
         _ => failure(StatusCode::NOT_FOUND, "CR-STO-0007", "account not found"),
@@ -1813,7 +1793,7 @@ async fn update_account_status(state: &ControlState, id: i64, status: &str) -> R
         Ok::<u64, anyhow::Error>(connection.changes())
     });
     if matches!(result, Ok(1)) {
-        let _ = sync_backend(state).await;
+        let _ = sync_backend_ex(state, CliPublish::Skip).await;
         success(json!({"id": id, "status": status}))
     } else {
         failure(StatusCode::NOT_FOUND, "CR-STO-0007", "account not found")
@@ -2170,7 +2150,7 @@ pub async fn account_action(
                 Ok::<u64, anyhow::Error>(connection.changes())
             });
             if matches!(result, Ok(1)) {
-                let _ = sync_backend(&state).await;
+                let _ = sync_backend_ex(&state, CliPublish::Skip).await;
                 success(json!({"id": id, "schedulable": schedulable}))
             } else {
                 failure(StatusCode::NOT_FOUND, "CR-STO-0007", "account not found")
@@ -4186,10 +4166,13 @@ fn oauth_route_model_matches(payload: &Value, public_model: &str, upstream_model
 }
 
 fn oauth_replica_alias(auth_type: &str, pool_prefix: &str, public_model: &str) -> String {
-    if auth_type.eq_ignore_ascii_case("gemini-cli") {
-        format!("{pool_prefix}/{public_model}")
-    } else {
-        public_model.to_owned()
+    match auth_type.trim().to_ascii_lowercase().as_str() {
+        // These CLIProxy executors do not always register `{prefix}/{model}`
+        // from the auth-file prefix alone. Host always requests that form, so
+        // the alias must match it. Codex/OpenAI still auto-prefix and keep a
+        // public-model alias.
+        "gemini-cli" | "xai" | "grok" => format!("{pool_prefix}/{public_model}"),
+        _ => public_model.to_owned(),
     }
 }
 
@@ -5661,6 +5644,10 @@ mod tests {
         assert_eq!(
             oauth_replica_alias("gemini-cli", "cr_r6_gemini", "public-gemini"),
             "cr_r6_gemini/public-gemini"
+        );
+        assert_eq!(
+            oauth_replica_alias("xai", "cr_r10a56_xai", "grok-4.6"),
+            "cr_r10a56_xai/grok-4.6"
         );
         assert_eq!(
             oauth_replica_alias("openai", "cr_r1_openai", "gpt-5.6-sol"),

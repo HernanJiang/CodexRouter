@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-3.2.0-0969da" alt="版本 3.2.0">
+  <img src="https://img.shields.io/badge/version-3.2.5-0969da" alt="版本 3.2.5">
   <img src="https://img.shields.io/badge/platform-Windows%20%2F%20macOS%20%2F%20Linux-0078d4" alt="Windows / macOS / Linux">
   <img src="https://img.shields.io/badge/architecture-x64-555555" alt="x64">
   <img src="https://img.shields.io/badge/default%20build-portable-2ea44f" alt="默认构建便携版">
@@ -87,6 +87,7 @@ CodexRouter 可以将 OAuth 和 API 渠道合并为 Codex 可见的模型目录�
 - 3.0.12：Claude Opus/Sonnet 4.6+ 目录上下文改为 1M（95% 压缩点 950k），不再用未知模型的 128k，Desktop 也就不会只显示约 122k。
 - 3.0.13：Gemini/Antigravity 额度 429 立刻换下一个 OAuth 账号，不再把整池冷却后再重试到 Codex 报 exceeded retry limit。
 - 3.0.18：ChatGPT 5 小时额度用尽后立刻切到已配置的同名第三方 API。CLI 热推失败不再把全部号池停掉（避免 `503 no schedulable credential in pool`）。
+- 3.2.5：保存并应用不再卡在「正在应用」；Grok 4.6 不再因为 `unknown provider for model cr_…_xai/grok-4.6` 中途断掉。
 - 3.2.3：Antigravity 账号卡片会列出 Gemini 3.8 Flash，即使实时目录还只有 3.7。
 - 3.2.2：Antigravity 可选 Gemini 3.8 Flash；保存并应用时缺一把 API 钥匙不会整次回滚。
 - 3.1.0：关闭应用会清掉旧便携版留下的 Host 端口；Muse 超长 MCP 工具名不再 400。

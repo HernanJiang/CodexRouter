@@ -2,11 +2,24 @@
 
 本文件记录面向用户的重要变化。完整技术细节以对应版本的源码和 GitHub Release 为准。
 
+## 3.2.5 - 2026-09-03
+
+### 修复
+
+- 「保存并应用」不再卡在「正在应用」，也不再刷 `CR-CFG-0005` / `event=backend.[REDACTED]`。3.2.4 虽然不再把热加载未对齐当失败，但每写一条渠道仍会探测 CLI 并轮询 `/v1/models`；CLI 一忙，十几条渠道就会把整次应用拖死。现在写渠道只更新本机路由表，YAML 只在最后一次组合路由同步时推一次，相同内容不会反复触发 CLI 热加载。活动日志也不再把长事件名脱敏成 `[REDACTED]`。
+- Grok 4.6 对话进行到一半不再因为 `unknown provider for model cr_r10a56_xai/grok-4.6` 断掉。xAI OAuth 副本现在按 Host 实际请求的 `{前缀}/{模型}` 注册别名（和 Gemini CLI 一样）；如果 CLIProxy 仍然报 unknown provider，Host 会换下一个 Grok 账号继续，而不是把错误直接丢回 Codex。
+
+## 3.2.4 - 2026-09-03
+
+### 修复
+
+- 「保存并应用」不再卡在「正在应用」并刷 `CR-CFG-0005`。每次写渠道都会等 CLIProxy `/v1/models` 出现全部模型；Gemini 3.8 Flash 等新模型本来就不会出现在这份清单里，于是每条渠道空等约 9 秒再重推配置。现在管理口 PUT 成功即继续，热加载未对齐不再当失败。
+
 ## 3.2.3 - 2026-09-03
 
 ### 修复
 
-- Antigravity 账号卡片在实时目录还只有 3.7 时也会列出 **Gemini 3.8 Flash**。本机 CLIProxy 返回的仍是 `gemini-3.7-flash-high` 等旧 ID，3.2.2 只做了折叠、没有把新模型写进可选列表。
+- Antigravity 账号卡片在实时目录还只有 3.7 时也会列出 **Gemini 3.8 Flash**。CLIProxy 当前返回的仍是 `gemini-3.7-flash-high` 等旧 ID，3.2.2 只做了折叠、没有把新模型写进可选列表。
 
 ## 3.2.2 - 2026-09-03
 
@@ -15,23 +28,19 @@
 - Antigravity 订阅把 Google 刚上线的 **Gemini 3.8 Flash** 收成一个可选模型。账号如果声明 High / Medium / Low 三档，界面只显示「Gemini 3.8 Flash」，路由默认走 Medium，和 3.7 Flash 一样。
 - Google Gemini 兼容 API 渠道的快捷预设改为 `gemini-3.8-flash`。官方思考档为 low / medium / high（不支持 minimal），默认 medium。
 
-### 修复
-
-- 「保存并应用」不再因为某一个 API 渠道的钥匙名对不上就整次回滚。会先按邻近编号找回已保存的 Key；仍然找不到时只跳过该渠道，其余模型和 Codex 绑定继续写入。
-
-## 3.2.0 - 2026-08-31
+## 3.2.1 - 2026-09-03
 
 ### 修复
 
-- 修复 DeepSeek 在兼容 Chat Completions/Responses 流中泄漏 `<｜DSML｜invoke>`、`<｜DSML｜parameter>`、伪工具调用和转义协议标记，导致对话出现协议幻觉的问题。
-- DSML 清理仅对 DeepSeek 路由启用，并跨 SSE 增量保持状态；正常回答和其他模型中的合法 XML/HTML 文本不受影响。
+- 「保存并应用」不再因为某一个 API 渠道的钥匙名对不上（例如配置写 `ModelApiKey-27-…`、凭据实际在 `ModelApiKey-28-…`）就整次回滚。会先按邻近编号找回已保存的 Key；仍然找不到时只跳过该渠道，其余模型和 Codex 绑定继续写入。
+- Codex Desktop / CraftStation 改写用户层 `~/.codex/config.toml` 时，系统层绑定仍然负责把所有模型送到本地路由。这次修复让用户可以再次成功点「保存并应用」把用户层绑定写回去，不必关掉 CraftStation。
 
 ## 3.1.19 - 2026-08-31
 
 ### 修复
 
 - 修复 ChatGPT 线程切换/恢复后，历史中的 `function_call_output` 丢失或带空 `call_id`，经兼容转换后触发 `A function call output without a call_id requires a name.` 的问题。
-- 能可靠匹配时恢复原始 `call_id`；无法可靠匹配的跨线程孤立输出降级为普通文本，避免伪造调用关系并阻止上游请求失败。
+- 对能够与前置函数调用可靠配对的输出恢复原始 `call_id`；无法配对的跨线程孤立输出降级为普通文本，避免伪造调用关系并阻止上游请求失败。
 
 ## 3.1.17 - 2026-08-31
 

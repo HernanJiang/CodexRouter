@@ -520,12 +520,23 @@ fn is_router_events_diagnostic(line: &str) -> bool {
     }
     // Configuration sync emits WARN-level `configuration` rows on every Apply.
     // They are not user-actionable and flood the activity log.
-    if router_event_name(line).eq_ignore_ascii_case("configuration")
+    let event = router_event_name(line);
+    if event.eq_ignore_ascii_case("configuration")
         || upper.contains(r#""EVENT":"CONFIGURATION""#)
-        || router_event_name(line).eq_ignore_ascii_case("ledger.record_failed")
+        || event.eq_ignore_ascii_case("ledger.record_failed")
         || upper.contains(r#""EVENT":"LEDGER.RECORD_FAILED""#)
-        || router_event_name(line).ends_with("quota_refresh_failed")
+        || event.ends_with("quota_refresh_failed")
+        || event == "backend.config_reload_deferred"
+        || event == "backend.route_table_published_without_cli_ack"
+        || event.ends_with("without_cli_ack")
     {
+        return false;
+    }
+    // Apply used to emit CR-CFG-0005 on every channel while CLIProxy was
+    // still reloading. Those rows are not actionable; only a real config
+    // push failure should reach the activity log.
+    let code = router_event_json_field(line, "error_code").unwrap_or_default();
+    if code.eq_ignore_ascii_case("CR-CFG-0005") && event != "backend.config_push_failed" {
         return false;
     }
     true
@@ -589,9 +600,16 @@ fn format_plain_diagnostic(label: &str, line: &str) -> String {
     });
     output.push_str(&summarize_error_for_display(&format!("{label} {line}")));
     let mut safe = redact_for_display(&output);
-    if safe.contains("event=[REDACTED]") {
-        if let Some(event) = event.as_deref() {
-            safe = safe.replacen("event=[REDACTED]", &format!("event={event}"), 1);
+    if let Some(event) = event.as_deref() {
+        let wanted = format!("event={event}");
+        if !safe.contains(&wanted) {
+            static EVENT_FIELD: OnceLock<Regex> = OnceLock::new();
+            let regex = EVENT_FIELD.get_or_init(|| {
+                Regex::new(r"event=[^\s|]+").expect("event field regex is valid")
+            });
+            if regex.is_match(&safe) {
+                safe = regex.replace(&safe, wanted.as_str()).into_owned();
+            }
         }
     }
     let event_name = event.as_deref().unwrap_or_default();
@@ -1039,10 +1057,30 @@ fn redaction_rules() -> &'static Vec<(Regex, &'static str)> {
 }
 
 pub(crate) fn redact_for_display(text: &str) -> String {
+    const LONG_TOKEN: &str = r"\b[A-Za-z0-9_]{32,}\b";
     redaction_rules()
         .iter()
         .fold(text.to_owned(), |value, (regex, replacement)| {
-            regex.replace_all(&value, *replacement).into_owned()
+            // Event names are long lowercase_snake tokens. The 32-char rule
+            // would otherwise turn backend.route_table_published_without_cli_ack
+            // into event=backend.[REDACTED].
+            if regex.as_str() == LONG_TOKEN {
+                regex
+                    .replace_all(&value, |caps: &regex::Captures| {
+                        let matched = caps.get(0).map(|m| m.as_str()).unwrap_or_default();
+                        if matched
+                            .bytes()
+                            .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+                        {
+                            matched.to_owned()
+                        } else {
+                            (*replacement).to_owned()
+                        }
+                    })
+                    .into_owned()
+            } else {
+                regex.replace_all(&value, *replacement).into_owned()
+            }
         })
 }
 
@@ -1144,10 +1182,23 @@ mod tests {
         assert!(format_diagnostic_line("Router events", LogKind::RouterEvents, ledger).is_none());
         let quota = r#"{"event":"control.oauth_quota_refresh_failed","error_code":"network_error","level":"WARN"}"#;
         assert!(format_diagnostic_line("Router events", LogKind::RouterEvents, quota).is_none());
+        let deferred = r#"{"error_code":"CR-CFG-0005","event":"backend.route_table_published_without_cli_ack","level":"WARN"}"#;
+        assert!(format_diagnostic_line("Router events", LogKind::RouterEvents, deferred).is_none());
         let network = r#"{"event":"control.account_recovery_probe_failed","error_code":"network_error","level":"WARN"}"#;
         let safe = format_diagnostic_line("Router events", LogKind::RouterEvents, network).unwrap();
         assert!(safe.contains("event=control.account_recovery_probe_failed"), "{safe}");
         assert!(!safe.contains("event=[REDACTED]"), "{safe}");
+        let long_event = "event=backend.route_table_published_without_cli_ack";
+        let redacted_event = redact_for_display(long_event);
+        assert_eq!(redacted_event, long_event, "{redacted_event}");
+        let push_failed = concat!(
+            r#"{"error_code":"CR-CFG-0005","event":"backend.route_table_published_without_cli_ack","#,
+            r#""level":"ERROR"}"#
+        );
+        assert!(
+            format_diagnostic_line("Router events", LogKind::RouterEvents, push_failed).is_none(),
+            "without_cli_ack must stay out of the activity log even at ERROR"
+        );
     }
 
     #[test]

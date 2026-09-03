@@ -5361,7 +5361,9 @@ pub fn rewrite_exhausted_account_status(status: u16, body: &str) -> u16 {
 /// with "error sending request" while the gateway is still silent.
 pub fn is_missing_provider_auth(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
-    lower.contains("auth_unavailable") || lower.contains("no auth available")
+    lower.contains("auth_unavailable")
+        || lower.contains("no auth available")
+        || lower.contains("unknown provider for model")
 }
 
 /// Sub2API reports an account pool drained by upstream rate limiting as 503.
@@ -7485,6 +7487,9 @@ mod tests {
         ));
         assert!(is_missing_provider_auth(
             "auth_unavailable: no auth available (providers=antigravity, model=cr_r13_antigravity/gemini-3.7-flash)"
+        ));
+        assert!(is_missing_provider_auth(
+            r#"{"error":{"message":"unknown provider for model cr_r10a56_xai/grok-4.6"}}"#
         ));
         assert!(is_exhausted_account_status(503, "no available accounts"));
     }

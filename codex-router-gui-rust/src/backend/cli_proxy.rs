@@ -3,7 +3,6 @@
 use anyhow::{bail, Context, Result};
 use reqwest::{Client, Method, StatusCode};
 use serde_json::Value;
-use std::collections::HashSet;
 use std::time::Duration;
 
 #[derive(Clone)]
@@ -117,72 +116,19 @@ impl CliProxyManagementClient {
         Ok(())
     }
 
-    /// Push a config snapshot and return only after its expected models are
-    /// visible in the live CLI registry. CLIProxyAPI's Windows watcher can
-    /// coalesce rapid writes, so a successful management PUT alone is not an
-    /// application acknowledgement.
+    /// Push a config snapshot. A successful management PUT already wrote the
+    /// YAML; CLIProxy reloads through its own watcher. Do not wait for every
+    /// scheduled model to appear in `/v1/models` — injected SKUs such as a
+    /// newly listed Gemini Flash are routed by Host even when the live CLI
+    /// catalog still omits them, and polling that list on every account write
+    /// is what pinned Apply on "Applying".
     pub async fn put_config_yaml_and_wait_for_models(
         &self,
         yaml_text: &str,
-        downstream_key: &str,
-        expected_models: &[String],
+        _downstream_key: &str,
+        _expected_models: &[String],
     ) -> Result<()> {
-        const MAX_PUSH_ATTEMPTS: usize = 3;
-        const POLLS_PER_PUSH: usize = 12;
-        const POLL_DELAY: Duration = Duration::from_millis(250);
-
-        let expected = expected_models.iter().collect::<HashSet<_>>();
-        for push_attempt in 0..MAX_PUSH_ATTEMPTS {
-            self.put_config_yaml(yaml_text).await?;
-            if expected.is_empty() {
-                return Ok(());
-            }
-
-            for poll in 0..POLLS_PER_PUSH {
-                if poll > 0 {
-                    tokio::time::sleep(POLL_DELAY).await;
-                }
-                let response = self
-                    .client
-                    .get(format!("{}/v1/models", self.base_url))
-                    .bearer_auth(downstream_key)
-                    .header("X-Request-ID", uuid::Uuid::now_v7().to_string())
-                    .timeout(Duration::from_secs(2))
-                    .send()
-                    .await;
-                let Ok(response) = response else {
-                    continue;
-                };
-                if !response.status().is_success() {
-                    continue;
-                }
-                let Ok(value) = response.json::<Value>().await else {
-                    continue;
-                };
-                let visible = value
-                    .get("data")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|item| item.get("id").and_then(Value::as_str))
-                    .collect::<HashSet<_>>();
-                if expected
-                    .iter()
-                    .all(|model| visible.contains(model.as_str()))
-                {
-                    return Ok(());
-                }
-            }
-
-            if push_attempt + 1 < MAX_PUSH_ATTEMPTS {
-                tokio::time::sleep(POLL_DELAY).await;
-            }
-        }
-
-        bail!(
-            "CR-CFG-0005: CLI runtime did not apply {} expected models",
-            expected.len()
-        )
+        self.put_config_yaml(yaml_text).await
     }
 
     pub async fn health(&self) -> Result<()> {
@@ -346,7 +292,7 @@ mod tests {
                         get(move || {
                             let pushes = get_pushes.clone();
                             async move {
-                                let model = if pushes.load(Ordering::SeqCst) >= 2 {
+                                let model = if pushes.load(Ordering::SeqCst) >= 1 {
                                     "cr_r4_antigravity/smoke-ag"
                                 } else {
                                     "cr_r3_openai/smoke-image"
@@ -372,7 +318,61 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(pushes.load(Ordering::SeqCst), 2);
+        assert_eq!(pushes.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn config_apply_succeeds_after_put_even_if_registry_omits_a_model() {
+        let pushes = Arc::new(AtomicUsize::new(0));
+        let gets = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let put_pushes = pushes.clone();
+        let get_count = gets.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route(
+                        "/v0/management/config.yaml",
+                        put(move || {
+                            let pushes = put_pushes.clone();
+                            async move {
+                                pushes.fetch_add(1, Ordering::SeqCst);
+                                AxumStatusCode::OK
+                            }
+                        }),
+                    )
+                    .route(
+                        "/v1/models",
+                        get(move || {
+                            let gets = get_count.clone();
+                            async move {
+                                gets.fetch_add(1, Ordering::SeqCst);
+                                Json(serde_json::json!({"data":[{"id":"gemini-3.7-flash-high"}]}))
+                            }
+                        }),
+                    ),
+            )
+            .await
+            .unwrap();
+        });
+        let client =
+            CliProxyManagementClient::new(format!("http://{address}"), "management-secret")
+                .unwrap();
+
+        client
+            .put_config_yaml_and_wait_for_models(
+                "openai-compatibility: []",
+                "downstream-secret",
+                &["cr_r13a52_antigravity/gemini-3.8-flash".to_owned()],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(pushes.load(Ordering::SeqCst), 1);
+        assert_eq!(gets.load(Ordering::SeqCst), 0);
         server.abort();
     }
 }
