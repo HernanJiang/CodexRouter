@@ -2105,6 +2105,11 @@ fn deployment_progress_line(zh: bool, line: &str) -> Option<String> {
             en: "Created a model channel",
         },
         Progress {
+            marker: "Skipped channel:",
+            zh: "已跳过缺少 API Key 的模型渠道，其余配置继续应用",
+            en: "Skipped a model channel with no saved API key; the rest of the configuration is still being applied",
+        },
+        Progress {
             marker: "isolated until recovery",
             zh: "OAuth 账号已隔离，等待额度恢复",
             en: "An OAuth account is isolated until its quota recovers",
@@ -2460,6 +2465,11 @@ fn localized_error_summary(zh: bool, text: &str) -> String {
             "ROUTER_DEPLOY_API_CHANNELS_FAILED",
             "无法写入 API 渠道。请检查密钥和渠道地址后再次保存并应用。",
             "Could not write API channels. Check API keys and channel URLs, then save and apply again.",
+        ),
+        (
+            "Missing API Key for model",
+            "有模型缺少 Windows 凭据管理器中的 API Key。该渠道已跳过，其余模型和 Codex 绑定仍会继续应用。",
+            "An API key is missing from Windows Credential Manager for one model. That channel was skipped; the remaining models and Codex binding are still applied.",
         ),
         (
             "ROUTER_DEPLOY_OAUTH_SYNC_FAILED",
@@ -11127,6 +11137,7 @@ mod main_tests {
             "Composite routes: desired=7; created=2; updated=1; removed=0",
             "Updated channel: Codex-Router / ChatGPT-5.6-Sol",
             "Created channel: Codex-Router / DeepSeek-V4-Flash",
+            "Skipped channel: GLM-5.3-Tokenrouter",
             "OAuth account 1 isolated until recovery: OAuth quota exhausted until reset",
             "Outbound proxy reconciliation: source=environment; resource=reused",
             "Catalog availability filter: kept=5; removed-unavailable=gpt-5.6-terra",
@@ -11151,6 +11162,7 @@ mod main_tests {
                         "Composite routes",
                         "Updated channel:",
                         "Created channel:",
+                        "Skipped channel:",
                         "isolated until recovery",
                         "Outbound proxy reconciliation",
                         "Catalog availability filter",

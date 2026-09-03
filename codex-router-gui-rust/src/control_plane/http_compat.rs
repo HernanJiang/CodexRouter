@@ -4098,6 +4098,9 @@ fn normalize_upstream_model_for_platform(platform: &str, model: &str) -> String 
         if model == "gemini-3.7-flash" || model == "gemini-3.7-flash-medium" {
             return "gemini-3.7-flash-high".to_owned();
         }
+        if model == "gemini-3.8-flash" || model == "gemini-3.8-flash-medium" {
+            return "gemini-3.8-flash-high".to_owned();
+        }
         if model == "gemini-3.1-pro-high" || model == "gemini-3.1-pro" {
             return "gemini-3.1-pro-low".to_owned();
         }
@@ -5733,6 +5736,15 @@ mod tests {
                 "gemini-3.7-flash"
             ),
             "gemini-3.7-flash-high"
+        );
+        assert_eq!(
+            mapped_upstream_model(
+                &json!({"credentials":{"model_mapping":{"gemini-3.8-flash":"gemini-3.8-flash-medium"}}}),
+                "antigravity",
+                "gemini-3.8-flash",
+                "gemini-3.8-flash"
+            ),
+            "gemini-3.8-flash-high"
         );
         assert_eq!(
             mapped_upstream_model(&payload, "antigravity", "claude-fable-5", "claude-fable-5"),

@@ -318,8 +318,8 @@ const CHANNEL_PRESETS: &[ChannelPreset] = &[
         label_zh: "Google Gemini 兼容 API",
         label_en: "Google Gemini compatible API",
         base_url: "https://generativelanguage.googleapis.com/v1beta/openai/",
-        model: "gemini-3.6-flash",
-        alias: "Gemini-3.6-Flash",
+        model: "gemini-3.8-flash",
+        alias: "Gemini-3.8-Flash",
         website_url: "https://aistudio.google.com/",
         docs_url: "https://ai.google.dev/gemini-api/docs/openai",
     },
@@ -487,6 +487,17 @@ pub fn detect_reasoning(model_name: &str) -> ReasoningSpec {
             "Anthropic Claude 4.6",
             "Anthropic 官方 Effort 文档；Opus 4.6 / Sonnet 4.6 为 low/medium/high/max，无 xhigh",
             "Official Anthropic effort guide; Opus 4.6 and Sonnet 4.6 support low/medium/high/max, not xhigh",
+        );
+    }
+    if name.contains("gemini-3.8") {
+        return ReasoningSpec::new(
+            &["low", "medium", "high"],
+            "medium",
+            false,
+            "Google Gemini 3.8 Flash",
+            "Google Gemini 3.8 Flash",
+            "Gemini 3.8 Flash 官方 thinking 档位（不支持 minimal）",
+            "Official Gemini 3.8 Flash thinking levels (minimal is not supported)",
         );
     }
     if name.contains("gemini-3") {
@@ -1489,6 +1500,10 @@ pub fn recommended_model_display_name(model_id: &str) -> String {
         ("claude-4-opus", "Claude-Opus-4"),
         ("claude-4-sonnet", "Claude-Sonnet-4"),
         ("claude-4-haiku", "Claude-Haiku-4"),
+        ("gemini-3-8-flash", "Gemini-3.8-Flash"),
+        ("gemini-3.8-flash", "Gemini-3.8-Flash"),
+        ("gemini-3-7-flash", "Gemini-3.7-Flash"),
+        ("gemini-3.7-flash", "Gemini-3.7-Flash"),
         ("gemini-3-6-flash", "Gemini-3.6-Flash"),
         ("gemini-3.6-flash", "Gemini-3.6-Flash"),
         ("gemini-3-6-pro", "Gemini-3.6-Pro"),
@@ -2460,6 +2475,55 @@ pub(crate) fn read_router_credential_text(name: &str) -> anyhow::Result<Option<Z
         .context("Windows credential contains invalid UTF-16")
 }
 
+fn model_api_key_parts(credential_name: &str) -> Option<(i32, String)> {
+    let rest = credential_name.strip_prefix("ModelApiKey-")?;
+    let (index, slug) = rest.split_once('-')?;
+    Some((index.parse().ok()?, slug.to_owned()))
+}
+
+pub(crate) fn model_api_key_alias_candidates(credential_name: &str, model: &str) -> Vec<String> {
+    let Some((index, name_slug)) = model_api_key_parts(credential_name) else {
+        return Vec::new();
+    };
+    let mut slugs = vec![name_slug];
+    let model_slug = slugify(model);
+    if !slugs.iter().any(|slug| slug == &model_slug) {
+        slugs.push(model_slug);
+    }
+    let mut candidates = Vec::new();
+    for delta in 1..=8 {
+        for slug in &slugs {
+            let high = index + delta;
+            candidates.push(format!("ModelApiKey-{high}-{slug}"));
+            if let Some(low) = index.checked_sub(delta).filter(|value| *value > 0) {
+                candidates.push(format!("ModelApiKey-{low}-{slug}"));
+            }
+        }
+    }
+    candidates
+}
+
+pub(crate) fn resolve_model_api_key(
+    model: &ModelConfig,
+) -> anyhow::Result<Option<Zeroizing<String>>> {
+    let name = model.credential_name.trim();
+    if name.is_empty() {
+        return Ok(None);
+    }
+    if let Some(value) = read_router_credential_text(name)? {
+        return Ok(Some(value));
+    }
+    for candidate in model_api_key_alias_candidates(name, &model.model) {
+        if candidate == name {
+            continue;
+        }
+        if let Some(value) = read_router_credential_text(&candidate)? {
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 pub(crate) fn write_router_credential_text(name: &str, secret: &str) -> anyhow::Result<()> {
     let mut encoded = secret.encode_utf16().collect::<Vec<_>>();
@@ -2865,6 +2929,7 @@ where
             "Composite routes",
             "Updated channel:",
             "Created channel:",
+            "Skipped channel:",
             "isolated until recovery",
             "Outbound proxy reconciliation",
             "Catalog availability filter",
@@ -3486,6 +3551,33 @@ fn prefer_oauth_summary(
             && (current.id <= 0 || candidate.id < current.id))
 }
 
+pub(crate) fn antigravity_gemini_flash_public_id(model_id: &str) -> Option<String> {
+    let id = model_id.trim();
+    let stripped = id
+        .strip_suffix("-high")
+        .or_else(|| id.strip_suffix("-medium"))
+        .or_else(|| id.strip_suffix("-low"))
+        .unwrap_or(id);
+    let rest = stripped.strip_prefix("gemini-3.")?;
+    let (minor, kind) = rest.split_once('-')?;
+    let minor: u32 = minor.parse().ok()?;
+    if minor < 7 || kind != "flash" {
+        return None;
+    }
+    Some(format!("gemini-3.{minor}-flash"))
+}
+
+fn antigravity_gemini_flash_display_name(public_id: &str) -> Option<String> {
+    let minor = public_id
+        .strip_prefix("gemini-3.")?
+        .strip_suffix("-flash")?;
+    if minor.chars().all(|ch| ch.is_ascii_digit()) {
+        Some(format!("Gemini 3.{minor} Flash"))
+    } else {
+        None
+    }
+}
+
 fn discovered_oauth_models(platform: &str, models: &Value) -> Vec<crate::OAuthModelSummary> {
     let mut discovered = Vec::new();
     let mut seen = HashSet::new();
@@ -3498,13 +3590,10 @@ fn discovered_oauth_models(platform: &str, models: &Value) -> Vec<crate::OAuthMo
             .unwrap_or_else(|| usage::string(model, "id"));
         if platform == "openai" && model_id == "gpt-5.6" {
             model_id = "gpt-5.6-sol".to_owned();
-        } else if platform == "antigravity"
-            && matches!(
-                model_id.as_str(),
-                "gemini-3.7-flash-high" | "gemini-3.7-flash-medium" | "gemini-3.7-flash-low"
-            )
-        {
-            model_id = "gemini-3.7-flash".to_owned();
+        } else if platform == "antigravity" {
+            if let Some(folded) = antigravity_gemini_flash_public_id(&model_id) {
+                model_id = folded;
+            }
         }
         if model_id.is_empty() || !seen.insert(model_id.clone()) {
             continue;
@@ -3515,8 +3604,8 @@ fn discovered_oauth_models(platform: &str, models: &Value) -> Vec<crate::OAuthMo
         }
         if model_id == "gpt-5.6-sol" {
             display_name = "ChatGPT-5.6-Sol".to_owned();
-        } else if model_id == "gemini-3.7-flash" {
-            display_name = "Gemini 3.7 Flash".to_owned();
+        } else if let Some(gemini_name) = antigravity_gemini_flash_display_name(&model_id) {
+            display_name = gemini_name;
         } else if display_name.is_empty() {
             display_name.clone_from(&model_id);
         }
@@ -4430,6 +4519,7 @@ base_url = "https://api.430123.xyz/v1"
             ("anthropic/claude-opus-5-fast", "Claude-Opus-5-Fast"),
             ("claude-sonnet-4-6-20260501", "Claude-Sonnet-4.6"),
             ("google/gemini-3-1-pro", "Gemini-3.1-Pro"),
+            ("gemini-3.8-flash", "Gemini-3.8-Flash"),
             ("gemini-3-pro-image-preview", "Gemini-3-Pro-Image-Preview"),
             ("deepseek/deepseek-v4-pro", "DeepSeek-V4-Pro"),
             ("deepseek/deepseek-v4-flash", "DeepSeek-V4-Flash"),
@@ -4506,7 +4596,7 @@ base_url = "https://api.430123.xyz/v1"
             ("ark-plan", "ark-code-latest"),
             ("mimo", "mimo-v2.5-pro"),
             ("deepseek", "deepseek-v4-pro"),
-            ("gemini", "gemini-3.6-flash"),
+            ("gemini", "gemini-3.8-flash"),
         ];
 
         for (id, model) in expected {
@@ -4716,6 +4806,26 @@ base_url = "https://api.430123.xyz/v1"
     }
 
     #[test]
+    fn antigravity_folds_gemini_38_flash_tiers_like_37() {
+        assert_eq!(
+            antigravity_gemini_flash_public_id("gemini-3.8-flash-high").as_deref(),
+            Some("gemini-3.8-flash")
+        );
+        assert_eq!(
+            antigravity_gemini_flash_public_id("gemini-3.8-flash").as_deref(),
+            Some("gemini-3.8-flash")
+        );
+        assert_eq!(
+            antigravity_gemini_flash_public_id("gemini-3.6-flash-high"),
+            None
+        );
+        assert_eq!(
+            antigravity_gemini_flash_public_id("gemini-3.8-flash-cyber"),
+            None
+        );
+    }
+
+    #[test]
     fn oauth_model_catalog_only_exposes_live_account_declarations() {
         let models = discovered_oauth_models(
             "antigravity",
@@ -4749,15 +4859,25 @@ base_url = "https://api.430123.xyz/v1"
                 {"id": "gemini-3.6-flash-high", "display_name": "Gemini 3.6 Flash High"},
                 {"id": "gemini-3.7-flash-high", "display_name": "Gemini 3.7 Flash High"},
                 {"id": "gemini-3.7-flash-medium", "display_name": "Gemini 3.7 Flash Medium"},
-                {"id": "gemini-3.7-flash-low", "display_name": "Gemini 3.7 Flash Low"}
+                {"id": "gemini-3.7-flash-low", "display_name": "Gemini 3.7 Flash Low"},
+                {"id": "gemini-3.8-flash-high", "display_name": "Gemini 3.8 Flash High"},
+                {"id": "gemini-3.8-flash-medium", "display_name": "Gemini 3.8 Flash Medium"},
+                {"id": "gemini-3.8-flash-low", "display_name": "Gemini 3.8 Flash Low"}
             ]),
         );
         let gemini_37 = antigravity_flash
             .iter()
             .filter(|model| model.id == "gemini-3.7-flash")
             .collect::<Vec<_>>();
+        let gemini_38 = antigravity_flash
+            .iter()
+            .filter(|model| model.id == "gemini-3.8-flash")
+            .collect::<Vec<_>>();
         assert_eq!(gemini_37.len(), 1);
         assert_eq!(gemini_37[0].display_name, "Gemini 3.7 Flash");
+        assert_eq!(gemini_38.len(), 1);
+        assert_eq!(gemini_38[0].display_name, "Gemini 3.8 Flash");
+        assert!(antigravity_flash.iter().any(|model| model.id == "gemini-3.6-flash-high"));
         assert!(
             !discovered_oauth_models("antigravity", &json!([{"id": "gemini-3.6-flash-low"}]))
                 .iter()
@@ -4788,6 +4908,7 @@ base_url = "https://api.430123.xyz/v1"
                 "message": "success",
                 "data": [
                     {"id": "gemini-3.7-flash-medium", "display_name": "Gemini 3.7 Flash Medium"},
+                    {"id": "gemini-3.8-flash-low", "display_name": "Gemini 3.8 Flash Low"},
                     {"id": "gemini-3.1-pro-high", "display_name": "Gemini 3.1 Pro High"}
                 ]
             }),
@@ -4797,7 +4918,7 @@ base_url = "https://api.430123.xyz/v1"
                 .iter()
                 .map(|model| model.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["gemini-3.7-flash", "gemini-3.1-pro-high"]
+            vec!["gemini-3.7-flash", "gemini-3.8-flash", "gemini-3.1-pro-high"]
         );
 
         let grok = oauth_models_from_response(
@@ -5538,6 +5659,45 @@ base_url = "https://api.430123.xyz/v1"
     }
 
     #[test]
+    fn model_api_key_aliases_cover_nearby_index_drift() {
+        let candidates =
+            model_api_key_alias_candidates("ModelApiKey-27-z-ai-glm-5-3-free", "z-ai/glm-5.3-free");
+        assert!(candidates.contains(&"ModelApiKey-28-z-ai-glm-5-3-free".to_owned()));
+        assert!(candidates.contains(&"ModelApiKey-26-z-ai-glm-5-3-free".to_owned()));
+        assert!(!candidates.contains(&"ModelApiKey-27-z-ai-glm-5-3-free".to_owned()));
+    }
+
+    #[test]
+    fn resolve_model_api_key_accepts_nearby_index_alias() {
+        let nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+        let stored = format!("ModelApiKey-28-alias-{nonce}");
+        let configured = format!("ModelApiKey-27-alias-{nonce}");
+        write_router_credential_text(&stored, "not-a-real-key").unwrap();
+        let model = ModelConfig {
+            model: format!("alias-{nonce}"),
+            credential_name: configured,
+            ..Default::default()
+        };
+        let resolved = resolve_model_api_key(&model);
+        let _ = delete_router_credential(&stored);
+        let key = resolved
+            .unwrap()
+            .expect("nearby ModelApiKey index should resolve");
+        assert_eq!(key.as_str(), "not-a-real-key");
+    }
+
+    #[test]
+    fn resolve_model_api_key_returns_none_when_no_alias_exists() {
+        let nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+        let model = ModelConfig {
+            model: "missing-model".into(),
+            credential_name: format!("ModelApiKey-27-missing-{nonce}"),
+            ..Default::default()
+        };
+        assert!(resolve_model_api_key(&model).unwrap().is_none());
+    }
+
+    #[test]
     fn model_catalog_uses_current_codex_input_modalities() {
         let mut config = RouterConfig::default();
         config.models.push(ModelConfig {
@@ -5617,6 +5777,12 @@ base_url = "https://api.430123.xyz/v1"
                 "high",
                 false,
             ),
+            (
+                "gemini-3.8-flash",
+                vec!["low", "medium", "high"],
+                "medium",
+                false,
+            ),
             ("kimi-k3", vec!["low", "high", "max"], "high", false),
             ("k3-256k", vec!["low", "high", "max"], "high", false),
             ("Kimi-K3", vec!["low", "high", "max"], "high", false),
@@ -5685,6 +5851,7 @@ base_url = "https://api.430123.xyz/v1"
             "grok-4.5",
             "claude-opus-4-6-thinking",
             "gemini-3.7-flash",
+            "gemini-3.8-flash",
         ];
         for model in models {
             let spec = detect_reasoning(model);

@@ -812,7 +812,7 @@ mod tests {
         let cfg = crate::config::RouterConfig {
             models: vec![
                 ModelConfig {
-                    model: "gemini-3.7-flash".to_owned(),
+                    model: "gemini-3.8-flash".to_owned(),
                     source: "apikey".to_owned(),
                     ..Default::default()
                 },
@@ -830,7 +830,7 @@ mod tests {
         let catalog = build_model_catalog(&cfg);
         let gemini = catalog
             .iter()
-            .find(|entry| entry["slug"] == "gemini-3.7-flash")
+            .find(|entry| entry["slug"] == "gemini-3.8-flash")
             .unwrap();
         let chatgpt = catalog
             .iter()

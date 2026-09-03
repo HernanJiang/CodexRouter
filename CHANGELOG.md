@@ -2,6 +2,17 @@
 
 本文件记录面向用户的重要变化。完整技术细节以对应版本的源码和 GitHub Release 为准。
 
+## 3.2.2 - 2026-09-03
+
+### 更新
+
+- Antigravity 订阅把 Google 刚上线的 **Gemini 3.8 Flash** 收成一个可选模型。账号如果声明 High / Medium / Low 三档，界面只显示「Gemini 3.8 Flash」，路由默认走 Medium，和 3.7 Flash 一样。
+- Google Gemini 兼容 API 渠道的快捷预设改为 `gemini-3.8-flash`。官方思考档为 low / medium / high（不支持 minimal），默认 medium。
+
+### 修复
+
+- 「保存并应用」不再因为某一个 API 渠道的钥匙名对不上就整次回滚。会先按邻近编号找回已保存的 Key；仍然找不到时只跳过该渠道，其余模型和 Codex 绑定继续写入。
+
 ## 3.2.0 - 2026-08-31
 
 ### 修复

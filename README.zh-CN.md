@@ -87,6 +87,7 @@ CodexRouter 可以将 OAuth 和 API 渠道合并为 Codex 可见的模型目录�
 - 3.0.12：Claude Opus/Sonnet 4.6+ 目录上下文改为 1M（95% 压缩点 950k），不再用未知模型的 128k，Desktop 也就不会只显示约 122k。
 - 3.0.13：Gemini/Antigravity 额度 429 立刻换下一个 OAuth 账号，不再把整池冷却后再重试到 Codex 报 exceeded retry limit。
 - 3.0.18：ChatGPT 5 小时额度用尽后立刻切到已配置的同名第三方 API。CLI 热推失败不再把全部号池停掉（避免 `503 no schedulable credential in pool`）。
+- 3.2.2：Antigravity 可选 Gemini 3.8 Flash；保存并应用时缺一把 API 钥匙不会整次回滚。
 - 3.1.0：关闭应用会清掉旧便携版留下的 Host 端口；Muse 超长 MCP 工具名不再 400。
 - 3.0.22：Muse / Meta 按 CLIProxy 的 MCP 命名空间拼接缩短工具名，避免 400。
 - 3.0.21：Muse / Meta 等第三方模型缩短超过 64 字符的 MCP 工具名，避免 400。

@@ -432,14 +432,17 @@ where
         if model.source == "oauth" {
             continue;
         }
-        if model.credential_name.trim().is_empty() {
-            bail!(
-                "ROUTER_DEPLOY_CREDENTIAL_REFERENCE_MISSING: model '{}'",
-                model.model
-            )
-        }
-        let api_key = super::read_router_credential_text(&model.credential_name)?
-            .with_context(|| format!("Missing API Key for model '{}'", model.model))?;
+        let Some(api_key) = super::resolve_model_api_key(model)? else {
+            on_log(format!(
+                "Skipped channel: {}",
+                if model.alias.trim().is_empty() {
+                    model.model.trim()
+                } else {
+                    model.alias.trim()
+                }
+            ));
+            continue;
+        };
         let account_name = api_account_name(model);
         managed_names.insert(account_name.clone());
         let existing = accounts
@@ -707,8 +710,10 @@ fn selected_oauth_model_mappings(routes: &[ModelRoute]) -> HashMap<i64, BTreeMap
 }
 
 fn oauth_upstream_model_id(platform: &str, requested: &str) -> String {
-    if platform.eq_ignore_ascii_case("antigravity") && requested == "gemini-3.7-flash" {
-        return "gemini-3.7-flash-medium".to_owned();
+    if platform.eq_ignore_ascii_case("antigravity") {
+        if let Some(public) = super::antigravity_gemini_flash_public_id(requested) {
+            return format!("{public}-medium");
+        }
     }
     requested.to_owned()
 }
@@ -2042,6 +2047,24 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_gemini_38_uses_the_medium_upstream_tier() {
+        let cfg = RouterConfig {
+            oauth_account_ids: Some(vec![26]),
+            models: vec![ModelConfig {
+                source: "oauth".to_owned(),
+                model: "gemini-3.8-flash".to_owned(),
+                oauth_account_id: 26,
+                oauth_platform: "antigravity".to_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let mappings = selected_oauth_model_mappings(&build_route_plan(&cfg));
+        assert_eq!(mappings[&26]["gemini-3.8-flash"], "gemini-3.8-flash-medium");
+    }
+
+    #[test]
     fn kimi_k3_channel_payload_joins_router_group_with_supported_transport_mapping() {
         let credential_name = format!(
             "Codex-Router-Test-Kimi-{}-{}",
@@ -2116,6 +2139,88 @@ mod tests {
             Ok(())
         })();
         let _ = crate::logic::remove_isolated_profile_credentials(&[credential_name]);
+        result.unwrap();
+    }
+
+    #[test]
+    fn missing_api_key_skips_that_channel_and_still_writes_the_others() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let present = format!(
+            "Codex-Router-Test-Present-{}-{nonce}",
+            std::process::id()
+        );
+        let missing = format!(
+            "Codex-Router-Test-Missing-{}-{nonce}",
+            std::process::id()
+        );
+        let result = (|| -> anyhow::Result<()> {
+            crate::logic::write_router_credential_text(&present, "present-credential")?;
+            let cfg = RouterConfig {
+                models: vec![
+                    ModelConfig {
+                        source: "apikey".to_owned(),
+                        model: "present-model".to_owned(),
+                        alias: "Present".to_owned(),
+                        base_url: "https://present.example/v1".to_owned(),
+                        credential_name: present.clone(),
+                        ..Default::default()
+                    },
+                    ModelConfig {
+                        source: "apikey".to_owned(),
+                        model: "missing-model".to_owned(),
+                        alias: "Missing".to_owned(),
+                        base_url: "https://missing.example/v1".to_owned(),
+                        credential_name: missing.clone(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            };
+            let routes = build_route_plan(&cfg);
+            let admin = MockAdmin::default();
+            let proxy_runtime = ProxyRuntime {
+                settings: crate::proxy::ProxySettings {
+                    mode: "direct".to_owned(),
+                    source: "test".to_owned(),
+                    proxy_url: None,
+                    no_proxy: String::new(),
+                    has_credentials: false,
+                    supports_account_binding: false,
+                    diagnostic: String::new(),
+                },
+                targets: BTreeMap::new(),
+            };
+            let mut accounts = Vec::new();
+            let cancel = AtomicBool::new(false);
+            let mut logs = Vec::new();
+            let managed = sync_api_channels(
+                &admin,
+                Path::new("."),
+                &cfg,
+                &routes,
+                7,
+                ManagedProxy::default(),
+                &proxy_runtime,
+                &mut accounts,
+                &cancel,
+                &mut |line| logs.push(line),
+            )?;
+            assert_eq!(managed.len(), 1);
+            assert!(logs.iter().any(|line| line.contains("Skipped channel: Missing")));
+            let calls = admin.calls();
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| call.method == "POST" && call.path == "/api/v1/admin/accounts")
+                    .count(),
+                1
+            );
+            Ok(())
+        })();
+        let _ = crate::logic::remove_isolated_profile_credentials(&[present, missing]);
         result.unwrap();
     }
 
