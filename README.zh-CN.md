@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-3.2.5-0969da" alt="版本 3.2.5">
+  <img src="https://img.shields.io/badge/version-3.2.9-0969da" alt="版本 3.2.9">
   <img src="https://img.shields.io/badge/platform-Windows%20%2F%20macOS%20%2F%20Linux-0078d4" alt="Windows / macOS / Linux">
   <img src="https://img.shields.io/badge/architecture-x64-555555" alt="x64">
   <img src="https://img.shields.io/badge/default%20build-portable-2ea44f" alt="默认构建便携版">
@@ -87,6 +87,10 @@ CodexRouter 可以将 OAuth 和 API 渠道合并为 Codex 可见的模型目录�
 - 3.0.12：Claude Opus/Sonnet 4.6+ 目录上下文改为 1M（95% 压缩点 950k），不再用未知模型的 128k，Desktop 也就不会只显示约 122k。
 - 3.0.13：Gemini/Antigravity 额度 429 立刻换下一个 OAuth 账号，不再把整池冷却后再重试到 Codex 报 exceeded retry limit。
 - 3.0.18：ChatGPT 5 小时额度用尽后立刻切到已配置的同名第三方 API。CLI 热推失败不再把全部号池停掉（避免 `503 no schedulable credential in pool`）。
+- 3.2.9：新增 API 渠道保存前固定先探 `/responses`，通了就按 responses 保存；只有 404/5xx 才回落到 `/chat/completions`。opencode Go 的 `muse-spark-1.3-contributor` 这类只支持 Responses 的模型现在可以直接添加。
+- 3.2.8：Grok 压缩后不再把旧对话和开发者前缀一起重放；目录窗口按 500k 发给 Desktop，不再显示成 190k 导致压缩完立刻 67%。
+- 3.2.7：Gemini 3.8 Flash 在 CLIProxy 还没有 3.8 SKU 时落到当前可用的 Gemini Flash，不再 `unknown provider`。
+- 3.2.6：Antigravity / Gemini 3.8 Flash 不再因为 `unknown provider for model cr_…_antigravity/…` 中途断掉；所有 OAuth 副本同时注册公开名和带前缀的 Host 请求 ID。
 - 3.2.5：保存并应用不再卡在「正在应用」；Grok 4.6 不再因为 `unknown provider for model cr_…_xai/grok-4.6` 中途断掉。
 - 3.2.3：Antigravity 账号卡片会列出 Gemini 3.8 Flash，即使实时目录还只有 3.7。
 - 3.2.2：Antigravity 可选 Gemini 3.8 Flash；保存并应用时缺一把 API 钥匙不会整次回滚。

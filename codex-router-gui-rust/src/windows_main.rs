@@ -1361,6 +1361,16 @@ fn set_api_model_protocol(model: &mut ModelConfig, protocol: logic::UpstreamProt
     model.extra = serde_json::to_string(&extra).unwrap_or_else(|_| "{}".to_owned());
 }
 
+/// 添加 API 模型时是否值得换一种协议再探一次。
+/// 401/403/429/超时/网络错误换协议也救不了，直接返回才能给出准确原因；
+/// 只有 404/5xx/其它 HTTP 异常才说明“这个协议不通，换一个试试”。
+fn api_probe_should_try_alternative(code: &str) -> bool {
+    matches!(
+        code,
+        "probe_not_found" | "probe_upstream" | "probe_http"
+    )
+}
+
 fn validate_api_model_connection(
     cfg: &RouterConfig,
     model: &mut ModelConfig,
@@ -1451,10 +1461,11 @@ fn validate_api_model_connection(
         let (probe_path, probe_body) = match protocol {
             logic::UpstreamProtocol::Responses => (
             "responses",
+            // 注意：不要带 max_output_tokens。部分推理网关（含 opencode Go 的
+            // muse-spark）在极小输出预算下直接回 5xx；"ping" 的回包本身只有几个 token。
             serde_json::json!({
                 "model": model.model.trim(),
                 "input": "ping",
-                "max_output_tokens": 1,
                 "stream": false,
             }),
         ),
@@ -1478,6 +1489,10 @@ fn validate_api_model_connection(
         let response = client
             .post(probe_url)
             .bearer_auth(api_key.as_str())
+            // 部分网关（opencode Go 会监控滥用流量）要求客户端自标识，
+            // 带上固定 UA 和标题，避免被当成匿名批量流量。
+            .header("User-Agent", format!("Codex-Router/{APP_VERSION}"))
+            .header("X-Title", "Codex-Router")
             .json(&probe_body)
             .send()
             .map_err(|error| {
@@ -1499,23 +1514,22 @@ fn validate_api_model_connection(
             _ => Err("probe_http".to_owned()),
         }
     };
-    let preferred = logic::classify_channel_route(model).upstream_protocol;
-    match probe(preferred) {
-        Ok(()) => Ok(()),
-        Err(first_error)
-            if matches!(
-                first_error.as_str(),
-                "probe_not_found" | "probe_upstream" | "probe_http"
-            ) =>
-        {
-            let alternative = match preferred {
-                logic::UpstreamProtocol::Responses => logic::UpstreamProtocol::ChatCompletions,
-                logic::UpstreamProtocol::ChatCompletions | logic::UpstreamProtocol::Anthropic => {
-                    logic::UpstreamProtocol::Responses
-                }
-            };
-            probe(alternative)?;
-            set_api_model_protocol(model, alternative);
+    // 添加模型固定先探 /responses：通了就按 responses 保存；
+    // 只有 404/5xx/其它 HTTP 异常才回落到 /chat/completions 再探，通了按 chat 保存。
+    // 两种协议对应互斥的 wire_api，探通哪个就存哪个，避免运行时再猜一次。
+    // 401/403/429/超时/网络错误直接返回，换协议也救不了，还能保留准确的错误原因。
+    let probe_order = [
+        logic::UpstreamProtocol::Responses,
+        logic::UpstreamProtocol::ChatCompletions,
+    ];
+    match probe(probe_order[0]) {
+        Ok(()) => {
+            set_api_model_protocol(model, probe_order[0]);
+            Ok(())
+        }
+        Err(first_error) if api_probe_should_try_alternative(&first_error) => {
+            probe(probe_order[1])?;
+            set_api_model_protocol(model, probe_order[1]);
             Ok(())
         }
         Err(error) => Err(error),
@@ -9854,6 +9868,8 @@ mod main_tests {
                 let request = String::from_utf8_lossy(&request[..count]);
                 if index == 0 {
                     assert!(request.starts_with("POST /v1/responses HTTP/1.1"));
+                    // /responses 探测不能带输出预算，避免推理网关在极小预算下 5xx。
+                    assert!(!request.contains("max_output_tokens"));
                 } else {
                     assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
                 }
@@ -9921,6 +9937,44 @@ mod main_tests {
         );
         let extra: serde_json::Value = serde_json::from_str(&model.extra).unwrap();
         assert_eq!(extra["openai_responses_mode"], "force_chat_completions");
+    }
+
+    #[test]
+    fn api_model_validation_prefers_responses_and_persists_protocol() {
+        // 只支持 /responses 的模型（如 opencode Go 的 muse-spark）：第一次探测就通，
+        // 直接按 responses 保存，不再回落到 /chat/completions。
+        let (cfg, mut model) = api_validation_fixture(
+            "200 OK",
+            r#"{"data":[{"id":"muse-spark-1.3-contributor"}]}"#,
+            &["200 OK"],
+        );
+        model.model = "muse-spark-1.3-contributor".to_owned();
+        assert_eq!(super::validate_api_model_connection(&cfg, &mut model), Ok(()));
+        let extra: serde_json::Value = serde_json::from_str(&model.extra).unwrap();
+        assert_eq!(extra["openai_responses_mode"], "force_responses");
+        assert_eq!(extra["codex_router_upstream_protocol"], "responses");
+    }
+
+    #[test]
+    fn api_probe_fallback_only_for_missing_or_upstream_errors() {
+        assert!(super::api_probe_should_try_alternative("probe_not_found"));
+        assert!(super::api_probe_should_try_alternative("probe_upstream"));
+        assert!(super::api_probe_should_try_alternative("probe_http"));
+        for code in [
+            "unauthorized",
+            "forbidden",
+            "rate_limited",
+            "timeout",
+            "network",
+            "request",
+            "upstream",
+            "http",
+            "invalid_response",
+            "credential_missing",
+            "proxy_config",
+        ] {
+            assert!(!super::api_probe_should_try_alternative(code), "{code}");
+        }
     }
 
     #[test]

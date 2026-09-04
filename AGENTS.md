@@ -32,7 +32,7 @@ D:\Work\CodexRouter\          唯一源码根 = git main。日常开发直接改
 当前入口：
 
 - 稳定 / 测试同一套：`D:\Work\CodexRouter\Release\<version>\Codex-Router-Portable-<version>-windows-x64\Codex-Router.exe`
-- 当前版本：**3.2.5**
+- 当前版本：**3.2.9**
 
 ## 每一版都必须打包 exe（默认）
 

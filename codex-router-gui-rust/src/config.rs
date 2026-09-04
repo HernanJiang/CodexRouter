@@ -612,11 +612,13 @@ impl RouterConfig {
         }
         let compact_migrated =
             migrate_auto_compact_percent_to_official(&incoming_version, &mut cfg);
+        let grok_window_migrated =
+            migrate_stale_grok_context_window(&incoming_version, &mut cfg);
         if compact_migrated {
             crate::logic::normalize_default_model(&mut cfg);
         }
         cfg.version = env!("CARGO_PKG_VERSION").to_owned();
-        if compact_migrated {
+        if compact_migrated || grok_window_migrated {
             let _ = cfg.save(path);
         }
         Ok(cfg)
@@ -669,6 +671,44 @@ fn migrate_auto_compact_percent_to_official(version: &str, cfg: &mut RouterConfi
     for model in &mut cfg.models {
         if model.auto_compact_percent != target {
             model.auto_compact_percent = target;
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn version_is_before_grok46_500k_window(version: &str) -> bool {
+    let version = version.trim();
+    if version.is_empty() {
+        return true;
+    }
+    let mut parts = version.split('.');
+    let major = parts.next().and_then(|part| part.parse::<u32>().ok());
+    let minor = parts.next().and_then(|part| part.parse::<u32>().ok());
+    let patch = parts.next().and_then(|part| part.parse::<u32>().ok());
+    match (major, minor, patch) {
+        (Some(major), Some(minor), Some(patch)) => {
+            major < 3 || (major == 3 && minor < 2) || (major == 3 && minor == 2 && patch < 8)
+        }
+        (Some(major), Some(minor), None) => major < 3 || (major == 3 && minor < 2),
+        (Some(major), None, None) => major < 3,
+        _ => true,
+    }
+}
+
+fn is_stale_grok46_context_window(model: &str, window: i64) -> bool {
+    let name = model.trim().to_ascii_lowercase();
+    name.contains("grok-4.6") && matches!(window, 200_000 | 256_000)
+}
+
+fn migrate_stale_grok_context_window(version: &str, cfg: &mut RouterConfig) -> bool {
+    if !version_is_before_grok46_500k_window(version) {
+        return false;
+    }
+    let mut changed = false;
+    for model in &mut cfg.models {
+        if is_stale_grok46_context_window(&model.model, model.context_window) {
+            model.context_window = 0;
             changed = true;
         }
     }
@@ -944,6 +984,50 @@ mod tests {
         let saved: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(saved["models"][0]["autoCompactPercent"], 95);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn pre_3_2_8_grok46_256k_window_is_reset_to_documented_default() {
+        let path = std::env::temp_dir().join(format!(
+            "codex-router-grok-window-migrate-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"version":"3.2.7","models":[{"model":"grok-4.6","contextWindow":256000},{"model":"gemini-3.8-flash","contextWindow":256000}]}"#,
+        )
+        .unwrap();
+        let config = RouterConfig::load(&path).unwrap();
+        assert_eq!(config.models[0].context_window, 0);
+        assert_eq!(config.models[1].context_window, 256_000);
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["models"][0]["contextWindow"], 0);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn post_3_2_8_manual_grok_window_is_preserved() {
+        let path = std::env::temp_dir().join(format!(
+            "codex-router-grok-window-keep-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"version":"3.2.8","models":[{"model":"grok-4.6","contextWindow":256000}]}"#,
+        )
+        .unwrap();
+        let config = RouterConfig::load(&path).unwrap();
+        assert_eq!(config.models[0].context_window, 256_000);
         std::fs::remove_file(path).unwrap();
     }
 

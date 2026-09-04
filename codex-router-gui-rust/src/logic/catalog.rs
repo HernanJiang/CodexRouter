@@ -467,10 +467,16 @@ pub fn build_model_catalog_with_root(cfg: &RouterConfig, router_root: &Path) -> 
         entry["truncation_policy"] = json!({"mode": "tokens", "limit": truncation_limit});
         entry["supports_parallel_tool_calls"] = Value::Bool(true);
         entry["experimental_supported_tools"] = Value::Array(vec![]);
-        entry["comp_hash"] = entry
-            .get("comp_hash")
-            .cloned()
-            .unwrap_or_else(|| Value::String("codex-router-v1".to_owned()));
+        // Do not inherit ChatGPT catalog `comp_hash` "3000". Desktop treats
+        // that hash as official-cache metadata and then falls back to a 200k
+        // window for unknown slugs, so Grok 500k is shown as 190k (200k@95%).
+        entry["comp_hash"] = Value::String(format!(
+            "codex-router-{}-{}-{}-{}",
+            env!("CARGO_PKG_VERSION"),
+            route.public_model_id,
+            context_window,
+            compact_percent
+        ));
 
         if is_restricted_oauth_model(model) || !is_openai_catalog_model(model) {
             apply_model_identity(&mut entry, model);

@@ -262,7 +262,9 @@ pub fn prepare_official_compact_request(body: &mut Value) {
 /// compacted item replaces every input item before it, so replaying that old
 /// prefix alongside the item causes duplicated context and repeated model
 /// reasoning.  This is intentionally public because the OpenAI-family path
-/// otherwise bypasses the third-party sanitizer in the gateway.
+/// otherwise bypasses the third-party sanitizer in the gateway.  Grok and
+/// other third-party models go through the sanitizer, which calls the same
+/// helper so a Codex text handoff is not replayed with the replaced prefix.
 pub fn normalize_official_compact_replay(body: &mut Value) -> bool {
     let Some(object) = body.as_object_mut() else {
         return false;
@@ -2305,19 +2307,21 @@ fn is_local_compact_id(value: &str) -> bool {
     value.trim().starts_with("cmp_local_")
 }
 
+fn item_is_compact_replay_marker(item: &Value) -> bool {
+    matches!(item_type(item).as_str(), "compaction" | "compact")
+        || text_looks_like_compact_handoff(&item_text(item))
+}
+
+fn text_looks_like_compact_handoff(text: &str) -> bool {
+    text.contains("【本地压缩摘要】")
+        || text.contains("【自动压缩后续跑】")
+        || text
+            .contains("Another language model started to solve this problem and produced a summary")
+        || text.contains("Here is the summary produced by the other language model")
+}
+
 fn input_looks_like_post_compact_replay(items: &[Value]) -> bool {
-    items.iter().any(|item| {
-        let kind = item_type(item);
-        if matches!(kind.as_str(), "compaction" | "compact") {
-            return true;
-        }
-        let text = item_text(item);
-        text.contains("【本地压缩摘要】")
-            || text.contains(
-                "Another language model started to solve this problem and produced a summary",
-            )
-            || text.contains("Here is the summary produced by the other language model")
-    })
+    items.iter().any(item_is_compact_replay_marker)
 }
 
 fn rewrite_codex_compact_handoff_text(text: &str) -> Option<String> {
@@ -2495,11 +2499,11 @@ pub fn sanitize_responses_request(path: &str, body: &mut Value) -> SanitizeStats
         capture_codex_app_project_context(object);
     }
 
-    // A returned compaction item represents the transcript before it.  Some
-    // Codex clients replay that item together with the old input and the old
-    // server-side continuation handle.  Keep the compaction item and the
-    // input after it, but do not send the replaced prefix a second time.
-    if stats.openai_family && !is_compact_path(path) && normalize_post_compact_replay(object) {
+    // A returned compaction item or Codex text handoff represents the
+    // transcript before it.  Some Codex clients replay that marker together
+    // with the old input, the developer prefix, and the old server-side
+    // continuation handle.  Keep the marker and the input after it.
+    if !is_compact_path(path) && normalize_post_compact_replay(object) {
         stats.converted_items += 1;
     }
 
@@ -2632,11 +2636,7 @@ fn normalize_post_compact_replay(object: &mut Map<String, Value>) -> bool {
     let compaction_index = object
         .get("input")
         .and_then(Value::as_array)
-        .and_then(|items| {
-            items
-                .iter()
-                .rposition(|item| matches!(item_type(item).as_str(), "compaction" | "compact"))
-        });
+        .and_then(|items| items.iter().rposition(item_is_compact_replay_marker));
     let Some(compaction_index) = compaction_index else {
         return false;
     };
@@ -6066,6 +6066,70 @@ mod tests {
         assert!(text.contains("不要输出空回复"));
         assert!(text.contains("优先级统一成账号 priority"));
         assert!(!text.contains("Another language model started"));
+    }
+
+    #[test]
+    fn grok_compact_handoff_replay_drops_replaced_prefix() {
+        let mut body = json!({
+            "model": "grok-4.6",
+            "previous_response_id": "resp_before_compact",
+            "conversation_id": "conv_before_compact",
+            "input": [
+                {"type":"message","role":"developer","content":[{"type":"input_text","text":"<app-context>\n# Codex desktop context\n"}]},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"old user task that should not be replayed"}]},
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"old assistant reasoning"}]},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:\n# Handoff\n还差把优先级统一成账号 priority。"}]},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"继续"}]}
+            ]
+        });
+        let stats = sanitize_responses_request("/v1/responses", &mut body);
+        assert!(stats.converted_items >= 1);
+        assert!(body.get("previous_response_id").is_none());
+        assert!(body.get("conversation_id").is_none());
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2);
+        let encoded = body.to_string();
+        assert!(!encoded.contains("old user task that should not be replayed"));
+        assert!(!encoded.contains("old assistant reasoning"));
+        assert!(!encoded.contains("<app-context>"));
+        assert!(!encoded.contains("Another language model started"));
+        assert!(encoded.contains("自动压缩后续跑"));
+        assert!(encoded.contains("优先级统一成账号 priority"));
+        assert_eq!(input[1]["content"][0]["text"], "继续");
+    }
+
+    #[test]
+    fn grok_official_compaction_replay_drops_replaced_prefix() {
+        let mut body = json!({
+            "model": "cr_r10a56_xai/grok-4.6",
+            "previous_response_id": "resp_before_compact",
+            "conversation_id": "conv_before_compact",
+            "input": [
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"old user task"}]},
+                {
+                    "type": "compaction",
+                    "encrypted_content": "xai-compact-blob-abcdefghijklmnopqrstuvwxyz012345"
+                },
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"continue from compact summary"}]}
+            ]
+        });
+        let stats = sanitize_responses_request("/v1/responses", &mut body);
+        assert!(stats.converted_items >= 1);
+        assert!(body.get("previous_response_id").is_none());
+        assert!(body.get("conversation_id").is_none());
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], "compaction");
+        assert_eq!(
+            input[0]["encrypted_content"],
+            "xai-compact-blob-abcdefghijklmnopqrstuvwxyz012345"
+        );
+        assert_eq!(
+            input[1]["content"][0]["text"],
+            "continue from compact summary"
+        );
+        let encoded = body.to_string();
+        assert!(!encoded.contains("old user task"));
     }
 
     fn grok_mid_agent_body() -> Value {

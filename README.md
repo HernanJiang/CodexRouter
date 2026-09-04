@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-3.2.5-0969da" alt="Version 3.2.5">
+  <img src="https://img.shields.io/badge/version-3.2.9-0969da" alt="Version 3.2.9">
   <img src="https://img.shields.io/badge/platform-Windows%20%2F%20macOS%20%2F%20Linux-0078d4" alt="Windows / macOS / Linux">
   <img src="https://img.shields.io/badge/architecture-x64-555555" alt="x64">
   <img src="https://img.shields.io/badge/default%20build-portable-2ea44f" alt="Portable build by default">

@@ -2,6 +2,31 @@
 
 本文件记录面向用户的重要变化。完整技术细节以对应版本的源码和 GitHub Release 为准。
 
+## 3.2.9 - 2026-09-04
+
+### 修复
+
+- 新增 API 渠道（OpenAI 兼容）保存前固定先探 `/responses`，通了就按 responses 保存；只有 404/5xx 等协议级失败才回落到 `/chat/completions` 再探，通了按 chat 保存。两种结果都会把探通的协议写进渠道，避免运行时再猜。opencode Go 的 `muse-spark-1.3-contributor` 这类只支持 Responses 的模型之前会卡在「模型已列出，但实际调用时上游返回 HTTP 5xx」，现在可以正常添加。
+- `/responses` 探测不再带 `max_output_tokens: 1`（部分推理网关在极小输出预算下直接 5xx），探测请求带上 `Codex-Router` 客户端标识。
+
+## 3.2.8 - 2026-09-03
+
+### 修复
+
+- Grok 压缩完立刻又显示约 67%，是两件事叠在一起。Codex Desktop 会把压缩前的对话、开发者前缀和压缩摘要一起重放；Grok 路径以前只改摘要措辞、不丢掉被替换的前缀，所以压缩等于没压。同时目录从 ChatGPT 模板抄了 `comp_hash: 3000`，Desktop 把 Grok 当成未知官方模型，窗口落到 200k×95%=190k，于是压缩后重新注入的 app-context / skills 大约 125k 看起来像「瞬间占满 67%」。现在压缩后的请求会丢掉摘要之前的内容，目录使用按模型窗口生成的 `comp_hash`，并把误写成 256k 的 Grok 4.6 窗口迁回文档默认 500k（Desktop 按 475k 显示）。
+
+## 3.2.7 - 2026-09-03
+
+### 修复
+
+- Antigravity 选 Gemini 3.8 Flash 时，CLIProxy 7.2.135 实时目录仍只有 3.7。别名若指向不存在的 `gemini-3.8-flash-high`，请求 `cr_…_antigravity/gemini-3.8-flash` 会 `unknown provider`。现在会落到目录里真正有的 Gemini Flash（当前是 3.7-high），卡片仍显示 3.8。
+
+## 3.2.6 - 2026-09-03
+
+### 修复
+
+- Antigravity / Gemini 不再因为 `unknown provider for model cr_…_antigravity/gemini-3.8-flash` 中途断掉。所有 OAuth 副本（Antigravity、xAI、Codex 等）同时注册公开模型名和 Host 实际请求的 `{前缀}/{模型}`，CLIProxy 无论是否自动加前缀都能解析。
+
 ## 3.2.5 - 2026-09-03
 
 ### 修复

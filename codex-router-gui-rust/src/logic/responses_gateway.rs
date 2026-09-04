@@ -805,11 +805,11 @@ fn handle_client(
                     request_body = serde_json::to_vec(&json_body)?;
                 }
             }
-            if openai_family
-                && !is_compact_path(&path)
-                && normalize_official_compact_replay(&mut json_body)
-            {
+            if !is_compact_path(&path) && normalize_official_compact_replay(&mut json_body) {
                 request_body = serde_json::to_vec(&json_body)?;
+                if continue_body.is_some() {
+                    continue_body = Some(json_body.clone());
+                }
             }
         }
     }

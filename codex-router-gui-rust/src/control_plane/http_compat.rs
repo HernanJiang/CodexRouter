@@ -18,7 +18,7 @@ use hmac::{Hmac, Mac};
 use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 use sha2::Sha256;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -283,6 +283,7 @@ async fn sync_backend_ex(state: &ControlState, publish: CliPublish) -> Result<us
     // triggers) is what pinned the UI on Applying. Host memory still rebuilds;
     // the final composite-route reconcile publishes YAML once.
     let cli_ready = publish_cli && state.cli.health().await.is_ok();
+    let live_model_ids = live_cli_model_ids(state, &backend).await;
     // The CLI is the authority for file-based auth indexes. Its synthesizer
     // may normalize paths or retain an existing index, so reproducing the
     // hash locally is only a startup fallback and is not sufficient for
@@ -528,11 +529,15 @@ async fn sync_backend_ex(state: &ControlState, publish: CliPublish) -> Result<us
                 .get_mut("model_aliases")
                 .and_then(Value::as_array_mut)
                 .expect("model_aliases was initialized as an array");
-            aliases.push(json!({
-                "name": mapped_upstream_model(&payload, &target_platform, &public_model, &upstream_model),
-                "alias": oauth_replica_alias(&auth_type, &pool_prefix, &public_model),
-                "force-mapping": true,
-            }));
+            let upstream = resolve_live_oauth_upstream(
+                &account_platform,
+                &auth_type,
+                &mapped_upstream_model(&payload, &target_platform, &public_model, &upstream_model),
+                &live_model_ids,
+            );
+            for alias in oauth_replica_aliases(&auth_type, &pool_prefix, &public_model) {
+                push_oauth_replica_alias(aliases, &upstream, &alias);
+            }
             if let Err(error) = write_auth_file(&backend.auth_dir, &replica_stem, &document) {
                 let _ = state.logger.write(json!({
                     "level":"WARN",
@@ -4078,8 +4083,13 @@ fn normalize_upstream_model_for_platform(platform: &str, model: &str) -> String 
         if model == "gemini-3.7-flash" || model == "gemini-3.7-flash-medium" {
             return "gemini-3.7-flash-high".to_owned();
         }
-        if model == "gemini-3.8-flash" || model == "gemini-3.8-flash-medium" {
-            return "gemini-3.8-flash-high".to_owned();
+        if model == "gemini-3.8-flash"
+            || model == "gemini-3.8-flash-medium"
+            || model == "gemini-3.8-flash-high"
+        {
+            // CLIProxy 7.2.135 does not register Gemini 3.8 SKUs. Keep the
+            // public 3.8 id and send a live 3.7 Flash SKU upstream.
+            return "gemini-3.7-flash-high".to_owned();
         }
         if model == "gemini-3.1-pro-high" || model == "gemini-3.1-pro" {
             return "gemini-3.1-pro-low".to_owned();
@@ -4165,14 +4175,117 @@ fn oauth_route_model_matches(payload: &Value, public_model: &str, upstream_model
     api_route_model_matches(payload, public_model, upstream_model)
 }
 
+#[cfg(test)]
 fn oauth_replica_alias(auth_type: &str, pool_prefix: &str, public_model: &str) -> String {
-    match auth_type.trim().to_ascii_lowercase().as_str() {
-        // These CLIProxy executors do not always register `{prefix}/{model}`
-        // from the auth-file prefix alone. Host always requests that form, so
-        // the alias must match it. Codex/OpenAI still auto-prefix and keep a
-        // public-model alias.
-        "gemini-cli" | "xai" | "grok" => format!("{pool_prefix}/{public_model}"),
-        _ => public_model.to_owned(),
+    let aliases = oauth_replica_aliases(auth_type, pool_prefix, public_model);
+    aliases
+        .iter()
+        .find(|alias| alias.contains('/'))
+        .cloned()
+        .or_else(|| aliases.into_iter().next())
+        .unwrap_or_else(|| public_model.to_owned())
+}
+
+fn oauth_replica_aliases(_auth_type: &str, pool_prefix: &str, public_model: &str) -> Vec<String> {
+    let public = public_model.trim();
+    if public.is_empty() {
+        return Vec::new();
+    }
+    let prefixed = format!("{pool_prefix}/{public}");
+    if prefixed == public {
+        vec![public.to_owned()]
+    } else {
+        // Host always requests `{prefix}/{public_model}`. Some CLIProxy
+        // executors auto-prefix a public alias; others only honor the exact
+        // alias string. Register both so Antigravity/Gemini, xAI/Grok, Claude
+        // and Codex keep resolving after a watcher reload.
+        vec![public.to_owned(), prefixed]
+    }
+}
+
+async fn live_cli_model_ids(state: &ControlState, backend: &BackendPaths) -> HashSet<String> {
+    state
+        .cli
+        .model_registry(&backend.downstream_key)
+        .await
+        .ok()
+        .and_then(|value| {
+            value.get("data").and_then(Value::as_array).map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_owned))
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+}
+
+fn live_has_model(live: &HashSet<String>, model: &str) -> bool {
+    let model = model.trim();
+    if model.is_empty() {
+        return false;
+    }
+    live.contains(model)
+        || live.iter().any(|id| {
+            id.rsplit_once('/')
+                .is_some_and(|(_, public)| public == model)
+        })
+}
+
+fn resolve_live_oauth_upstream(
+    platform: &str,
+    auth_type: &str,
+    desired: &str,
+    live: &HashSet<String>,
+) -> String {
+    let desired = desired.trim();
+    if desired.is_empty() || live_has_model(live, desired) {
+        return desired.to_owned();
+    }
+    let antigravity = auth_type.eq_ignore_ascii_case("antigravity")
+        || auth_type.eq_ignore_ascii_case("gemini-cli")
+        || config_compiler::normalize_platform(platform) == "gemini";
+    if antigravity && desired.to_ascii_lowercase().contains("gemini-3.8") {
+        // CLIProxy 7.2.135 still lists 3.7 Flash as the newest Gemini SKU.
+        // Keep the public 3.8 id, but point the alias at a live Flash SKU
+        // so Host's `{prefix}/gemini-3.8-flash` request is not unknown.
+        for fallback in [
+            "gemini-3.7-flash-high",
+            "gemini-3.7-flash",
+            "gemini-3.6-flash-high",
+            "gemini-3-flash",
+        ] {
+            if live.is_empty() || live_has_model(live, fallback) {
+                return fallback.to_owned();
+            }
+        }
+    }
+    if antigravity && desired.to_ascii_lowercase().contains("gemini") {
+        for fallback in [
+            "gemini-3.8-flash-high",
+            "gemini-3.7-flash-high",
+            "gemini-3.6-flash-high",
+            "gemini-3-flash",
+        ] {
+            if live_has_model(live, fallback) {
+                return fallback.to_owned();
+            }
+        }
+    }
+    desired.to_owned()
+}
+
+fn push_oauth_replica_alias(aliases: &mut Vec<Value>, name: &str, alias: &str) {
+    let exists = aliases.iter().any(|entry| {
+        entry.get("name").and_then(Value::as_str) == Some(name)
+            && entry.get("alias").and_then(Value::as_str) == Some(alias)
+    });
+    if !exists {
+        aliases.push(json!({
+            "name": name,
+            "alias": alias,
+            "force-mapping": true,
+        }));
     }
 }
 
@@ -5650,8 +5763,70 @@ mod tests {
             "cr_r10a56_xai/grok-4.6"
         );
         assert_eq!(
+            oauth_replica_alias(
+                "antigravity",
+                "cr_r12991a54_antigravity",
+                "gemini-3.8-flash"
+            ),
+            "cr_r12991a54_antigravity/gemini-3.8-flash"
+        );
+        assert_eq!(
+            oauth_replica_aliases(
+                "antigravity",
+                "cr_r12991a54_antigravity",
+                "gemini-3.8-flash"
+            ),
+            vec![
+                "gemini-3.8-flash".to_owned(),
+                "cr_r12991a54_antigravity/gemini-3.8-flash".to_owned()
+            ]
+        );
+        assert_eq!(
+            oauth_replica_aliases("codex", "cr_r1a61_openai", "gpt-5.6-sol"),
+            vec![
+                "gpt-5.6-sol".to_owned(),
+                "cr_r1a61_openai/gpt-5.6-sol".to_owned()
+            ]
+        );
+        assert_eq!(
             oauth_replica_alias("openai", "cr_r1_openai", "gpt-5.6-sol"),
-            "gpt-5.6-sol"
+            "cr_r1_openai/gpt-5.6-sol"
+        );
+    }
+
+    #[test]
+    fn antigravity_gemini_38_falls_back_to_live_flash() {
+        let live = HashSet::from([
+            "cr_r12991a54_antigravity/gemini-3.7-flash-high".to_owned(),
+            "cr_r12991a54_antigravity/gemini-3.6-flash-high".to_owned(),
+        ]);
+        assert_eq!(
+            resolve_live_oauth_upstream(
+                "antigravity",
+                "antigravity",
+                "gemini-3.8-flash-high",
+                &live
+            ),
+            "gemini-3.7-flash-high"
+        );
+        let live_38 = HashSet::from(["cr_r12991a54_antigravity/gemini-3.8-flash-high".to_owned()]);
+        assert_eq!(
+            resolve_live_oauth_upstream(
+                "antigravity",
+                "antigravity",
+                "gemini-3.8-flash-high",
+                &live_38
+            ),
+            "gemini-3.8-flash-high"
+        );
+        assert_eq!(
+            resolve_live_oauth_upstream(
+                "antigravity",
+                "antigravity",
+                "gemini-3.8-flash-high",
+                &HashSet::new()
+            ),
+            "gemini-3.7-flash-high"
         );
     }
 
@@ -5731,7 +5906,7 @@ mod tests {
                 "gemini-3.8-flash",
                 "gemini-3.8-flash"
             ),
-            "gemini-3.8-flash-high"
+            "gemini-3.7-flash-high"
         );
         assert_eq!(
             mapped_upstream_model(&payload, "antigravity", "claude-fable-5", "claude-fable-5"),

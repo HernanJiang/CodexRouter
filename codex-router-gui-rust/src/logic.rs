@@ -1906,6 +1906,7 @@ fn catalog_content_etag(models: &[Value]) -> String {
             .get("effective_context_window_percent")
             .and_then(Value::as_i64)
             .unwrap_or(0);
+        let comp_hash = entry.get("comp_hash").and_then(Value::as_str).unwrap_or("");
         fingerprint.push('\n');
         fingerprint.push_str(slug);
         fingerprint.push('\t');
@@ -1914,6 +1915,8 @@ fn catalog_content_etag(models: &[Value]) -> String {
         fingerprint.push_str(&auto_compact.to_string());
         fingerprint.push('\t');
         fingerprint.push_str(&percent.to_string());
+        fingerprint.push('\t');
+        fingerprint.push_str(comp_hash);
     }
     let digest = sha2::Sha256::digest(fingerprint.as_bytes());
     let hex = digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
@@ -1966,6 +1969,7 @@ fn catalog_compact_percent_mismatch(doc: &Value, cfg: &RouterConfig) -> bool {
             (
                 i64::from(clamp_auto_compact_percent(model.auto_compact_percent)),
                 resolve_auto_compact_token_limit(model),
+                resolve_context_window(model),
             ),
         );
     }
@@ -1986,7 +1990,17 @@ fn catalog_compact_percent_mismatch(doc: &Value, cfg: &RouterConfig) -> bool {
             .get("auto_compact_token_limit")
             .and_then(Value::as_i64)
             .unwrap_or(-1);
-        if percent != want.0 || auto_compact != want.1 {
+        let window = entry
+            .get("context_window")
+            .and_then(Value::as_i64)
+            .unwrap_or(-1);
+        let comp_hash = entry.get("comp_hash").and_then(Value::as_str).unwrap_or("");
+        if percent != want.0
+            || auto_compact != want.1
+            || window != want.2
+            || comp_hash == "3000"
+            || !comp_hash.contains(env!("CARGO_PKG_VERSION"))
+        {
             return true;
         }
     }
@@ -6119,6 +6133,10 @@ base_url = "https://api.430123.xyz/v1"
         assert_eq!(catalog["models"][0]["context_window"], 500_000);
         assert_eq!(catalog["models"][0]["effective_context_window_percent"], 95);
         assert_eq!(catalog["models"][0]["auto_compact_token_limit"], 475_000);
+        let hash = catalog["models"][0]["comp_hash"].as_str().unwrap();
+        assert!(hash.contains(env!("CARGO_PKG_VERSION")));
+        assert!(hash.contains("500000"));
+        assert_ne!(hash, "3000");
         assert_ne!(catalog["etag"], "codex-router-local-v2");
         assert!(catalog["etag"].as_str().unwrap().contains(env!("CARGO_PKG_VERSION")));
         assert!(!stale.exists());
